@@ -51,6 +51,23 @@ pub(crate) mod recording_journal;
 #[path = "recording_work_profile.rs"]
 pub(crate) mod work_profile;
 
+#[cfg(all(test, unix, debug_assertions))]
+pub(crate) mod object_diagnostic;
+
+macro_rules! object_io {
+    ($source:ident, $site:ident, $correlation_id:expr, $call:expr) => {{
+        #[cfg(all(test, unix, debug_assertions))]
+        let result = object_diagnostic::$source(
+            object_diagnostic::ObjectIoSite::$site,
+            $correlation_id,
+            || $call,
+        );
+        #[cfg(not(all(test, unix, debug_assertions)))]
+        let result = ($call).map_err(|_| object_io_error($correlation_id));
+        result
+    }};
+}
+
 #[cfg(test)]
 type CommitObserver = Option<Box<dyn Fn(&str)>>;
 
@@ -4446,21 +4463,34 @@ fn create_staging_files(
     #[cfg(unix)]
     let _admission_caller = CallerGuard::enter(Caller::SegmentStage);
     binding.revalidate(correlation_id)?;
-    let root =
-        AdmittedPrivateRoot::open(&binding.root).map_err(|_| object_io_error(correlation_id))?;
-    let staging_root = root
-        .open_or_create_private_child("staging")
-        .map_err(|_| object_io_error(correlation_id))?;
-    let recording_directory = staging_root
-        .open_or_create_private_child(&recording_id.as_uuid().to_string())
-        .map_err(|_| object_io_error(correlation_id))?;
+    let root = object_io!(
+        private,
+        StagingProjectRootOpen,
+        correlation_id,
+        AdmittedPrivateRoot::open(&binding.root)
+    )?;
+    let staging_root = object_io!(
+        private,
+        StagingRootOpenOrCreate,
+        correlation_id,
+        root.open_or_create_private_child("staging")
+    )?;
+    let recording_directory = object_io!(
+        private,
+        StagingRecordingOpenOrCreate,
+        correlation_id,
+        staging_root.open_or_create_private_child(&recording_id.as_uuid().to_string())
+    )?;
     // UUIDv7 supplies entropy for collision resistance while preserving no caller
     // material in the staging path.
     let directory_name = uuid::Uuid::now_v7().to_string();
-    let staging = recording_directory
-        .create_private_child(&directory_name)
-        .map_err(|_| object_io_error(correlation_id))?;
-    recording_directory.sync().map_err(|_| object_io_error(correlation_id))?;
+    let staging = object_io!(
+        private,
+        StagingDirectoryCreate,
+        correlation_id,
+        recording_directory.create_private_child(&directory_name)
+    )?;
+    object_io!(private, StagingRecordingSync, correlation_id, recording_directory.sync())?;
     let directory = staging.path().to_path_buf();
     drop(staging);
     Ok(StagingFiles {
@@ -4521,7 +4551,12 @@ fn ensure_owner_only_directory(
     let _admission_caller = CallerGuard::enter(Caller::ManagedDirectory);
     let relative =
         directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
-    let root_cap = AdmittedPrivateRoot::open(root).map_err(|_| object_io_error(correlation_id))?;
+    let root_cap = object_io!(
+        private,
+        ObjectProjectRootOpen,
+        correlation_id,
+        AdmittedPrivateRoot::open(root)
+    )?;
     let mut current = root_cap;
     let mut traversed = 0_usize;
     for component in relative.components() {
@@ -4533,11 +4568,14 @@ fn ensure_owner_only_directory(
             return Err(atomic_install_error(correlation_id));
         }
         let name = name.to_str().ok_or_else(|| atomic_install_error(correlation_id))?;
-        current = current
-            .open_or_create_private_child(name)
-            .map_err(|_| object_io_error(correlation_id))?;
+        current = object_io!(
+            private,
+            ObjectParentOpenOrCreate,
+            correlation_id,
+            current.open_or_create_private_child(name)
+        )?;
     }
-    current.revalidate().map_err(|_| object_io_error(correlation_id))
+    object_io!(private, ObjectParentRevalidate, correlation_id, current.revalidate())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4578,18 +4616,31 @@ fn write_synced_file(
     #[cfg(unix)]
     let _admission_caller = CallerGuard::enter(Caller::SegmentStage);
     note_staging_write();
-    let parent = path.parent().ok_or_else(|| object_io_error(correlation_id))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| object_io_error(correlation_id))?;
-    let root = AdmittedPrivateRoot::open(parent).map_err(|_| object_io_error(correlation_id))?;
-    let mut file = root.create_private_file(name).map_err(|_| object_io_error(correlation_id))?;
-    file.write_all(bytes).map_err(|_| object_io_error(correlation_id))?;
-    file.flush().map_err(|_| object_io_error(correlation_id))?;
-    sync_recording_file(&file, sync).map_err(|_| object_io_error(correlation_id))?;
-    root.validate_file_binding(name, &file, true).map_err(|_| object_io_error(correlation_id))?;
-    root.sync().map_err(|_| object_io_error(correlation_id))
+    let parent = object_io!(missing, StageFileParent, correlation_id, path.parent().ok_or(()))?;
+    let name = object_io!(
+        missing,
+        StageFileName,
+        correlation_id,
+        path.file_name().and_then(|name| name.to_str()).ok_or(())
+    )?;
+    let root = object_io!(
+        private,
+        StageFileParentOpen,
+        correlation_id,
+        AdmittedPrivateRoot::open(parent)
+    )?;
+    let mut file =
+        object_io!(private, StageFileCreate, correlation_id, root.create_private_file(name))?;
+    object_io!(direct, StageFileWrite, correlation_id, file.write_all(bytes))?;
+    object_io!(direct, StageFileFlush, correlation_id, file.flush())?;
+    object_io!(direct, StageFileSync, correlation_id, sync_recording_file(&file, sync))?;
+    object_io!(
+        private,
+        StageFileBinding,
+        correlation_id,
+        root.validate_file_binding(name, &file, true)
+    )?;
+    object_io!(private, StageFileParentSync, correlation_id, root.sync())
 }
 
 #[cfg(unix)]
@@ -5072,6 +5123,11 @@ fn commit_failpoint(
         return Err(if atomic_boundary {
             atomic_install_error(correlation_id)
         } else {
+            // These two failpoints are consumed by best-effort cleanup.
+            #[cfg(all(unix, debug_assertions))]
+            if !matches!(point, "after-commit-before-cleanup" | "cleanup-staging-directory-fsync") {
+                object_diagnostic::observe_failpoint();
+            }
             object_io_error(correlation_id)
         });
     }

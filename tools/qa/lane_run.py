@@ -266,6 +266,19 @@ IO_ERROR_KINDS = frozenset({
     "CrossesDevices", "TooManyLinks", "InvalidFilename", "ArgumentListTooLong", "Interrupted",
     "Unsupported", "UnexpectedEof", "OutOfMemory", "InProgress", "Other", "Uncategorized",
 })
+SPARSE_ACK_TEST = "recording_port::tests::sparse_acknowledged_batches_hit_admission_before_becoming_unreadable"
+SPARSE_ACK_TARGET = {"crate": "xtrace-store", "targetKind": "lib", "targetName": "xtrace_store"}
+SPARSE_ACK_SOURCE = "crates/xtrace-store/src/recording_port.rs"
+SPARSE_ACK_PANIC = 'panic!("acknowledgement object io {diagnostic}");'
+OBJECT_IO_DIAGNOSTIC = re.compile(
+    r"acknowledgement object io iteration=([1-9][0-9]{0,4}) operation=([A-Za-z]+)"
+    r" error=([A-Za-z]+) admission=([A-Za-z]+) kind=([A-Za-z]+)"
+    r" errno=(unavailable|-?[0-9]{1,10}) context=(unavailable|[A-Za-z0-9,()\-]+)"
+)
+OBJECT_IO_CONTEXT = re.compile(
+    r"([A-Za-z]+),([0-9]{1,2}),([A-Za-z]+),(?:None|Some\(([A-Za-z]+)\)),"
+    r"(?:None|Some\((-?[0-9]{1,19})\)),(?:None|Some\((true|false)\))"
+)
 
 
 class UnverifiedReason(str, Enum):
@@ -385,6 +398,8 @@ class CheckoutMetadata:
         self.listing_refusals: set[str] = set()
         self.admission_objects: set[str] = set()
         self.admission_callers: set[str] = set()
+        self.object_io_sites: set[str] = set()
+        self.sparse_ack_panic_sites: set[str] = set()
         self.java_files: dict[str, list[str]] = {}
         for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
@@ -404,6 +419,11 @@ class CheckoutMetadata:
                     self.admission_objects.update(_diagnostic_variants(source, "AdmissionObject"))
                 if name == "crates/xtrace-private-storage/src/caller.rs":
                     self.admission_callers.update(_diagnostic_variants(source, "AdmissionCaller"))
+            if name == "crates/xtrace-store/src/recording_store/object_diagnostic.rs":
+                self.object_io_sites = _diagnostic_variants(source, "ObjectIoSite")
+            if name == SPARSE_ACK_SOURCE:
+                self.sparse_ack_panic_sites = {f"{name}:{number}" for number, line in
+                                              enumerate(source.splitlines(), 1) if line.strip() == SPARSE_ACK_PANIC}
         self._read_rust_contexts(sources)
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
@@ -862,6 +882,42 @@ def _rust_failure_name(name: str, metadata: CheckoutMetadata, index) -> str:
     return name if name in metadata.rust_tests and not _private(name, index, verified_identifier=True) else UNVERIFIED
 
 
+def _sparse_acknowledgement_io(line: str, metadata: CheckoutMetadata, index) -> dict | None:
+    """Rebuild typed facts from the one attested sparse acknowledgement panic."""
+    match = OBJECT_IO_DIAGNOSTIC.fullmatch(line) if len(line) <= 512 else None
+    if match is None:
+        return None
+    iteration, operation, error, admission, kind, errno, context = (
+        None if value == "unavailable" else value for value in match.groups())
+    iteration = int(iteration)
+    errno = int(errno) if errno is not None else None
+    if (iteration > 10_000  # MAX_RECORDING_SEGMENTS bounds this test's loop
+            or operation is not None and operation not in metadata.object_io_sites
+            or error is not None and error not in metadata.error_variants
+            or (error == "Admission") != (admission is not None)
+            or admission is not None and admission not in metadata.admission_operations
+            or kind is not None and kind not in IO_ERROR_KINDS
+            or errno is not None and (kind is None or not -(2**31) <= errno < 2**31)
+            or operation is None and any(value is not None for value in (error, kind))):
+        return None
+    fields = {"iteration": iteration, "operation": operation, "privateStorageError": error,
+              "admissionOperation": admission, "kind": kind, "errno": errno, "context": None}
+    if context is not None:
+        match = OBJECT_IO_CONTEXT.fullmatch(context)
+        if match is None or admission is None:
+            return None
+        site, changes, listing, obj, depth, nlink = match.groups()
+        changes = int(changes)
+        depth = int(depth) if depth is not None else None
+        if (site not in metadata.admission_sites or changes > 31 or listing not in metadata.listing_refusals
+                or obj is not None and obj not in metadata.admission_objects
+                or depth is not None and not MIN_COMPONENT_DEPTH <= depth <= MAX_COMPONENT_DEPTH):
+            return None
+        fields["context"] = {"site": site, "changes": changes, "listing": listing, "object": obj,
+                             "componentDepth": depth, "nlinkChanged": None if nlink is None else nlink == "true"}
+    return None if _private(line, index, verified_identifier=True) else fields
+
+
 def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata, index) -> list[dict]:
     if not report.counts[1]:
         return []  # Expected panics in a successful binary are not failures.
@@ -885,7 +941,8 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
     section = None
     current = None
     ambiguous = None
-    for line, allowed in zip(report.body, report.boundaries):
+    sparse_ack_seen = False
+    for line_number, (line, allowed) in enumerate(zip(report.body, report.boundaries)):
         if allowed and (header := CARGO_SECTION.fullmatch(line)):
             section = header[1]
             current = rows.get(section)
@@ -914,6 +971,15 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
                         current["panicSites"].append(site)
                     if current["location"] == UNVERIFIED:
                         current["location"] = site
+                if (binary == SPARSE_ACK_TARGET and section == current["test"] == panic[1] == SPARSE_ACK_TEST
+                        and site in metadata.sparse_ack_panic_sites):
+                    if sparse_ack_seen:
+                        current.pop("acknowledgementObjectIo", None)
+                    elif line_number + 1 < len(report.body) and report.boundaries[line_number + 1]:
+                        facts = _sparse_acknowledgement_io(report.body[line_number + 1], metadata, index)
+                        if facts is not None:
+                            current["acknowledgementObjectIo"] = facts
+                    sparse_ack_seen = True
         if current is not None and line.strip():
             current["withheldLines"] += 1
     return [*rows.values(), *([ambiguous] if ambiguous is not None else [])]

@@ -91,6 +91,100 @@ class FloorConfigurationTests(unittest.TestCase):
 
 
 class FloorEnvironmentTests(CheckoutFixture):
+    def test_both_configured_store_commands_publish_only_validated_acknowledgement_facts(self):
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        paths = (
+            "crates/xtrace-store/Cargo.toml", "crates/xtrace-store/src/lib.rs",
+            "crates/xtrace-store/src/recording_store/object_diagnostic.rs", lane_run.SPARSE_ACK_SOURCE,
+            "crates/xtrace-private-storage/src/diagnostic.rs", "crates/xtrace-private-storage/src/admission.rs",
+        )
+        metadata = lane_run.CheckoutMetadata({path: (repo / path).read_text() for path in paths})
+        self.assertIn(lane_run.SPARSE_ACK_TEST, metadata.rust_tests)
+        self.assertEqual(len(metadata.sparse_ack_panic_sites), 1)
+        site = next(iter(metadata.sparse_ack_panic_sites))
+        test = lane_run.SPARSE_ACK_TEST
+        valid = ("acknowledgement object io iteration=972 operation=StagingDirectoryCreate error=Admission"
+                 " admission=AclState kind=unavailable errno=unavailable"
+                 " context=ProbeState,1,NotChecked,Some(Directory),Some(-1),Some(false)")
+        expected = {"iteration": 972, "operation": "StagingDirectoryCreate", "privateStorageError": "Admission",
+                    "admissionOperation": "AclState", "kind": None, "errno": None,
+                    "context": {"site": "ProbeState", "changes": 1, "listing": "NotChecked", "object": "Directory",
+                                "componentDepth": -1, "nlinkChanged": False}}
+        journal_cases = [
+            (f"acknowledgement object io iteration=1 operation={operation} error=unavailable"
+             f" admission=unavailable kind={kind} errno={errno} context=unavailable",
+             site, "xtrace_store", {"iteration": 1, "operation": operation, "privateStorageError": None,
+                                    "admissionOperation": None, "kind": kind, "errno": errno, "context": None})
+            for operation, kind, errno in (
+                ("CheckpointWrite", "StorageFull", 28),
+                ("CheckpointSync", "PermissionDenied", 13),
+                ("JournalWrite", "StorageFull", 28),
+                ("JournalSync", "StorageFull", 28),
+            )
+        ]
+        for payload, location, binary, published in (
+            (valid, site, "xtrace_store", expected),
+            ("acknowledgement object io iteration=10000 operation=StageFileWrite error=unavailable"
+             " admission=unavailable kind=StorageFull errno=28 context=unavailable",
+             site, "xtrace_store", {"iteration": 10000, "operation": "StageFileWrite", "privateStorageError": None,
+                                    "admissionOperation": None, "kind": "StorageFull", "errno": 28, "context": None}),
+            ("acknowledgement object io iteration=1 operation=StagingRecordingSync error=Operation"
+             " admission=unavailable kind=Other errno=unavailable context=unavailable",
+             site, "xtrace_store", {"iteration": 1, "operation": "StagingRecordingSync",
+                                    "privateStorageError": "Operation", "admissionOperation": None,
+                                    "kind": "Other", "errno": None, "context": None}),
+            *journal_cases,
+            (journal_cases[-1][0].replace("operation=JournalSync", "operation=FixtureCANARY"),
+             site, "xtrace_store", None),
+            (valid.replace("error=Admission", "error=/private/CANARY"), site, "xtrace_store", None),
+            (valid.replace("Some(-1)", "Some(-9223372036854775809)"), site, "xtrace_store", None),
+            (valid.replace("iteration=972", "iteration=10001"), site, "xtrace_store", None),
+            (valid + " payload=CANARY", site, "xtrace_store", None),
+            (valid, f"{lane_run.SPARSE_ACK_SOURCE}:1", "xtrace_store", None),
+            (valid, site, "wrong_target", None),
+        ):
+            with self.subTest(payload=payload, site=location, binary=binary), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                raw = (f"Running unittests src/lib.rs (target/debug/deps/{binary}-0123456789abcdef)\n"
+                       f"\nrunning 2 tests\ntest {test} ... FAILED\n"
+                       f"\nfailures:\n\n---- {test} stdout ----\n"
+                       "fixture path /private/CANARY and ACL principal fixture-CANARY\n"
+                       f"\nthread '{test}' (42) panicked at {location}:13:\n{payload}\n"
+                       f"\nfailures:\n    {test}\n"
+                       "\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n")
+
+                def cargo(cmd, *, log, env, observations, **kwargs):
+                    self.assertEqual(cmd[:2], ["cargo", "test"])
+                    self.assertIn(release_floor.DIAGNOSTIC_FEATURE, cmd)
+                    self.assertEqual(pathlib.Path(env["XTRACE_CI_DIAG_DIR"]).parent, pathlib.Path(log.name).parent)
+                    log.write(raw.encode())
+                    return subprocess.CompletedProcess(cmd, 101), False, observations.finish(1, False)
+
+                def run(argv, *, env, **kwargs):
+                    args = lane_run.parser().parse_args(argv[4:])
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        return lane_run.cmd_run(args), 1
+
+                with mock.patch.object(run_gates, "_run", side_effect=run), \
+                        mock.patch.object(lane_run, "_checkout_metadata", return_value=metadata), \
+                        mock.patch.object(lane_run.rust_timing, "run", side_effect=cargo), \
+                        release_floor.configured_floor(root, 7200):
+                    for gate in (gate for gate in run_gates.GATES
+                                 if gate.name in {"rust-focused", "rust-workspace"}):
+                        public = io.StringIO()
+                        with contextlib.redirect_stdout(public):
+                            self.assertEqual(run_gates._run(gate.argv, cwd=repo, env={}), (101, 1))
+                        fragment = (root / "frag" / f"rust__-__{gate.name}.json").read_text()
+                        rows = json.loads(fragment)["failureDetails"]["failures"]
+                        self.assertEqual(len(rows), 1)
+                        self.assertEqual(rows[0]["test"], test)
+                        self.assertEqual(rows[0].get("acknowledgementObjectIo"), published)
+                        logged = [json.loads(line.removeprefix("lane failure "))
+                                  for line in public.getvalue().splitlines() if line.startswith("lane failure ")]
+                        self.assertEqual(logged, rows)
+                        self.assertNotIn("CANARY", fragment + public.getvalue())
+                        self.assertNotIn("acknowledgement object io", fragment + public.getvalue())
+
     def test_stripped_floor_environment_gets_directory_only_in_test_task(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

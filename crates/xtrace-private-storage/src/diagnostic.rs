@@ -258,6 +258,81 @@ impl AdmissionFailure {
         self.context = context;
         self
     }
+
+    /// Render only the context attached to the returned refusal for a store test.
+    #[cfg(all(feature = "spawn-counter", debug_assertions))]
+    pub fn diagnostic_context(failure: Option<Self>) -> impl fmt::Display {
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        let context = failure.and_then(|failure| failure.context);
+        #[cfg(not(target_os = "linux"))]
+        let context = {
+            let _ = failure;
+            None
+        };
+        ContextFacts(context)
+    }
+}
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+struct ContextFacts(Option<AdmissionContext>);
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+impl fmt::Display for ContextFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(context) = self.0 else { return formatter.write_str("unavailable") };
+        write!(
+            formatter,
+            "{:?},{},{:?},{:?},{:?},{:?}",
+            context.site,
+            context.changes,
+            context.listing,
+            context.object,
+            context.component_depth,
+            context.nlink_changed
+        )
+    }
+}
+
+// The store enables spawn-counter through its existing dev dependency only.
+// This scope is independent of the best-effort CI file sink and never retains
+// the error object. The outer store test scope owns the first failing site.
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+type IoFacts = (io::ErrorKind, Option<i32>);
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+thread_local! {
+    static DISCARDED_IO: std::cell::Cell<Option<Option<IoFacts>>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+pub(crate) fn observe_discarded_io(error: impl Into<io::Error>) {
+    DISCARDED_IO.with(|slot| {
+        if slot.get() == Some(None) {
+            let error = error.into();
+            slot.set(Some(Some((error.kind(), error.raw_os_error()))));
+        }
+    });
+}
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+impl crate::PrivateStorageError {
+    /// Run one private-storage call and observe I/O facts its error mapping discards.
+    pub fn with_io_diagnostic<T>(
+        call: impl FnOnce() -> Result<T, Self>,
+    ) -> (Result<T, Self>, Option<IoFacts>) {
+        struct Restore(Option<Option<IoFacts>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DISCARDED_IO.with(|slot| slot.set(self.0));
+            }
+        }
+
+        let _restore = Restore(DISCARDED_IO.with(|slot| slot.replace(Some(None))));
+        let result = call();
+        let facts =
+            if result.is_err() { DISCARDED_IO.with(|slot| slot.get().flatten()) } else { None };
+        (result, facts)
+    }
 }
 
 /// Observe a refusal without changing the caller's fallback or deadline precedence.
@@ -1010,5 +1085,58 @@ mod tests {
             "operation=AclState kind=None raw_os_error=None"
         );
         Ok(())
+    }
+
+    #[cfg(all(feature = "spawn-counter", debug_assertions))]
+    #[test]
+    fn discarded_io_is_scoped_and_preserves_the_generic_operation_error() {
+        use crate::PrivateStorageError;
+
+        let (result, facts) = PrivateStorageError::with_io_diagnostic(|| {
+            Err::<(), _>(PrivateStorageError::Operation.discard_io(rustix::io::Errno::NOSPC))
+        });
+        assert_eq!(result, Err(PrivateStorageError::Operation));
+        assert_eq!(
+            facts,
+            Some((io::ErrorKind::StorageFull, Some(rustix::io::Errno::NOSPC.raw_os_error())))
+        );
+
+        let (result, facts) = PrivateStorageError::with_io_diagnostic(|| {
+            Err::<(), _>(
+                PrivateStorageError::Operation
+                    .discard_io(io::Error::other("/private/path fixture-canary")),
+            )
+        });
+        assert_eq!(result, Err(PrivateStorageError::Operation));
+        assert_eq!(facts, Some((io::ErrorKind::Other, None)));
+
+        let (_, facts) = PrivateStorageError::with_io_diagnostic(|| {
+            let (_, inner) = PrivateStorageError::with_io_diagnostic(|| {
+                Err::<(), _>(PrivateStorageError::Operation.discard_io(rustix::io::Errno::NOSPC))
+            });
+            assert!(inner.is_some());
+            Err::<(), _>(PrivateStorageError::Operation)
+        });
+        assert_eq!(facts, None);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "spawn-counter", debug_assertions))]
+    #[test]
+    fn acknowledgement_context_comes_from_the_returned_admission_refusal() {
+        let context = AdmissionContext {
+            site: AdmissionSite::ProbeState,
+            changes: 1,
+            listing: ListingRefusal::NotChecked,
+            object: Some(AdmissionObject::Directory),
+            component_depth: Some(-1),
+            nlink_changed: Some(false),
+        };
+        let failure = AdmissionFailure::facts(AdmissionOperation::AclState, None, None)
+            .with_context(Some(context));
+        assert_eq!(
+            AdmissionFailure::diagnostic_context(Some(failure)).to_string(),
+            "ProbeState,1,NotChecked,Some(Directory),Some(-1),Some(false)"
+        );
+        assert_eq!(AdmissionFailure::diagnostic_context(None).to_string(), "unavailable");
     }
 }
