@@ -75,11 +75,27 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
     groups = r.get("burstRouteGroups", [])
     problem_scope = "problems across scenario verdicts and burst route groups" if groups else "problems"
     problem_note = f"{problem_scope}: {json.dumps(pc, sort_keys=True)}"
-    bad_src = [k for k in ("no-source-file-line", "source-binding-unacceptable", "source-binding-missing",
-                          "burst-recording-detail-unavailable", "burst-boundary-recordings-missing") if pc.get(k)]
-    bad_src.extend(sorted({p for group in groups for p in group["problems"]
-                           if p.startswith("no-") and p.endswith("-frame")}))
-    source_note = f"; problems: {','.join(bad_src)}" if bad_src else ""
+    group_problems = {p.split("(", 1)[0] for group in groups for p in group["problems"]}
+    source_gaps = {"no-source-file-line", "source-binding-unacceptable", "source-binding-missing",
+                   "burst-recording-detail-unavailable", "burst-boundary-recordings-missing",
+                   "recording-detail-incomplete", "recording-evidence-incomplete", "partial-recording",
+                   "burst-source-expectation-unresolved", "burst-boundary-not-verified", "serial-boundary-not-verified"}
+    bad_src = source_gaps & (group_problems | {p for p, count in pc.items() if count})
+    bad_src.update(p for p in group_problems if p.startswith("no-") and p.endswith("-frame"))
+    mixed_groups = [g for g in groups if "burst-frame-expectations-differ" in g["problems"]]
+    if pc.get("burst-frame-expectations-differ", 0) > len(mixed_groups):
+        bad_src.add("burst-source-expectation-unresolved")
+    for group in mixed_groups:
+        coverage = group.get("frameExpectations", [])
+        if len(coverage) < 2 or any(c.get("framesCovered") is not True or c.get("sourceCovered") is not True for c in coverage):
+            bad_src.add("burst-source-expectation-unresolved")
+    list_gap = api.get("listReadGap")
+    incomplete_details = api.get("incompleteDetails", 0)
+    if list_gap:
+        bad_src.add("api-recordings-list-incomplete")
+    if incomplete_details:
+        bad_src.add("recording-detail-incomplete")
+    source_note = f"; problems: {','.join(sorted(bad_src))}" if bad_src else ""
     if not api.get("ok"):
         out.append(("recordings-per-scenario", "fail", f"read API unavailable: {api.get('reason', '')[:120]}"
                     + (f"; {problem_note}" if groups else "")))
@@ -87,17 +103,21 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
         out.append(("api-json-artifact", "fail", "no API JSON captured"))
     else:
         v = [s for s in sc if (s.get("recordingVerdict") or {}).get("passed")]
-        out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) else "fail",
+        read_note = f"; incomplete API listing: {list_gap[:120]}" if list_gap else ""
+        out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) and not list_gap else "fail",
                     f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
-                    f"({api.get('recordings', 0)} recordings); {problem_note}"))
+                    f"({api.get('recordings', 0)} recordings); {problem_note}{read_note}"))
         n_src = r.get("recordingsWithSource", 0)
         out.append(("source-identity", "pass" if n_src > 0 and not bad_src else "fail",
                     (f"{n_src} recordings carry a matched .java file and method-range start line with an accepted source binding "
                      f"(not an executed line)" if n_src > 0 else "no recording frame carried a matched .java file and start line")
                     + source_note))
         n_rec = api.get("recordings", 0)
+        if incomplete_details:
+            read_note += f"; {incomplete_details} incomplete recording details"
         out.append(("api-json-artifact", "pass" if n_rec > 0 else "fail",
-                    f"{n_rec} recordings saved as API JSON" if n_rec > 0 else "the read API returned 0 recordings, nothing to save"))
+                    (f"{n_rec} recordings saved as API JSON" if n_rec > 0 else "the read API returned 0 recordings, nothing to save")
+                    + read_note))
     # record-stop-flow, restart-reopen, partial-recording-reopen, active-line-frames and frame-values come from `flows` below
     out.append(("launcher-exit-after-sigterm", "pass" if r.get("notes", {}).get("launcherExitCode") in (0, 143, -15) else "fail",
                 f"xtrace run exited {r.get('notes', {}).get('launcherExitCode')} after SIGTERM to the launcher pid"))

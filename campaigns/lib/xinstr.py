@@ -18,6 +18,7 @@ import subprocess
 import time
 from collections import Counter
 from typing import Any, Callable
+from urllib.parse import quote
 
 # matched against the class part of a frame symbol such as `OwnerController.findOwner`
 LAYER_PATTERNS = {
@@ -213,48 +214,138 @@ def stop_process_group(proc: subprocess.Popen, wait: float = 15.0) -> None:
                 pass
 
 
+def _next_page(doc: dict, key: str, seen: set[str], has_rows: bool) -> str | None:
+    token = doc[key]
+    if token is not None:
+        if not has_rows or not isinstance(token, str) or not re.fullmatch(r"[!-~]+", token) or token in seen:
+            raise ValueError("invalid pagination continuation")
+        seen.add(token)
+    return token
+
+
+def detail_read_incomplete(detail: dict | None) -> bool:
+    """Identify an unavailable or incomplete detail read, independent of capture completion."""
+    return detail is None or "_detailReadGap" in detail or "_http" in detail
+
+
 def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int = 400) -> dict[str, Any]:
-    """Read the project's recordings and full event windows through the API. Raw JSON is saved under out_dir."""
+    """Save observed pages and explicitly mark any listing or detail read that stops early."""
     out_dir.mkdir(parents=True, exist_ok=True)
     listing: list[dict] = []
     after = None
-    pages = 0
-    while pages < 20:
-        q = "/api/v1/recordings?limit=200" + (f"&after={after}" if after else "")
-        st, doc = client.get(q)
+    seen: set[str] = set()
+    listed_ids: set[str] = set()
+    listed = False
+    list_gap = ""
+    problem = None
+    live_timeout = False
+    for pages in range(20):
+        q = "/api/v1/recordings?limit=200" + (f"&after={quote(after, safe='')}" if after else "")
+        try:
+            st, doc = client.get(q)
+        except (OSError, http.client.HTTPException) as exc:
+            list_gap = "recordings list transport failure"
+            live_timeout = isinstance(exc, TimeoutError) and client.deadline is not None
+            break
         (out_dir / f"recordings-page-{pages}.json").write_text(json.dumps(doc, indent=1, sort_keys=True))
         if st != 200:
-            return {"ok": False, "reason": f"recordings list HTTP {st}", "problem": read_problem(st, doc),
-                    "recordings": [], "details": {}}
-        listing += doc.get("recordings", [])
-        after = doc.get("nextAfter")
-        pages += 1
-        if not after or len(listing) >= max_recordings:
+            list_gap = f"recordings list HTTP {st}"
+            problem = read_problem(st, doc)
             break
+        rows = doc.get("recordings") if isinstance(doc, dict) else None
+        if (not isinstance(rows, list) or (after is not None and not rows)
+                or any(not isinstance(row, dict) or not isinstance(row.get("recordingId"), str)
+                       or not re.fullmatch(r"[A-Za-z0-9_-]+", row["recordingId"]) for row in rows)):
+            list_gap = "recordings list malformed page"
+            break
+        page_ids = {row["recordingId"] for row in rows}
+        if len(page_ids) != len(rows) or listed_ids & page_ids:
+            list_gap = "recordings list repeated recording IDs"
+            break
+        listed_ids.update(page_ids)
+        listed = True
+        listing.extend(rows)
+        try:
+            after = _next_page(doc, "nextAfter", seen, bool(rows))
+        except (KeyError, ValueError):
+            list_gap = "recordings list malformed continuation"
+            break
+        if len(listing) > max_recordings or (after is not None and len(listing) >= max_recordings):
+            list_gap = "recordings list recording bound reached"
+            break
+        if after is None:
+            break
+    else:
+        list_gap = "recordings list pagination bound reached"
+
+    listing = listing[:max_recordings]
     details: dict[str, dict] = {}
-    for rec in listing[:max_recordings]:
+    for rec in listing:
+        if live_timeout:
+            break
         rid = rec["recordingId"]
         events: list[dict] = []
         cursor = None
+        seen = set()
         first: dict | None = None
+        detail_gap = None
+        incomplete_evidence: dict[str, None] = {}
         for _ in range(40):
-            st, doc = client.get(f"/api/v1/recordings/{rid}?limit=1000" + (f"&cursor={cursor}" if cursor else ""))
+            q = f"/api/v1/recordings/{rid}?limit=1000" + (f"&cursor={quote(cursor, safe='')}" if cursor else "")
+            try:
+                st, doc = client.get(q)
+            except (OSError, http.client.HTTPException) as exc:
+                detail_gap = "detail transport failure"
+                live_timeout = isinstance(exc, TimeoutError) and client.deadline is not None
+                break
             if st != 200:
-                first = first or {"_http": st, "events": []}
+                if first is None:
+                    first = {"_http": st}
+                detail_gap = f"detail HTTP {st}"
                 break
-            first = first or {k: v for k, v in doc.items() if k != "events"}
-            events += doc.get("events", [])
-            cursor = doc.get("nextCursor")
-            if not cursor:
+            rows = doc.get("events") if isinstance(doc, dict) else None
+            if (not isinstance(rows, list) or (cursor is not None and not rows)
+                    or any(not isinstance(row, dict) for row in rows)
+                    or doc.get("recordingId", rid) != rid):
+                detail_gap = "detail malformed page"
                 break
+            if first is None:
+                first = {k: v for k, v in doc.items() if k != "events"}
+            events.extend(rows)
+            if isinstance(doc.get("incompleteEvidence"), list):
+                incomplete_evidence.update((code, None) for code in doc["incompleteEvidence"] if isinstance(code, str))
+            try:
+                cursor = _next_page(doc, "nextCursor", seen, bool(rows))
+            except (KeyError, ValueError):
+                detail_gap = "detail malformed continuation"
+                break
+            if cursor is None:
+                break
+        else:
+            detail_gap = "detail pagination bound reached"
         d = dict(first or {})
         d["events"] = events
+        if detail_gap is not None:
+            d["_detailReadGap"] = detail_gap
+        else:
+            d["nextCursor"] = None
+        if incomplete_evidence:
+            d["incompleteEvidence"] = list(incomplete_evidence)
         d.setdefault("recordingId", rid)
+        if "sessionContext" in rec:
+            d.setdefault("sessionContext", rec["sessionContext"])
         if rec.get("openedAt") is not None:  # kept for time-window attribution of recordings to scenarios
             d.setdefault("_openedAt", rec["openedAt"])
         details[rid] = d
         (out_dir / f"recording-{rid}.json").write_text(json.dumps(d, indent=1, sort_keys=True))
-    return {"ok": True, "reason": "", "recordings": listing, "details": details}
+    result = {"ok": listed, "reason": "" if listed else list_gap, "recordings": listing, "details": details}
+    if list_gap:
+        result["listReadGap"] = list_gap
+    if len(details) < len(listing):
+        result["detailCollectionGap"] = "recording detail read timed out before all listed IDs were read"
+    if problem is not None:
+        result["problem"] = problem
+    return result
 
 
 # --------------------------------------------------------------- analysis ----
@@ -305,7 +396,7 @@ def response_event_status(detail: dict) -> int | None:
     return None
 
 
-def layer_frames(detail: dict, layer: str, name_hint: str | list[str] | None = None) -> list[dict]:
+def layer_frames(detail: dict, layer: str, name_hint: str | list[str] | tuple[str, ...] | None = None) -> list[dict]:
     """Match layer classes with optional class-name or exact class.method symbol alternatives."""
     pat = LAYER_PATTERNS[layer]
     out = []
@@ -424,6 +515,10 @@ def layer_source_ok(detail: dict, layers: list[str], hints: dict) -> tuple[bool,
     frames = [ev for layer in layers for ev in layer_frames(detail, layer, hints.get(layer))]
     if not frames:  # no layer expectation: fall back to any frame event
         frames = [ev for ev in detail.get("events", []) if str(ev.get("kind", "")).endswith("frame_enter")]
+    return _frame_source_ok(frames)
+
+
+def _frame_source_ok(frames: list[dict]) -> tuple[bool, str | None]:
     with_src = [ev for ev in frames if source_ok(ev)]
     if any(binding_state(ev) == "ok" for ev in with_src):
         return True, None
@@ -494,19 +589,24 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
     try:
         while time.monotonic() < deadline:
             api = collect_api(client, out_dir)
-            if not api["ok"]:
-                boundary["readError"] = api["reason"]
+            if api["ok"]:
+                boundary = burst_accounting(api["details"], sent, expectations, before)
+            read_gap = api.get("listReadGap") or api.get("detailCollectionGap") or (api["reason"] if not api["ok"] else "")
+            if not read_gap and any(detail_read_incomplete(detail) for rid, detail in api["details"].items()
+                                    if rid not in before):
+                read_gap = "recording detail read incomplete"
+            if read_gap:
+                boundary["readError"] = read_gap
                 if "problem" in api:
                     boundary["readProblem"] = api["problem"]
                 break
-            boundary = burst_accounting(api["details"], sent, expectations, before)
             if boundary["verified"] and time.monotonic() <= deadline:
                 if require_complete and (boundary["capacityDrops"] or boundary["partialRecordingIds"]):
                     boundary["verified"] = False
                     boundary["verifiedAt"] = None
                 return boundary
-    except (TimeoutError, OSError) as exc:
-        boundary["readError"] = str(exc)
+    except OSError:
+        boundary["readError"] = "recording snapshot could not be read or saved"
     finally:
         client.deadline = None
     boundary["verified"] = False
@@ -540,6 +640,68 @@ def serial_frame_symbols(details: dict[str, dict], sent: list, burst: frozenset,
     return {sid: sorted(symbols) for sid, symbols in names.items()}
 
 
+def _burst_frame_evidence(matched: dict[str, dict], checks: list[dict]) -> tuple[dict, list[dict], list[str]]:
+    """Count witnesses for each distinct expectation across the group, without allocating recordings."""
+    signatures = set()
+    for check in checks or [{}]:
+        hints = check.get("layerHints", {})
+        rules = []
+        for layer in sorted(set(check.get("layers", []))):
+            hint = hints.get(layer)
+            if isinstance(hint, str):
+                hint = [hint]
+            rules.append((layer, None if hint is None else tuple(sorted(set(hint)))))
+        signatures.add(tuple(rules))
+
+    occurrences = Counter(rule for signature in signatures for rule in signature)
+    different = len(signatures) > 1
+    layer_ids: dict[str, set[str]] = {}
+    missing_layers = set()
+    reports = {}
+    for layer, hints in occurrences:
+        frame_ids, source_ids = set(), set()
+        for rid, detail in matched.items():
+            frames = layer_frames(detail, layer, hints)
+            if frames:
+                frame_ids.add(rid)
+                if _frame_source_ok(frames)[0]:
+                    source_ids.add(rid)
+        layer_ids.setdefault(layer, set()).update(frame_ids)
+        if matched and (not frame_ids or (not different and len(frame_ids) < len(matched))):
+            missing_layers.add(layer)
+        reports[layer, hints] = (frame_ids, source_ids)
+
+    coverage = []
+    for signature in sorted(signatures, key=str):
+        # A shared layer's source cannot satisfy a different layer or hint.
+        distinct_rules = [rule for rule in signature if occurrences[rule] < len(signatures)]
+        if distinct_rules:
+            sourced = [reports[rule][1] for rule in distinct_rules]
+            source_covered = all(sourced)
+        elif signature:
+            sourced = [reports[rule][1] for rule in signature]
+            source_covered = any(sourced)
+        else:
+            sourced = [{rid for rid, detail in matched.items() if layer_source_ok(detail, [], {})[0]}]
+            source_covered = bool(sourced[0])
+        coverage.append({
+            "layers": {layer: {"hints": None if hints is None else list(hints),
+                               "recordingsWithFrame": len(reports[layer, hints][0]),
+                               "recordingsWithSource": len(reports[layer, hints][1])} for layer, hints in signature},
+            "recordingsWithSource": len(set().union(*sourced)),
+            "framesCovered": all(reports[rule][0] for rule in signature),
+            "sourceCovered": source_covered,
+        })
+
+    problems = [f"no-{layer}-frame" for layer in sorted(missing_layers)]
+    if different:
+        problems.append("burst-frame-expectations-differ")
+        if any(not item["sourceCovered"] for item in coverage):
+            problems.append("burst-source-expectation-unresolved")
+    layers = {layer: {"recordingsWithFrame": len(ids), "of": len(matched)} for layer, ids in sorted(layer_ids.items())}
+    return layers, coverage, problems
+
+
 def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[dict]],
                          burst: frozenset, boundary: dict | None, serial_boundary: dict | None,
                          evidence_ids: tuple[set[str], set[str]]) -> list[dict]:
@@ -560,8 +722,8 @@ def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[
         requests = row["requests"] if row is not None else 0
         checks = route_checks.get((method, route), [])
         route_ids = set(row["recordingIds"]) - serial_ids if row is not None else set()
-        # The reader leaves an HTTP error placeholder when the first detail page fails.
-        matched = {rid: details[rid] for rid in sorted(route_ids) if rid in details and "_http" not in details[rid]}
+        matched = {rid: details[rid] for rid in sorted(route_ids)
+                   if rid in details and not detail_read_incomplete(details[rid])}
         unread = route_ids - matched.keys()
         problems = []
         if requests != len(matched):
@@ -574,6 +736,8 @@ def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[
         partial.update(rid for rid, d in matched.items() if d.get("completion") == "partial")
         if partial:
             problems.append("partial-recording")
+        if any(d.get("incompleteEvidence") for rid, d in matched.items() if rid not in partial):
+            problems.append("recording-evidence-incomplete")
 
         observed_kinds = (*OBSERVED_OUTCOME_KINDS, "client_aborted", "unobserved")
         outcomes = Counter()
@@ -603,18 +767,8 @@ def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[
             problems.append("outcome-unobserved")
         status_ids.update(with_status)
 
-        layers = sorted({layer for e in checks for layer in e.get("layers", [])})
-        different_frames = any(set(e.get("layers", [])) != set(checks[0].get("layers", []))
-                               or e.get("layerHints", {}) != checks[0].get("layerHints", {}) for e in checks[1:])
-        layer_report = {}
-        for layer in layers:
-            hints = [e.get("layerHints", {}).get(layer) for e in checks if layer in e.get("layers", [])]
-            have = sum(any(layer_frames(d, layer, hint) for hint in hints) for d in matched.values())
-            layer_report[layer] = {"recordingsWithFrame": have, "of": len(matched)}
-            if matched and (not have or (not different_frames and have < len(matched))):
-                problems.append(f"no-{layer}-frame")
-        if different_frames:
-            problems.append("burst-frame-expectations-differ")
+        layer_report, frame_expectations, frame_problems = _burst_frame_evidence(matched, checks)
+        problems.extend(frame_problems)
         with_source = set()
         # Missing boundary IDs and unreadable details for known IDs are separate evidence gaps.
         missing = expected_recordings - len(route_ids)
@@ -638,7 +792,8 @@ def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[
             "partialRecordings": len(partial), "recordingsWithStatus": len(with_status),
             "outcomes": [{"httpStatus": status, "kind": kind, "recordings": count}
                          for (status, kind), count in sorted(outcomes.items(), key=str)],
-            "layers": layer_report, "recordingsWithSource": len(with_source), "problems": problems,
+            "layers": layer_report, "frameExpectations": frame_expectations,
+            "recordingsWithSource": len(with_source), "problems": problems,
         })
     return groups
 
@@ -744,17 +899,18 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             symbols.update(ev["symbol"] for d in matched for ev in d.get("events", [])
                            if str(ev.get("kind", "")).endswith("frame_enter")
                            and isinstance(ev.get("symbol"), str) and ev["symbol"])
-            with_status = [d for d in matched if outcome_matches(d, e)]
+            readable = [d for d in matched if not detail_read_incomplete(d)]
+            with_status = [d for d in readable if outcome_matches(d, e)]
             need = e.get("minCount", 1)
             if problems:
                 pass
             elif not matched:
                 problems.append("no-recording-for-route")
             else:
-                seen = sorted({str(recording_http_status(d) or (d.get("outcome") or {}).get("kind")) for d in matched})
+                seen = sorted({str(recording_http_status(d) or (d.get("outcome") or {}).get("kind")) for d in readable})
                 expected = e.get("outcome", e.get("status"))
-                if "statuses" in e and Counter(recording_http_status(d) for d in matched) != Counter(e["statuses"]):
-                    observed = sorted((recording_http_status(d) for d in matched), key=str)
+                if "statuses" in e and Counter(recording_http_status(d) for d in readable) != Counter(e["statuses"]):
+                    observed = sorted((recording_http_status(d) for d in readable), key=str)
                     problems.append(f"http-outcome-multiset-mismatch(expected {e['statuses']}, saw {observed})")
                 elif not with_status:
                     problems.append(f"http-outcome-mismatch(expected {expected}, saw {','.join(seen)})")
@@ -762,8 +918,12 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                     problems.append(f"http-outcome-count-mismatch(expected {len(matched)}, observed {len(with_status)})")
                 elif len(with_status) < need:
                     problems.append(f"count-below-minimum(need {need}, have {len(with_status)})")
+            if len(readable) != len(matched):
+                problems.append("recording-detail-incomplete")
             if (boundary is not None or serial_boundary is not None) and any(d.get("completion") == "partial" for d in matched):
                 problems.append("partial-recording")
+            if any(d.get("incompleteEvidence") for d in matched):
+                problems.append("recording-evidence-incomplete")
             unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in OBSERVED_OUTCOME_KINDS]
             if with_status and unobserved:
                 problems.append("outcome-unobserved")
@@ -904,8 +1064,9 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             live_client = ViewerClient(ready["origin"])
             live_client.exchange(bootstrap_token(ready["url"]))
             initial = collect_api(live_client, out_dir / "boundary-before")
-            if not initial["ok"]:
-                raise RuntimeError("cannot snapshot recordings before scenarios: " + initial["reason"])
+            if not initial["ok"] or initial.get("listReadGap"):
+                raise RuntimeError("cannot snapshot recordings before scenarios: "
+                                   + (initial.get("listReadGap") or initial["reason"]))
             # One existing 60-second HTTP/read budget covers both phases and their accounting.
             burst_deadline = time.monotonic() + 60.0
             if ordered[0].id in burst:
@@ -1011,12 +1172,15 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if not boundary["verified"]:
             classes["burst-boundary-not-verified"] = 1
     scenario_items = [e for sid, v in verdicts.items() if sid not in burst for e in v["expectations"]]
+    incomplete_details = sum(detail_read_incomplete(api["details"].get(r["recordingId"])) for r in api["recordings"])
     receipt = {
         "schemaVersion": 1, "kind": "instrumented_campaign_non_release", "project": project, "releaseAcceptance": False,
         "instrumented": True, "signed": False, "pin": pin, "syntheticDataOnly": True, "configurationAdaptations": adaptations,
         "harnessSha256": {p.name: xcamp.sha256_file(p) for p in harness_files}, "bootMs": boot_ms,
         "durationSeconds": round(time.time() - started, 1), "notes": notes,
-        "api": {"ok": api["ok"], "reason": api["reason"], "recordings": len(api["recordings"])},
+        "api": {"ok": api["ok"], "reason": api["reason"], "recordings": len(api["recordings"]),
+                "listReadGap": api.get("listReadGap"),
+                "incompleteDetails": incomplete_details},
         "attribution": "serial routes require exact counts before the verified boundary. "
                        "The burst boundary accounts for later recordings as a group. Individual burst correlation is missing.",
         "requestsSent": len(sent_log),
@@ -1026,7 +1190,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         # A successful read after shutdown cannot repair a failed live boundary or
         # turn an unreached workload into a successful interleaved overhead run.
         # The result describes collection and workload. Recording verdicts judge isolation.
-        "result": "recorded" if api["ok"] and workloads_passed and boundaries_verified else "failed",
+        "result": "recorded" if api["ok"] and not api.get("listReadGap") and workloads_passed and boundaries_verified else "failed",
     }
     (out_dir / "receipt.json").write_text(json.dumps(receipt, indent=1, sort_keys=True))
     return receipt
