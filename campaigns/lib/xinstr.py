@@ -278,11 +278,12 @@ def route_regex(template: str) -> re.Pattern[str]:
 REQUEST_SYMBOL = re.compile(r"^http\.request ([A-Z]+) (\S+)$")
 RESPONSE_SYMBOL = re.compile(r"^http\.response (\d{3})$")
 REQUEST_CORRELATION_GAP = (
-    "Spring MVC records method and route template only, without concrete path, query or headers; "
-    "standard capture has no argument bindings; focused Owner form objects are unavailable. "
+    "No unique observed request-to-recording mapping. "
+    "Spring MVC records method and route template only, without concrete path, query or headers. "
+    "Standard capture has no argument bindings. Focused Owner form objects are unavailable. "
     "Need an allowlisted non-secret request marker "
     "retained per recording and known to the harness, or the recording id returned to the requester. "
-    "Recording UUID and openedAt are not request correlations"
+    "Request order, recording UUIDs and openedAt supply ordering or recording identity only."
 )
 
 
@@ -456,7 +457,7 @@ def capacity_counts(details: dict[str, dict]) -> dict[str, int]:
 
 def burst_accounting(details: dict[str, dict], sent: list[tuple[str | None, str, str]],
                      expectations: dict[str, list[dict]], before: dict[str, dict]) -> dict[str, Any]:
-    """Account for terminal recordings and session refusals, without assigning refusals to routes."""
+    """Account for a group's terminal recordings by route and refusals by session."""
     routes = {(e["method"], e["route"]) for exps in expectations.values() for e in exps}
     literals = frozenset(route for _, route in routes if "{" not in route)
     fresh = {rid: d for rid, d in details.items() if rid not in before}
@@ -513,39 +514,29 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
     return boundary
 
 
-def scenario_frame_symbols(details: dict[str, dict], sent: list, burst: frozenset,
-                           boundary: dict | None, serial_boundary: dict) -> dict[str, list[str]]:
-    """Inventory every attributable request, including routes without a scenario expectation."""
+def serial_frame_symbols(details: dict[str, dict], sent: list, burst: frozenset,
+                         serial_boundary: dict) -> dict[str, list[str]]:
+    """Inventory serial scenarios, including routes without a scenario expectation."""
     names: dict[str, set[str]] = {}
     if not serial_boundary["verified"]:
         return {}
     routes = {info for d in details.values() if (info := request_info(d)) is not None}
     literals = frozenset(route for _, route in routes if "{" not in route)
-    phases = [(False, set(serial_boundary["recordingIds"]))]
-    if boundary is not None:
-        phases.append((True, set(boundary["recordingIds"]) - set(serial_boundary["snapshotIds"])))
-    for concurrent, ids in phases:
-        for method, route in routes:
-            requests = [r for r in sent if r[0] is not None and (r[0] in burst) == concurrent
-                        and r[1] == method and _path_matches(r[2], route, literals)]
-            recordings = [d for rid, d in details.items() if rid in ids and request_info(d) == (method, route)]
-            if not requests or not recordings:
-                continue
-            if concurrent:
-                owners = {r[0] for r in requests}
-                if len(owners) != 1:
-                    continue  # Shared concurrent routes have no per-request correlation.
-                attributed = [(requests[0][0], d) for d in recordings]
-            else:
-                times = [recording_time(d) for d in recordings]
-                if len(recordings) != len(requests) or any(t is None for t in times) or len(set(times)) != len(times):
-                    continue
-                order = sorted(range(len(recordings)), key=lambda i: times[i])
-                attributed = [(r[0], recordings[order[i]]) for i, r in enumerate(requests)]
-            for sid, detail in attributed:
-                names.setdefault(sid, set()).update(ev["symbol"] for ev in detail.get("events", [])
-                                                   if str(ev.get("kind", "")).endswith("frame_enter")
-                                                   and isinstance(ev.get("symbol"), str) and ev["symbol"])
+    ids = set(serial_boundary["recordingIds"])
+    for method, route in routes:
+        requests = [r for r in sent if r[0] is not None and r[0] not in burst
+                    and r[1] == method and _path_matches(r[2], route, literals)]
+        recordings = [d for rid, d in details.items() if rid in ids and request_info(d) == (method, route)]
+        if not requests or len(recordings) != len(requests):
+            continue
+        times = [recording_time(d) for d in recordings]
+        if any(t is None for t in times) or len(set(times)) != len(times):
+            continue
+        order = sorted(range(len(recordings)), key=lambda i: times[i])
+        for request, index in zip(requests, order):
+            names.setdefault(request[0], set()).update(ev["symbol"] for ev in recordings[index].get("events", [])
+                                                      if str(ev.get("kind", "")).endswith("frame_enter")
+                                                      and isinstance(ev.get("symbol"), str) and ev["symbol"])
     return {sid: sorted(symbols) for sid, symbols in names.items()}
 
 
@@ -554,44 +545,56 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             boundary: dict[str, Any] | None = None, serial_boundary: dict[str, Any] | None = None) -> dict[str, Any]:
     """Expect a status or an exact `statuses` multiset per route, plus layers and source evidence.
 
-    A verified serial boundary partitions serial IDs from the later burst. Without a boundary,
-    routes shared with a burst remain ambiguous. Serial routes retain exact counts in either case.
-    Without `sent`, results are explicitly campaign-wide.
+    A verified serial boundary partitions serial IDs from the later burst. Burst routes can
+    provide group evidence. Per-request isolation requires an observed mapping the read API
+    does not supply. Without a boundary, serial routes shared with a burst also remain ambiguous.
     """
     literal_routes = frozenset((e["route"].rstrip("/") or "/") for exps in expectations.values() for e in exps if "{" not in e["route"])
     verdicts: dict[str, Any] = {}
-    inventory = scenario_frame_symbols(details, sent, burst, boundary, serial_boundary) \
+    inventory = serial_frame_symbols(details, sent, burst, serial_boundary) \
         if sent is not None and serial_boundary is not None else None
+    serial_ids = set(serial_boundary["recordingIds"]) if serial_boundary is not None else set()
+    burst_ids = set(boundary["recordingIds"]) - serial_ids if boundary is not None else set()
     for sid, exps in expectations.items():
+        is_burst = sid in burst
         items = []
         attributed_total = 0
         symbols: set[str] = set()
         for e in exps:
-            matched_all = [d for d in details.values() if recording_matches(d, e["method"], e["route"], literal_routes)]
             problems: list[str] = []
             attribution = "campaign-wide"
-            matched = matched_all
-            if sent is not None:
+            reqs = [r for r in (sent or []) if r[1] == e["method"] and _path_matches(r[2], e["route"], literal_routes)]
+            check_route = not is_burst
+            if is_burst:
+                matched = []
+                if serial_boundary is not None and not serial_boundary["verified"]:
+                    problems.append("serial-boundary-not-verified")
+                else:
+                    if serial_boundary is not None and (boundary is None or not boundary["verified"]):
+                        problems.append("burst-boundary-not-verified")
+                    if boundary is not None:
+                        if serial_boundary is None and not boundary["verified"]:
+                            problems.append(f"burst-unaccounted(requests {boundary['requests']}, recordings {boundary['recordingCount']}, "
+                                            f"capacity drops {boundary['capacityDrops']}, unaccounted {boundary['unaccounted']})")
+                        if boundary["capacityDrops"] or boundary["partialRecordingIds"]:
+                            problems.append(f"burst-drops(capacity {boundary['capacityDrops']}, partial {len(boundary['partialRecordingIds'])})")
+                        owners = {r[0] for r in reqs if r[0] in burst}
+                        # A route shared across concurrent scenarios stays in the boundary report.
+                        check_route = sent is not None and (sid not in owners or len(owners) == 1)
+                        if owners == {sid}:
+                            matched = [d for rid, d in details.items() if rid in burst_ids
+                                       and recording_matches(d, e["method"], e["route"], literal_routes)]
+            else:
+                matched = [d for d in details.values() if recording_matches(d, e["method"], e["route"], literal_routes)]
+            if sent is not None and not is_burst:
                 attribution = "order"
-                reqs = [r for r in sent if r[1] == e["method"] and _path_matches(r[2], e["route"], literal_routes)]
+                matched_all = matched
                 mine = [i for i, r in enumerate(reqs) if r[0] == sid]
-                times = [recording_time(d) for d in matched_all]
-                first_burst = next((i for i, r in enumerate(reqs) if r[0] in burst), None)
                 if serial_boundary is not None:
                     attribution = "verified-boundary"
-                    serial_ids = set(serial_boundary["recordingIds"])
                     matched = []
                     if not serial_boundary["verified"]:
                         problems.append("serial-boundary-not-verified")
-                    elif sid in burst:
-                        if boundary is None or not boundary["verified"]:
-                            problems.append("burst-boundary-not-verified")
-                        if boundary is not None:
-                            matched = [d for rid, d in details.items() if rid in set(boundary["recordingIds"])
-                                       and rid not in serial_ids
-                                       and recording_matches(d, e["method"], e["route"], literal_routes)]
-                            if boundary["capacityDrops"] or boundary["partialRecordingIds"]:
-                                problems.append(f"burst-drops(capacity {boundary['capacityDrops']}, partial {len(boundary['partialRecordingIds'])})")
                     else:
                         serial_reqs = [r for r in reqs if r[0] is not None and r[0] not in burst]
                         mine = [i for i, r in enumerate(serial_reqs) if r[0] == sid]
@@ -607,17 +610,8 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                             matched = [serial[order[i]] for i in mine]
                 elif boundary is not None:
                     attribution = "verified-boundary"
-                    burst_ids = set(boundary["recordingIds"])
                     snapshot_ids = set(boundary["snapshotIds"])
-                    if sid in burst:
-                        matched = [d for rid, d in details.items() if rid in burst_ids
-                                   and recording_matches(d, e["method"], e["route"], literal_routes)]
-                        if not boundary["verified"]:
-                            problems.append(f"burst-unaccounted(requests {boundary['requests']}, recordings {boundary['recordingCount']}, "
-                                            f"capacity drops {boundary['capacityDrops']}, unaccounted {boundary['unaccounted']})")
-                        if boundary["capacityDrops"] or boundary["partialRecordingIds"]:
-                            problems.append(f"burst-drops(capacity {boundary['capacityDrops']}, partial {len(boundary['partialRecordingIds'])})")
-                    elif not boundary["verified"]:
+                    if not boundary["verified"]:
                         matched = []
                         problems.append("burst-boundary-not-verified(serial requests not sent)")
                     else:
@@ -634,7 +628,7 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                         else:
                             order = sorted(range(len(serial)), key=lambda i: (times[i], i))
                             matched = [serial[order[i]] for i in mine]
-                elif first_burst is not None:
+                elif any(r[0] in burst for r in reqs):
                     matched = []
                     attribution = "ambiguous"
                     problems.append("attribution-ambiguous(burst shares route without request correlation or verified boundary; "
@@ -644,21 +638,22 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 elif len(matched_all) != len(reqs):
                     matched = []
                     problems.append(f"attribution-ambiguous(recordings {len(matched_all)}, requests {len(reqs)})")
-                elif any(t is None for t in times):
-                    matched = []
-                    problems.append("attribution-ambiguous(recording time unknown)")
                 else:
-                    order = sorted(range(len(matched_all)), key=lambda i: (times[i], i))
-                    matched = [matched_all[order[i]] for i in mine]
-            if any(p.startswith("attribution-ambiguous") for p in problems):
-                attribution = "ambiguous"
-            attributed_total += len(matched)
-            symbols.update(ev["symbol"] for d in matched for ev in d.get("events", [])
-                           if str(ev.get("kind", "")).endswith("frame_enter")
-                           and isinstance(ev.get("symbol"), str) and ev["symbol"])
+                    times = [recording_time(d) for d in matched_all]
+                    if any(t is None for t in times):
+                        matched = []
+                        problems.append("attribution-ambiguous(recording time unknown)")
+                    else:
+                        order = sorted(range(len(matched_all)), key=lambda i: (times[i], i))
+                        matched = [matched_all[order[i]] for i in mine]
+            if not is_burst:
+                attributed_total += len(matched)
+                symbols.update(ev["symbol"] for d in matched for ev in d.get("events", [])
+                               if str(ev.get("kind", "")).endswith("frame_enter")
+                               and isinstance(ev.get("symbol"), str) and ev["symbol"])
             with_status = [d for d in matched if outcome_matches(d, e)]
             need = e.get("minCount", 1)
-            if problems:
+            if problems or not check_route:
                 pass
             elif not matched:
                 problems.append("no-recording-for-route")
@@ -674,7 +669,7 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                     problems.append(f"http-outcome-count-mismatch(expected {len(matched)}, observed {len(with_status)})")
                 elif len(with_status) < need:
                     problems.append(f"count-below-minimum(need {need}, have {len(with_status)})")
-            if (boundary is not None or serial_boundary is not None) and sid not in burst and any(d.get("completion") == "partial" for d in matched):
+            if (boundary is not None or serial_boundary is not None) and not is_burst and any(d.get("completion") == "partial" for d in matched):
                 problems.append("partial-recording")
             unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in OBSERVED_OUTCOME_KINDS]
             if with_status and unobserved:
@@ -697,13 +692,20 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             if with_status and not src:
                 problems.append("source-binding-unacceptable" if "unacceptable" in why else
                                 "source-binding-missing" if "missing" in why else "no-source-file-line")
-            items.append({"method": e["method"], "route": e["route"], "expectedStatus": e.get("status"),
-                          "expectedStatuses": e.get("statuses"), "expectedOutcome": e.get("outcome"), "attribution": attribution,
-                          "recordingsMatchingRoute": len(matched), "recordingsWithStatus": len(with_status),
-                          "layers": layer_report, "recordingsWithSource": len(src), "problems": problems,
-                          "passed": not problems})
-        verdicts[sid] = {"passed": all(i["passed"] for i in items), "expectations": items,
-                         "attribution": "ambiguous" if any(i["attribution"] == "ambiguous" for i in items)
+            if is_burst:
+                problems.append(f"attribution-ambiguous({REQUEST_CORRELATION_GAP})")
+            if any(p.startswith("attribution-ambiguous") for p in problems):
+                attribution = "ambiguous"
+            item = {"method": e["method"], "route": e["route"], "expectedStatus": e.get("status"),
+                    "expectedStatuses": e.get("statuses"), "expectedOutcome": e.get("outcome"), "attribution": attribution,
+                    "recordingsMatchingRoute": len(matched), "recordingsWithStatus": len(with_status),
+                    "layers": layer_report, "recordingsWithSource": len(src), "problems": problems,
+                    "passed": not problems}
+            if is_burst:
+                item["evidenceScope"] = "burst-route-group"
+            items.append(item)
+        verdicts[sid] = {"passed": not is_burst and all(i["passed"] for i in items), "expectations": items,
+                         "attribution": "ambiguous" if is_burst or any(i["attribution"] == "ambiguous" for i in items)
                          else "verified-boundary" if boundary is not None or serial_boundary is not None else "order" if sent is not None else "campaign-wide",
                          "recordingsAttributed": attributed_total,
                          "frameSymbols": inventory.get(sid, []) if inventory is not None else sorted(symbols)}
@@ -922,13 +924,15 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "harnessSha256": {p.name: xcamp.sha256_file(p) for p in harness_files}, "bootMs": boot_ms,
         "durationSeconds": round(time.time() - started, 1), "notes": notes,
         "api": {"ok": api["ok"], "reason": api["reason"], "recordings": len(api["recordings"])},
-        "attribution": "serial routes require exact counts before the verified boundary; burst uses only later recording IDs",
+        "attribution": "serial routes require exact counts before the verified boundary. "
+                       "The burst boundary accounts for later recordings as a group. Individual burst correlation is missing.",
         "requestsSent": len(sent_log),
         "problemClasses": problem_classes(verdicts), "scenarios": scen_out,
         "recordingsWithSource": sum(e["recordingsWithSource"] for v in verdicts.values() for e in v["expectations"]),
         "recordingsWithStatus": sum(e["recordingsWithStatus"] for v in verdicts.values() for e in v["expectations"]),
         # A successful read after shutdown cannot repair a failed live boundary or
         # turn an unreached workload into a successful interleaved overhead run.
+        # The result describes collection and workload. Recording verdicts judge isolation.
         "result": "recorded" if api["ok"] and workloads_passed and boundaries_verified else "failed",
     }
     (out_dir / "receipt.json").write_text(json.dumps(receipt, indent=1, sort_keys=True))

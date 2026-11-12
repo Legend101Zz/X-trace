@@ -9,6 +9,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import xinstr  # noqa: E402
 
 
+BURST_CORRELATION_PROBLEM = f"attribution-ambiguous({xinstr.REQUEST_CORRELATION_GAP})"
+
+
 def rec(method, path, status, symbols=("OwnerController.showOwner", "OwnerRepository.findById"), src=True, kind="responded",
         resp_symbol=None):
     evs = [{"kind": "recording_event_kind:request_update", "symbol": f"http.request {method} {path}", "interaction": {"method": method}, "source": None}]
@@ -400,18 +403,64 @@ class T(unittest.TestCase):
 
     def test_boundary_records_exact_ids_counts_and_verification_time(self):
         exp, sent, details = self.boundary_fixture()
+        exp["burst"][0]["layers"] = ["controller"]
         with mock.patch.object(xinstr.time, "time", return_value=123):
             boundary = xinstr.burst_accounting(details, sent, exp, {})
         self.assertTrue(boundary["verified"])
         self.assertEqual(boundary["verifiedAt"], 123)
         self.assertEqual(boundary["recordingIds"], ["0", "1"])
         self.assertEqual(boundary["recordingCount"], 2)
-        verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
-        self.assertTrue(verdict["burst"]["passed"], verdict)
+        self.assertEqual(boundary["requests"], 2)
+        verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)["burst"]
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertEqual(verdict["attribution"], "ambiguous")
+        self.assertEqual(verdict["recordingsAttributed"], 0)
+        self.assertEqual(verdict["frameSymbols"], [])
+        item = verdict["expectations"][0]
+        self.assertFalse(item["passed"])
+        self.assertEqual(item["attribution"], "ambiguous")
+        self.assertEqual(item["evidenceScope"], "burst-route-group")
+        self.assertEqual(item["recordingsMatchingRoute"], 2)
+        self.assertEqual(item["recordingsWithStatus"], 2)
+        self.assertEqual(item["layers"], {"controller": {"recordingsWithFrame": 2, "of": 2}})
+        self.assertEqual(item["recordingsWithSource"], 2)
+        self.assertEqual(item["problems"], [BURST_CORRELATION_PROBLEM])
         details["0"]["outcome"]["httpStatus"] = 500
         verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
         self.assertEqual(verdict["burst"]["expectations"][0]["problems"],
-                         ["http-outcome-count-mismatch(expected 2, observed 1)"])
+                         ["http-outcome-count-mismatch(expected 2, observed 1)", BURST_CORRELATION_PROBLEM])
+
+    def test_duplicate_concrete_paths_cannot_be_correlated_within_or_across_bursts(self):
+        path = "/owners/1"
+        details = {}
+        for i in range(2):
+            rid = f"01a12327-{0x100 + i:04x}-7000-8000-000000000000"
+            details[rid] = {**rec("GET", path, 200), "recordingId": rid, "completion": "complete",
+                            "_openedAt": f"2026-10-10T00:00:0{i}Z"}
+        for scenarios in (("burst", "burst"), ("burst", "other-burst")):
+            with self.subTest(scenarios=scenarios):
+                burst = frozenset(scenarios)
+                exp = {sid: [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]
+                       for sid in burst}
+                sent = [(sid, "GET", path) for sid in scenarios]
+                serial = xinstr.burst_accounting({}, [], exp, {})
+                boundary = xinstr.burst_accounting(details, sent, exp, {})
+                self.assertTrue(serial["verified"])
+                self.assertTrue(boundary["verified"])
+                self.assertEqual(boundary["recordingIds"], sorted(details))
+                self.assertEqual(boundary["routes"][0]["requests"], 2)
+                self.assertEqual(boundary["routes"][0]["recordings"], 2)
+                with mock.patch.object(xinstr, "recording_time") as recording_time:
+                    verdicts = xinstr.analyze(details, exp, sent, burst, boundary, serial)
+                recording_time.assert_not_called()
+                for verdict in verdicts.values():
+                    self.assertFalse(verdict["passed"])
+                    self.assertEqual(verdict["attribution"], "ambiguous")
+                    self.assertEqual(verdict["recordingsAttributed"], 0)
+                    self.assertEqual(verdict["frameSymbols"], [])
+                    item = verdict["expectations"][0]
+                    self.assertEqual(item["recordingsMatchingRoute"], 2 if len(burst) == 1 else 0)
+                    self.assertEqual(item["problems"], [BURST_CORRELATION_PROBLEM])
 
     def test_partial_accounting_polls_state_and_expiry_reports_exact_numbers(self):
         exp, sent, details = self.boundary_fixture()
@@ -429,8 +478,12 @@ class T(unittest.TestCase):
         self.assertFalse(boundary["verified"])
         self.assertIsNone(boundary["verifiedAt"])
         v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertFalse(v["burst"]["passed"])
+        self.assertEqual(v["burst"]["recordingsAttributed"], 0)
+        self.assertEqual(v["burst"]["expectations"][0]["recordingsMatchingRoute"], 1)
         self.assertEqual(v["burst"]["expectations"][0]["problems"],
-                         ["burst-unaccounted(requests 2, recordings 1, capacity drops 0, unaccounted 1)"])
+                         ["burst-unaccounted(requests 2, recordings 1, capacity drops 0, unaccounted 1)",
+                          BURST_CORRELATION_PROBLEM])
         self.assertFalse(v["serial"]["passed"])
 
     def test_snapshot_finishing_after_budget_does_not_verify(self):
@@ -458,7 +511,9 @@ class T(unittest.TestCase):
         v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
         self.assertEqual(v["serial"]["expectations"][0]["problems"],
                          ["serial-count-mismatch(recordings 2, requests 1)"])
-        self.assertEqual(v["burst"]["recordingsAttributed"], 2)
+        self.assertFalse(v["burst"]["passed"])
+        self.assertEqual(v["burst"]["recordingsAttributed"], 0)
+        self.assertEqual(v["burst"]["expectations"][0]["recordingsMatchingRoute"], 2)
         del details["serial"]
         del details["late"]
         v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
@@ -479,9 +534,26 @@ class T(unittest.TestCase):
         self.assertEqual(boundary["capacityDrops"], 1)
         self.assertEqual(boundary["partialRecordingIds"], ["0"])
         v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
-        self.assertEqual(v["burst"]["expectations"][0]["problems"], ["burst-drops(capacity 1, partial 1)"])
+        self.assertFalse(v["burst"]["passed"])
+        self.assertEqual(v["burst"]["expectations"][0]["problems"],
+                         ["burst-drops(capacity 1, partial 1)", BURST_CORRELATION_PROBLEM])
         before = {"old": {"sessionContext": context}}
         self.assertFalse(xinstr.burst_accounting(details, sent, exp, before)["verified"])
+
+    def test_partial_recordings_and_capacity_drops_each_fail_burst_isolation(self):
+        exp, sent, details = self.boundary_fixture()
+        partial = {**details, "0": {**details["0"], "completion": "partial"}}
+        refused = {"0": {**details["0"], "sessionContext": {"runtimeSessionId": "s", "rejectedRequests": "1"}}}
+        for snapshot, capacity, partial_count in ((partial, 0, 1), (refused, 1, 0)):
+            with self.subTest(capacity=capacity, partial=partial_count):
+                serial = xinstr.burst_accounting({}, [], exp, {})
+                boundary = xinstr.burst_accounting(snapshot, sent, exp, {})
+                self.assertTrue(boundary["verified"])
+                verdict = xinstr.analyze(snapshot, exp, sent, frozenset({"burst"}), boundary, serial)["burst"]
+                self.assertFalse(verdict["passed"])
+                self.assertEqual(verdict["recordingsAttributed"], 0)
+                self.assertEqual(verdict["expectations"][0]["problems"],
+                                 [f"burst-drops(capacity {capacity}, partial {partial_count})", BURST_CORRELATION_PROBLEM])
 
     def test_capacity_context_null_zero_maxima_and_independent_sessions(self):
         details = {str(i): {"sessionContext": context} for i, context in enumerate([
@@ -520,7 +592,14 @@ class T(unittest.TestCase):
         self.assertFalse(xinstr.burst_accounting(details, sent, exp, {})["verified"])
         details["0"]["completion"] = "complete"
         details["extra"] = dict(details["0"])
-        self.assertFalse(xinstr.burst_accounting(details, sent, exp, {})["verified"])
+        boundary = xinstr.burst_accounting(details, sent, exp, {})
+        self.assertFalse(boundary["verified"])
+        verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)["burst"]
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["recordingsAttributed"], 0)
+        self.assertEqual(verdict["expectations"][0]["problems"],
+                         ["burst-unaccounted(requests 2, recordings 3, capacity drops 0, unaccounted -1)",
+                          BURST_CORRELATION_PROBLEM])
 
     def test_serial_boundary_requires_one_complete_recording_per_request(self):
         exp, sent, details = self.boundary_fixture()
@@ -545,10 +624,15 @@ class T(unittest.TestCase):
         burst_sent = [("burst", "GET", "/owners/3")]
         combined = {**details, **later}
         boundary = xinstr.burst_accounting(combined, burst_sent, exp, details)
+        self.assertTrue(serial["verified"])
+        self.assertTrue(boundary["verified"])
         sent = serial_sent + burst_sent + [(None, "GET", "/owners/4")]
         verdict = xinstr.analyze(combined, exp, sent, frozenset({"burst"}), boundary, serial)
         self.assertTrue(verdict["serial"]["passed"], verdict)
-        self.assertTrue(verdict["burst"]["passed"], verdict)
+        self.assertEqual(verdict["serial"]["recordingsAttributed"], 2)
+        self.assertFalse(verdict["burst"]["passed"], verdict)
+        self.assertEqual(verdict["burst"]["attribution"], "ambiguous")
+        self.assertEqual(verdict["burst"]["expectations"][0]["problems"], [BURST_CORRELATION_PROBLEM])
         # Late recordings are outside the serial snapshot, even with the same route and time.
         del combined["1"]
         combined["canary"] = {**later["burst"], "_openedAt": "2026-10-10T00:00:01Z"}
@@ -557,7 +641,9 @@ class T(unittest.TestCase):
                          ["serial-count-mismatch(recordings 1, requests 2)"])
         self.assertFalse(verdict["serial"]["passed"])
         self.assertEqual(verdict["serial"]["frameSymbols"], [])
-        self.assertEqual(verdict["burst"]["recordingsAttributed"], 1)
+        self.assertEqual(verdict["burst"]["recordingsAttributed"], 0)
+        self.assertEqual(verdict["burst"]["frameSymbols"], [])
+        self.assertEqual(verdict["burst"]["expectations"][0]["recordingsMatchingRoute"], 1)
 
     def test_frame_symbols_are_unique_names_from_attributed_entries_even_on_bad_outcomes(self):
         detail = rec("GET", "/vets", 500, symbols=("VetController.show", "VetRepository.findAll", "VetController.show"))
@@ -601,27 +687,36 @@ class T(unittest.TestCase):
                     events.append(sc.id)
                     xcamp.SENT_LOG.append(("GET", "/owners/1"))
                     return {"id": sc.id, "passed": True, "semanticEffectFingerprint": "fp", "requests": [], "elapsedMs": 1}
-                exp, sent, details = self.boundary_fixture()
-                boundary = xinstr.burst_accounting(details, sent, exp, {})
-                boundary["verified"] = verified
+                exp, _, details = self.boundary_fixture()
+                details["0"]["_openedAt"] = "2026-10-10T00:00:00Z"
+                serial_details = {"0": details["0"]} if verified else {}
+                boundaries = []
+
                 def wait(*args, **kwargs):
                     events.append("boundary")
-                    if len(events) == 2:
+                    if not boundaries:
                         self.assertEqual([r[0] for r in args[2]], ["serial"])
                         self.assertTrue(kwargs["require_complete"])
+                        boundary = xinstr.burst_accounting(serial_details, args[2], exp, {})
                     else:
                         self.assertEqual([r[0] for r in args[2]], ["burst"])
                         self.assertEqual(args[5], deadline[0], "both phases share the existing budget")
+                        boundary = xinstr.burst_accounting(details, args[2], exp, serial_details)
+                    boundaries.append(boundary)
                     deadline.append(args[5])
                     return boundary
+
                 deadline = []
-                api = {"ok": True, "reason": "", "recordings": [], "details": {}}
+                initial = {"ok": True, "reason": "", "recordings": [], "details": {}}
+                # A later read may find a serial recording even when the live boundary failed.
+                final_details = details if verified else {"0": details["0"]}
+                api = {**initial, "recordings": [{"recordingId": rid} for rid in final_details], "details": final_details}
                 with mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
                      mock.patch.object(xinstr, "list_recording_ids", return_value=set()), \
                      mock.patch.object(xinstr, "start_viewer", return_value=(object(), {"origin": stack.base, "url": "http://x/#" + "A" * 43})), \
                      mock.patch.object(xinstr, "ViewerClient"), \
                      mock.patch.object(xinstr, "stop_process_group"), \
-                     mock.patch.object(xinstr, "collect_api", return_value=api), \
+                     mock.patch.object(xinstr, "collect_api", side_effect=[initial, api]), \
                      mock.patch.object(xinstr, "wait_burst_boundary", side_effect=wait), \
                      mock.patch.object(xcamp, "run_scenario", side_effect=run):
                     receipt = xinstr.run_instrumented(
@@ -631,14 +726,24 @@ class T(unittest.TestCase):
                         project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
                         canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
                 self.assertEqual(events, ["serial", "boundary", "burst", "boundary"] if verified else ["serial", "boundary"])
-                self.assertEqual(receipt["notes"]["serialBoundary"], boundary)
+                self.assertEqual(receipt["notes"]["serialBoundary"], boundaries[0])
+                self.assertEqual(receipt["notes"]["serialBoundary"]["verified"], verified)
+                burst = next(s for s in receipt["scenarios"] if s["id"] == "burst")
+                self.assertFalse(burst["recordingVerdict"]["passed"])
                 if verified:
-                    self.assertEqual(receipt["notes"]["burstBoundary"], boundary)
+                    self.assertEqual(receipt["notes"]["burstBoundary"], boundaries[1])
+                    self.assertTrue(receipt["notes"]["burstBoundary"]["verified"])
                     self.assertEqual(receipt["result"], "recorded")
+                    self.assertEqual(receipt["api"]["recordings"], 2)
+                    serial = next(s for s in receipt["scenarios"] if s["id"] == "serial")
+                    self.assertTrue(serial["recordingVerdict"]["passed"])
+                    self.assertTrue(burst["scenarioChecksPassed"])
+                    self.assertEqual(burst["recordingVerdict"]["recordingsAttributed"], 0)
+                    self.assertEqual(burst["recordingVerdict"]["expectations"][0]["problems"], [BURST_CORRELATION_PROBLEM])
+                    self.assertEqual(receipt["problemClasses"], {"attribution-ambiguous": 1})
                 self.assertTrue(all("frameSymbols" in sc for sc in receipt["scenarios"]))
                 stack.down.assert_called_once()
                 if not verified:
-                    burst = next(s for s in receipt["scenarios"] if s["id"] == "burst")
                     self.assertFalse(burst["scenarioChecksPassed"])
                     self.assertEqual(burst["notRunReason"], "serial boundary was not verified")
                     self.assertEqual(receipt["result"], "failed", "a later API read cannot repair a skipped workload")
