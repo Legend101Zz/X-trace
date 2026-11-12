@@ -43,6 +43,14 @@ impl PrivateStorageError {
     pub(crate) fn io(operation: Step, error: impl Into<std::io::Error>) -> Self {
         Self::Admission(AdmissionFailure::io(operation, error))
     }
+
+    // Use only on terminal error paths. A recovered I/O error does not describe
+    // the error returned by a private-storage operation.
+    pub(crate) fn discard_io(self, _error: impl Into<std::io::Error>) -> Self {
+        #[cfg(all(feature = "spawn-counter", debug_assertions))]
+        crate::diagnostic::observe_discarded_io(_error);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -369,7 +377,7 @@ impl AdmittedPrivateRoot {
         validate_child_name(name)?;
         self.revalidate_until(op)?;
         rustix::fs::mkdirat(&self.directory, name, rustix::fs::Mode::from_raw_mode(0o700))
-            .map_err(|_| PrivateStorageError::Operation)?;
+            .map_err(|error| PrivateStorageError::Operation.discard_io(error))?;
         self.revalidate_until(op)?;
         self.sync_until(op)?;
         let child = rustix::fs::openat(
@@ -382,12 +390,13 @@ impl AdmittedPrivateRoot {
             rustix::fs::Mode::empty(),
         )
         .map(File::from)
-        .map_err(|_| PrivateStorageError::Unavailable)?;
+        .map_err(|error| PrivateStorageError::Unavailable.discard_io(error))?;
         self.revalidate_until(op)?;
         let path = self.path.join(name);
         admit_directory_descriptor_until(&path, &child, DirectoryRole::PrivateLeaf, op)?;
         self.revalidate_until(op)?;
-        let metadata = child.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata =
+            child.metadata().map_err(|error| PrivateStorageError::Unavailable.discard_io(error))?;
         Ok(Self {
             path,
             directory: child,
@@ -432,7 +441,7 @@ impl AdmittedPrivateRoot {
             Err(error) if error == rustix::io::Errno::NOENT => {
                 self.create_private_child_until(name, op)
             }
-            Err(_) => Err(PrivateStorageError::Unavailable),
+            Err(error) => Err(PrivateStorageError::Unavailable.discard_io(error)),
         }
     }
 
@@ -831,11 +840,12 @@ impl AdmittedPrivateRoot {
         )
         .map(File::from)
         .map_err(|error| {
-            if error == rustix::io::Errno::EXIST {
+            let variant = if error == rustix::io::Errno::EXIST {
                 PrivateStorageError::AlreadyExists
             } else {
                 PrivateStorageError::Operation
-            }
+            };
+            variant.discard_io(error)
         })?;
         self.validate_file_binding_with_link_policy_until(name, &file, true, false, op)?;
         self.revalidate_until(op)?;
@@ -1054,9 +1064,10 @@ impl AdmittedPrivateRoot {
         }
         validate_child_name(name)?;
         self.revalidate_until(op)?;
-        let descriptor = file.metadata().map_err(|_| PrivateStorageError::Operation)?;
+        let descriptor =
+            file.metadata().map_err(|error| PrivateStorageError::Operation.discard_io(error))?;
         let named = std::fs::symlink_metadata(self.path.join(name))
-            .map_err(|_| PrivateStorageError::Unavailable)?;
+            .map_err(|error| PrivateStorageError::Unavailable.discard_io(error))?;
         use std::os::unix::fs::MetadataExt as _;
         let descriptor_identity = FileIdentity::from_metadata(&descriptor);
         let named_identity = FileIdentity::from_metadata(&named);
@@ -1085,14 +1096,16 @@ impl AdmittedPrivateRoot {
         if descriptor.dev() != directory_metadata.dev() {
             return Err(PrivateStorageError::Unavailable);
         }
-        let filesystem = rustix::fs::fstatfs(file).map_err(|_| PrivateStorageError::Unavailable)?;
+        let filesystem = rustix::fs::fstatfs(file)
+            .map_err(|error| PrivateStorageError::Unavailable.discard_io(error))?;
         if !owner_enforcing_local_filesystem(&filesystem, self.profile) {
             return Err(PrivateStorageError::Unavailable);
         }
         self.revalidate_until(op)?;
         let named_after = std::fs::symlink_metadata(self.path.join(name))
-            .map_err(|_| PrivateStorageError::Unavailable)?;
-        let opened_after = file.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+            .map_err(|error| PrivateStorageError::Unavailable.discard_io(error))?;
+        let opened_after =
+            file.metadata().map_err(|error| PrivateStorageError::Unavailable.discard_io(error))?;
         if FileIdentity::from_metadata(&named_after) != descriptor_identity
             || FileIdentity::from_metadata(&opened_after) != descriptor_identity
             || named_after.nlink() != descriptor.nlink()
@@ -1143,7 +1156,8 @@ impl AdmittedPrivateRoot {
 
     fn sync_until(&self, op: &Operation) -> Result<(), PrivateStorageError> {
         self.revalidate_until(op)?;
-        rustix::fs::fsync(&self.directory).map_err(|_| PrivateStorageError::Operation)
+        rustix::fs::fsync(&self.directory)
+            .map_err(|error| PrivateStorageError::Operation.discard_io(error))
     }
 }
 

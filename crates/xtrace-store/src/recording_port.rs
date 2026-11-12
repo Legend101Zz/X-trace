@@ -2129,6 +2129,20 @@ mod tests {
         }
     }
 
+    #[cfg(all(unix, debug_assertions))]
+    #[allow(clippy::panic, reason = "failed test publishes only fixed object I/O facts")]
+    fn sparse_acknowledgement_failed<T>(
+        error: xtrace_application::PortError,
+        scope: &crate::recording_store::object_diagnostic::Scope,
+        iteration: u64,
+    ) -> T {
+        if error.message().starts_with("XTR-STORE-OBJECT-IO: ") {
+            let diagnostic = scope.report(iteration);
+            panic!("acknowledgement object io {diagnostic}");
+        }
+        acknowledgement_failed(error)
+    }
+
     #[test]
     fn sparse_acknowledged_batches_hit_admission_before_becoming_unreadable() {
         use xtrace_application::recording::{DEFAULT_SEGMENT_EVENT_BYTES, MAX_RECORDING_SEGMENTS};
@@ -2161,9 +2175,16 @@ mod tests {
         let last = u64::from(MAX_RECORDING_SEGMENTS) + 1;
         let mut phase = Phase::enter("admission_loop");
         for sequence in 2..=last {
+            #[cfg(all(unix, debug_assertions))]
+            let observation = crate::recording_store::object_diagnostic::Scope::enter();
             let receipt = capture
-                .record_events(RecordEvents { recording_id, events: vec![sparse_event(sequence)] })
-                .unwrap_or_else(acknowledgement_failed);
+                .record_events(RecordEvents { recording_id, events: vec![sparse_event(sequence)] });
+            #[cfg(all(unix, debug_assertions))]
+            let receipt = receipt.unwrap_or_else(|error| {
+                sparse_acknowledgement_failed(error, &observation, sequence - 1)
+            });
+            #[cfg(not(all(unix, debug_assertions)))]
+            let receipt = receipt.unwrap_or_else(acknowledgement_failed);
             assert_eq!((receipt.accepted, receipt.dropped), (1, 0));
             if (sequence - 1) % 256 == 0 || sequence == last {
                 profile.progress((sequence - 1) as usize);
