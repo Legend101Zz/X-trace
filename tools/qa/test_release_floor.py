@@ -366,7 +366,7 @@ class FloorSupervisorTests(unittest.TestCase):
                 "    stream.write(''.join(json.dumps(row) + '\\n' for row in records))\n"
                 "with os.fdopen(os.open(directory / 'spring-premain-order-wait.txt', "
                 "os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:\n"
-                "    stream.write('v1 successful-request 0 0\\n')\n"
+                "    stream.write('v2 successful-request 0 0 present unavailable present\\n')\n"
                 f"os.write(1, {output.encode()!r})\n"
                 "signal.pause()\n")
             cargo.chmod(0o700)
@@ -428,10 +428,11 @@ class FloorSupervisorTests(unittest.TestCase):
             self.assertEqual(fragment["springPremainOrderWait"], {
                 "status": "observed", "phase": "successful-request", "state": "no-complete-segment-rows",
                 "expectedRows": 1, "completeRows": 0, "completeRowsLimit": 16, "matchingRows": 0,
+                "captureMarkers": {"incomplete": "present", "drainExpired": "unavailable", "otherIncomplete": "present"},
             })
             for text in (json.dumps(fragment), public.getvalue()):
                 self.assertNotIn("captured-value-731", text)
-                self.assertNotIn("v1 successful-request 0 0", text)
+                self.assertNotIn("v2 successful-request 0 0", text)
                 self.assertNotIn("target/debug", text)
                 self.assertNotIn(str(root), text)
             self.assertEqual(list((root / "frag").glob("*.json")), [root / "frag/rust__-__rust-workspace.json"])

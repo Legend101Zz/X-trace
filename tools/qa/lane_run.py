@@ -768,8 +768,12 @@ SPRING_ORDER_WAIT_PHASES = {
     "successful-request": 1, "error-request": 2, "attestation-mismatch": 3, "classfile-mutation": 4,
 }
 SPRING_ORDER_WAIT_ROW_LIMIT = 16
-SPRING_ORDER_WAIT_MAX_BYTES = 64
-SPRING_ORDER_WAIT_RECORD = re.compile(rb"v1 ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3])\n")
+SPRING_ORDER_WAIT_MAX_BYTES = 96
+SPRING_MARKER_OBSERVATION = rb"(present|not-observed|unavailable)"
+SPRING_ORDER_WAIT_RECORD = re.compile(
+    rb"v2 ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3]) "
+    + b" ".join([SPRING_MARKER_OBSERVATION] * 3) + rb"\n"
+)
 
 
 def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index) -> dict:
@@ -790,6 +794,12 @@ def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index
     complete, matching = int(record[2]), int(record[3])
     if expected is None or complete > SPRING_ORDER_WAIT_ROW_LIMIT or matching > complete or matching >= expected:
         return unavailable
+    incomplete, drain_expired, other_incomplete = (value.decode("ascii") for value in record.groups()[3:])
+    observations = {incomplete, drain_expired, other_incomplete}
+    # All marker states come from one snapshot. An unseen marker is only
+    # "not-observed" after EOF; until then its observation is unavailable.
+    if {"not-observed", "unavailable"} <= observations:
+        return unavailable
     if complete == 0:
         state = "no-complete-segment-rows"
     elif matching == 0:
@@ -797,7 +807,9 @@ def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index
     else:
         state = "insufficient-matching-rows"
     result = {"status": "observed", "phase": phase, "state": state, "expectedRows": expected,
-              "completeRows": complete, "completeRowsLimit": SPRING_ORDER_WAIT_ROW_LIMIT, "matchingRows": matching}
+              "completeRows": complete, "completeRowsLimit": SPRING_ORDER_WAIT_ROW_LIMIT, "matchingRows": matching,
+              "captureMarkers": {"incomplete": incomplete, "drainExpired": drain_expired,
+                                 "otherIncomplete": other_incomplete}}
     return unavailable if _private(_encoded(result).decode("ascii"), index, verified_identifier=True) else result
 
 
