@@ -1353,10 +1353,19 @@ class T(unittest.TestCase):
                         out_dir=root / "out", norm_extra=[], expectations=exp, xtrace="xtrace", project_dir=root,
                         data_home=root / "data", adaptations=[], canaries=None, baseline_receipt=baseline_path,
                         extra_canary_paths=[], harness_files=[])
+                wait.assert_called_once()
                 self.assertEqual(wait.call_args.args[2], sent)
-                self.assertTrue(receipt["notes"]["serialBoundary"]["verified"])
-                self.assertTrue(receipt["notes"]["burstBoundary"]["verified"])
-                self.assertEqual(receipt["notes"]["burstBoundary"]["recordingIds"], boundary["recordingIds"])
+                serial = receipt["notes"]["serialBoundary"]
+                self.assertTrue(serial["verified"])
+                self.assertEqual(serial["requests"], 0)
+                self.assertEqual(serial["recordingIds"], [])
+                self.assertEqual(serial["capacityDrops"], 0)
+                self.assertEqual(serial["unaccounted"], 0)
+                burst = receipt["notes"]["burstBoundary"]
+                self.assertTrue(burst["verified"])
+                self.assertEqual(burst["recordingIds"], boundary["recordingIds"])
+                self.assertEqual(burst["capacityDrops"], 0)
+                self.assertEqual(burst["unaccounted"], 0)
                 reason = list_gap or detail_failures.get(gap, "")
                 self.assertEqual(receipt["api"]["ok"], not reason)
                 self.assertEqual(receipt["api"]["reason"], reason)

@@ -1071,6 +1071,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             burst_deadline = time.monotonic() + 60.0
             if ordered[0].id in burst:
                 serial_boundary = burst_accounting(initial["details"], [], expectations, initial["details"])
+                notes["serialBoundary"] = serial_boundary
             burst_before = initial["details"]
         for index, sc in enumerate(ordered):
             mark = len(xcamp.SENT_LOG)
