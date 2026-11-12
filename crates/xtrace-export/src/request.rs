@@ -189,6 +189,8 @@ pub struct ClaimInput {
     pub confidence_basis_points: Option<u16>,
     /// Limitation codes.
     pub limitation_codes: Vec<String>,
+    /// Whether an empty list was explicitly reported. Nonempty lists report codes directly.
+    pub empty_limitations_reported: bool,
     /// Parameters.
     pub params: Vec<ParamInput>,
     /// Responses.
@@ -206,24 +208,24 @@ pub struct ClaimInput {
     pub request_body_media_type: Option<String>,
 }
 
-/// Facts retained by a summary-only catalog read port. These are not a claim:
-/// locations and confidence must never be attributed to an arbitrary handler.
+/// Aggregate catalog facts, which may be supplied alongside individual claims.
+/// Locations and confidence must never be attributed to an arbitrary handler.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogSummaryInput {
-    /// Number of underlying claims, whose individual projections are unavailable.
+    /// Number of underlying claims.
     pub claim_count: usize,
-    /// All distinct handler symbols, without inferred locations.
-    pub handler_symbols: Vec<String>,
-    /// Whether the catalog reports conflicting handlers.
-    pub handler_conflict: bool,
+    /// All distinct handler symbols when reported, without inferred locations.
+    pub handler_symbols: Option<Vec<String>>,
+    /// Whether the catalog reports conflicting handlers, when known.
+    pub handler_conflict: Option<bool>,
     /// Location attributable to a handler only when exactly one claim exists.
     pub single_claim_handler: Option<HandlerInput>,
     /// Highest confidence across claims, not an individual claim's confidence.
     pub highest_confidence_basis_points: Option<u16>,
-    /// Distinct provenance labels.
-    pub provenance: Vec<String>,
-    /// Union of claim limitations.
-    pub limitation_codes: Vec<String>,
+    /// Distinct provenance labels when reported.
+    pub provenance: Option<Vec<String>>,
+    /// Union of claim limitations when reported.
+    pub limitation_codes: Option<Vec<String>>,
 }
 
 /// One catalog operation.
@@ -245,7 +247,7 @@ pub struct OperationInput {
     pub claims_available: bool,
     /// Claims.
     pub claims: Vec<ClaimInput>,
-    /// Explicitly labelled aggregate facts when individual claims cannot be read.
+    /// Explicitly labelled aggregate facts about the underlying claims.
     pub catalog_summary: Option<CatalogSummaryInput>,
 }
 

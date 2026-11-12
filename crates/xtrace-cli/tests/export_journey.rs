@@ -447,7 +447,11 @@ fn assert_refused(fx: &Fx, format: &str, needle: &str) {
 
 #[test]
 fn secret_shaped_handler_text_is_refused_by_every_format_with_the_policy_exit_code() {
-    for symbol in ["password=hunter2hunter2", "src/routes.js#password:hunter2hunter2"] {
+    for symbol in [
+        "password=hunter2hunter2",
+        "src/routes.js#password:hunter2hunter2",
+        "src/(private routes)/token=hunter2hunter2.js#list",
+    ] {
         let leaky = TRANSCRIPT.replace("OrderController.get", symbol);
         let fx = project_with_catalog(&leaky);
         for format in ["openapi", "postman", "curl", "bundle"] {
@@ -874,7 +878,13 @@ fn claim_transcript(route: &str, symbols: &[String]) -> String {
 fn export_persisted_path_bearing_handler_symbols_across_formats() {
     use serde_json::json;
 
-    let relative = "src/routes.js#list";
+    let relative = [
+        "src/(admin)/routes.js#list",
+        "src/feature routes/route!.ts#GET",
+        "src/order routes.js#list",
+        "src/routes.js#list",
+        "src/routes/[id].ts#GET",
+    ];
     let unsafe_symbols = [
         ("/home/export-owner-private/routes.js#list", "export-owner-private"),
         ("src/../traversal-private.js#list", "traversal-private"),
@@ -883,8 +893,13 @@ fn export_persisted_path_bearing_handler_symbols_across_formats() {
         (r"\\host\share\unc-private.js#list", "unc-private"),
         ("src/routes.js#/embedded-private.js", "embedded-private"),
         ("src/..#terminal-traversal", "terminal-traversal"),
+        ("src/handler=/home/prefixed-private.js#list", "prefixed-private"),
+        ("src/path Q:/embedded-drive-private.js#list", "embedded-drive-private"),
+        ("src/%2e%2e/encoded-traversal-private.js#list", "encoded-traversal-private"),
+        ("src/%2Fencoded-absolute-private.js#list", "encoded-absolute-private"),
     ];
-    let symbols: Vec<_> = std::iter::once(relative)
+    let symbols: Vec<_> = relative
+        .into_iter()
         .chain(unsafe_symbols.iter().map(|(symbol, _)| *symbol))
         .map(str::to_owned)
         .collect();
@@ -956,12 +971,12 @@ fn export_persisted_path_bearing_handler_symbols_across_formats() {
             assert_eq!(metadata["claims_projection"], "available");
             assert_eq!(metadata["claim_count"], ids.len());
             assert_eq!(metadata["handler_conflict"], true);
-            assert_eq!(metadata["handler_symbols"], json!([relative]));
+            assert_eq!(metadata["handler_symbols"], json!(relative));
             let claims = metadata["claims"].as_array().unwrap();
             assert_eq!(claims.len(), ids.len());
             for (index, id) in ids.iter().enumerate() {
                 let row = claims.iter().find(|claim| claim["claim_id"] == *id).unwrap();
-                let symbol = if index == 0 { json!(relative) } else { Value::Null };
+                let symbol = relative.get(index).map_or(Value::Null, |symbol| json!(symbol));
                 assert_eq!(row.get("handler_symbol"), Some(&symbol));
                 assert_eq!(row["source_evidence"][0]["relative_path"], "Handlers.java");
                 assert_eq!(row["source_evidence"][0]["start_line"], index + 1);

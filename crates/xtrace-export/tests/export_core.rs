@@ -65,10 +65,48 @@ fn comment_metadata(text: &str) -> serde_json::Value {
     serde_json::from_str(metadata).unwrap()
 }
 
+fn operation_metadata(
+    out: &xtrace_export::ExportOutput,
+    format: ExportFormat,
+    route: &str,
+    expected: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::{Value, json};
+
+    let file = |path| text(out.files.iter().find(|f| f.path == path).unwrap());
+    let postman = || {
+        let doc: Value = serde_json::from_str(file("collection.postman.json")).unwrap();
+        let name = format!("GET /{route}");
+        let item =
+            doc["item"].as_array().unwrap().iter().find(|item| item["name"] == name).unwrap();
+        comment_metadata(item["request"]["description"].as_str().unwrap())
+    };
+    let curl = || {
+        let suffix = format!("-get-{route}.sh");
+        let recipe = out.files.iter().find(|f| f.path.ends_with(&suffix)).unwrap();
+        comment_metadata(text(recipe))
+    };
+    match format {
+        ExportFormat::OpenApi => {
+            let doc: Value = serde_json::from_str(file("openapi.json")).unwrap();
+            doc["paths"][format!("/{route}")]["get"]["x-xtrace"].clone()
+        }
+        ExportFormat::Postman => postman(),
+        ExportFormat::Curl => curl(),
+        ExportFormat::Bundle => {
+            let metadata_yaml = xtrace_export::canonical::yaml(&json!({"x-xtrace": expected}));
+            let block =
+                metadata_yaml.lines().map(|line| format!("      {line}\n")).collect::<String>();
+            assert!(file("openapi.yaml").contains(&block), "bundle YAML for {route}");
+            assert_eq!(postman(), curl());
+            postman()
+        }
+    }
+}
+
 #[test]
 fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
-    use serde_json::{Value, json};
-    use xtrace_export::canonical;
+    use serde_json::json;
 
     let first = json!({"symbol": "First.get", "path": "First.java", "line_start": 4});
     let second =
@@ -180,7 +218,6 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
     {
         let out = export(&input, &ExportRequest::new(format)).unwrap();
         assert_eq!(out.operation_count, 5, "{format:?}");
-        let file = |path| text(out.files.iter().find(|f| f.path == path).unwrap());
         for (route, expected) in [
             ("legacy", &expected_legacy),
             ("summary", &expected_summary),
@@ -188,42 +225,7 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
             ("partial", &expected_partial),
             ("consistent", &expected_consistent),
         ] {
-            let postman = || {
-                let doc: Value = serde_json::from_str(file("collection.postman.json")).unwrap();
-                let item = doc["item"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|item| item["name"] == format!("GET /{route}"))
-                    .unwrap();
-                comment_metadata(item["request"]["description"].as_str().unwrap())
-            };
-            let curl = || {
-                let recipe = out
-                    .files
-                    .iter()
-                    .find(|f| f.path.ends_with(&format!("-get-{route}.sh")))
-                    .unwrap();
-                comment_metadata(text(recipe))
-            };
-            let metadata = match format {
-                ExportFormat::OpenApi => {
-                    let doc: Value = serde_json::from_str(file("openapi.json")).unwrap();
-                    doc["paths"][format!("/{route}")]["get"]["x-xtrace"].clone()
-                }
-                ExportFormat::Postman => postman(),
-                ExportFormat::Curl => curl(),
-                ExportFormat::Bundle => {
-                    let metadata_yaml = canonical::yaml(&json!({"x-xtrace": expected}));
-                    let block = metadata_yaml
-                        .lines()
-                        .map(|line| format!("      {line}\n"))
-                        .collect::<String>();
-                    assert!(file("openapi.yaml").contains(&block), "bundle YAML for {route}");
-                    assert_eq!(postman(), curl());
-                    postman()
-                }
-            };
+            let metadata = operation_metadata(&out, format, route, expected);
             assert_eq!(&metadata, expected, "{format:?} {route}");
         }
         for reason in [
@@ -257,6 +259,146 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
                 .iter()
                 .any(|o| o.operation_id == "partial" && o.reason == "handler_conflict_unresolved")
         );
+    }
+}
+
+#[test]
+fn equal_count_summary_checks_reported_facts_across_formats() {
+    use serde_json::{Value, json};
+
+    let known = json!({
+        "claim_id": "known", "provenance": "static_analysis", "confidence_basis_points": 8200,
+        "limitation_codes": ["missing_schema"],
+        "handler": {"symbol": "First.get", "path": "First.java", "line_start": 4}
+    });
+    let unknown = json!({"claim_id": "unknown", "provenance": null, "limitation_codes": null});
+    let empty_limitations = json!({"claim_id": "empty", "limitation_codes": []});
+    let summary = json!({
+        "handler_symbols": ["First.get"], "provenance": ["static_analysis"],
+        "highest_confidence_basis_points": 8200, "limitation_codes": ["missing_schema"]
+    });
+    let cases = [
+        ("handler", json!([known]), json!({"handler_symbols": ["Second.get"]}), true),
+        ("conflict", json!([known]), json!({"handler_conflict": true}), true),
+        (
+            "denied-conflict",
+            json!([known, {"claim_id": "second", "handler_symbol": "Second.get"}, unknown]),
+            json!({"handler_conflict": false}),
+            true,
+        ),
+        (
+            "location",
+            json!([known]),
+            json!({"single_claim_handler": {
+                "symbol": "First.get", "path": "First.java", "line_start": 5
+            }}),
+            true,
+        ),
+        ("provenance", json!([known, unknown]), json!({"provenance": ["runtime_hint"]}), true),
+        ("limitations", json!([known]), json!({"limitation_codes": []}), true),
+        (
+            "empty-limitations",
+            json!([empty_limitations]),
+            json!({"limitation_codes": ["missing_schema"]}),
+            true,
+        ),
+        ("confidence", json!([known]), json!({"highest_confidence_basis_points": 9000}), true),
+        (
+            "confidence-below-known",
+            json!([known, unknown]),
+            json!({"highest_confidence_basis_points": 6500}),
+            true,
+        ),
+        (
+            "confidence-above-known",
+            json!([known, unknown]),
+            json!({"highest_confidence_basis_points": 9000}),
+            false,
+        ),
+        ("consistent", json!([known]), summary.clone(), false),
+        ("unknown-rows", json!([unknown]), summary, false),
+        (
+            "additional-handler",
+            json!([known, unknown]),
+            json!({"handler_symbols": ["First.get", "Second.get"]}),
+            false,
+        ),
+        (
+            "unknown-summary",
+            json!([known]),
+            json!({"handler_symbols": null, "handler_conflict": null}),
+            false,
+        ),
+    ];
+    let mut operations = Vec::new();
+    for (route, claims, summary, _) in &cases {
+        let mut summary = summary.clone();
+        summary["claim_count"] = json!(claims.as_array().unwrap().len());
+        operations.push(json!({
+            "operation_id": route, "method": "GET", "route_template": format!("/{route}"),
+            "claims": claims, "catalog_summary": summary
+        }));
+    }
+    let input = xtrace_export::input_json::parse(&json!({"operations": operations})).unwrap();
+    let mut openapi = Vec::new();
+    for format in
+        [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
+    {
+        let out = export(&input, &ExportRequest::new(format)).unwrap();
+        assert_eq!(out.operation_count, cases.len());
+        for (index, (route, claims, summary, inconsistent)) in cases.iter().enumerate() {
+            let expected = openapi.get(index).unwrap_or(&Value::Null);
+            let metadata = operation_metadata(&out, format, route, expected);
+            assert_eq!(
+                metadata["claims_projection"],
+                if *inconsistent { "inconsistent" } else { "available" },
+                "{format:?} {route}"
+            );
+            assert_eq!(
+                out.omissions.iter().any(|o| o.operation_id == *route
+                    && o.what == "claims"
+                    && o.reason == "claim_summary_mismatch"),
+                *inconsistent,
+                "{format:?} {route}"
+            );
+            let rows = metadata["claims"].as_array().unwrap();
+            assert_eq!(rows.len(), claims.as_array().unwrap().len());
+            assert_eq!(metadata["claim_count"], rows.len());
+            let aggregate = &metadata["catalog_summary"];
+            assert_eq!(aggregate["claim_count"], rows.len());
+            for field in [
+                "handler_symbols",
+                "provenance",
+                "limitation_codes",
+                "highest_confidence_basis_points",
+            ] {
+                assert_eq!(
+                    aggregate.get(field),
+                    Some(&summary[field]),
+                    "{format:?} {route} {field}"
+                );
+            }
+            if let Some(conflict) = summary.get("handler_conflict") {
+                assert_eq!(aggregate.get("handler_conflict"), Some(conflict));
+            }
+            if let Some(location) = summary.get("single_claim_handler") {
+                assert_eq!(aggregate.get("single_claim_handler"), Some(location));
+            }
+            for claim in claims.as_array().unwrap() {
+                let row = rows.iter().find(|row| row["claim_id"] == claim["claim_id"]).unwrap();
+                for (field, value) in claim.as_object().unwrap() {
+                    if !value.is_null() {
+                        let field = if field == "handler" { "handler_location" } else { field };
+                        assert_eq!(row.get(field), Some(value), "{format:?} {route} {field}");
+                    }
+                }
+            }
+            if format == ExportFormat::OpenApi {
+                openapi.push(metadata);
+            } else {
+                assert_eq!(&metadata, expected, "{format:?} {route}");
+            }
+        }
     }
 }
 

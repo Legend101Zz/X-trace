@@ -140,7 +140,7 @@ fn claim(v: &Value, at: &str) -> Result<ClaimInput, String> {
     let o = obj(v, at)?;
     let mut out = ClaimInput {
         claim_id: req(o, "claim_id", at)?,
-        provenance: s(o, "provenance", at)?,
+        provenance: optional_string(o, "provenance", at)?.unwrap_or_default(),
         handler_symbol: optional_string(o, "handler_symbol", at)?,
         source_evidence: non_null(o, "source_evidence")
             .map(|evidence| {
@@ -159,9 +159,13 @@ fn claim(v: &Value, at: &str) -> Result<ClaimInput, String> {
         },
         ..Default::default()
     };
-    for c in arr(o, "limitation_codes", at)? {
-        if let Value::String(code) = c {
-            out.limitation_codes.push(code.clone());
+    if non_null(o, "limitation_codes").is_some() {
+        let limitations = arr(o, "limitation_codes", at)?;
+        out.empty_limitations_reported = limitations.is_empty();
+        for c in limitations {
+            if let Value::String(code) = c {
+                out.limitation_codes.push(code.clone());
+            }
         }
     }
     for (i, p) in arr(o, "params", at)?.iter().enumerate() {
@@ -220,6 +224,9 @@ fn handler(value: &Value, at: &str) -> Result<HandlerInput, String> {
 fn catalog_summary(value: &Value, at: &str) -> Result<CatalogSummaryInput, String> {
     let o = obj(value, at)?;
     let strings = |key| {
+        if non_null(o, key).is_none() {
+            return Ok(None);
+        }
         arr(o, key, at)?
             .iter()
             .map(|value| {
@@ -229,16 +236,15 @@ fn catalog_summary(value: &Value, at: &str) -> Result<CatalogSummaryInput, Strin
                     .ok_or_else(|| format!("{at}.{key}: expected an array of strings"))
             })
             .collect::<Result<Vec<_>, _>>()
+            .map(Some)
     };
     let count = n(o, "claim_count", at)?.ok_or_else(|| format!("{at}.claim_count: required"))?;
-    let handler_symbols = strings("handler_symbols")?;
-    let distinct_handlers = handler_symbols
-        .first()
-        .is_some_and(|first| handler_symbols.iter().any(|symbol| symbol != first));
     Ok(CatalogSummaryInput {
         claim_count: usize::try_from(count).map_err(|_| format!("{at}.claim_count: too large"))?,
-        handler_symbols,
-        handler_conflict: b(o, "handler_conflict", distinct_handlers, at)?,
+        handler_symbols: strings("handler_symbols")?,
+        handler_conflict: non_null(o, "handler_conflict")
+            .map(|_| b(o, "handler_conflict", false, at))
+            .transpose()?,
         single_claim_handler: non_null(o, "single_claim_handler")
             .map(|value| handler(value, &format!("{at}.single_claim_handler")))
             .transpose()?,
