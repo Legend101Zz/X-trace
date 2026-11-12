@@ -412,15 +412,25 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
     // Keep the aggregate location list and minimum reported confidence for legacy consumers.
     let legacy_only = !claims.is_empty()
         && claims.iter().all(|c| c.source_evidence.is_none() && c.handler_symbol.is_none());
+    // Compare the reported facts before filtering symbols and locations for export.
+    let symbol_conflict = op.catalog_summary.as_ref().and_then(summary_symbol_conflict);
+    let summary_inconsistent = op
+        .catalog_summary
+        .as_ref()
+        .is_some_and(|summary| summary_handler_disagrees(summary, symbol_conflict));
+    if summary_inconsistent {
+        omit(omissions, &op.operation_id, "claims".to_owned(), "claim_summary_mismatch");
+    }
     let (claim_metadata, mut handlers) = if claims_available {
-        let (metadata, handlers) = exact_claim_metadata(op, &claims, omissions, legacy_only);
+        let (metadata, handlers) =
+            exact_claim_metadata(op, &claims, omissions, legacy_only, summary_inconsistent);
         (Some(metadata), handlers)
     } else {
         (None, Vec::new())
     };
     let mut catalog_summary = op.catalog_summary.clone();
     if let Some(summary) = &mut catalog_summary {
-        summary.handler_conflict = summary_handler_conflict(summary);
+        summary.handler_conflict = summary.handler_conflict.or(symbol_conflict);
         if let Some(symbols) = &mut summary.handler_symbols {
             symbols.sort();
             symbols.dedup();
@@ -471,7 +481,7 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
                 "per_claim_confidence_unavailable",
             );
         }
-        if summary.handler_conflict == Some(true) {
+        if summary.handler_conflict == Some(true) || symbol_conflict == Some(true) {
             omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
         }
     }
@@ -518,6 +528,7 @@ fn exact_claim_metadata(
     claims: &[&ClaimInput],
     omissions: &mut BTreeSet<Omission>,
     legacy_only: bool,
+    summary_inconsistent: bool,
 ) -> (Value, Vec<HandlerInput>) {
     let mut reported_symbols = BTreeSet::new();
     let mut safe_symbols = BTreeSet::new();
@@ -561,14 +572,16 @@ fn exact_claim_metadata(
         }
         rows.push(row);
     }
-    let partial =
-        op.catalog_summary.as_ref().is_some_and(|summary| summary.claim_count > rows.len());
-    let empty_complete = rows.is_empty() && !partial;
+    let summary_count =
+        op.catalog_summary.as_ref().map_or(rows.len(), |summary| summary.claim_count);
+    let partial = summary_count > rows.len();
+    let complete = summary_count == rows.len();
+    let empty_complete = rows.is_empty() && complete;
     let handler_conflict = if reported_symbols.len() > 1 {
         omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
         Some(true)
     } else {
-        (empty_complete || (!rows.is_empty() && handlers_known)).then_some(false)
+        (complete && handlers_known).then_some(false)
     };
     if partial {
         omit(omissions, &op.operation_id, "claims".to_owned(), "claims_projection_partial");
@@ -578,6 +591,7 @@ fn exact_claim_metadata(
             omit(omissions, &op.operation_id, "claims".to_owned(), "claim_count_mismatch");
             "inconsistent"
         }
+        _ if summary_inconsistent => "inconsistent",
         Some(summary) if summary_disagrees(summary, claims, &reported_symbols, handlers_known) => {
             omit(omissions, &op.operation_id, "claims".to_owned(), "claim_summary_mismatch");
             "inconsistent"
@@ -595,11 +609,37 @@ fn exact_claim_metadata(
     (metadata, handlers)
 }
 
-fn summary_handler_conflict(summary: &CatalogSummaryInput) -> Option<bool> {
-    summary.handler_conflict.or_else(|| {
-        summary.handler_symbols.as_ref().map(|symbols| {
-            symbols.first().is_some_and(|first| symbols.iter().any(|symbol| symbol != first))
-        })
+fn summary_symbol_conflict(summary: &CatalogSummaryInput) -> Option<bool> {
+    let symbols = summary.handler_symbols.as_deref()?;
+    // A blank entry leaves the set incomplete. Two named handlers still establish conflict.
+    let mut known = symbols.iter().filter(|symbol| !symbol.is_empty());
+    if let Some(first) = known.next()
+        && known.any(|symbol| symbol != first)
+    {
+        return Some(true);
+    }
+    symbols.iter().all(|symbol| !symbol.is_empty()).then_some(false)
+}
+
+fn summary_handler_disagrees(summary: &CatalogSummaryInput, symbol_conflict: Option<bool>) -> bool {
+    if let (Some(reported), Some(from_symbols)) = (summary.handler_conflict, symbol_conflict)
+        && reported != from_symbols
+    {
+        return true;
+    }
+    if summary.claim_count == 0
+        && (summary.handler_conflict == Some(true)
+            || summary.handler_symbols.iter().flatten().any(|symbol| !symbol.is_empty()))
+    {
+        return true;
+    }
+    summary.single_claim_handler.as_ref().is_some_and(|location| {
+        summary.claim_count != 1
+            || (!location.symbol.is_empty()
+                && summary.handler_symbols.as_ref().is_some_and(|symbols| {
+                    symbols.iter().all(|symbol| !symbol.is_empty())
+                        && !symbols.contains(&location.symbol)
+                }))
     })
 }
 
@@ -627,7 +667,10 @@ fn summary_disagrees(
     let conflict = symbols.len() > 1;
     if summary_set_disagrees(summary.handler_symbols.as_deref(), symbols, handlers_complete)
         || ((conflict || handlers_complete)
-            && summary_handler_conflict(summary).is_some_and(|reported| reported != conflict))
+            && summary
+                .handler_conflict
+                .or_else(|| summary_symbol_conflict(summary))
+                .is_some_and(|reported| reported != conflict))
     {
         return true;
     }

@@ -321,7 +321,7 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
         "operation_id": "partial", "application_component": "", "binding_key": "",
         "effective_state": "unknown", "claims_projection": "partial", "claim_count": 1,
         "catalog_summary": aggregate,
-        "handler_conflict": false, "handler_symbols": ["Second.get"],
+        "handler_conflict": null, "handler_symbols": ["Second.get"],
         "handlers": [second], "confidence_basis_points": 6500,
         "provenance": ["static_analysis"], "limitation_codes": ["missing_schema"],
         "claims": [expected_legacy["claims"][1]]
@@ -416,6 +416,18 @@ fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
             json!([known, {"claim_id": "second", "handler_symbol": "Second.get"}, unknown]),
             json!({"handler_conflict": false}),
             true,
+        ),
+        (
+            "complete-denied-symbol-conflict",
+            json!([known, {"claim_id": "second", "handler_symbol": "Second.get"}]),
+            json!({"handler_symbols": ["First.get", "Second.get"], "handler_conflict": false}),
+            true,
+        ),
+        (
+            "complete-agreeing-rows",
+            json!([known, {"claim_id": "second", "handler_symbol": "First.get"}]),
+            json!({"handler_symbols": ["First.get"], "handler_conflict": false}),
+            false,
         ),
         (
             "location",
@@ -569,6 +581,34 @@ fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
             let rows = metadata["claims"].as_array().unwrap();
             assert_eq!(rows.len(), row_count);
             assert_eq!(metadata["claim_count"], rows.len());
+            let row_conflict = match *route {
+                "denied-conflict"
+                | "partial-denied-conflict"
+                | "complete-denied-symbol-conflict" => Some(true),
+                "handler"
+                | "conflict"
+                | "complete-agreeing-rows"
+                | "location"
+                | "limitations"
+                | "confidence"
+                | "consistent"
+                | "unknown-summary" => Some(false),
+                _ => None,
+            };
+            assert_eq!(
+                metadata.get("handler_conflict"),
+                Some(&json!(row_conflict)),
+                "{format:?} {route}"
+            );
+            let unresolved = row_conflict == Some(true)
+                || matches!(*route, "conflict" | "additional-handler" | "partial-extras");
+            assert_eq!(
+                out.omissions.iter().any(|o| {
+                    o.operation_id == *route && o.reason == "handler_conflict_unresolved"
+                }),
+                unresolved,
+                "{format:?} {route}"
+            );
             let aggregate = &metadata["catalog_summary"];
             assert_eq!(aggregate["claim_count"], summary_count);
             for field in [
@@ -603,6 +643,236 @@ fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
             }
         }
     }
+}
+
+#[test]
+fn handler_summary_consistency_is_independent_of_claim_availability() {
+    use serde_json::{Value, json};
+
+    let one = json!(["First.get"]);
+    let multiple = json!(["First.get", "Second.get"]);
+    let cases = [
+        // Symbols, supplied flag, exported flag, mismatch, unresolved conflict.
+        ("denied", &multiple, json!(false), json!(false), true, true),
+        ("reported", &multiple, json!(true), json!(true), false, true),
+        ("derived", &multiple, Value::Null, json!(true), false, true),
+        ("one-reported", &one, json!(false), json!(false), false, false),
+        ("one-derived", &one, Value::Null, json!(false), false, false),
+        ("one-asserted-conflict", &one, json!(true), json!(true), true, true),
+        ("unknown-asserted-conflict", &Value::Null, json!(true), json!(true), false, true),
+        ("unknown-denied-conflict", &Value::Null, json!(false), json!(false), false, false),
+        ("unknown-conflict", &Value::Null, Value::Null, Value::Null, false, false),
+    ];
+    let partial_claims = json!([{"claim_id": "first", "handler_symbol": "First.get"}]);
+    let operations: Vec<_> = cases
+        .iter()
+        .flat_map(|(name, symbols, reported, ..)| {
+            [("summary", &Value::Null), ("partial", &partial_claims)].map(|(kind, claims)| {
+                let route = format!("{kind}-{name}");
+                json!({
+                    "operation_id": route, "method": "GET", "route_template": format!("/{route}"),
+                    "claims": claims, "catalog_summary": {
+                        "claim_count": 2, "handler_symbols": symbols, "handler_conflict": reported
+                    }
+                })
+            })
+        })
+        .collect();
+    let input = xtrace_export::input_json::parse(&json!({"operations": operations})).unwrap();
+    let mut openapi = std::collections::BTreeMap::new();
+    for format in
+        [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
+    {
+        let out = export(&input, &ExportRequest::new(format)).unwrap();
+        assert_eq!(out.operation_count, 2 * cases.len());
+        for (name, symbols, _, flag, mismatch, conflict) in &cases {
+            for (kind, partial) in [("summary", false), ("partial", true)] {
+                let route = format!("{kind}-{name}");
+                let expected = openapi.get(&route).unwrap_or(&Value::Null);
+                let metadata = operation_metadata(&out, format, &route, expected);
+                let summary = if partial {
+                    assert_eq!(
+                        metadata["claims_projection"],
+                        if *mismatch { "inconsistent" } else { "partial" },
+                        "{format:?} {route}"
+                    );
+                    assert_eq!(metadata["claim_count"], 1);
+                    assert_eq!(metadata["handler_symbols"], one);
+                    assert_eq!(metadata.get("handler_conflict"), Some(&Value::Null));
+                    assert_eq!(
+                        metadata["claims"],
+                        json!([{
+                            "claim_id": "first", "handler_symbol": "First.get", "provenance": null,
+                            "confidence_basis_points": null, "limitation_codes": null,
+                            "source_evidence": null
+                        }])
+                    );
+                    &metadata["catalog_summary"]
+                } else {
+                    assert_eq!(metadata["claims_projection"], "unavailable");
+                    assert!(metadata.get("claims").is_none());
+                    &metadata
+                };
+                assert_eq!(summary["claim_count"], 2);
+                assert_eq!(summary.get("handler_symbols"), Some(*symbols), "{format:?} {route}");
+                assert_eq!(summary.get("handler_conflict"), Some(flag), "{format:?} {route}");
+                let prefixes: &[_] = if format == ExportFormat::Bundle {
+                    &["openapi:", "postman:", "curl:"]
+                } else {
+                    &[""]
+                };
+                for prefix in prefixes {
+                    for (field, reason, present) in [
+                        ("claims", "claim_summary_mismatch", *mismatch),
+                        ("claims", "claims_projection_partial", partial),
+                        ("claims", "claims_projection_unavailable", !partial),
+                        ("handler", "handler_conflict_unresolved", *conflict),
+                    ] {
+                        let what = format!("{prefix}{field}");
+                        assert_eq!(
+                            out.omissions
+                                .iter()
+                                .filter(|o| {
+                                    o.operation_id == route && o.what == what && o.reason == reason
+                                })
+                                .count(),
+                            usize::from(present),
+                            "{format:?} {route} {what} {reason}"
+                        );
+                    }
+                }
+                if format == ExportFormat::OpenApi {
+                    openapi.insert(route, metadata);
+                } else {
+                    assert_eq!(&metadata, expected, "{format:?} {route}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn summary_handler_checks_respect_counts_location_scope_and_symbol_filtering() {
+    use serde_json::{Value, json};
+
+    let location = json!({"symbol": "First.get", "path": "First.java", "line_start": 4});
+    let cases = [
+        (
+            "empty-with-conflict",
+            json!({
+                "claim_count": 2, "handler_symbols": [], "handler_conflict": true
+            }),
+            true,
+            true,
+        ),
+        (
+            "zero-with-handler",
+            json!({
+                "claim_count": 0, "handler_symbols": ["First.get"], "handler_conflict": false
+            }),
+            true,
+            false,
+        ),
+        (
+            "location-out-of-scope",
+            json!({
+                "claim_count": 2, "single_claim_handler": location
+            }),
+            true,
+            false,
+        ),
+        (
+            "location-missing-from-set",
+            json!({
+                "claim_count": 1, "handler_symbols": ["Second.get"], "single_claim_handler": location
+            }),
+            true,
+            false,
+        ),
+        (
+            "location-with-unknown-set",
+            json!({
+                "claim_count": 1, "single_claim_handler": location
+            }),
+            false,
+            false,
+        ),
+        (
+            "duplicate-symbols",
+            json!({
+                "claim_count": 2, "handler_symbols": ["First.get", "First.get"], "handler_conflict": false
+            }),
+            false,
+            false,
+        ),
+        (
+            "blank-symbol",
+            json!({
+                "claim_count": 2, "handler_symbols": ["", "First.get"]
+            }),
+            false,
+            false,
+        ),
+        (
+            "filtered-conflict",
+            json!({
+                "claim_count": 2, "handler_symbols": ["First.get", "../summary-private.java"],
+                "handler_conflict": false
+            }),
+            true,
+            true,
+        ),
+        (
+            "count-and-summary",
+            json!({
+                "claim_count": 1, "handler_symbols": ["First.get"], "handler_conflict": true
+            }),
+            true,
+            true,
+        ),
+    ];
+    let operations: Vec<_> = cases
+        .iter()
+        .map(|(route, summary, ..)| {
+            let mut op = json!({
+                "operation_id": route, "method": "GET", "route_template": format!("/{route}"),
+                "catalog_summary": summary
+            });
+            if *route == "count-and-summary" {
+                op["claims"] = json!([
+                    {"claim_id": "first", "handler_symbol": "First.get"},
+                    {"claim_id": "second", "handler_symbol": "First.get"}
+                ]);
+            }
+            op
+        })
+        .collect();
+    let input = xtrace_export::input_json::parse(&json!({"operations": operations})).unwrap();
+    let out = export(&input, &ExportRequest::new(ExportFormat::OpenApi)).unwrap();
+    let rendered = text(&out.files[0]);
+    assert!(!rendered.contains("summary-private.java"));
+    let doc: Value = serde_json::from_str(rendered).unwrap();
+    let omissions =
+        |route, reason| out.omissions.iter().any(|o| o.operation_id == route && o.reason == reason);
+    for (route, _, mismatch, conflict) in cases {
+        assert_eq!(omissions(route, "claim_summary_mismatch"), mismatch, "{route}");
+        assert_eq!(omissions(route, "handler_conflict_unresolved"), conflict, "{route}");
+    }
+    let metadata = |route| &doc["paths"][route]["get"]["x-xtrace"];
+    assert_eq!(metadata("/location-with-unknown-set")["handlers"], json!([location]));
+    for route in ["/location-with-unknown-set", "/blank-symbol"] {
+        assert_eq!(metadata(route).get("handler_conflict"), Some(&Value::Null));
+    }
+    assert_eq!(metadata("/duplicate-symbols")["handler_symbols"], json!(["First.get"]));
+    assert_eq!(metadata("/filtered-conflict")["handler_symbols"], json!(["First.get"]));
+    assert_eq!(metadata("/filtered-conflict")["handler_conflict"], false);
+    assert!(omissions("filtered-conflict", "handler_symbol_invalid"));
+    assert!(omissions("count-and-summary", "claim_count_mismatch"));
+    let inconsistent = metadata("/count-and-summary");
+    assert_eq!(inconsistent["claims_projection"], "inconsistent");
+    assert_eq!(inconsistent["claims"].as_array().unwrap().len(), 2);
+    assert_eq!(inconsistent["catalog_summary"]["claim_count"], 1);
+    assert_eq!(inconsistent.get("handler_conflict"), Some(&Value::Null));
 }
 
 #[test]

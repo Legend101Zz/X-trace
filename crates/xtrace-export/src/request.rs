@@ -228,9 +228,10 @@ impl ClaimInput {
 pub struct CatalogSummaryInput {
     /// Number of underlying claims.
     pub claim_count: usize,
-    /// All distinct handler symbols when reported, without inferred locations.
+    /// Complete set of reported handler symbols. An empty list reports no symbols.
+    /// `None` means the set is unknown.
     pub handler_symbols: Option<Vec<String>>,
-    /// Whether the catalog reports conflicting handlers, when known.
+    /// Reported conflict flag. Export checks it against any supplied handler set.
     pub handler_conflict: Option<bool>,
     /// Location attributable to a handler only when exactly one claim exists.
     pub single_claim_handler: Option<HandlerInput>,
