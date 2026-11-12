@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.bouncycastle.crypto.digests.Blake3Digest;
 import xtp.agent.v1.CapabilityOuterClass.Capability;
 import xtp.agent.v1.CapabilityOuterClass.CapabilitySet;
@@ -60,6 +61,19 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   static final String START_FRAME_GAP_SYMBOL = FRAME_GAP_SYMBOL + ".started";
   static final String FINISH_FRAME_GAP_SYMBOL = FRAME_GAP_SYMBOL + ".finished";
 
+  private enum IncompleteReason {
+    DRAIN_EXPIRED(1, "XTR-JAVA-CAPTURE-DRAIN-EXPIRED"),
+    OTHER(2, "XTR-JAVA-CAPTURE-OTHER-INCOMPLETE");
+
+    private final int bit;
+    private final String marker;
+
+    IncompleteReason(int bit, String marker) {
+      this.bit = bit;
+      this.marker = marker;
+    }
+  }
+
   private final Transport session;
   private final BoundedEventQueue queue;
   private final RuntimeBridgeSink sink;
@@ -67,7 +81,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private final Duration shutdownTimeout;
   private final AtomicBoolean stopping = new AtomicBoolean();
   private final AtomicBoolean shutdownRequested = new AtomicBoolean();
-  private final AtomicBoolean incompleteReported = new AtomicBoolean();
+  private final AtomicInteger incompleteReasons = new AtomicInteger();
   private final Map<String, PendingRecording> recordings = new HashMap<>();
   private final long maxPendingEventBytes;
   private long pendingEventBytes;
@@ -117,11 +131,12 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   }
 
   boolean incompleteWasReported() {
-    return incompleteReported.get();
+    return incompleteReasons.get() != 0;
   }
 
   @Override
   public void run() {
+    boolean drainExpired = false;
     try {
       int signalsSinceFlush = 0;
       while (!stopping.get()) {
@@ -129,7 +144,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         reportRejectedStarts();
         if (stopping.get() || shutdownDrained()) break;
         if (shutdownExpired()) {
-          reportIncomplete();
+          drainExpired = true;
+          reportIncomplete(IncompleteReason.DRAIN_EXPIRED);
           break;
         }
         QueueSignal signal = queue.poll(POLL_INTERVAL);
@@ -143,17 +159,17 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       }
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
-      if (!stopping.get()) reportIncomplete();
+      if (!stopping.get()) reportIncomplete(IncompleteReason.OTHER);
     } catch (ClientException | RuntimeException failure) {
       failClosed();
     } finally {
       sink.stopAccepting();
       observeIncompleteSignal();
-      if (!sink.startAdmissionsDrained()
+      if (!drainExpired && (!sink.startAdmissionsDrained()
           || !recordings.isEmpty()
           || !queue.isEmpty()
-          || sink.activeRecordings() > 0) {
-        reportIncomplete();
+          || sink.activeRecordings() > 0)) {
+        reportIncomplete(IncompleteReason.OTHER);
       }
       BootstrapBridge.disable(sink);
       closeSessionQuietly();
@@ -395,7 +411,6 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private void abandon(PendingRecording pending, String reason) throws ClientException {
     if (pending.unrecoverable) return;
     pending.unrecoverable = true;
-    incompleteReported.set(true);
     if (pending.started) {
       // An absent digest already seals the prefix as partial: total loss is unknown, including
       // observations that may arrive after abandonment. The wire counters are exact, so only
@@ -419,9 +434,13 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       requireRecordingAck(finished, pending.recordingId, pending.sequence);
     }
     // Only fixed reasons and the validated UUID belong in diagnostics, never captured fields.
+    IncompleteReason classification = IncompleteReason.OTHER;
+    int previous = markIncomplete(classification);
+    String marker = (previous & classification.bit) == 0
+        ? ",\"reason\":\"" + classification.marker + "\"" : "";
     System.err.println("{\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\","
         + "\"message\":\"X-trace " + reason + "; affected recording remains incomplete\","
-        + "\"recordingId\":\"" + pending.recordingId + "\"}");
+        + "\"recordingId\":\"" + pending.recordingId + "\"" + marker + "}");
   }
 
   /** Sends the buffered prefix; the response stays behind terminal gap accounting until Finish. */
@@ -843,13 +862,22 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     BootstrapBridge.disable(sink);
     stopping.set(true);
     if (thread.isAlive() && Thread.currentThread() != thread) thread.interrupt();
-    reportIncomplete();
+    reportIncomplete(IncompleteReason.OTHER);
   }
 
-  private void reportIncomplete() {
-    if (incompleteReported.compareAndSet(false, true)) {
+  private int markIncomplete(IncompleteReason reason) {
+    return incompleteReasons.getAndUpdate(bits -> bits | reason.bit);
+  }
+
+  private void reportIncomplete(IncompleteReason reason) {
+    int previous = markIncomplete(reason);
+    if (previous == 0) {
       System.err.println(
-          "{\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\",\"message\":\"X-trace recording transport stopped; application continues\"}");
+          "{\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\",\"message\":\"X-trace recording transport stopped; application continues\",\"reason\":\""
+              + reason.marker + "\"}");
+    } else if ((previous & reason.bit) == 0) {
+      // An earlier incomplete report must not hide a later observation of drain expiry.
+      System.err.println("{\"code\":\"" + reason.marker + "\"}");
     }
   }
 
@@ -858,7 +886,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     if (failureKind == BridgeSink.INCOMPLETE_FINISH_REJECTED) {
       stopIncomplete();
     } else if (failureKind == BridgeSink.INCOMPLETE_START_REJECTED) {
-      reportIncomplete();
+      reportIncomplete(IncompleteReason.OTHER);
     }
   }
 
@@ -897,12 +925,18 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   @Override
   public void close() {
+    close(() -> {});
+  }
+
+  // Lets the shutdown regression release an admitted producer after the fence and deadline.
+  void close(Runnable afterShutdownRequested) {
     sink.stopStarting();
     shutdownStartedNs = System.nanoTime();
     shutdownRequested.set(true);
+    afterShutdownRequested.run();
     if (thread.getState() == Thread.State.NEW) {
       if (!sink.startAdmissionsDrained() || !queue.isEmpty() || sink.activeRecordings() > 0) {
-        reportIncomplete();
+        reportIncomplete(IncompleteReason.OTHER);
       }
       sink.stopAccepting();
       closeSessionQuietly();
@@ -910,6 +944,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     }
     try {
       thread.join(shutdownTimeout.toMillis() + POLL_INTERVAL.toMillis() + 250);
+      // A live thread here may be in transport I/O or session close. Only the
+      // writer's drain check can report that it observed work at expiry.
       if (thread.isAlive()) stopIncomplete();
       thread.join(250);
     } catch (InterruptedException interrupted) {

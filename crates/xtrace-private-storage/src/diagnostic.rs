@@ -1,11 +1,13 @@
 //! Admission diagnostics contain fixed vocabulary and numeric OS facts only.
 
-use std::io;
+use std::{fmt, io};
 
 /// Check sites, rather than paths, distinguish otherwise identical ACL-state refusals.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AdmissionSite {
     Snapshot,
+    #[cfg(target_os = "linux")]
+    ProbeSnapshot,
     ProbeState,
     MemoState,
     Filesystem,
@@ -13,10 +15,14 @@ pub(crate) enum AdmissionSite {
     Listing,
     #[cfg(target_os = "macos")]
     RecheckListing,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     RecheckAcl,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     RecheckState,
+    #[cfg(target_os = "linux")]
+    RecheckSnapshot,
+    #[cfg(target_os = "linux")]
+    RecheckProbe,
     #[cfg(target_os = "macos")]
     RecheckFilesystem,
 }
@@ -161,7 +167,7 @@ pub enum AdmissionOperation {
 }
 
 /// Privacy-safe facts about a failed admission. No error text or pathname is retained.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, thiserror::Error)]
 #[error("operation={operation:?} kind={kind:?} raw_os_error={raw_os_error:?}")]
 pub struct AdmissionFailure {
     /// Failed operation, drawn from a fixed vocabulary.
@@ -170,18 +176,60 @@ pub struct AdmissionFailure {
     pub kind: Option<io::ErrorKind>,
     /// OS error number, when the OS supplied one.
     pub raw_os_error: Option<i32>,
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    context: Option<AdmissionContext>,
+}
+
+impl PartialEq for AdmissionFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation == other.operation
+            && self.kind == other.kind
+            && self.raw_os_error == other.raw_os_error
+    }
+}
+
+impl Eq for AdmissionFailure {}
+
+impl fmt::Debug for AdmissionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut failure = formatter.debug_struct("AdmissionFailure");
+        failure
+            .field("operation", &self.operation)
+            .field("kind", &self.kind)
+            .field("raw_os_error", &self.raw_os_error);
+        // The default Linux test job captures Debug output without the artifact feature.
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        if let Some(context) = self.context {
+            failure.field("context", &context);
+        }
+        failure.finish()
+    }
 }
 
 impl AdmissionFailure {
+    const fn facts(
+        operation: AdmissionOperation,
+        kind: Option<io::ErrorKind>,
+        raw_os_error: Option<i32>,
+    ) -> Self {
+        Self {
+            operation,
+            kind,
+            raw_os_error,
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            context: None,
+        }
+    }
+
     pub(crate) fn check(operation: AdmissionOperation) -> Self {
-        let failure = Self { operation, kind: None, raw_os_error: None };
+        let failure = Self::facts(operation, None, None);
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
         ci::record(failure, None);
         failure
     }
 
     pub(crate) fn check_context(operation: AdmissionOperation, context: AdmissionContext) -> Self {
-        let failure = Self { operation, kind: None, raw_os_error: None };
+        let failure = Self::facts(operation, None, None);
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
         ci::record(failure, Some(context));
         // The context is not part of the returned error or the release diagnostic channel.
@@ -196,13 +244,94 @@ impl AdmissionFailure {
         failure
     }
 
-    pub(crate) fn io(operation: AdmissionOperation, error: impl Into<io::Error>) -> Self {
+    /// Build an I/O refusal from the error kind and errno, discarding the error text.
+    pub fn io(operation: AdmissionOperation, error: impl Into<io::Error>) -> Self {
         let error = error.into();
-        let failure =
-            Self { operation, kind: Some(error.kind()), raw_os_error: error.raw_os_error() };
+        let failure = Self::facts(operation, Some(error.kind()), error.raw_os_error());
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
         ci::record(failure, None);
         failure
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    pub(crate) fn with_context(mut self, context: Option<AdmissionContext>) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Render only the context attached to the returned refusal for a store test.
+    #[cfg(all(feature = "spawn-counter", debug_assertions))]
+    pub fn diagnostic_context(failure: Option<Self>) -> impl fmt::Display {
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        let context = failure.and_then(|failure| failure.context);
+        #[cfg(not(target_os = "linux"))]
+        let context = {
+            let _ = failure;
+            None
+        };
+        ContextFacts(context)
+    }
+}
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+struct ContextFacts(Option<AdmissionContext>);
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+impl fmt::Display for ContextFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(context) = self.0 else { return formatter.write_str("unavailable") };
+        write!(
+            formatter,
+            "{:?},{},{:?},{:?},{:?},{:?}",
+            context.site,
+            context.changes,
+            context.listing,
+            context.object,
+            context.component_depth,
+            context.nlink_changed
+        )
+    }
+}
+
+// The store enables spawn-counter through its existing dev dependency only.
+// This scope is independent of the best-effort CI file sink and never retains
+// the error object. The outer store test scope owns the first failing site.
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+type IoFacts = (io::ErrorKind, Option<i32>);
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+thread_local! {
+    static DISCARDED_IO: std::cell::Cell<Option<Option<IoFacts>>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+pub(crate) fn observe_discarded_io(error: impl Into<io::Error>) {
+    DISCARDED_IO.with(|slot| {
+        if slot.get() == Some(None) {
+            let error = error.into();
+            slot.set(Some(Some((error.kind(), error.raw_os_error()))));
+        }
+    });
+}
+
+#[cfg(all(feature = "spawn-counter", debug_assertions))]
+impl crate::PrivateStorageError {
+    /// Run one private-storage call and observe I/O facts its error mapping discards.
+    pub fn with_io_diagnostic<T>(
+        call: impl FnOnce() -> Result<T, Self>,
+    ) -> (Result<T, Self>, Option<IoFacts>) {
+        struct Restore(Option<Option<IoFacts>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DISCARDED_IO.with(|slot| slot.set(self.0));
+            }
+        }
+
+        let _restore = Restore(DISCARDED_IO.with(|slot| slot.replace(Some(None))));
+        let result = call();
+        let facts =
+            if result.is_err() { DISCARDED_IO.with(|slot| slot.get().flatten()) } else { None };
+        (result, facts)
     }
 }
 
@@ -526,11 +655,11 @@ mod ci {
             let expected = concat!(module_path!(), "::record_shape_and_libtest_thread_name");
             let expected = expected.split_once("::").map_or(expected, |(_, name)| name);
             assert_eq!(std::thread::current().name(), Some(expected));
-            let failure = AdmissionFailure {
-                operation: AdmissionOperation::NamedMetadata,
-                kind: Some(std::io::ErrorKind::PermissionDenied),
-                raw_os_error: Some(13),
-            };
+            let failure = AdmissionFailure::facts(
+                AdmissionOperation::NamedMetadata,
+                Some(std::io::ErrorKind::PermissionDenied),
+                Some(13),
+            );
             let record = line(failure, Some(expected), None)?;
             let record = record.as_str()?;
             assert_eq!(
@@ -551,11 +680,7 @@ mod ci {
                 std::fs::read_to_string(directory.path().join("private-storage.jsonl"))?,
                 record.repeat(2)
             );
-            let absent = AdmissionFailure {
-                operation: AdmissionOperation::Deadline,
-                kind: None,
-                raw_os_error: None,
-            };
+            let absent = AdmissionFailure::facts(AdmissionOperation::Deadline, None, None);
             assert_eq!(
                 line(absent, None, None)?.as_str()?,
                 "{\"thread\":null,\"error\":\"Admission\",\"operation\":\"Deadline\",\"kind\":null,\"errno\":null}\n"
@@ -568,11 +693,7 @@ mod ci {
         -> Result<(), Box<dyn std::error::Error>> {
             let _sink = TestSinkGuard::enter()?;
             use crate::diagnostic::{AdmissionContext, AdmissionSite, ListingRefusal};
-            let failure = AdmissionFailure {
-                operation: AdmissionOperation::AclState,
-                kind: None,
-                raw_os_error: None,
-            };
+            let failure = AdmissionFailure::facts(AdmissionOperation::AclState, None, None);
             let context = AdmissionContext {
                 site: AdmissionSite::Snapshot,
                 changes: 3,
@@ -643,11 +764,7 @@ mod ci {
         #[test]
         fn test_sink_restores_nested_overrides_and_keeps_separate_budgets() -> std::io::Result<()> {
             let outer = TestSinkGuard::enter()?;
-            let failure = AdmissionFailure {
-                operation: AdmissionOperation::AclState,
-                kind: None,
-                raw_os_error: None,
-            };
+            let failure = AdmissionFailure::facts(AdmissionOperation::AclState, None, None);
             record(failure, None);
             {
                 let _inner = TestSinkGuard::enter()?;
@@ -818,11 +935,11 @@ mod ci {
             if std::env::var_os(CHILD).is_some() {
                 use rustix::process::{Resource, Rlimit, setrlimit};
                 setrlimit(Resource::Fsize, Rlimit { current: Some(4096), maximum: Some(4096) })?;
-                let original = AdmissionFailure {
-                    operation: AdmissionOperation::NamedMetadata,
-                    kind: Some(std::io::ErrorKind::PermissionDenied),
-                    raw_os_error: Some(13),
-                };
+                let original = AdmissionFailure::facts(
+                    AdmissionOperation::NamedMetadata,
+                    Some(std::io::ErrorKind::PermissionDenied),
+                    Some(13),
+                );
                 for _ in 0..MAX_RECORDS + 1 {
                     assert_eq!(
                         AdmissionFailure::io(
@@ -868,11 +985,11 @@ mod ci {
                     assert!(!contents.is_empty());
                     assert!(contents.len() <= 4096);
                     let expected = line(
-                        AdmissionFailure {
-                            operation: AdmissionOperation::NamedMetadata,
-                            kind: Some(std::io::ErrorKind::PermissionDenied),
-                            raw_os_error: Some(13),
-                        },
+                        AdmissionFailure::facts(
+                            AdmissionOperation::NamedMetadata,
+                            Some(std::io::ErrorKind::PermissionDenied),
+                            Some(13),
+                        ),
                         Some(concat!(
                             "diagnostic::ci::tests::",
                             "saturated_file_and_fsize_limit_preserve_original_admission"
@@ -968,5 +1085,58 @@ mod tests {
             "operation=AclState kind=None raw_os_error=None"
         );
         Ok(())
+    }
+
+    #[cfg(all(feature = "spawn-counter", debug_assertions))]
+    #[test]
+    fn discarded_io_is_scoped_and_preserves_the_generic_operation_error() {
+        use crate::PrivateStorageError;
+
+        let (result, facts) = PrivateStorageError::with_io_diagnostic(|| {
+            Err::<(), _>(PrivateStorageError::Operation.discard_io(rustix::io::Errno::NOSPC))
+        });
+        assert_eq!(result, Err(PrivateStorageError::Operation));
+        assert_eq!(
+            facts,
+            Some((io::ErrorKind::StorageFull, Some(rustix::io::Errno::NOSPC.raw_os_error())))
+        );
+
+        let (result, facts) = PrivateStorageError::with_io_diagnostic(|| {
+            Err::<(), _>(
+                PrivateStorageError::Operation
+                    .discard_io(io::Error::other("/private/path fixture-canary")),
+            )
+        });
+        assert_eq!(result, Err(PrivateStorageError::Operation));
+        assert_eq!(facts, Some((io::ErrorKind::Other, None)));
+
+        let (_, facts) = PrivateStorageError::with_io_diagnostic(|| {
+            let (_, inner) = PrivateStorageError::with_io_diagnostic(|| {
+                Err::<(), _>(PrivateStorageError::Operation.discard_io(rustix::io::Errno::NOSPC))
+            });
+            assert!(inner.is_some());
+            Err::<(), _>(PrivateStorageError::Operation)
+        });
+        assert_eq!(facts, None);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "spawn-counter", debug_assertions))]
+    #[test]
+    fn acknowledgement_context_comes_from_the_returned_admission_refusal() {
+        let context = AdmissionContext {
+            site: AdmissionSite::ProbeState,
+            changes: 1,
+            listing: ListingRefusal::NotChecked,
+            object: Some(AdmissionObject::Directory),
+            component_depth: Some(-1),
+            nlink_changed: Some(false),
+        };
+        let failure = AdmissionFailure::facts(AdmissionOperation::AclState, None, None)
+            .with_context(Some(context));
+        assert_eq!(
+            AdmissionFailure::diagnostic_context(Some(failure)).to_string(),
+            "ProbeState,1,NotChecked,Some(Directory),Some(-1),Some(false)"
+        );
+        assert_eq!(AdmissionFailure::diagnostic_context(None).to_string(), "unavailable");
     }
 }

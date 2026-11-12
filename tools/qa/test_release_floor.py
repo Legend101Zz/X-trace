@@ -12,7 +12,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from tools.qa import lane_run, release_floor
+from tools.qa import floor_progress, lane_run, release_floor
 from tools.qa.test_lane_run import CheckoutFixture
 from tools.release import run_gates
 from tools.release.test_release_tools import own_process_snapshot
@@ -64,7 +64,8 @@ class FloorConfigurationTests(unittest.TestCase):
         original = run_gates.GATES
         executed = []
 
-        def run():
+        def run(*, gate_progress):
+            self.assertIsInstance(gate_progress, floor_progress.GateCheckpoint)
             self.assertIn("--cache-root", sys.argv)
             self.assertEqual(sys.argv[sys.argv.index("--command-timeout") + 1], "7200")
             executed.extend(run_gates.GATES)
@@ -90,6 +91,100 @@ class FloorConfigurationTests(unittest.TestCase):
 
 
 class FloorEnvironmentTests(CheckoutFixture):
+    def test_both_configured_store_commands_publish_only_validated_acknowledgement_facts(self):
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        paths = (
+            "crates/xtrace-store/Cargo.toml", "crates/xtrace-store/src/lib.rs",
+            "crates/xtrace-store/src/recording_store/object_diagnostic.rs", lane_run.SPARSE_ACK_SOURCE,
+            "crates/xtrace-private-storage/src/diagnostic.rs", "crates/xtrace-private-storage/src/admission.rs",
+        )
+        metadata = lane_run.CheckoutMetadata({path: (repo / path).read_text() for path in paths})
+        self.assertIn(lane_run.SPARSE_ACK_TEST, metadata.rust_tests)
+        self.assertEqual(len(metadata.sparse_ack_panic_sites), 1)
+        site = next(iter(metadata.sparse_ack_panic_sites))
+        test = lane_run.SPARSE_ACK_TEST
+        valid = ("acknowledgement object io iteration=972 operation=StagingDirectoryCreate error=Admission"
+                 " admission=AclState kind=unavailable errno=unavailable"
+                 " context=ProbeState,1,NotChecked,Some(Directory),Some(-1),Some(false)")
+        expected = {"iteration": 972, "operation": "StagingDirectoryCreate", "privateStorageError": "Admission",
+                    "admissionOperation": "AclState", "kind": None, "errno": None,
+                    "context": {"site": "ProbeState", "changes": 1, "listing": "NotChecked", "object": "Directory",
+                                "componentDepth": -1, "nlinkChanged": False}}
+        journal_cases = [
+            (f"acknowledgement object io iteration=1 operation={operation} error=unavailable"
+             f" admission=unavailable kind={kind} errno={errno} context=unavailable",
+             site, "xtrace_store", {"iteration": 1, "operation": operation, "privateStorageError": None,
+                                    "admissionOperation": None, "kind": kind, "errno": errno, "context": None})
+            for operation, kind, errno in (
+                ("CheckpointWrite", "StorageFull", 28),
+                ("CheckpointSync", "PermissionDenied", 13),
+                ("JournalWrite", "StorageFull", 28),
+                ("JournalSync", "StorageFull", 28),
+            )
+        ]
+        for payload, location, binary, published in (
+            (valid, site, "xtrace_store", expected),
+            ("acknowledgement object io iteration=10000 operation=StageFileWrite error=unavailable"
+             " admission=unavailable kind=StorageFull errno=28 context=unavailable",
+             site, "xtrace_store", {"iteration": 10000, "operation": "StageFileWrite", "privateStorageError": None,
+                                    "admissionOperation": None, "kind": "StorageFull", "errno": 28, "context": None}),
+            ("acknowledgement object io iteration=1 operation=StagingRecordingSync error=Operation"
+             " admission=unavailable kind=Other errno=unavailable context=unavailable",
+             site, "xtrace_store", {"iteration": 1, "operation": "StagingRecordingSync",
+                                    "privateStorageError": "Operation", "admissionOperation": None,
+                                    "kind": "Other", "errno": None, "context": None}),
+            *journal_cases,
+            (journal_cases[-1][0].replace("operation=JournalSync", "operation=FixtureCANARY"),
+             site, "xtrace_store", None),
+            (valid.replace("error=Admission", "error=/private/CANARY"), site, "xtrace_store", None),
+            (valid.replace("Some(-1)", "Some(-9223372036854775809)"), site, "xtrace_store", None),
+            (valid.replace("iteration=972", "iteration=10001"), site, "xtrace_store", None),
+            (valid + " payload=CANARY", site, "xtrace_store", None),
+            (valid, f"{lane_run.SPARSE_ACK_SOURCE}:1", "xtrace_store", None),
+            (valid, site, "wrong_target", None),
+        ):
+            with self.subTest(payload=payload, site=location, binary=binary), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                raw = (f"Running unittests src/lib.rs (target/debug/deps/{binary}-0123456789abcdef)\n"
+                       f"\nrunning 2 tests\ntest {test} ... FAILED\n"
+                       f"\nfailures:\n\n---- {test} stdout ----\n"
+                       "fixture path /private/CANARY and ACL principal fixture-CANARY\n"
+                       f"\nthread '{test}' (42) panicked at {location}:13:\n{payload}\n"
+                       f"\nfailures:\n    {test}\n"
+                       "\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n")
+
+                def cargo(cmd, *, log, env, observations, **kwargs):
+                    self.assertEqual(cmd[:2], ["cargo", "test"])
+                    self.assertIn(release_floor.DIAGNOSTIC_FEATURE, cmd)
+                    self.assertEqual(pathlib.Path(env["XTRACE_CI_DIAG_DIR"]).parent, pathlib.Path(log.name).parent)
+                    log.write(raw.encode())
+                    return subprocess.CompletedProcess(cmd, 101), False, observations.finish(1, False)
+
+                def run(argv, *, env, **kwargs):
+                    args = lane_run.parser().parse_args(argv[4:])
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        return lane_run.cmd_run(args), 1
+
+                with mock.patch.object(run_gates, "_run", side_effect=run), \
+                        mock.patch.object(lane_run, "_checkout_metadata", return_value=metadata), \
+                        mock.patch.object(lane_run.rust_timing, "run", side_effect=cargo), \
+                        release_floor.configured_floor(root, 7200):
+                    for gate in (gate for gate in run_gates.GATES
+                                 if gate.name in {"rust-focused", "rust-workspace"}):
+                        public = io.StringIO()
+                        with contextlib.redirect_stdout(public):
+                            self.assertEqual(run_gates._run(gate.argv, cwd=repo, env={}), (101, 1))
+                        fragment = (root / "frag" / f"rust__-__{gate.name}.json").read_text()
+                        rows = json.loads(fragment)["failureDetails"]["failures"]
+                        self.assertEqual(len(rows), 1)
+                        self.assertEqual(rows[0]["test"], test)
+                        self.assertEqual(rows[0].get("acknowledgementObjectIo"), published)
+                        logged = [json.loads(line.removeprefix("lane failure "))
+                                  for line in public.getvalue().splitlines() if line.startswith("lane failure ")]
+                        self.assertEqual(logged, rows)
+                        self.assertNotIn("CANARY", fragment + public.getvalue())
+                        self.assertNotIn("acknowledgement object io", fragment + public.getvalue())
+
     def test_stripped_floor_environment_gets_directory_only_in_test_task(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -146,6 +241,60 @@ class FloorSupervisorTests(unittest.TestCase):
         # The owned checkout is the fallback when no scratch root is configured.
         return tempfile.TemporaryDirectory(
             dir=os.environ.get("XTRACE_TEST_SCRATCH_ROOT") or pathlib.Path(__file__).resolve().parents[2])
+
+    def test_floor_store_profiles_are_isolated_per_gate(self):
+        with self.private_temporary_directory() as temporary:
+            root = pathlib.Path(temporary)
+            run_dir = root / "floor-1-jdk17-node22"
+            run_dir.mkdir(mode=0o700)
+            logs = run_dir / "logs"
+            logs.mkdir(mode=0o700)
+            gates = tuple(gate for gate in run_gates.GATES
+                          if gate.name in release_floor.RUST_TEST_GATES or gate.name == "rust-build")
+            floor_env = run_gates.build_task_env(
+                root, {"XTRACE_CI_PRIVATE_ROOT": "ambient-value"}, scratch=root / "tmp", home=root / "home")
+            self.assertNotIn("XTRACE_CI_PRIVATE_ROOT", floor_env)
+            expected = {}
+            checkpoint = floor_progress.GateCheckpoint()
+            proof = dict.fromkeys(floor_progress.SOURCE_FIELDS, "a" * 40)
+
+            def run(argv, *, env, log_path, command_observed, **kwargs):
+                gate = log_path.stem
+                command_observed("started")
+                if gate in release_floor.RUST_TEST_GATES:
+                    directory = pathlib.Path(env["XTRACE_CI_PRIVATE_ROOT"])
+                    self.assertEqual(directory, pathlib.Path(env["XTRACE_LANE_RECOVERY_DIR"]))
+                    self.assertEqual(directory, floor_progress.rust_directory(run_dir, gate))
+                    completed = len(expected) + 1
+                    expected[gate] = completed
+                    path = directory / "frag" / "store-singletons-progress.txt"
+                    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+                        stream.write(f"state=progress completed={completed} elapsed_ns=100\n")
+                else:
+                    self.assertNotIn("XTRACE_CI_PRIVATE_ROOT", env)
+                    self.assertNotIn("XTRACE_LANE_RECOVERY_DIR", env)
+                command_observed("completed")
+                return 0, 1
+
+            with mock.patch.object(run_gates, "GATES", gates), \
+                    mock.patch.object(run_gates, "_run", side_effect=run), \
+                    mock.patch.object(lane_run, "_checkout_metadata", return_value=lane_run.CheckoutMetadata({})), \
+                    release_floor.configured_floor(root, 7200):
+                for gate in run_gates.GATES:
+                    checkpoint(run_dir, gate.name, "selected", proof)
+                    run_gates._run(gate.argv, cwd=root, env=floor_env, log_path=logs / f"{gate.name}.log",
+                                   command_observed=lambda state: checkpoint(run_dir, gate.name, state, proof))
+                public = floor_progress.collect(run_dir / floor_progress.CHECKPOINT_NAME, root, proof,
+                                                tuple(gate.name for gate in gates))
+            self.assertEqual(set(public["rustGates"]), release_floor.RUST_TEST_GATES)
+            for gate, completed in expected.items():
+                self.assertEqual(public["rustGates"][gate]["storeProfiles"], {
+                    "status": "observed", "profiles": {"singletons": {
+                        "lastReport": {"state": "progress", "completed": completed, "elapsed_ns": 100},
+                    }},
+                })
+            self.assertEqual(list((root / "frag").glob("*.json")), [])
+            self.assertNotIn(str(root), json.dumps(public))
 
     def test_wrapper_timeout_preserves_its_completed_fragment(self):
         with self.private_temporary_directory() as temporary:
@@ -215,6 +364,9 @@ class FloorSupervisorTests(unittest.TestCase):
                 "with os.fdopen(os.open(directory / 'private-storage.jsonl', "
                 "os.O_WRONLY | os.O_CREAT, 0o600), 'w') as stream:\n"
                 "    stream.write(''.join(json.dumps(row) + '\\n' for row in records))\n"
+                "with os.fdopen(os.open(directory / 'spring-premain-order-wait.txt', "
+                "os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:\n"
+                "    stream.write('v2 successful-request 0 0 present unavailable present\\n')\n"
                 f"os.write(1, {output.encode()!r})\n"
                 "signal.pause()\n")
             cargo.chmod(0o700)
@@ -273,8 +425,14 @@ class FloorSupervisorTests(unittest.TestCase):
             self.assertEqual(fragment["failureDetails"]["timeout"]["runningTests"], [waiting.rsplit("::", 1)[-1]])
             self.assertEqual(fragment["failureDetails"]["observedDiagnostics"], [
                 {"test": name, "relevance": "unknown", "category": ["Admission", "Deadline"]}])
+            self.assertEqual(fragment["springPremainOrderWait"], {
+                "status": "observed", "phase": "successful-request", "state": "no-complete-segment-rows",
+                "expectedRows": 1, "completeRows": 0, "completeRowsLimit": 16, "matchingRows": 0,
+                "captureMarkers": {"incomplete": "present", "drainExpired": "unavailable", "otherIncomplete": "present"},
+            })
             for text in (json.dumps(fragment), public.getvalue()):
                 self.assertNotIn("captured-value-731", text)
+                self.assertNotIn("v2 successful-request 0 0", text)
                 self.assertNotIn("target/debug", text)
                 self.assertNotIn(str(root), text)
             self.assertEqual(list((root / "frag").glob("*.json")), [root / "frag/rust__-__rust-workspace.json"])

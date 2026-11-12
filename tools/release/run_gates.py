@@ -1229,6 +1229,7 @@ def _run(
     provenance: bool = False,
     provenance_report: dict[str, Any] | None = None,
     outcome_report: dict[str, bool] | None = None,
+    command_observed: Callable[[str], None] | None = None,
 ) -> tuple[int, float]:
     """Run one supervised command, optionally enforcing a live log-size cap.
 
@@ -1246,6 +1247,7 @@ def _run(
     On normal return, `outcome_report` receives `timed_out` from this
     supervisor's deadline observation. A child's exit code 124 alone does not
     set it. The return tuple and existing reports are unchanged.
+    `command_observed` records a spawn and a wait result before receipt work.
     """
     started = time.monotonic()
     fd = private_roots.create_private_file(
@@ -1296,6 +1298,8 @@ def _run(
                 prov.note_root(process.pid)
             tree_confirmed_drained = False
             deadline = time.monotonic() + timeout
+            if command_observed is not None:
+                command_observed("started")
             # Keep the direct child unreaped until its first ps snapshot; Popen
             # does not poll or wait implicitly, so short-lived roots remain visible.
             snapshot = _process_snapshot()
@@ -1311,6 +1315,8 @@ def _run(
                     track(root_identity, snapshot)
                 try:
                     code = process.wait(timeout=0.05)
+                    if command_observed is not None:
+                        command_observed("completed")
                     break
                 except subprocess.TimeoutExpired:
                     if time.monotonic() >= deadline:
@@ -2188,7 +2194,7 @@ def _retain_uncertain_leases(leases: Sequence[Lease], exc: UncertainProcessTree)
     return failed
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, *, gate_progress=None) -> int:
     if os.name != "posix":
         raise ValueError("release gate process-tree control requires a POSIX host")
     if args.command_timeout <= 0:
@@ -2321,6 +2327,12 @@ def run(args: argparse.Namespace) -> int:
         gate_settle_reports: dict[str, dict[str, Any]] = {}
         gate_provenance_reports: dict[str, dict[str, Any]] = {}
 
+        def observe_gate(name: str, state: str) -> None:
+            gate_progress(run_dir, name, state, {
+                "head": head_start, "phaseBase": base, "workingTreeDigest": dirty_start,
+                "phaseDiffSha256": manifest["phaseDiffSha256Before"],
+            })
+
         def run_gate_command(
             argv: list[str], *, cwd: pathlib.Path, env: dict[str, str],
             temp_log_path: pathlib.Path, log_path: pathlib.Path, gate: Gate,
@@ -2335,6 +2347,7 @@ def run(args: argparse.Namespace) -> int:
                     log_path=temp_log_path,
                     settle_report=natural_exit_settle,
                     provenance=use_provenance, provenance_report=provenance_evidence,
+                    **({"command_observed": lambda state: observe_gate(gate.name, state)} if gate_progress else {}),
                 )
             except (UncertainProcessTree, AttemptedGateFailure) as exc:
                 if not exc.command_started:
@@ -2389,6 +2402,8 @@ def run(args: argparse.Namespace) -> int:
                 results.extend({"name": later.name, "status": "unreached", "reason": "source identity changed before gate"} for later in GATES[index:])
                 manifest["integrityFailure"] = "source identity changed before gate"
                 break
+            if gate_progress is not None:
+                observe_gate(gate.name, "selected")
             gate_env = dict(env)
             argv = list(gate.argv)
             if gate.env == "rustdoc":
@@ -2584,7 +2599,7 @@ def run(args: argparse.Namespace) -> int:
                 lease.release()
 
 
-def main() -> int:
+def main(*, gate_progress=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="Git checkout to gate")
     parser.add_argument("--base", required=True, help="full immutable phase-base commit SHA")
@@ -2599,7 +2614,7 @@ def main() -> int:
                         help="disable process-provenance classification of uninspectable processes")
     args = parser.parse_args()
     try:
-        return run(args)
+        return run(args, gate_progress=gate_progress) if gate_progress is not None else run(args)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"release gates not accepted: {exc}", file=sys.stderr)
         return 2

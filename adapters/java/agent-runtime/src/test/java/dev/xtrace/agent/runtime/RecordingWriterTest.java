@@ -11,7 +11,10 @@ import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.bootstrap.BridgeSink;
 import dev.xtrace.agent.runtime.line.ValueSanitizer;
 import dev.xtrace.agent.runtime.line.ValueSnapshot;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
@@ -21,6 +24,9 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
 import xtp.agent.v1.CapabilityOuterClass.CapabilitySet;
 import xtp.agent.v1.Recording.EventBatch;
 import xtp.agent.v1.Recording.InteractionKind;
@@ -31,6 +37,7 @@ import xtp.agent.v1.Transport.Ack;
 import xtp.agent.v1.Transport.AckDurability;
 import xtp.agent.v1.Transport.Health;
 
+@ResourceLock(Resources.SYSTEM_ERR)
 class RecordingWriterTest {
   @Test
   void insertsSupportedGapBeforeResponseAndPreservesSanitizedIdentity() throws Exception {
@@ -117,7 +124,43 @@ class RecordingWriterTest {
   }
 
   @Test
-  void gracefulShutdownReportsAnActiveRecordingThatNeverEnqueuesFinish() throws Exception {
+  void gracefulShutdownDrainsFinishOfferedAfterTheStartFence() throws Throwable {
+    BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofSeconds(2));
+    assertTrue(sink.offerStart(REC, 1, "POST", "/orders"));
+    assertTrue(sink.offerEvent(REC, REC + ":1", "", BridgeEventKind.REQUEST_UPDATE, "request", 2, 0));
+    CountDownLatch drainRequested = new CountDownLatch(1);
+    var producer = Executors.newSingleThreadExecutor();
+    List<String> diagnostics = captureDiagnostics(() -> {
+      writer.start();
+      try {
+        transport.await(RecordingStarted.class);
+        assertEquals(1, sink.activeRecordings());
+        var finished = producer.submit(() -> {
+          assertTrue(drainRequested.await(2, TimeUnit.SECONDS));
+          return sink.offerFinish(REC, 1, 3, 201, 0);
+        });
+        writer.close(drainRequested::countDown);
+        assertTrue(finished.get(2, TimeUnit.SECONDS));
+      } finally {
+        if (drainRequested.getCount() != 0) writer.close();
+        producer.shutdownNow();
+      }
+    });
+
+    assertEquals(1, transport.finishes.size());
+    assertEquals(REC, FakeTransport.uuid(transport.finishes.get(0).getRecordingId().toByteArray()));
+    assertEquals(0, sink.activeRecordings());
+    assertTrue(queue.isEmpty());
+    assertTrue(transport.closed.get());
+    assertFalse(writer.incompleteWasReported());
+    assertTrue(diagnostics.isEmpty());
+  }
+
+  @Test
+  void gracefulShutdownReportsAnActiveRecordingThatNeverEnqueuesFinish() throws Throwable {
     BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
     RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
     FakeTransport transport = new FakeTransport();
@@ -127,26 +170,59 @@ class RecordingWriterTest {
     assertTrue(
         sink.offerEvent(
             recordingId, recordingId + ":1", "", BridgeEventKind.REQUEST_UPDATE, "request", 2, 0));
-    writer.start();
-    writer.close();
+    List<String> diagnostics = captureDiagnostics(() -> {
+      writer.start();
+      try {
+        transport.await(RecordingStarted.class);
+      } finally {
+        writer.close();
+      }
+    });
 
     assertTrue(writer.incompleteWasReported());
     assertTrue(transport.closed.get());
+    assertTrue(transport.finishes.isEmpty());
+    assertIncompleteDiagnostic(diagnostics, "XTR-JAVA-CAPTURE-DRAIN-EXPIRED");
   }
 
   @Test
-  void rejectedTerminalSignalFailsTheWriterClosedAndReportsIncomplete() throws Exception {
+  void drainExpiryIsReportedEvenAfterAnEarlierIncompleteDiagnostic() throws Throwable {
+    BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(40));
+    assertTrue(sink.offerStart(REC, 1, "POST", "/orders"));
+    List<String> diagnostics = captureDiagnostics(() -> {
+      writer.start();
+      try {
+        transport.await(RecordingStarted.class);
+        sink.reportIncomplete(BridgeSink.INCOMPLETE_START_REJECTED);
+      } finally {
+        writer.close();
+      }
+    });
+
+    assertEquals(2, diagnostics.size());
+    assertIncompleteDiagnostic(diagnostics.subList(0, 1), "XTR-JAVA-CAPTURE-OTHER-INCOMPLETE");
+    assertEquals("{\"code\":\"XTR-JAVA-CAPTURE-DRAIN-EXPIRED\"}", diagnostics.get(1));
+  }
+
+  @Test
+  void rejectedTerminalSignalFailsTheWriterClosedAndReportsIncomplete() throws Throwable {
     BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
     RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
     FakeTransport transport = new FakeTransport();
     RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100));
     sink.reportIncomplete(BridgeSink.INCOMPLETE_FINISH_REJECTED);
-    writer.start();
-    writer.close();
+    List<String> diagnostics = captureDiagnostics(() -> {
+      writer.start();
+      writer.close();
+    });
 
     assertTrue(writer.isStopping());
     assertTrue(writer.incompleteWasReported());
     assertTrue(transport.closed.get());
+    assertIncompleteDiagnostic(diagnostics, "XTR-JAVA-CAPTURE-OTHER-INCOMPLETE");
   }
 
   @Test
@@ -165,6 +241,24 @@ class RecordingWriterTest {
   }
 
   private static final String REC = "00000000-0000-4000-8000-0000000000aa";
+
+  private static List<String> captureDiagnostics(Executable action) throws Throwable {
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    PrintStream original = System.err;
+    try (PrintStream capture = new PrintStream(bytes, true, StandardCharsets.UTF_8)) {
+      System.setErr(capture);
+      action.execute();
+    } finally {
+      System.setErr(original);
+    }
+    return bytes.toString(StandardCharsets.UTF_8).lines().toList();
+  }
+
+  private static void assertIncompleteDiagnostic(List<String> diagnostics, String reason) {
+    assertEquals(1, diagnostics.size());
+    assertTrue(diagnostics.get(0).contains("\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\""));
+    assertTrue(diagnostics.get(0).endsWith("\"reason\":\"" + reason + "\"}"));
+  }
 
   @Test
   void unfinishedQuietRequestSendsItsStartAndEventsWithoutWaitingForABatchOrFinish()

@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from tools.qa import canary, libtest_output, rust_timing, store_profiles
-from tools.release import ci_floor
+from tools.release import ci_floor, private_roots
 
 MAX_FAILING = 32
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
@@ -246,8 +246,8 @@ MAX_TIMING_CHECKPOINT_BYTES = 1024 * 1024
 WITHHELD = "withheld: privacy scan"
 CARGO_SECTION = libtest_output.SECTION
 CARGO_PANIC = libtest_output.PANIC
-CARGO_STATE = re.compile(r"^test (\S+) \.\.\.(?: (ok|FAILED|ignored))?$")
-CARGO_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
+CARGO_STATE = rust_timing.TEST_STATE
+CARGO_RUNNING = rust_timing.TEST_RUNNING
 GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\((?P<params>[^\n]*)\))?"
                           r"(?:\[(?P<index>[^\n]*)\])? (?P<status>STARTED|PASSED|FAILED|SKIPPED)$")
 JAVA_SITE = re.compile(r"^\s*at [\w.$]+\((\w+\.java:\d+)\)\s*$")
@@ -266,6 +266,19 @@ IO_ERROR_KINDS = frozenset({
     "CrossesDevices", "TooManyLinks", "InvalidFilename", "ArgumentListTooLong", "Interrupted",
     "Unsupported", "UnexpectedEof", "OutOfMemory", "InProgress", "Other", "Uncategorized",
 })
+SPARSE_ACK_TEST = "recording_port::tests::sparse_acknowledged_batches_hit_admission_before_becoming_unreadable"
+SPARSE_ACK_TARGET = {"crate": "xtrace-store", "targetKind": "lib", "targetName": "xtrace_store"}
+SPARSE_ACK_SOURCE = "crates/xtrace-store/src/recording_port.rs"
+SPARSE_ACK_PANIC = 'panic!("acknowledgement object io {diagnostic}");'
+OBJECT_IO_DIAGNOSTIC = re.compile(
+    r"acknowledgement object io iteration=([1-9][0-9]{0,4}) operation=([A-Za-z]+)"
+    r" error=([A-Za-z]+) admission=([A-Za-z]+) kind=([A-Za-z]+)"
+    r" errno=(unavailable|-?[0-9]{1,10}) context=(unavailable|[A-Za-z0-9,()\-]+)"
+)
+OBJECT_IO_CONTEXT = re.compile(
+    r"([A-Za-z]+),([0-9]{1,2}),([A-Za-z]+),(?:None|Some\(([A-Za-z]+)\)),"
+    r"(?:None|Some\((-?[0-9]{1,19})\)),(?:None|Some\((true|false)\))"
+)
 
 
 class UnverifiedReason(str, Enum):
@@ -385,6 +398,8 @@ class CheckoutMetadata:
         self.listing_refusals: set[str] = set()
         self.admission_objects: set[str] = set()
         self.admission_callers: set[str] = set()
+        self.object_io_sites: set[str] = set()
+        self.sparse_ack_panic_sites: set[str] = set()
         self.java_files: dict[str, list[str]] = {}
         for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
@@ -404,6 +419,11 @@ class CheckoutMetadata:
                     self.admission_objects.update(_diagnostic_variants(source, "AdmissionObject"))
                 if name == "crates/xtrace-private-storage/src/caller.rs":
                     self.admission_callers.update(_diagnostic_variants(source, "AdmissionCaller"))
+            if name == "crates/xtrace-store/src/recording_store/object_diagnostic.rs":
+                self.object_io_sites = _diagnostic_variants(source, "ObjectIoSite")
+            if name == SPARSE_ACK_SOURCE:
+                self.sparse_ack_panic_sites = {f"{name}:{number}" for number, line in
+                                              enumerate(source.splitlines(), 1) if line.strip() == SPARSE_ACK_PANIC}
         self._read_rust_contexts(sources)
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
@@ -561,6 +581,13 @@ class CheckoutMetadata:
         name = candidate if candidate in self.tests else candidate.rsplit("::", 1)[-1]
         return name if name in self.tests and not _private(name, index, verified_identifier=True) else UNVERIFIED
 
+    def rust_progress_test(self, name, binary, index) -> bool:
+        """Attest the full libtest name in the observed target, including module prefixes."""
+        return (index is not None and isinstance(name, str) and ci_floor._valid_test_id(name)
+                and any(isinstance(owner, rust_timing.Target) and owner.public() == binary
+                        for owner in self.rust_test_owners.get(name, ()))
+                and not _private(name, index, verified_identifier=True))
+
     def test_unverified_reason(self, candidate: str) -> UnverifiedReason:
         """Explain a name already rejected by test(), without retaining it."""
         if not self.files:
@@ -586,13 +613,13 @@ class CheckoutMetadata:
         return UNVERIFIED if _private(site, index, verified_identifier=True) else site
 
 
-def _checkout_metadata() -> CheckoutMetadata:
-    root = pathlib.Path(__file__).resolve().parents[2]
+def _checkout_metadata(root: pathlib.Path | None = None, revision: str = "HEAD") -> CheckoutMetadata:
+    root = root if root is not None else pathlib.Path(__file__).resolve().parents[2]
     try:
         # HEAD is the commit checked out by the lane. Capture its tree before
         # running the command; neither the index nor working files attest facts.
         # Object ids from this single tree listing pin every subsequent blob read.
-        with subprocess.Popen(["git", "-C", str(root), "ls-tree", "-r", "-z", "HEAD"],
+        with subprocess.Popen(["git", "-C", str(root), "ls-tree", "-r", "-z", revision],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
             output, _ = proc.communicate()
             if proc.returncode:
@@ -650,26 +677,34 @@ class AdmissionDiagnostic:
     fields: dict[str, str | int | bool] = field(default_factory=dict)
 
 
+def _open_ci_diagnostic(directory: pathlib.Path, filename: str) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    root_fd = os.open(directory, flags | os.O_DIRECTORY)
+    try:
+        root = os.fstat(root_fd)
+        if root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700:
+            raise ValueError("CI diagnostic directory is not private")
+        fd = os.open(filename, flags, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise ValueError("CI diagnostic record is not private")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, index) -> list[AdmissionDiagnostic]:
     """Read bounded product records. Raw output is never a diagnostic source."""
     if directory is None:
         return []
     records = []
     try:
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-        root_fd = os.open(directory, flags | os.O_DIRECTORY)
-        try:
-            root = os.fstat(root_fd)
-            if root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700:
-                return []
-            fd = os.open("private-storage.jsonl", flags, dir_fd=root_fd)
-        finally:
-            os.close(root_fd)
-        with os.fdopen(fd, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
-                return []
+        with os.fdopen(_open_ci_diagnostic(directory, "private-storage.jsonl"), "rb") as stream:
             for _ in range(MAX_CI_RECORDS):
                 raw = stream.readline(MAX_CI_RECORD_BYTES + 1)
                 if not raw:
@@ -725,6 +760,57 @@ def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, 
     except (OSError, ValueError):
         return []
     return records
+
+
+SPRING_ORDER_WAIT_TEST = "premain_captures_real_spring_request_and_fails_open_without_leaking_canaries"
+SPRING_ORDER_WAIT_TARGET = {"crate": "xtrace-cli", "targetKind": "test", "targetName": "java_premain_spring"}
+SPRING_ORDER_WAIT_PHASES = {
+    "successful-request": 1, "error-request": 2, "attestation-mismatch": 3, "classfile-mutation": 4,
+}
+SPRING_ORDER_WAIT_ROW_LIMIT = 16
+SPRING_ORDER_WAIT_MAX_BYTES = 96
+SPRING_MARKER_OBSERVATION = rb"(present|not-observed|unavailable)"
+SPRING_ORDER_WAIT_RECORD = re.compile(
+    rb"v2 ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3]) "
+    + b" ".join([SPRING_MARKER_OBSERVATION] * 3) + rb"\n"
+)
+
+
+def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index) -> dict:
+    """Rebuild a single deadline observation from the task's private diagnostic file."""
+    unavailable = {"status": "unavailable"}
+    if not metadata.rust_progress_test(SPRING_ORDER_WAIT_TEST, SPRING_ORDER_WAIT_TARGET, index):
+        return unavailable
+    try:
+        with os.fdopen(_open_ci_diagnostic(directory, "spring-premain-order-wait.txt"), "rb") as stream:
+            raw = stream.read(SPRING_ORDER_WAIT_MAX_BYTES + 1)
+    except (OSError, ValueError):
+        return unavailable
+    record = SPRING_ORDER_WAIT_RECORD.fullmatch(raw)
+    if record is None:
+        return unavailable
+    phase = record[1].decode("ascii")
+    expected = SPRING_ORDER_WAIT_PHASES.get(phase)
+    complete, matching = int(record[2]), int(record[3])
+    if expected is None or complete > SPRING_ORDER_WAIT_ROW_LIMIT or matching > complete or matching >= expected:
+        return unavailable
+    incomplete, drain_expired, other_incomplete = (value.decode("ascii") for value in record.groups()[3:])
+    observations = {incomplete, drain_expired, other_incomplete}
+    # All marker states come from one snapshot. An unseen marker is only
+    # "not-observed" after EOF; until then its observation is unavailable.
+    if {"not-observed", "unavailable"} <= observations:
+        return unavailable
+    if complete == 0:
+        state = "no-complete-segment-rows"
+    elif matching == 0:
+        state = "no-matching-marker"
+    else:
+        state = "insufficient-matching-rows"
+    result = {"status": "observed", "phase": phase, "state": state, "expectedRows": expected,
+              "completeRows": complete, "completeRowsLimit": SPRING_ORDER_WAIT_ROW_LIMIT, "matchingRows": matching,
+              "captureMarkers": {"incomplete": incomplete, "drainExpired": drain_expired,
+                                 "otherIncomplete": other_incomplete}}
+    return unavailable if _private(_encoded(result).decode("ascii"), index, verified_identifier=True) else result
 
 
 def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]], list[str]]:
@@ -808,6 +894,42 @@ def _rust_failure_name(name: str, metadata: CheckoutMetadata, index) -> str:
     return name if name in metadata.rust_tests and not _private(name, index, verified_identifier=True) else UNVERIFIED
 
 
+def _sparse_acknowledgement_io(line: str, metadata: CheckoutMetadata, index) -> dict | None:
+    """Rebuild typed facts from the one attested sparse acknowledgement panic."""
+    match = OBJECT_IO_DIAGNOSTIC.fullmatch(line) if len(line) <= 512 else None
+    if match is None:
+        return None
+    iteration, operation, error, admission, kind, errno, context = (
+        None if value == "unavailable" else value for value in match.groups())
+    iteration = int(iteration)
+    errno = int(errno) if errno is not None else None
+    if (iteration > 10_000  # MAX_RECORDING_SEGMENTS bounds this test's loop
+            or operation is not None and operation not in metadata.object_io_sites
+            or error is not None and error not in metadata.error_variants
+            or (error == "Admission") != (admission is not None)
+            or admission is not None and admission not in metadata.admission_operations
+            or kind is not None and kind not in IO_ERROR_KINDS
+            or errno is not None and (kind is None or not -(2**31) <= errno < 2**31)
+            or operation is None and any(value is not None for value in (error, kind))):
+        return None
+    fields = {"iteration": iteration, "operation": operation, "privateStorageError": error,
+              "admissionOperation": admission, "kind": kind, "errno": errno, "context": None}
+    if context is not None:
+        match = OBJECT_IO_CONTEXT.fullmatch(context)
+        if match is None or admission is None:
+            return None
+        site, changes, listing, obj, depth, nlink = match.groups()
+        changes = int(changes)
+        depth = int(depth) if depth is not None else None
+        if (site not in metadata.admission_sites or changes > 31 or listing not in metadata.listing_refusals
+                or obj is not None and obj not in metadata.admission_objects
+                or depth is not None and not MIN_COMPONENT_DEPTH <= depth <= MAX_COMPONENT_DEPTH):
+            return None
+        fields["context"] = {"site": site, "changes": changes, "listing": listing, "object": obj,
+                             "componentDepth": depth, "nlinkChanged": None if nlink is None else nlink == "true"}
+    return None if _private(line, index, verified_identifier=True) else fields
+
+
 def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata, index) -> list[dict]:
     if not report.counts[1]:
         return []  # Expected panics in a successful binary are not failures.
@@ -831,7 +953,8 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
     section = None
     current = None
     ambiguous = None
-    for line, allowed in zip(report.body, report.boundaries):
+    sparse_ack_seen = False
+    for line_number, (line, allowed) in enumerate(zip(report.body, report.boundaries)):
         if allowed and (header := CARGO_SECTION.fullmatch(line)):
             section = header[1]
             current = rows.get(section)
@@ -860,6 +983,15 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
                         current["panicSites"].append(site)
                     if current["location"] == UNVERIFIED:
                         current["location"] = site
+                if (binary == SPARSE_ACK_TARGET and section == current["test"] == panic[1] == SPARSE_ACK_TEST
+                        and site in metadata.sparse_ack_panic_sites):
+                    if sparse_ack_seen:
+                        current.pop("acknowledgementObjectIo", None)
+                    elif line_number + 1 < len(report.body) and report.boundaries[line_number + 1]:
+                        facts = _sparse_acknowledgement_io(report.body[line_number + 1], metadata, index)
+                        if facts is not None:
+                            current["acknowledgementObjectIo"] = facts
+                    sparse_ack_seen = True
         if current is not None and line.strip():
             current["withheldLines"] += 1
     return [*rows.values(), *([ambiguous] if ambiguous is not None else [])]
@@ -1175,7 +1307,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 index = _excerpt_index(getattr(args, "canaries", ""))
                 observations = rust_timing.Observations(
                     metadata.rust_targets,
-                    lambda value: index is None or _private(value, index, verified_identifier=True))
+                    lambda value: index is None or _private(value, index, verified_identifier=True),
+                    verified_test=(None if recovery is None else
+                                   lambda name, binary: metadata.rust_progress_test(name, binary, index)))
                 proc, timed_out, timing = rust_timing.run(
                     cmd, log=log, cwd=args.cwd or None, env=child_env, timeout=args.timeout, observations=observations,
                     **({"checkpoint": recovery / "timing.json"} if recovery is not None else {}))
@@ -1200,13 +1334,38 @@ def cmd_run(args: argparse.Namespace) -> int:
                         timed_out=timed_out, timing=timing)
 
 
-def prepare_recovery(root: pathlib.Path) -> pathlib.Path:
+def prepare_recovery(root: pathlib.Path, *, directory: pathlib.Path | None = None) -> pathlib.Path:
     """Keep recovery state outside the uploaded fragment glob, owned by the supervisor."""
-    directory = pathlib.Path(tempfile.mkdtemp(prefix="lane-recovery-", dir=root))
+    if directory is None:
+        directory = pathlib.Path(tempfile.mkdtemp(prefix="lane-recovery-", dir=root))
+    else:
+        private_roots.ensure_private_directory(directory, must_create=True)
+        # The store producer uses a fixed frag/ relative to XTRACE_CI_PRIVATE_ROOT.
+        (directory / "frag").mkdir(mode=0o700)
     (directory / "diagnostics").mkdir(mode=0o700)
     with os.fdopen(os.open(directory / "output.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"):
         pass
     return directory
+
+
+def restore_timing_checkpoint(stream, metadata, index, *, progress=False):
+    raw = stream.read(MAX_TIMING_CHECKPOINT_BYTES + 1)
+    if len(raw) > MAX_TIMING_CHECKPOINT_BYTES:
+        raise ValueError("oversize timing checkpoint")
+    checkpoint = json.loads(raw)
+    if progress and (not isinstance(checkpoint, dict) or set(checkpoint) != {"started", "state"}):
+        raise ValueError("invalid timing checkpoint")
+    started = checkpoint["started"]
+    now = time.monotonic()
+    if type(started) not in (int, float) or not math.isfinite(started) or not 0 <= started <= now:
+        raise ValueError("invalid checkpoint clock")
+    wall = now - started
+    observations = rust_timing.Observations.restore(
+        checkpoint["state"], metadata.rust_targets,
+        lambda value: index is None or _private(value, index, verified_identifier=True),
+        verified_test=(None if not progress else lambda name, binary: metadata.rust_progress_test(name, binary, index)),
+        max_wall=math.ceil(wall * 1000) / 1000 if progress else None)
+    return observations, wall
 
 
 def recover_timeout(args, directory: pathlib.Path, metadata: CheckoutMetadata, duration: float) -> int:
@@ -1218,16 +1377,7 @@ def recover_timeout(args, directory: pathlib.Path, metadata: CheckoutMetadata, d
     basis = "supervised-wrapper; timing-checkpoint-unavailable"
     try:
         with open(directory / "timing.json", "rb") as stream:
-            raw = stream.read(MAX_TIMING_CHECKPOINT_BYTES + 1)
-        if len(raw) > MAX_TIMING_CHECKPOINT_BYTES:
-            raise ValueError("oversize timing checkpoint")
-        checkpoint = json.loads(raw)
-        started = checkpoint["started"]
-        now = time.monotonic()
-        if type(started) not in (int, float) or not math.isfinite(started) or not 0 <= started <= now:
-            raise ValueError("invalid checkpoint clock")
-        observations = rust_timing.Observations.restore(checkpoint["state"], metadata.rust_targets, private)
-        wall = now - started
+            observations, wall = restore_timing_checkpoint(stream, metadata, index)
         basis = "cargo-start-to-supervisor-cleanup"
     except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
         pass  # Startup may have timed out before Cargo or its first checkpoint.
@@ -1293,6 +1443,8 @@ def finalize_run(args, *, cmd, log_path, metadata, diagnostic_directory, code, t
         frag["storeProfiles"] = store_profiles.collect(out)
     if status == "fail":
         frag["timedOut"] = timed_out
+        if suite == "rust" and diagnostic_directory is not None and rust_timing.is_test_command(cmd):
+            frag["springPremainOrderWait"] = spring_order_wait(diagnostic_directory, metadata, index)
         frag["failureDetails"] = (failure_details(
             text, timed_out, budget=_remaining_excerpt_budget(out, fragment_path), index=index, metadata=metadata,
             diagnostic_records=_ci_diagnostics(diagnostic_directory, metadata, index))

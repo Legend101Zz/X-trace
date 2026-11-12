@@ -1,7 +1,7 @@
 # X-trace: current state
 
 The one place for "where are we". Rewrite it (do not append) at the end of every working session. History lives in
-`docs/progress.md` and in git. Last updated: 2026-11-11.
+`docs/progress.md` and in git. Last updated: 2026-11-12.
 
 ## Release status
 
@@ -12,10 +12,9 @@ The one place for "where are we". Rewrite it (do not append) at the end of every
   HUMAN-OWNER, REVIEWS-EXACT, DISTRIBUTED-RECHECK (end of release).
 - How work happens now: ADR 0012 (Codex workers, Claude orchestrator, heavy tests on GitHub, pull requests,
   merge rules scaled to risk, GitHub issues for tickets and wave tracking).
-- Development merges require Linux `ci-ok` and clean reviews. Do not wait for, trigger or require macOS CI.
-  At release, the owner runs `tools/dev/macos-release-check.sh` locally on a Mac; fix failures before release.
-- The per-check `/bin/ls` cost was found and replaced by native ACL checks. The JDK 21 macOS suite took 718 s on
-  `a7a4268`, down from over 3000 s. Remaining macOS test failures are deferred to the release check.
+- The owner decided on 2026-11-11 that development CI is Linux-only (ADR 0012 amendment). Merges require Linux
+  `ci-ok` and clean reviews. Before release, the owner runs `tools/dev/macos-release-check.sh` locally on a Mac
+  and fixes failures. Remaining macOS failures are deferred to that check.
 
 ## Work map (GitHub issues)
 
@@ -34,38 +33,78 @@ work.
 
 Epic: #2. Close an issue only when every box is ticked with evidence on merged `main`.
 
-## Next work, in order
+## Wave 2 delivered
 
-1. **Wave 2 = #3:** finish the three pushed, unmerged branches. Merge `origin/main` into each; never rebase pushed
-   history.
-   - `ultra/r2w2-qb`: real Petclinic harness flows and product outcome kinds.
-   - `ultra/r2w2-xb`: `xtrace export` for OpenAPI/Postman/cURL.
-   - `ultra/r2w2-jb`: final HTTP status read after view rendering, and source roots relative to the project. Not yet
-     reviewed.
+PR #38 merged as `f92f0bf`. It delivered Spring MVC capture on Petclinic, export, lifecycle, focused capture,
+a durable journal, a CI diagnostics channel, and the macOS native ACL fast path in `xtrace-macos-acl`.
+Linux `ci-ok` passed on `8d2a9b1` in run `43024028230`; both release floors passed 23/23.
+The Petclinic campaign in run `43024105219` passed 37 of 45 steps. The other eight were reported, not passed.
 
-   Then the product gaps: Spring Data repository frames (JDK proxies), the agent's limit of 8 unwritten
-   recordings, TUI rows showing only ids, line events not reaching the read API. Done when the Petclinic campaign
-   is green with zero not-implemented steps.
-2. **#4**, then **#5** and **#6** in parallel, then **#7** (the UI is built from the new design handoff), **#8**,
-   then **#9**.
+## Wave 3 handoff
 
-Wave 1 (#18, PR #20, merged as `931f917`) removed the races behind the scan, Node HTTP, release-tool runner,
-`pack_inventory` and Spring fixture test failures (#12, #13, #15, #16, #21), recorded the owner's ADR 0012 answers
-(#17) and added the hosted macOS workflow (#19). Its head passed `ci-ok` on three runs and `macos-ok`.
+[Draft PR #70](https://github.com/Legend101Zz/X-trace/pull/70) tracks `wave/w3` under
+[#69](https://github.com/Legend101Zz/X-trace/issues/69). Main remains at `f92f0bf`. The current batch is
+unmerged and awaits fresh exact-head Linux CI. `ef29c58` delivered the caught-panic source-line and workload-poison
+fixes.
 
-## Known nondeterministic tests (fix; never retry to green)
+- [#22](https://github.com/Legend101Zz/X-trace/issues/22) adds attach port and readiness diagnostics. The latest
+  local change also addresses the carried stderr reporting race with coordination capped by the original startup
+  deadline. Four CLI test binaries compile; formatting and diff checks passed. Review found no blocker or major;
+  one minor remains: the inherited-stderr regression does not cover the 250 ms grace cap with a longer caller
+  deadline. Carry a synchronized case that verifies readiness reports while stderr remains open and before that
+  deadline to the next fix batch. Runtime verification awaits CI. #22 remains open.
+- [#71](https://github.com/Legend101Zz/X-trace/issues/71) tracks the floor timeout diagnosis. The local diagnostics
+  change publishes bounded, validated gate, command and Rust progress and fixed store profiles through the existing
+  sanitize and upload path, separate from strict receipt acceptance. It cannot promise artifacts if the runner is
+  lost or teardown is skipped. Nine Python modules compile. Reviews found no blocker or major; one minor remains:
+  final failure-summary framing can leave `harnessResultObserved` false. Carry it to the next fix batch.
+- The local storage change replaces per-envelope SQL point queries for frame verification with one inclusive range
+  query per decoded segment in the existing read transaction. Source work-count analysis identified at least
+  1,958,576 point queries in the focused replay. Row checks, admission, snapshot, XTF verification, budgets and
+  whole-recording honesty remain in place. Store check, Clippy, library test compilation, formatting and diff checks
+  passed. Reviews found no blocker or major; one minor is that the counter checks the current range statement and
+  could miss a future additional statement. Carry it to the next fix batch. Runtime equivalence, the query-count
+  assertion and floor timing await CI; the effect of batching on floor runtime remains unmeasured.
 
-- `crates/xtrace-cli/tests/lifecycle_journey.rs` `stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart`
-  (#14): the test now waits for the zombie state and its failure message shows the exit code and stderr, but the
-  2026-10-10 failure's cause is unproven. If it recurs, read that message first.
-- `adapters/java/attach-helper` `JavaAttachAcceptanceTest` still picks a free port before starting the Spring
-  fixture, the race fixed in #21 for the Rust journeys (#22).
+Post-merge main CI [43042206403](https://github.com/Legend101Zz/X-trace/actions/runs/43042206403) attempt 5
+completed with Ubuntu DNS setup failures. Wave run
+[43061181831](https://github.com/Legend101Zz/X-trace/actions/runs/43061181831) attempt 2 passed
+release-tool-tests, main gates, Java 17/21, Node and the JDK 21/Node 24 floor (23/23). The JDK 17/Node 22
+floor hit the 120-minute job limit and `ci-ok` failed. Its sanitizer rejected an incomplete receipt and upload
+succeeded; the rejected summary's zero gate count does not establish that no tests ran. The focused store binary
+completed in 3202.711 seconds, compared with 2152.296 seconds focused and 2167.236 seconds workspace on the
+JDK 21 floor. A missing workspace fragment leaves the command active at cancellation unknown. The real timeout was
+not rerun. New regressions await CI; no local runtime tests ran and no deadlines or budgets changed.
+
+To finish [#3](https://github.com/Legend101Zz/X-trace/issues/3), address #32 (exact export claims and policy
+digest), #36 (observed per-request burst correlation), and #52 (bounded observed cause types with a scoped
+contract/ADR ticket), then #4, #5 and #6 in parallel, #7, #8 and #9. Integrate and review the work, obtain
+exact-head Linux `ci-ok` and clean reviews, and run a fresh packaged Petclinic campaign before assessing #3.
+No fresh campaign has run for this batch. Close an issue only with evidence for every box on merged `main`.
+
+## Petclinic accommodations and remaining evidence
+
+The Wave 2 campaign reported these gaps; they are not passes for missing evidence:
+
+- The observed baseline jar hash differed from the pinned hash.
+- Serial load was paced, with request budgets and an acknowledged database wait; unpaced load was not exercised.
+  Possible capture drops qualify the overhead measurement; no budget was applied.
+- The analyzer was built from source; packaging it belongs to #8. TUI routes were checked in detail, not in the list.
+- Focused capture and exception message redaction have the reported privacy scope.
+- The campaign receipt was unsigned and non-release. Release acceptance needs accepted campaign receipts.
+
+The ctime-only admission refusal is still unexplained; diagnostics now attribute it.
+
+## Known nondeterministic test (fix; never retry to green)
+
+[#14](https://github.com/Legend101Zz/X-trace/issues/14) remains open: the historical zombie lifecycle failure log lacks the
+actual stop status and stderr, so its cause remains unknown. The current test waits for zombie state and reports
+status and stderr. No speculative fix is justified. If it recurs, preserve those diagnostics and the exact CI head.
+Three green exact-head runs remain unestablished.
 
 ## Branches
 
-- On 2026-11-09, with the owner's approval, about 130 merged or throwaway remote branches were deleted. Only
-  `main` and the unmerged keepers `ultra/r2w2-qb`, `ultra/r2w2-xb`, `ultra/r2w2-jb` remain. `ultra/r2w3-r4` is
-  gone; it raised a test deadline and added a retry.
+- `wave/w3` is based on main at `f92f0bf`; the reviewed batch awaits fresh exact-head CI.
 - Wave branches (`wave/<n>`) are deleted after their merge and a green post-merge `main`.
 
 ## Waiting for the owner

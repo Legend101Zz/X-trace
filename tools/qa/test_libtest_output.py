@@ -22,6 +22,17 @@ HEADER = "     Running tests/journey.rs (target/debug/deps/journey-0123456789abc
 SITE = "crates/example/tests/journey.rs:2"
 
 
+def head_scope_panic_location():
+    path = "crates/xtrace-private-storage/src/scope.rs"
+    root = pathlib.Path(__file__).resolve().parents[2]
+    # Read committed source, as _checkout_metadata() does.
+    source = subprocess.run(["git", "-C", str(root), "show", f"HEAD:{path}"],
+                            check=True, capture_output=True, text=True).stdout
+    line = next(i for i, text in enumerate(source.splitlines(), 1)
+                if text.strip() == 'panic!("store call failed inside a scope");')
+    return path, line
+
+
 def transcript(names, body="", *, header=HEADER, failed=None, passed=0):
     failed = len(names) if failed is None else failed
     return (f"{header}\n\nrunning {passed + failed} tests\n{body}\nfailures:\n\n"
@@ -109,15 +120,10 @@ class LibtestOutputTests(unittest.TestCase):
                                  (lane_run.UNVERIFIED, "ambiguous-panic-block", []))
 
     def test_existing_caught_scope_panic_passes_next_to_an_unrelated_failure(self):
-        path = "crates/xtrace-private-storage/src/scope.rs"
-        root = pathlib.Path(__file__).resolve().parents[2]
-        # Use the same committed source as _checkout_metadata(), not a working edit.
-        source = subprocess.run(["git", "-C", str(root), "show", f"HEAD:{path}"],
-                                check=True, capture_output=True, text=True).stdout
+        path, line = head_scope_panic_location()
+        site = f"{path}:{line}"
         name = "scope::tests::a_panic_inside_a_live_scope_leaves_nothing_behind_for_the_next_scope"
         unrelated = "admission::tests::an_expired_deadline_refuses_before_any_probe"
-        line = next(i for i, text in enumerate(source.splitlines(), 1)
-                    if 'panic!("store call failed inside a scope")' in text)
         self.metadata = lane_run._checkout_metadata()
         self.assertIn(name, self.metadata.rust_tests)
         self.assertIn(unrelated, self.metadata.rust_tests)
@@ -125,14 +131,12 @@ class LibtestOutputTests(unittest.TestCase):
         self.assertLessEqual(line, self.metadata.files[path])
         # A keyword match cannot suppress an attested, canary-free repository site.
         hits = {}
-        lane_run.canary.scan_bytes(f"{path}:{line}".encode(), lane_run.CANARY_INDEX, hits, "fixture")
+        lane_run.canary.scan_bytes(site.encode(), lane_run.CANARY_INDEX, hits, "fixture")
         self.assertEqual(hits, {})
         self.assertEqual(lane_run.PRIVATE_TEXT.search(path)[0], "private-")
-        self.assertEqual(line, 171)
-        self.assertEqual(self.metadata.location(f"{path}:{line}", lane_run.CANARY_INDEX),
-                         "crates/xtrace-private-storage/src/scope.rs:171")
+        self.assertEqual(self.metadata.location(site, lane_run.CANARY_INDEX), site)
         header = "     Running unittests src/lib.rs (target/debug/deps/xtrace_private_storage-0123456789abcdef)"
-        text = transcript([unrelated], f"thread '{name}' panicked at {path}:{line}:13:\n"
+        text = transcript([unrelated], f"thread '{name}' panicked at {site}:13:\n"
                           f"store call failed inside a scope\ntest {name} ... ok\n"
                           f"test {unrelated} ... FAILED\n", passed=1, header=header)
         failed, ambiguous = self.details(text)["failures"]
@@ -172,7 +176,8 @@ class LibtestOutputTests(unittest.TestCase):
     def test_head_private_storage_site_and_binary_publish_without_message_prose(self):
         self.metadata = lane_run._checkout_metadata()
         name = "scope::tests::a_panic_inside_a_live_scope_leaves_nothing_behind_for_the_next_scope"
-        site = "crates/xtrace-private-storage/src/scope.rs:171"
+        path, line = head_scope_panic_location()
+        site = f"{path}:{line}"
         header = "     Running unittests src/lib.rs (target/debug/deps/xtrace_private_storage-0123456789abcdef)"
         fragment, public = self.finalize(transcript([name], f"---- {name} stdout ----\n"
                                                   f"thread 'worker' panicked at {site}:13:\n"

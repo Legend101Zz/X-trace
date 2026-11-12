@@ -7,17 +7,24 @@
     reason = "end-to-end test asserts on controlled local process and fixture state"
 )]
 
+#[path = "common/spring_readiness.rs"]
+mod spring_readiness;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use prost::Message as _;
 use rusqlite::Connection;
 use serde_json::Value;
+use spring_readiness::ReadinessStderr;
 use tempfile::TempDir;
 use xtrace_domain::ContentHash;
 use xtrace_protocol::generated::agent::{InteractionKind, RecordingEvent, RecordingEventKind};
@@ -33,6 +40,44 @@ const CANARIES: &[&str] = &[
     "SQL_BIND_CANARY_1D3",
     "ERROR_CANARY_1D3",
 ];
+
+const CAPTURE_MARKERS: [&[u8]; 3] = [
+    b"XTR-JAVA-CAPTURE-INCOMPLETE",
+    b"XTR-JAVA-CAPTURE-DRAIN-EXPIRED",
+    b"XTR-JAVA-CAPTURE-OTHER-INCOMPLETE",
+];
+const CAPTURE_SCAN_EOF: u8 = 1 << CAPTURE_MARKERS.len();
+
+#[derive(Default)]
+struct CaptureMarkerScan(AtomicU8);
+
+impl CaptureMarkerScan {
+    fn scan(&self, bytes: &[u8]) {
+        let seen = self.0.load(Ordering::Relaxed);
+        let mut observed = seen;
+        for (index, marker) in CAPTURE_MARKERS.iter().enumerate() {
+            let bit = 1 << index;
+            if seen & bit == 0 && bytes.windows(marker.len()).any(|window| window == *marker) {
+                observed |= bit;
+            }
+        }
+        // The stderr reader is the sole writer. A deadline snapshots all bits together.
+        self.0.store(observed, Ordering::Relaxed);
+    }
+
+    fn observations(&self) -> [&'static str; CAPTURE_MARKERS.len()] {
+        let seen = self.0.load(Ordering::Relaxed);
+        std::array::from_fn(|index| {
+            if seen & (1 << index) != 0 {
+                "present"
+            } else if seen & CAPTURE_SCAN_EOF != 0 {
+                "not-observed"
+            } else {
+                "unavailable"
+            }
+        })
+    }
+}
 
 struct ManagedChild(Child);
 
@@ -63,6 +108,8 @@ struct CapturedProcess {
     stdout: thread::JoinHandle<ScannedOutput>,
     stderr: thread::JoinHandle<ScannedOutput>,
     stdout_lines: std::sync::mpsc::Receiver<Vec<u8>>,
+    readiness_stderr: ReadinessStderr,
+    capture_markers: Arc<CaptureMarkerScan>,
 }
 
 impl CapturedProcess {
@@ -72,15 +119,23 @@ impl CapturedProcess {
             panic!("spawn {label}: {error}");
         }));
         let mut stdout = child.stdout.take().expect("captured child stdout");
-        let mut stderr = child.stderr.take().expect("captured child stderr");
+        let stderr = child.stderr.take().expect("captured child stderr");
+        let readiness_stderr = ReadinessStderr::default();
+        let mut stderr = readiness_stderr.observe(stderr);
         let (lines_tx, stdout_lines) = std::sync::mpsc::channel();
+        let capture_markers = Arc::new(CaptureMarkerScan::default());
+        let stderr_markers = Arc::clone(&capture_markers);
         Self {
             child,
             stdout: thread::spawn(move || {
-                drain_scanned_with_lines(&mut stdout, 256 * 1024, Some(lines_tx))
+                drain_scanned_with_lines(&mut stdout, 256 * 1024, Some(lines_tx), None)
             }),
-            stderr: thread::spawn(move || drain_scanned(&mut stderr, 256 * 1024)),
+            stderr: thread::spawn(move || {
+                drain_scanned_with_lines(&mut stderr, 256 * 1024, None, Some(&stderr_markers))
+            }),
             stdout_lines,
+            readiness_stderr,
+            capture_markers,
         }
     }
 
@@ -156,8 +211,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         "local proof requires JDK 17 or 21, got: {version_text}"
     );
 
-    let valid = launch_fixture(&agent, &fixture, &bootstrap);
-    let port = wait_for_fixture(&valid.stdout_lines);
+    let mut valid = launch_fixture(&agent, &fixture, &bootstrap);
+    let port = wait_for_fixture(&mut valid);
     let isolation = http(port, "GET", "/__fixture/isolation", &[], None);
     assert_eq!(isolation.status, 200);
     let isolation_json: Value = serde_json::from_slice(&isolation.body).expect("isolation JSON");
@@ -171,7 +226,11 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let count = http(port, "GET", "/__fixture/count", &[], None);
     assert_eq!(serde_json::from_slice::<Value>(&count.body).unwrap()["count"], 1);
 
-    let recordings = wait_for_order_recordings(&project_root, 1);
+    let recordings = wait_for_order_recordings(
+        &project_root,
+        OrderWaitPhase::SuccessfulRequest,
+        &valid.capture_markers,
+    );
     let (recording_id, object) = &recordings[0];
     let logical = zstd::stream::decode_all(object.as_slice()).expect("decompress stored XTF");
     let events = decode_events(&logical);
@@ -187,7 +246,11 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_eq!(error_response.body, br#"{"status":"failed"}"#);
     let count = http(port, "GET", "/__fixture/count", &[], None);
     assert_eq!(serde_json::from_slice::<Value>(&count.body).unwrap()["count"], 1);
-    let recordings = wait_for_order_recordings(&project_root, 2);
+    let recordings = wait_for_order_recordings(
+        &project_root,
+        OrderWaitPhase::ErrorRequest,
+        &valid.capture_markers,
+    );
     let error_logical =
         zstd::stream::decode_all(recordings[1].1.as_slice()).expect("decompress error XTF");
     let error_events = decode_events(&error_logical);
@@ -334,13 +397,18 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let mut mismatch_daemon = start_quiet_daemon(&repo, &data_home);
     let mismatch_bootstrap = mismatch_daemon.1.clone();
     let manifest_mismatched_fixture = tamper_fixture_class_attestation(root.path(), &fixture);
-    let mismatched = launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap);
-    let mismatch_port = wait_for_fixture(&mismatched.stdout_lines);
+    let mut mismatched = launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap);
+    let mismatch_port = wait_for_fixture(&mut mismatched);
     assert_eq!(post_order(mismatch_port).status, 201);
+    let mismatch_markers = Arc::clone(&mismatched.capture_markers);
     let (mismatch_stdout, mismatch_stderr) = mismatched.stop();
     assert_scanned_clean("class mismatch fixture stdout", &mismatch_stdout);
     assert_scanned_clean("class mismatch fixture stderr", &mismatch_stderr);
-    let mismatch_recordings = wait_for_order_recordings(&project_root, 3);
+    let mismatch_recordings = wait_for_order_recordings(
+        &project_root,
+        OrderWaitPhase::AttestationMismatch,
+        &mismatch_markers,
+    );
     let loaded_mismatch_logical = zstd::stream::decode_all(mismatch_recordings[2].1.as_slice())
         .expect("decompress loaded-class mismatch XTF");
     let loaded_mismatch_events = decode_events(&loaded_mismatch_logical);
@@ -356,13 +424,19 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let mut mutated_class_daemon = start_quiet_daemon(&repo, &data_home);
     let mutated_class_bootstrap = mutated_class_daemon.1.clone();
     let mutated_class_fixture = mutate_fixture_classfile(root.path(), &fixture);
-    let mutated_class = launch_fixture(&agent, &mutated_class_fixture, &mutated_class_bootstrap);
-    let mutated_class_port = wait_for_fixture(&mutated_class.stdout_lines);
+    let mut mutated_class =
+        launch_fixture(&agent, &mutated_class_fixture, &mutated_class_bootstrap);
+    let mutated_class_port = wait_for_fixture(&mut mutated_class);
     assert_eq!(post_order(mutated_class_port).status, 201, "mutated class remains loadable");
+    let mutation_markers = Arc::clone(&mutated_class.capture_markers);
     let (mutated_class_stdout, mutated_class_stderr) = mutated_class.stop();
     assert_scanned_clean("mutated class fixture stdout", &mutated_class_stdout);
     assert_scanned_clean("mutated class fixture stderr", &mutated_class_stderr);
-    let class_mutation_recordings = wait_for_order_recordings(&project_root, 4);
+    let class_mutation_recordings = wait_for_order_recordings(
+        &project_root,
+        OrderWaitPhase::ClassfileMutation,
+        &mutation_markers,
+    );
     let class_mutation_recording_id = &class_mutation_recordings[3].0;
     let class_mutation_logical =
         zstd::stream::decode_all(class_mutation_recordings[3].1.as_slice())
@@ -391,15 +465,15 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_canaries_absent("actual classfile mutation CLI", &class_mutation_show.stdout);
     signal_and_wait(&mut mutated_class_daemon.0, "-INT");
 
-    let unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap);
-    let unavailable_port = wait_for_fixture(&unavailable.stdout_lines);
+    let mut unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap);
+    let unavailable_port = wait_for_fixture(&mut unavailable);
     assert_eq!(post_order(unavailable_port).status, 201);
     let (unavailable_stdout, unavailable_stderr) = unavailable.stop();
     assert!(text(&unavailable_stderr.sample).contains("XTR-JAVA-AGENT-UNAVAILABLE"));
 
     let invalid_path = root.path().join("missing private bootstrap.json");
-    let invalid = launch_fixture(&agent, &fixture, &invalid_path);
-    let invalid_port = wait_for_fixture(&invalid.stdout_lines);
+    let mut invalid = launch_fixture(&agent, &fixture, &invalid_path);
+    let invalid_port = wait_for_fixture(&mut invalid);
     assert_eq!(post_order(invalid_port).status, 201);
     let (invalid_stdout, invalid_stderr) = invalid.stop();
     assert!(text(&invalid_stderr.sample).contains("XTR-JAVA-AGENT-UNAVAILABLE"));
@@ -655,25 +729,14 @@ fn launch_fixture(agent: &Path, fixture: &Path, bootstrap: &Path) -> CapturedPro
     CapturedProcess::spawn(command, "Spring fixture")
 }
 
-fn wait_for_fixture(lines: &std::sync::mpsc::Receiver<Vec<u8>>) -> u16 {
+fn wait_for_fixture(process: &mut CapturedProcess) -> u16 {
     let deadline = Instant::now() + Duration::from_secs(30);
-    let port = loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .expect("Spring fixture readiness deadline elapsed");
-        let line = lines
-            .recv_timeout(remaining)
-            .expect("Spring fixture did not report its bound port before the readiness deadline");
-        // Boot 4.1.1 logs the connector's local port only after it has started.
-        let line = String::from_utf8_lossy(&line);
-        if let Some((_, address)) = line.split_once("Tomcat started on port ") {
-            if let Some((port, _)) = address.split_once(" (http)") {
-                let port = port.parse::<u16>().expect("Spring fixture bound port");
-                assert_ne!(port, 0, "Spring fixture must report its actual bound port");
-                break port;
-            }
-        }
-    };
+    let port = spring_readiness::wait_for_fixture(
+        &process.stdout_lines,
+        deadline,
+        &mut process.child,
+        &process.readiness_stderr,
+    );
     loop {
         if let Ok(response) = try_http(port, "GET", "/__fixture/count", &[], None) {
             if response.status == 200 {
@@ -805,13 +868,58 @@ fn wait_for_store_quiescence(project_root: &Path) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OrderWaitPhase {
+    SuccessfulRequest,
+    ErrorRequest,
+    AttestationMismatch,
+    ClassfileMutation,
+}
+
+impl OrderWaitPhase {
+    fn label_and_expected_count(self) -> (&'static str, usize) {
+        match self {
+            Self::SuccessfulRequest => ("successful-request", 1),
+            Self::ErrorRequest => ("error-request", 2),
+            Self::AttestationMismatch => ("attestation-mismatch", 3),
+            Self::ClassfileMutation => ("classfile-mutation", 4),
+        }
+    }
+}
+
+const ORDER_WAIT_DIAGNOSTIC: &str = "spring-premain-order-wait.txt";
+const ORDER_WAIT_ROW_LIMIT: usize = 16;
+
+fn wait_for_order_recordings(
+    project_root: &Path,
+    phase: OrderWaitPhase,
+    capture_markers: &CaptureMarkerScan,
+) -> Vec<(String, Vec<u8>)> {
+    let directory = std::env::var_os("XTRACE_CI_DIAG_DIR").map(PathBuf::from);
+    wait_for_order_recordings_until(
+        project_root,
+        phase,
+        Instant::now() + Duration::from_secs(10),
+        directory.as_deref(),
+        capture_markers,
+    )
+}
+
 /// The generic request root also records the fixture's own readiness and count polls, so the
 /// journey selects its recordings by the request they hold, never by persisted ordinal.
-fn wait_for_order_recordings(project_root: &Path, expected_count: usize) -> Vec<(String, Vec<u8>)> {
+fn wait_for_order_recordings_until(
+    project_root: &Path,
+    phase: OrderWaitPhase,
+    deadline: Instant,
+    diagnostic_directory: Option<&Path>,
+    capture_markers: &CaptureMarkerScan,
+) -> Vec<(String, Vec<u8>)> {
     let marker: &[u8] = b"http.request POST /orders";
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let (label, expected_count) = phase.label_and_expected_count();
     loop {
-        let orders: Vec<(String, Vec<u8>)> = wait_for_recordings(project_root, 0)
+        let recordings = read_complete_recordings(project_root);
+        let complete_rows = recordings.len();
+        let orders: Vec<(String, Vec<u8>)> = recordings
             .into_iter()
             .filter(|(_, object)| {
                 let logical = zstd::stream::decode_all(object.as_slice()).expect("decode XTF");
@@ -821,54 +929,216 @@ fn wait_for_order_recordings(project_root: &Path, expected_count: usize) -> Vec<
         if orders.len() >= expected_count {
             return orders;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{expected_count} POST /orders recordings were not persisted before deadline"
-        );
+        if Instant::now() >= deadline {
+            let complete_rows = complete_rows.min(ORDER_WAIT_ROW_LIMIT);
+            let matching_rows = orders.len();
+            let [incomplete, drain_expired, other_incomplete] = capture_markers.observations();
+            // The lane reads this one-shot record separately from libtest output. Use the
+            // last poll's counts and keep a diagnostic I/O error from replacing the panic.
+            if let Some(directory) = diagnostic_directory
+                && let Ok(mut file) = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.join(ORDER_WAIT_DIAGNOSTIC))
+            {
+                let _ = writeln!(
+                    file,
+                    "v2 {label} {complete_rows} {matching_rows} {incomplete} {drain_expired} {other_incomplete}"
+                );
+            }
+            panic!(
+                "{expected_count} POST /orders recordings were not persisted before deadline \
+                 (phase={label} lastCompleteRows={complete_rows} completeRowsLimit={ORDER_WAIT_ROW_LIMIT} \
+                 lastMatchingRows={matching_rows} captureIncomplete={incomplete} \
+                 drainExpired={drain_expired} otherIncomplete={other_incomplete})"
+            );
+        }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
-fn wait_for_recordings(project_root: &Path, expected_count: usize) -> Vec<(String, Vec<u8>)> {
+fn read_complete_recordings(project_root: &Path) -> Vec<(String, Vec<u8>)> {
     let database = project_root.join("metadata.sqlite3");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let connection = Connection::open(&database).expect("selected-root SQLite");
-        let mut statement = connection
-            .prepare(
-                "SELECT hex(rs.recording_id), rs.object_hash \
+    let connection = Connection::open(&database).expect("selected-root SQLite");
+    let mut statement = connection
+        .prepare(
+            "SELECT hex(rs.recording_id), rs.object_hash \
                  FROM recording_segments rs \
                  JOIN recordings r ON r.recording_id = rs.recording_id \
                  WHERE rs.segment_ordinal = 0 AND r.status = 'complete' ORDER BY rs.rowid",
+        )
+        .expect("prepare recording query");
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
+        .expect("query recordings")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read recording rows");
+    rows.into_iter()
+        .map(|(recording_hex, object_hash)| {
+            let hash = lower_hex(&object_hash);
+            let path = project_root
+                .join("objects/b3")
+                .join(&hash[..2])
+                .join(format!("{}.xtf.zst", &hash[2..]));
+            let object = fs::read(path).expect("read immutable XTF object");
+            let expected = format!("b3:{hash}").parse::<ContentHash>().unwrap();
+            verify_compressed_segment(&object, expected).expect("verify XTF object");
+            (recording_hex, object)
+        })
+        .collect()
+}
+
+#[test]
+fn order_wait_deadline_reports_the_last_complete_segment_observation() {
+    use xtrace_domain::{ProjectId, RecordingId};
+    use xtrace_store::{XtfSegmentInput, encode_segment};
+
+    let root = temp_root();
+    let directory = root.path();
+    let diagnostic = directory.join(ORDER_WAIT_DIAGNOSTIC);
+    let connection = Connection::open(directory.join("metadata.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE recordings (recording_id BLOB PRIMARY KEY, status TEXT);
+             CREATE TABLE recording_segments (recording_id BLOB, segment_ordinal INTEGER, object_hash BLOB);
+             INSERT INTO recordings VALUES (X'AA', 'partial'), (X'BB', 'complete');
+             INSERT INTO recording_segments VALUES (X'AA', 0, X'00'), (X'BB', 1, X'00');",
+        )
+        .unwrap();
+    let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(100));
+    let add_complete_recording = |id, symbol: &str| {
+        let uuid = uuid::Uuid::from_u128(id);
+        let recording_id = RecordingId::from_uuid(uuid);
+        let encoded = encode_segment(&XtfSegmentInput {
+            project_id,
+            recording_id,
+            segment_ordinal: 0,
+            events: vec![XtfEventEnvelope {
+                recording_seq: 2,
+                event: Some(RecordingEvent {
+                    event_id: "request".into(),
+                    recording_seq: 2,
+                    symbol: symbol.into(),
+                    ..RecordingEvent::default()
+                }),
+            }],
+        })
+        .unwrap();
+        let hash = encoded.content_hash();
+        let hex = lower_hex(hash.as_bytes());
+        let objects = directory.join("objects/b3").join(&hex[..2]);
+        fs::create_dir_all(&objects).unwrap();
+        fs::write(objects.join(format!("{}.xtf.zst", &hex[2..])), encoded.compressed_bytes())
+            .unwrap();
+        let id = uuid.as_bytes().as_slice();
+        connection.execute("INSERT INTO recordings VALUES (?1, 'complete')", [id]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO recording_segments VALUES (?1, 0, ?2)",
+                (id, hash.as_bytes().as_slice()),
             )
-            .expect("prepare recording query");
-        let rows = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
-            .expect("query recordings")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read recording rows");
-        if rows.len() >= expected_count {
-            return rows
-                .into_iter()
-                .map(|(recording_hex, object_hash)| {
-                    let hash = lower_hex(&object_hash);
-                    let path = project_root
-                        .join("objects/b3")
-                        .join(&hash[..2])
-                        .join(format!("{}.xtf.zst", &hash[2..]));
-                    let object = fs::read(path).expect("read immutable XTF object");
-                    let expected = format!("b3:{hash}").parse::<ContentHash>().unwrap();
-                    verify_compressed_segment(&object, expected).expect("verify XTF object");
-                    (recording_hex, object)
-                })
-                .collect();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{expected_count} recordings were not persisted before deadline"
-        );
-        thread::sleep(Duration::from_millis(25));
+            .unwrap();
+    };
+    let assert_panic = |phase, markers: &CaptureMarkerScan, diagnostic_directory, panic_message| {
+        let panic = std::panic::catch_unwind(|| {
+            wait_for_order_recordings_until(
+                directory,
+                phase,
+                Instant::now(),
+                diagnostic_directory,
+                markers,
+            )
+        })
+        .expect_err("the recording wait must still fail at the deadline");
+        assert_eq!(panic.downcast_ref::<String>().unwrap().as_str(), panic_message);
+    };
+    let assert_deadline = |phase, markers, panic_message, record| {
+        assert_panic(phase, markers, Some(directory), panic_message);
+        assert_eq!(fs::read_to_string(&diagnostic).unwrap(), record);
+        fs::remove_file(&diagnostic).unwrap();
+    };
+
+    let unavailable = CaptureMarkerScan::default();
+    assert_deadline(
+        OrderWaitPhase::SuccessfulRequest,
+        &unavailable,
+        "1 POST /orders recordings were not persisted before deadline \
+         (phase=successful-request lastCompleteRows=0 completeRowsLimit=16 lastMatchingRows=0 \
+         captureIncomplete=unavailable drainExpired=unavailable otherIncomplete=unavailable)",
+        "v2 successful-request 0 0 unavailable unavailable unavailable\n",
+    );
+    for id in 1..=17 {
+        add_complete_recording(id, "http.request GET /__fixture/count");
     }
+    let clean = CaptureMarkerScan::default();
+    drain_scanned_with_lines(&mut b"private fixture stderr".as_slice(), 8, None, Some(&clean));
+    assert_deadline(
+        OrderWaitPhase::ErrorRequest,
+        &clean,
+        "2 POST /orders recordings were not persisted before deadline \
+         (phase=error-request lastCompleteRows=16 completeRowsLimit=16 lastMatchingRows=0 \
+         captureIncomplete=not-observed drainExpired=not-observed otherIncomplete=not-observed)",
+        "v2 error-request 16 0 not-observed not-observed not-observed\n",
+    );
+    add_complete_recording(18, "http.request POST /orders");
+    let expired = CaptureMarkerScan::default();
+    let mut stderr = vec![b'x'; 4094];
+    stderr.extend_from_slice(CAPTURE_MARKERS[0]);
+    stderr.extend_from_slice(b" private fixture stderr BODY_CANARY_1D3 ");
+    stderr.extend_from_slice(CAPTURE_MARKERS[1]);
+    let scanned = drain_scanned_with_lines(&mut stderr.as_slice(), 8, None, Some(&expired));
+    assert_eq!(scanned.sample, b"xxxxxxxx");
+    assert_eq!(scanned.leaked_canaries, ["BODY_CANARY_1D3"]);
+    let mismatch_message = "3 POST /orders recordings were not persisted before deadline \
+        (phase=attestation-mismatch lastCompleteRows=16 completeRowsLimit=16 lastMatchingRows=1 \
+        captureIncomplete=present drainExpired=present otherIncomplete=not-observed)";
+    assert_deadline(
+        OrderWaitPhase::AttestationMismatch,
+        &expired,
+        mismatch_message,
+        "v2 attestation-mismatch 16 1 present present not-observed\n",
+    );
+    assert_panic(OrderWaitPhase::AttestationMismatch, &expired, None, mismatch_message);
+    let missing = directory.join("missing-diagnostic-directory");
+    assert_panic(OrderWaitPhase::AttestationMismatch, &expired, Some(&missing), mismatch_message);
+    let partial = CaptureMarkerScan::default();
+    partial.scan(CAPTURE_MARKERS[0]);
+    partial.scan(CAPTURE_MARKERS[2]);
+    assert_deadline(
+        OrderWaitPhase::ClassfileMutation,
+        &partial,
+        "4 POST /orders recordings were not persisted before deadline \
+         (phase=classfile-mutation lastCompleteRows=16 completeRowsLimit=16 lastMatchingRows=1 \
+         captureIncomplete=present drainExpired=unavailable otherIncomplete=present)",
+        "v2 classfile-mutation 16 1 present unavailable present\n",
+    );
+    for id in 19..=21 {
+        add_complete_recording(id, "http.request POST /orders");
+    }
+    let orders = wait_for_order_recordings_until(
+        directory,
+        OrderWaitPhase::ClassfileMutation,
+        Instant::now(),
+        Some(directory),
+        &unavailable,
+    );
+    assert_eq!(orders.len(), 4);
+    assert!(!diagnostic.exists(), "a successful wait must not create a deadline record");
+}
+
+#[test]
+fn capture_marker_scan_finds_each_marker_split_across_reads_beyond_the_sample() {
+    let markers = CaptureMarkerScan::default();
+    let mut stderr = Vec::new();
+    for marker in CAPTURE_MARKERS {
+        let boundary = (stderr.len() / 4096 + 1) * 4096;
+        stderr.resize(boundary - 1, b'x');
+        stderr.extend_from_slice(marker);
+    }
+    let scanned = drain_scanned_with_lines(&mut stderr.as_slice(), 16, None, Some(&markers));
+    assert_eq!(scanned.sample, b"xxxxxxxxxxxxxxxx");
+    assert_eq!(markers.observations(), ["present", "present", "present"]);
 }
 
 fn decode_events(logical: &[u8]) -> Vec<RecordingEvent> {
@@ -1011,22 +1281,35 @@ fn read_files(root: &Path) -> Vec<Vec<u8>> {
 }
 
 fn drain_scanned(reader: &mut impl Read, limit: usize) -> ScannedOutput {
-    drain_scanned_with_lines(reader, limit, None)
+    drain_scanned_with_lines(reader, limit, None, None)
 }
 
 fn drain_scanned_with_lines(
     reader: &mut impl Read,
     limit: usize,
     lines: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    capture_markers: Option<&CaptureMarkerScan>,
 ) -> ScannedOutput {
     let mut pending_line = Vec::new();
     let mut kept = Vec::new();
     let mut leaked_canaries = Vec::new();
     let mut tail = Vec::new();
     let mut buffer = [0_u8; 4096];
+    let overlap = CANARIES
+        .iter()
+        .map(|canary| canary.len())
+        .chain(
+            CAPTURE_MARKERS.iter().filter(|_| capture_markers.is_some()).map(|marker| marker.len()),
+        )
+        .max()
+        .unwrap_or_default()
+        .saturating_sub(1);
     loop {
         let count = reader.read(&mut buffer).expect("drain child output");
         if count == 0 {
+            if let Some(markers) = capture_markers {
+                markers.0.fetch_or(CAPTURE_SCAN_EOF, Ordering::Relaxed);
+            }
             break;
         }
         // Forward complete stdout lines without changing the full-stream privacy scan.
@@ -1049,12 +1332,10 @@ fn drain_scanned_with_lines(
                 leaked_canaries.push(*canary);
             }
         }
-        let tail_length = CANARIES
-            .iter()
-            .map(|canary| canary.len().saturating_sub(1))
-            .max()
-            .unwrap_or_default()
-            .min(searchable.len());
+        if let Some(markers) = capture_markers {
+            markers.scan(&searchable);
+        }
+        let tail_length = overlap.min(searchable.len());
         tail.clear();
         tail.extend_from_slice(&searchable[searchable.len() - tail_length..]);
     }
