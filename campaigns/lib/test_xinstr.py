@@ -818,6 +818,7 @@ class T(unittest.TestCase):
         tail = {"events": live["0"]["events"][-1:], "nextCursor": None}
         cases = [
             ("complete", [tail], None),
+            ("capture-partial", [tail], None),
             ("capture-gap", [{**tail, "incompleteEvidence": ["gap_event_sequence:5"]}], None),
             ("HTTP", [(503, {"detail": "private"})], "detail HTTP 503"),
             ("transport", [TimeoutError("private")], "detail transport failure"),
@@ -832,12 +833,14 @@ class T(unittest.TestCase):
         for case, pages, gap in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
                 client = mock.Mock(deadline=None)
-                client.get.side_effect = [listing, (200, first),
+                first_page = {**first, "completion": "partial"} if case == "capture-partial" else first
+                client.get.side_effect = [listing, (200, first_page),
                                           *(p if isinstance(p, (tuple, Exception)) else (200, p) for p in pages),
                                           (200, {**live["1"], "nextCursor": None})]
                 out = pathlib.Path(td)
                 api = xinstr.collect_api(client, out)
-                self.assertTrue(api["ok"])
+                self.assertEqual(api["ok"], gap is None)
+                self.assertEqual(api["reason"], gap or "")
                 self.assertNotIn("listReadGap", api)
                 detail = api["details"]["0"]
                 self.assertEqual(detail, json.loads((out / "recording-0.json").read_text()))
@@ -856,7 +859,9 @@ class T(unittest.TestCase):
                     self.assertEqual(detail["events"], first["events"] + tail["events"])
                     self.assertIsNone(detail["nextCursor"])
                     self.assertEqual(ids, ({"0", "1"}, {"0", "1"}))
-                    self.assertEqual(group["problems"], ["recording-evidence-incomplete"] if case == "capture-gap" else [])
+                    expected_problems = {"capture-gap": ["recording-evidence-incomplete"],
+                                         "capture-partial": ["partial-recording"]}
+                    self.assertEqual(group["problems"], expected_problems.get(case, []))
                 if case == "capture-gap":
                     self.assertEqual(detail["incompleteEvidence"], ["gap_event_sequence:5"])
 
@@ -874,13 +879,15 @@ class T(unittest.TestCase):
             ([page(0, "next")], 1, 1, "recordings list recording bound reached"),
             ([page(i, f"next-{i}") for i in range(20)], 400, 20, "recordings list pagination bound reached"),
             ([page(0, "next"), page(1, None)], 2, 2, None),
+            ([(200, {"recordings": [], "nextAfter": None})], 400, 0, None),
         ]
         for pages, limit, count, gap in cases:
             with self.subTest(gap=gap), tempfile.TemporaryDirectory() as td:
                 client = mock.Mock(deadline=None)
                 client.get.side_effect = [*pages, *((200, {"events": [], "nextCursor": None}) for _ in range(count))]
                 api = xinstr.collect_api(client, pathlib.Path(td), limit)
-                self.assertTrue(api["ok"])
+                self.assertEqual(api["ok"], gap is None)
+                self.assertEqual(api["reason"], gap or "")
                 self.assertEqual(api.get("listReadGap"), gap)
                 self.assertEqual(set(api["details"]), {str(i) for i in range(count)})
                 self.assertEqual(client.get.call_count, len(pages) + count)
@@ -897,6 +904,8 @@ class T(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as td:
             api = xinstr.collect_api(client, pathlib.Path(td))
+        self.assertFalse(api["ok"])
+        self.assertEqual(api["reason"], api["detailCollectionGap"])
         self.assertEqual(client.get.call_count, 3)
         self.assertEqual([r["recordingId"] for r in api["recordings"]], ["0", "1"])
         self.assertEqual(set(api["details"]), {"0"})
@@ -906,11 +915,10 @@ class T(unittest.TestCase):
 
     def test_incomplete_reads_cannot_verify_a_live_boundary_even_with_all_ids(self):
         exp, sent, details = self.boundary_fixture()
-        cases = [({"ok": True, "details": details, "listReadGap": "recordings list pagination bound reached"},
-                  "recordings list pagination bound reached"),
-                 ({"ok": True, "details": {**details, "0": {**details["0"], "_detailReadGap": "detail HTTP 503"}}},
-                  "recording detail read incomplete")]
-        for api, gap in cases:
+        cases = [(details, "recordings list pagination bound reached"),
+                 ({**details, "0": {**details["0"], "_detailReadGap": "detail HTTP 503"}}, "detail HTTP 503")]
+        for observed, gap in cases:
+            api = {"ok": False, "reason": gap, "details": observed}
             with self.subTest(gap=gap), mock.patch.object(xinstr.time, "monotonic", return_value=0), \
                  mock.patch.object(xinstr, "collect_api", return_value=api) as collect:
                 boundary = xinstr.wait_burst_boundary(mock.Mock(), pathlib.Path("unused"), sent, exp, {}, 3)
@@ -1175,23 +1183,91 @@ class T(unittest.TestCase):
         self.assertEqual(summary["source-identity"][0], "fail")
         self.assertIn("burst-boundary-recordings-missing", summary["source-identity"][1])
 
+    def test_burst_refuses_unread_historical_capacity_baseline(self):
+        import json
+        import tempfile
+        import xcamp
+        from types import SimpleNamespace
+
+        exp, sent, live = self.boundary_fixture()
+        exp = {"burst": exp["burst"]}
+        context = {"runtimeSessionId": "session-a", "rejectedRequests": "1"}
+        historical = {**rec("GET", "/vets", 200), "completion": "complete", "sessionContext": context}
+        admitted = {**live["0"], "sessionContext": context}
+        client = mock.Mock(deadline=None)
+        client.get.side_effect = [
+            (200, {"recordings": [{"recordingId": "old"}], "nextAfter": None}),
+            (503, {"detail": "private"}),
+            (200, {"recordings": [{"recordingId": "old"}, {"recordingId": "0"}], "nextAfter": None}),
+            (200, {**historical, "nextCursor": None}),
+            (200, {**admitted, "nextCursor": None}),
+        ]
+        stack = mock.Mock(launcher_exit=0, base="http://127.0.0.1:1234")
+        stack.logs.return_value = ""
+
+        def run(*args):
+            xcamp.SENT_LOG.extend((method, path) for _, method, path in sent)
+            return {"id": "burst", "passed": True, "semanticEffectFingerprint": "fp", "requests": [], "elapsedMs": 1}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(xinstr.os.environ), \
+             mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
+             mock.patch.object(xinstr, "list_recording_ids", return_value={"old"}), \
+             mock.patch.object(xinstr, "start_viewer", return_value=(object(), {"origin": stack.base, "url": "http://x/#" + "A" * 43})), \
+             mock.patch.object(xinstr, "ViewerClient", return_value=client), mock.patch.object(xinstr, "stop_process_group"), \
+             mock.patch.object(xcamp, "run_scenario", side_effect=run) as run_scenario:
+            root = pathlib.Path(td)
+            with self.assertRaisesRegex(RuntimeError, "cannot snapshot recordings before scenarios: detail HTTP 503"):
+                xinstr.run_instrumented(
+                    project="p", pin={}, make_stack=lambda _: stack, scenarios=[SimpleNamespace(id="burst", kind="concurrency")],
+                    out_dir=root / "out", norm_extra=[], expectations=exp, xtrace="xtrace", project_dir=root,
+                    data_home=root / "data", adaptations=[], canaries=None, baseline_receipt=None, extra_canary_paths=[],
+                    harness_files=[])
+            run_scenario.assert_not_called()
+            stack.down.assert_called_once()
+            self.assertEqual(client.get.call_count, 2)
+            saved = json.loads((root / "out/boundary-before/recording-old.json").read_text())
+            self.assertEqual(saved["_detailReadGap"], "detail HTTP 503")
+            self.assertNotIn("sessionContext", saved)
+
+            later = xinstr.collect_api(client, root / "later")
+            self.assertTrue(later["ok"])
+            self.assertEqual(xinstr.capacity_counts(later["details"]), {"session-a": 1})
+            boundary = xinstr.burst_accounting(later["details"], sent, exp, {"old": historical})
+            self.assertFalse(boundary["verified"])
+            self.assertEqual((boundary["capacityDrops"], boundary["unaccounted"]), (0, 1))
+
     def test_single_owner_burst_gaps_reach_the_receipt_and_summary(self):
+        import json
         import tempfile
         import xcamp
         from types import SimpleNamespace
         from tools.qa.camp_instr_steps import instrumented_steps
+        from tools.qa.camp_overhead import compare_interleaved
+        from tools.qa.test_camp_overhead import paired_runs
 
+        unavailable = (1, 1, {"burst-route-count-mismatch": 1, "burst-recording-detail-unavailable": 1,
+                              "no-source-file-line": 1})
+        detail_failures = {
+            "http-error": "detail HTTP 404",
+            "later-http-error": "detail HTTP 503",
+            "later-transport": "detail transport failure",
+            "later-malformed": "detail malformed page",
+            "detail-bound": "detail pagination bound reached",
+            "missing-detail": "recording detail read timed out before all listed IDs were read",
+        }
+        list_failures = {
+            "incomplete-listing": ("recordings list HTTP 503", (503, {"detail": "private"})),
+            "listing-transport": ("recordings list transport failure", ConnectionResetError("private")),
+            "listing-malformed": ("recordings list malformed page", (200, {"recordings": None, "nextAfter": None})),
+            "listing-bound": ("recordings list pagination bound reached", None),
+        }
         cases = {
             "binding": (2, 1, {"source-binding-missing": 1}),
             "frame": (2, 2, {"no-controller-frame": 1}),
-            "absent": (1, 1, {"burst-route-count-mismatch": 1, "burst-recording-detail-unavailable": 1,
-                              "no-source-file-line": 1}),
-            "http-error": (1, 1, {"burst-route-count-mismatch": 1, "burst-recording-detail-unavailable": 1,
-                                  "no-source-file-line": 1}),
-            "later-http-error": (1, 1, {"burst-route-count-mismatch": 1, "burst-recording-detail-unavailable": 1,
-                                        "no-source-file-line": 1}),
+            "absent": unavailable,
             "complete-pagination": (2, 2, {}),
-            "incomplete-listing": (2, 2, {}),
+            **dict.fromkeys(detail_failures, unavailable),
+            **dict.fromkeys(list_failures, (2, 2, {})),
         }
         for gap, (matched, sourced, classes) in cases.items():
             with self.subTest(gap=gap), tempfile.TemporaryDirectory() as td:
@@ -1207,53 +1283,89 @@ class T(unittest.TestCase):
                 self.assertTrue(boundary["verified"])
                 self.assertEqual(boundary["routes"][0]["recordingIds"], ["0", "1"])
                 final = dict(live)
-                if gap in ("absent", "http-error"):
+                if gap == "absent":
                     final["late"] = final.pop("1")
-                    if gap == "http-error":
-                        final["1"] = {"_http": 404, "events": []}
-                initial = {"ok": True, "reason": "", "recordings": [], "details": {}}
-                api = {**initial, "recordings": [{"recordingId": rid} for rid in final], "details": final}
-                if gap in ("later-http-error", "complete-pagination"):
-                    client = mock.Mock()
-                    client.get.side_effect = [
-                        (200, {"recordings": api["recordings"], "nextAfter": None}),
-                        (200, {**live["0"], "nextCursor": None}),
-                        (200, {**live["1"], "events": live["1"]["events"][:-1], "nextCursor": "next"}),
-                        ((503, {"detail": "private"}) if gap == "later-http-error" else
-                         (200, {"events": live["1"]["events"][-1:], "nextCursor": None})),
-                    ]
-                    api = xinstr.collect_api(client, pathlib.Path(td) / "readback")
-                elif gap == "incomplete-listing":
-                    client = mock.Mock()
-                    client.get.side_effect = [
-                        (200, {"recordings": api["recordings"], "nextAfter": "next"}),
-                        (503, {"detail": "private"}),
-                        *((200, {**detail, "nextCursor": None}) for detail in live.values()),
-                    ]
-                    api = xinstr.collect_api(client, pathlib.Path(td) / "readback")
+                if gap in ("http-error", "missing-detail"):
+                    final["late"] = live["1"]
+                rows = [{"recordingId": rid} for rid in final]
+                list_gap, list_failure = list_failures.get(gap, (None, None))
+                pages = [(200, {"recordings": rows, "nextAfter": "next" if list_gap else None})]
+                if gap == "listing-bound":
+                    for i in range(19):
+                        rid = f"extra-{i}"
+                        pages.append((200, {"recordings": [{"recordingId": rid}], "nextAfter": rid}))
+                        final[rid] = {"events": []}
+                elif list_gap:
+                    pages.append(list_failure)
+                tail = {"events": live["1"]["events"][-1:], "nextCursor": None}
+                later_pages = {
+                    "complete-pagination": [(200, tail)],
+                    "later-http-error": [(503, {"detail": "private"})],
+                    "later-transport": [ConnectionResetError("private")],
+                    "later-malformed": [(200, {"events": None, "nextCursor": None})],
+                    "detail-bound": [(200, {**tail, "nextCursor": f"next-{i}"}) for i in range(39)],
+                    "missing-detail": [TimeoutError("private")],
+                }
+                for rid, detail in final.items():
+                    if rid == "1" and gap == "http-error":
+                        pages.append((404, {"detail": "private"}))
+                    elif rid == "1" and gap in later_pages:
+                        pages.append((200, {**detail, "events": detail["events"][:-1], "nextCursor": "next"}))
+                        pages.extend(later_pages[gap])
+                    elif rid != "late" or gap != "missing-detail":
+                        pages.append((200, {**detail, "nextCursor": None}))
+                client = mock.Mock(deadline=1 if gap == "missing-detail" else None)
+                client.get.side_effect = pages
+                live_client = mock.Mock()
+                live_client.get.side_effect = [
+                    (200, {"recordings": [], "nextAfter": None}),
+                    (200, {"recordings": [{"recordingId": rid} for rid in live], "nextAfter": None}),
+                    *((200, {**detail, "nextCursor": None}) for detail in live.values()),
+                ]
                 scenario = SimpleNamespace(id="burst", kind="concurrency")
                 stack = mock.Mock(launcher_exit=0, base="http://127.0.0.1:1234")
                 stack.logs.return_value = ""
+                runs = paired_runs()
+                pin = runs[0]["receipt"]["pin"]
+                baseline = runs[-2]["receipt"]
+                baseline["scenarios"][0].update(id="burst", semanticEffectFingerprint="fp",
+                                                requests=[{"elapsedMs": 1} for _ in sent])
+                root = pathlib.Path(td)
+                baseline_path = root / "baseline.json"
+                baseline_path.write_text(json.dumps(baseline))
 
                 def run(*args):
                     xcamp.SENT_LOG.extend((m, path) for _, m, path in sent)
                     return {"id": "burst", "passed": True, "semanticEffectFingerprint": "fp",
-                            "requests": [], "elapsedMs": 1}
+                            "requests": [{"label": "get", "response": {"status": 200}, "elapsedMs": 1} for _ in sent],
+                            "elapsedMs": 1}
 
-                with mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
+                with mock.patch.dict(xinstr.os.environ), \
+                     mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
                      mock.patch.object(xinstr, "list_recording_ids", return_value=set()), \
                      mock.patch.object(xinstr, "start_viewer", return_value=(object(), {"origin": stack.base, "url": "http://x/#" + "A" * 43})), \
-                     mock.patch.object(xinstr, "ViewerClient"), mock.patch.object(xinstr, "stop_process_group"), \
-                     mock.patch.object(xinstr, "collect_api", side_effect=[initial, api]), \
-                     mock.patch.object(xinstr, "wait_burst_boundary", return_value=boundary) as wait, \
+                     mock.patch.object(xinstr, "ViewerClient", side_effect=[live_client, client]), \
+                     mock.patch.object(xinstr, "stop_process_group"), \
+                     mock.patch.object(xinstr, "wait_burst_boundary", wraps=xinstr.wait_burst_boundary) as wait, \
                      mock.patch.object(xcamp, "run_scenario", side_effect=run):
                     receipt = xinstr.run_instrumented(
-                        project="p", pin={}, make_stack=lambda _: stack, scenarios=[scenario],
-                        out_dir=pathlib.Path(td) / "out", norm_extra=[], expectations=exp, xtrace="xtrace",
-                        project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
-                        canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
+                        project="p", pin=pin, make_stack=lambda _: stack, scenarios=[scenario],
+                        out_dir=root / "out", norm_extra=[], expectations=exp, xtrace="xtrace", project_dir=root,
+                        data_home=root / "data", adaptations=[], canaries=None, baseline_receipt=baseline_path,
+                        extra_canary_paths=[], harness_files=[])
                 self.assertEqual(wait.call_args.args[2], sent)
-                self.assertEqual(receipt["result"], "failed" if gap == "incomplete-listing" else "recorded")
+                self.assertTrue(receipt["notes"]["serialBoundary"]["verified"])
+                self.assertTrue(receipt["notes"]["burstBoundary"]["verified"])
+                self.assertEqual(receipt["notes"]["burstBoundary"]["recordingIds"], boundary["recordingIds"])
+                reason = list_gap or detail_failures.get(gap, "")
+                self.assertEqual(receipt["api"]["ok"], not reason)
+                self.assertEqual(receipt["api"]["reason"], reason)
+                self.assertEqual(receipt["result"], "failed" if reason else "recorded")
+                self.assertEqual(client.get.call_count, len(pages))
+                runs[-1]["receipt"] = json.loads((root / "out/receipt.json").read_text())
+                overhead = compare_interleaved(runs)
+                self.assertEqual(overhead["eligibleForClaim"], not reason, overhead["errors"])
+                self.assertEqual(overhead["aggregate"]["p50Ratio"], None if reason else 2)
                 self.assertEqual(receipt["problemClasses"], {"attribution-ambiguous": 1, **classes})
                 self.assertEqual(receipt["recordingsWithStatus"], matched)
                 self.assertEqual(receipt["recordingsWithSource"], sourced)
@@ -1270,8 +1382,16 @@ class T(unittest.TestCase):
                 if matched == 1:
                     self.assertIn("burst-recording-detail-unavailable(missing 1)", group["problems"])
                     self.assertEqual(receipt["api"]["recordings"], len(final))
-                self.assertEqual(receipt["api"]["incompleteDetails"], int(gap in ("http-error", "later-http-error")))
-                self.assertEqual(receipt["api"]["listReadGap"], "recordings list HTTP 503" if gap == "incomplete-listing" else None)
+                self.assertEqual(receipt["api"]["incompleteDetails"], int(gap in detail_failures) + int(gap == "missing-detail"))
+                self.assertEqual(receipt["api"]["listReadGap"], list_gap)
+                if gap == "missing-detail":
+                    self.assertFalse((root / "out/api/recording-late.json").exists())
+                if gap in detail_failures:
+                    saved = json.loads((root / "out/api/recording-1.json").read_text())
+                    self.assertEqual(saved["_detailReadGap"], "detail transport failure" if gap == "missing-detail" else reason)
+                    self.assertNotIn("private", json.dumps(saved))
+                    if gap != "http-error":
+                        self.assertEqual(saved["events"][:len(live["1"]["events"]) - 1], live["1"]["events"][:-1])
                 verdict = receipt["scenarios"][0]["recordingVerdict"]
                 self.assertFalse(verdict["passed"])
                 self.assertEqual(verdict["attribution"], "ambiguous")
@@ -1285,7 +1405,8 @@ class T(unittest.TestCase):
                 for problem in classes:
                     self.assertIn(f'"{problem}": 1', summary["recordings-per-scenario"][1])
                 self.assertEqual(summary["source-identity"][0], "pass" if gap == "complete-pagination" else "fail")
-                if gap == "incomplete-listing":
+                self.assertEqual(summary["api-json-artifact"][0], "fail" if reason else "pass")
+                if list_gap:
                     self.assertIn("api-recordings-list-incomplete", summary["source-identity"][1])
                 for problem in classes.keys() - {"burst-route-count-mismatch"}:
                     self.assertIn(problem, summary["source-identity"][1])

@@ -229,13 +229,12 @@ def detail_read_incomplete(detail: dict | None) -> bool:
 
 
 def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int = 400) -> dict[str, Any]:
-    """Save observed pages and explicitly mark any listing or detail read that stops early."""
+    """Save observed pages. Success requires a complete listing and every listed detail."""
     out_dir.mkdir(parents=True, exist_ok=True)
     listing: list[dict] = []
     after = None
     seen: set[str] = set()
     listed_ids: set[str] = set()
-    listed = False
     list_gap = ""
     problem = None
     live_timeout = False
@@ -263,7 +262,6 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             list_gap = "recordings list repeated recording IDs"
             break
         listed_ids.update(page_ids)
-        listed = True
         listing.extend(rows)
         try:
             after = _next_page(doc, "nextAfter", seen, bool(rows))
@@ -280,6 +278,7 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
 
     listing = listing[:max_recordings]
     details: dict[str, dict] = {}
+    first_detail_gap = ""
     for rec in listing:
         if live_timeout:
             break
@@ -336,13 +335,18 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             d.setdefault("sessionContext", rec["sessionContext"])
         if rec.get("openedAt") is not None:  # kept for time-window attribution of recordings to scenarios
             d.setdefault("_openedAt", rec["openedAt"])
+        if not first_detail_gap and detail_read_incomplete(d):
+            first_detail_gap = detail_gap or "recording detail read incomplete"
         details[rid] = d
         (out_dir / f"recording-{rid}.json").write_text(json.dumps(d, indent=1, sort_keys=True))
-    result = {"ok": listed, "reason": "" if listed else list_gap, "recordings": listing, "details": details}
+    detail_collection_gap = ("recording detail read timed out before all listed IDs were read"
+                             if len(details) < len(listing) else "")
+    reason = list_gap or detail_collection_gap or first_detail_gap
+    result = {"ok": not reason, "reason": reason, "recordings": listing, "details": details}
     if list_gap:
         result["listReadGap"] = list_gap
-    if len(details) < len(listing):
-        result["detailCollectionGap"] = "recording detail read timed out before all listed IDs were read"
+    if detail_collection_gap:
+        result["detailCollectionGap"] = detail_collection_gap
     if problem is not None:
         result["problem"] = problem
     return result
@@ -589,14 +593,11 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
     try:
         while time.monotonic() < deadline:
             api = collect_api(client, out_dir)
-            if api["ok"]:
+            # Keep observed counts for diagnosis even when the snapshot cannot verify the boundary.
+            if api["ok"] or api["details"]:
                 boundary = burst_accounting(api["details"], sent, expectations, before)
-            read_gap = api.get("listReadGap") or api.get("detailCollectionGap") or (api["reason"] if not api["ok"] else "")
-            if not read_gap and any(detail_read_incomplete(detail) for rid, detail in api["details"].items()
-                                    if rid not in before):
-                read_gap = "recording detail read incomplete"
-            if read_gap:
-                boundary["readError"] = read_gap
+            if not api["ok"]:
+                boundary["readError"] = api["reason"]
                 if "problem" in api:
                     boundary["readProblem"] = api["problem"]
                 break
@@ -1064,9 +1065,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             live_client = ViewerClient(ready["origin"])
             live_client.exchange(bootstrap_token(ready["url"]))
             initial = collect_api(live_client, out_dir / "boundary-before")
-            if not initial["ok"] or initial.get("listReadGap"):
-                raise RuntimeError("cannot snapshot recordings before scenarios: "
-                                   + (initial.get("listReadGap") or initial["reason"]))
+            if not initial["ok"]:
+                raise RuntimeError("cannot snapshot recordings before scenarios: " + initial["reason"])
             # One existing 60-second HTTP/read budget covers both phases and their accounting.
             burst_deadline = time.monotonic() + 60.0
             if ordered[0].id in burst:
@@ -1137,6 +1137,10 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     groups = burst_route_evidence(api["details"], expectations, burst, boundary, serial_boundary, burst_evidence_ids)
     if api["ok"]:
         verdicts = analyze(api["details"], expectations, sent_log, burst, boundary, serial_boundary)
+    elif burst:
+        # Individual burst attribution is ambiguous even when final collection fails.
+        verdicts = analyze({}, {sid: checks for sid, checks in expectations.items() if sid in burst},
+                           burst=burst, boundary=boundary, serial_boundary=serial_boundary)
 
     baseline_fp: dict[str, str] = {}
     if baseline_receipt and baseline_receipt.exists():
@@ -1190,7 +1194,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         # A successful read after shutdown cannot repair a failed live boundary or
         # turn an unreached workload into a successful interleaved overhead run.
         # The result describes collection and workload. Recording verdicts judge isolation.
-        "result": "recorded" if api["ok"] and not api.get("listReadGap") and workloads_passed and boundaries_verified else "failed",
+        "result": "recorded" if api["ok"] and workloads_passed and boundaries_verified else "failed",
     }
     (out_dir / "receipt.json").write_text(json.dumps(receipt, indent=1, sort_keys=True))
     return receipt

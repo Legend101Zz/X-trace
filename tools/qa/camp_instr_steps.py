@@ -91,33 +91,33 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
             bad_src.add("burst-source-expectation-unresolved")
     list_gap = api.get("listReadGap")
     incomplete_details = api.get("incompleteDetails", 0)
+    api_complete = api.get("ok") is True and not (list_gap or incomplete_details)
     if list_gap:
         bad_src.add("api-recordings-list-incomplete")
     if incomplete_details:
         bad_src.add("recording-detail-incomplete")
     source_note = f"; problems: {','.join(sorted(bad_src))}" if bad_src else ""
-    if not api.get("ok"):
-        out.append(("recordings-per-scenario", "fail", f"read API unavailable: {api.get('reason', '')[:120]}"
-                    + (f"; {problem_note}" if groups else "")))
-        out.append(("source-identity", "fail", "no recordings read back" + source_note))
-        out.append(("api-json-artifact", "fail", "no API JSON captured"))
+    read_note = f"; incomplete API listing: {list_gap[:120]}" if list_gap else ""
+    if incomplete_details:
+        read_note += f"; {incomplete_details} incomplete recording details"
+    reason = api.get("reason")
+    if not api_complete and reason and reason != list_gap:
+        read_note += f"; read API unavailable: {reason[:120]}"
+    n_rec = api.get("recordings", 0)
+    v = [s for s in sc if api_complete and (s.get("recordingVerdict") or {}).get("passed")]
+    out.append(("recordings-per-scenario", "pass" if api_complete and sc and len(v) == len(sc) else "fail",
+                f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
+                f"({n_rec} recordings); {problem_note}{read_note}"))
+    n_src = r.get("recordingsWithSource", 0)
+    out.append(("source-identity", "pass" if api_complete and n_src > 0 and not bad_src else "fail",
+                (f"{n_src} recordings carry a matched .java file and method-range start line with an accepted source binding "
+                 f"(not an executed line)" if n_src > 0 else "no recording frame carried a matched .java file and start line")
+                + source_note))
+    if not api_complete:
+        artifact_note = f"incomplete API collection ({n_rec} recording IDs listed)"
     else:
-        v = [s for s in sc if (s.get("recordingVerdict") or {}).get("passed")]
-        read_note = f"; incomplete API listing: {list_gap[:120]}" if list_gap else ""
-        out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) and not list_gap else "fail",
-                    f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
-                    f"({api.get('recordings', 0)} recordings); {problem_note}{read_note}"))
-        n_src = r.get("recordingsWithSource", 0)
-        out.append(("source-identity", "pass" if n_src > 0 and not bad_src else "fail",
-                    (f"{n_src} recordings carry a matched .java file and method-range start line with an accepted source binding "
-                     f"(not an executed line)" if n_src > 0 else "no recording frame carried a matched .java file and start line")
-                    + source_note))
-        n_rec = api.get("recordings", 0)
-        if incomplete_details:
-            read_note += f"; {incomplete_details} incomplete recording details"
-        out.append(("api-json-artifact", "pass" if n_rec > 0 else "fail",
-                    (f"{n_rec} recordings saved as API JSON" if n_rec > 0 else "the read API returned 0 recordings, nothing to save")
-                    + read_note))
+        artifact_note = f"{n_rec} recordings saved as API JSON" if n_rec else "the read API returned 0 recordings, nothing to save"
+    out.append(("api-json-artifact", "pass" if api_complete and n_rec > 0 else "fail", artifact_note + read_note))
     # record-stop-flow, restart-reopen, partial-recording-reopen, active-line-frames and frame-values come from `flows` below
     out.append(("launcher-exit-after-sigterm", "pass" if r.get("notes", {}).get("launcherExitCode") in (0, 143, -15) else "fail",
                 f"xtrace run exited {r.get('notes', {}).get('launcherExitCode')} after SIGTERM to the launcher pid"))

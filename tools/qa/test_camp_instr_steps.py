@@ -107,8 +107,8 @@ class T(unittest.TestCase):
                 self.assertIn(problem, d["source-identity"][1])
                 self.assertIn("1 recordings carry a matched .java file", d["source-identity"][1])
                 self.assertIn(artifact, d["api-json-artifact"][1])
-                if "listReadGap" in gap:
-                    self.assertEqual(d["recordings-per-scenario"][0], "fail")
+                self.assertEqual(d["api-json-artifact"][0], "fail")
+                self.assertEqual(d["recordings-per-scenario"][0], "fail")
 
     def test_mixed_burst_source_coverage_needs_support_for_every_expectation(self):
         r = {"scenarios": [sc("a", rec=False), sc("b", rec=False)], "api": {"ok": True, "recordings": 2},
