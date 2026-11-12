@@ -5,12 +5,14 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from tools.qa import floor_progress, lane_run, rust_timing
-from tools.release import ci_floor, private_roots
+from tools.qa import floor_progress, lane_run, release_floor, rust_timing
+from tools.release import ci_floor, private_roots, run_gates
+from tools.release.test_release_tools import own_process_snapshot
 
 
 class FloorProgressTests(unittest.TestCase):
@@ -31,6 +33,8 @@ class FloorProgressTests(unittest.TestCase):
             "crates/example/Cargo.toml": '[package]\nname = "example-crate"\n',
             "crates/example/src/lib.rs": "mod tests {\n#[test]\nfn waiting() {}\n"
                                          "#[test]\nfn canary_case() {}\n}\n",
+            "crates/xtrace-cli/Cargo.toml": '[package]\nname = "xtrace-cli"\n',
+            "crates/xtrace-cli/tests/java_premain_spring.rs": f"#[test]\nfn {lane_run.SPRING_ORDER_WAIT_TEST}() {{}}\n",
             "Cargo.lock": "cargo fixture\n",
             "adapters/java/gradle.lockfile": "gradle fixture\n",
             "adapters/node/package-lock.json": "{}\n",
@@ -167,6 +171,7 @@ class FloorProgressTests(unittest.TestCase):
         private_roots.atomic_write_private(profile, b"state=returned completed=12 elapsed_ns=48")
         self.assertEqual(self.sanitize()["progress"]["rustGates"][gate], {
             "rustProgress": floor_progress.UNAVAILABLE, "storeProfiles": floor_progress.UNAVAILABLE,
+            "springPremainOrderWait": floor_progress.UNAVAILABLE,
         })
         timing_path.unlink()
         outside = self.root / "timing.json"
@@ -182,3 +187,133 @@ class FloorProgressTests(unittest.TestCase):
             self.assertEqual(self.sanitize()["progress"], floor_progress.UNAVAILABLE)
         private_roots.atomic_write_private(self.checkpoint, b'{"version":1,"gates":')
         self.assertEqual(self.sanitize()["progress"], floor_progress.UNAVAILABLE)
+
+    def test_completed_workspace_publishes_spring_deadline_in_sanitized_summary(self):
+        self.check_spring_deadline_summary(interrupt=False)
+
+    def test_interrupted_workspace_recovers_spring_deadline_without_lane_fragment(self):
+        self.check_spring_deadline_summary(interrupt=True)
+
+    def check_spring_deadline_summary(self, *, interrupt):
+        gate = "rust-workspace"
+        valid = b"v1 attestation-mismatch 5 2\n"
+        log_only = b"v1 error-request 2 1\n"
+        private_values = ("captured-value-731", "/fixture/customer.txt", "b3:0123456789abcdef")
+        workload_output = log_only + ("\n".join(private_values) + "\n").encode()
+        recovery = floor_progress.rust_directory(self.run_dir, gate)
+        record = recovery / "diagnostics" / "spring-premain-order-wait.txt"
+        fragment = self.root / "frag" / f"rust__-__{gate}.json"
+        # The supervisor checkpoint and the one-shot record can outlive receipt publication.
+        (self.run_dir / "receipt.json").unlink()
+        (self.root / "release-tool-tests-summary.json").unlink()
+        logs = self.run_dir / "logs"
+        logs.mkdir(mode=0o700)
+        cargo = self.root / "cargo"
+        cargo.write_text(
+            f"#!{sys.executable}\n"
+            "import os, pathlib, signal\n"
+            "directory = pathlib.Path(os.environ['XTRACE_CI_DIAG_DIR'])\n"
+            "with os.fdopen(os.open(directory / 'spring-premain-order-wait.txt', "
+            "os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:\n"
+            f"    stream.write({valid!r})\n"
+            f"os.write(1, {workload_output!r})\n"
+            + ("signal.pause()\n" if interrupt else "raise SystemExit(101)\n")
+        )
+        cargo.chmod(0o700)
+        env = {
+            **os.environ, "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
+            # Load the real wrapper from this checkout and attest the fixture's Git tree.
+            "PYTHONPATH": str(pathlib.Path(__file__).resolve().parents[2]),
+            "GIT_DIR": str(self.repo / ".git"), "GIT_WORK_TREE": str(self.repo),
+        }
+        for previous in ci_floor.EXPECTED_GATE_NAMES[:ci_floor.EXPECTED_GATE_NAMES.index(gate)]:
+            self.observe(previous, "selected", "started", "completed")
+        self.observe(gate, "selected")
+        snapshot = own_process_snapshot()
+        scans = 0
+        interrupted = False
+
+        def interrupt_after_record(**kwargs):
+            nonlocal scans, interrupted
+            processes = snapshot(**kwargs)
+            scans += 1
+            # Give the supervisor its initial process identity snapshot. The wrapper
+            # flushes output only after Cargo closes the record, so no sleep is needed.
+            if interrupt and not interrupted and scans >= 3 and record.is_file():
+                if log_only in (recovery / "output.log").read_bytes():
+                    interrupted = True
+                    raise KeyboardInterrupt
+            return processes
+
+        with mock.patch.object(run_gates, "_process_snapshot", side_effect=interrupt_after_record), \
+                release_floor.configured_floor(self.root, 7200):
+            argv = next(item.argv for item in run_gates.GATES if item.name == gate)
+            code, _ = run_gates._run(
+                argv, cwd=self.repo, env=env, timeout=10, log_path=logs / f"{gate}.log",
+                command_observed=lambda state: self.observe(gate, state),
+            )
+        self.assertEqual(interrupted, interrupt)
+        self.assertEqual(code, 130 if interrupt else 101)
+        self.assertEqual(record.read_bytes(), valid)
+        self.assertIn(log_only, (recovery / "output.log").read_bytes())
+        expected = {
+            "status": "observed", "phase": "attestation-mismatch", "state": "insufficient-matching-rows",
+            "expectedRows": 3, "completeRows": 5, "completeRowsLimit": 16, "matchingRows": 2,
+        }
+        if interrupt:
+            self.assertIn("owned process tree drained", (logs / f"{gate}.log").read_text())
+            self.assertFalse(fragment.exists())
+        else:
+            fragment_text = fragment.read_text()
+            self.assertEqual(json.loads(fragment_text)["springPremainOrderWait"], expected)
+            for value in (*private_values, valid.decode().strip(), log_only.decode().strip()):
+                self.assertNotIn(value, fragment_text)
+
+        def sanitize_artifact():
+            argv = [
+                "release_floor", "sanitize-floor", "--root", str(self.root), "--repo", str(self.repo),
+                "--label", self.args.label, "--tuple", self.args.tuple,
+                "--expected-head", self.args.expected_head, "--phase-base", self.args.phase_base,
+            ]
+            public = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(public):
+                self.assertEqual(release_floor.main(), 1)
+            text = (self.root / "release-floor-summary.json").read_text()
+            for value in (*private_values, valid.decode().strip(), log_only.decode().strip(), str(self.root)):
+                self.assertNotIn(value, text + public.getvalue())
+            summary = json.loads(text)
+            self.assertEqual((summary["floorStatus"], summary["gateCount"], summary["gates"]), ("unreached", 0, []))
+            self.assertFalse(summary["releaseAcceptance"])
+            return summary["progress"]
+
+        def observation():
+            return sanitize_artifact()["rustGates"][gate]["springPremainOrderWait"]
+
+        progress = sanitize_artifact()
+        self.assertEqual(progress["lastObservedGate"], gate)
+        self.assertEqual(progress["commandObservation"], "started" if interrupt else "completed")
+        self.assertEqual(progress["rustGates"][gate]["springPremainOrderWait"], expected)
+
+        record.unlink()
+        self.assertEqual(observation(), floor_progress.UNAVAILABLE)  # The matching grammar in stdout is ignored.
+        private_roots.atomic_write_private(record, valid + workload_output)
+        self.assertEqual(observation(), floor_progress.UNAVAILABLE)
+        private_roots.atomic_write_private(record, valid)
+        record.chmod(0o644)
+        self.assertEqual(observation(), floor_progress.UNAVAILABLE)
+        record.chmod(0o600)
+        moved = recovery.with_name("unverified-recovery")
+        recovery.rename(moved)
+        recovery.symlink_to(moved, target_is_directory=True)
+        self.assertEqual(observation(), floor_progress.UNAVAILABLE)
+        recovery.unlink()
+        moved.rename(recovery)
+        self.assertEqual(observation(), expected)
+
+        self.observe(gate, "selected")
+        self.assertEqual(observation(), floor_progress.UNAVAILABLE)
+        self.writer(self.run_dir, gate, "started", {**self.proof, "head": "b" * 40})
+        self.assertEqual(sanitize_artifact(), floor_progress.UNAVAILABLE)
+        self.observe(gate, "started")
+        (self.repo / "untracked-fixture.txt").touch()
+        self.assertEqual(sanitize_artifact(), floor_progress.UNAVAILABLE)

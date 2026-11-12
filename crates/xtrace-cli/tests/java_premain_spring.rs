@@ -13,6 +13,7 @@ mod spring_readiness;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -179,7 +180,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let count = http(port, "GET", "/__fixture/count", &[], None);
     assert_eq!(serde_json::from_slice::<Value>(&count.body).unwrap()["count"], 1);
 
-    let recordings = wait_for_order_recordings(&project_root, 1);
+    let recordings = wait_for_order_recordings(&project_root, OrderWaitPhase::SuccessfulRequest);
     let (recording_id, object) = &recordings[0];
     let logical = zstd::stream::decode_all(object.as_slice()).expect("decompress stored XTF");
     let events = decode_events(&logical);
@@ -195,7 +196,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_eq!(error_response.body, br#"{"status":"failed"}"#);
     let count = http(port, "GET", "/__fixture/count", &[], None);
     assert_eq!(serde_json::from_slice::<Value>(&count.body).unwrap()["count"], 1);
-    let recordings = wait_for_order_recordings(&project_root, 2);
+    let recordings = wait_for_order_recordings(&project_root, OrderWaitPhase::ErrorRequest);
     let error_logical =
         zstd::stream::decode_all(recordings[1].1.as_slice()).expect("decompress error XTF");
     let error_events = decode_events(&error_logical);
@@ -348,7 +349,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let (mismatch_stdout, mismatch_stderr) = mismatched.stop();
     assert_scanned_clean("class mismatch fixture stdout", &mismatch_stdout);
     assert_scanned_clean("class mismatch fixture stderr", &mismatch_stderr);
-    let mismatch_recordings = wait_for_order_recordings(&project_root, 3);
+    let mismatch_recordings =
+        wait_for_order_recordings(&project_root, OrderWaitPhase::AttestationMismatch);
     let loaded_mismatch_logical = zstd::stream::decode_all(mismatch_recordings[2].1.as_slice())
         .expect("decompress loaded-class mismatch XTF");
     let loaded_mismatch_events = decode_events(&loaded_mismatch_logical);
@@ -371,7 +373,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let (mutated_class_stdout, mutated_class_stderr) = mutated_class.stop();
     assert_scanned_clean("mutated class fixture stdout", &mutated_class_stdout);
     assert_scanned_clean("mutated class fixture stderr", &mutated_class_stderr);
-    let class_mutation_recordings = wait_for_order_recordings(&project_root, 4);
+    let class_mutation_recordings =
+        wait_for_order_recordings(&project_root, OrderWaitPhase::ClassfileMutation);
     let class_mutation_recording_id = &class_mutation_recordings[3].0;
     let class_mutation_logical =
         zstd::stream::decode_all(class_mutation_recordings[3].1.as_slice())
@@ -803,13 +806,52 @@ fn wait_for_store_quiescence(project_root: &Path) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OrderWaitPhase {
+    SuccessfulRequest,
+    ErrorRequest,
+    AttestationMismatch,
+    ClassfileMutation,
+}
+
+impl OrderWaitPhase {
+    fn label_and_expected_count(self) -> (&'static str, usize) {
+        match self {
+            Self::SuccessfulRequest => ("successful-request", 1),
+            Self::ErrorRequest => ("error-request", 2),
+            Self::AttestationMismatch => ("attestation-mismatch", 3),
+            Self::ClassfileMutation => ("classfile-mutation", 4),
+        }
+    }
+}
+
+const ORDER_WAIT_DIAGNOSTIC: &str = "spring-premain-order-wait.txt";
+const ORDER_WAIT_ROW_LIMIT: usize = 16;
+
+fn wait_for_order_recordings(project_root: &Path, phase: OrderWaitPhase) -> Vec<(String, Vec<u8>)> {
+    let directory = std::env::var_os("XTRACE_CI_DIAG_DIR").map(PathBuf::from);
+    wait_for_order_recordings_until(
+        project_root,
+        phase,
+        Instant::now() + Duration::from_secs(10),
+        directory.as_deref(),
+    )
+}
+
 /// The generic request root also records the fixture's own readiness and count polls, so the
 /// journey selects its recordings by the request they hold, never by persisted ordinal.
-fn wait_for_order_recordings(project_root: &Path, expected_count: usize) -> Vec<(String, Vec<u8>)> {
+fn wait_for_order_recordings_until(
+    project_root: &Path,
+    phase: OrderWaitPhase,
+    deadline: Instant,
+    diagnostic_directory: Option<&Path>,
+) -> Vec<(String, Vec<u8>)> {
     let marker: &[u8] = b"http.request POST /orders";
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let (label, expected_count) = phase.label_and_expected_count();
     loop {
-        let orders: Vec<(String, Vec<u8>)> = wait_for_recordings(project_root, 0)
+        let recordings = read_complete_recordings(project_root);
+        let complete_rows = recordings.len();
+        let orders: Vec<(String, Vec<u8>)> = recordings
             .into_iter()
             .filter(|(_, object)| {
                 let logical = zstd::stream::decode_all(object.as_slice()).expect("decode XTF");
@@ -819,54 +861,156 @@ fn wait_for_order_recordings(project_root: &Path, expected_count: usize) -> Vec<
         if orders.len() >= expected_count {
             return orders;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{expected_count} POST /orders recordings were not persisted before deadline"
-        );
+        if Instant::now() >= deadline {
+            // The lane reads this one-shot record separately from libtest output. Use the
+            // last poll's counts and keep a diagnostic I/O error from replacing the panic.
+            if let Some(directory) = diagnostic_directory
+                && let Ok(mut file) = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.join(ORDER_WAIT_DIAGNOSTIC))
+            {
+                let _ = writeln!(
+                    file,
+                    "v1 {label} {} {}",
+                    complete_rows.min(ORDER_WAIT_ROW_LIMIT),
+                    orders.len()
+                );
+            }
+            panic!("{expected_count} POST /orders recordings were not persisted before deadline");
+        }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
-fn wait_for_recordings(project_root: &Path, expected_count: usize) -> Vec<(String, Vec<u8>)> {
+fn read_complete_recordings(project_root: &Path) -> Vec<(String, Vec<u8>)> {
     let database = project_root.join("metadata.sqlite3");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let connection = Connection::open(&database).expect("selected-root SQLite");
-        let mut statement = connection
-            .prepare(
-                "SELECT hex(rs.recording_id), rs.object_hash \
+    let connection = Connection::open(&database).expect("selected-root SQLite");
+    let mut statement = connection
+        .prepare(
+            "SELECT hex(rs.recording_id), rs.object_hash \
                  FROM recording_segments rs \
                  JOIN recordings r ON r.recording_id = rs.recording_id \
                  WHERE rs.segment_ordinal = 0 AND r.status = 'complete' ORDER BY rs.rowid",
+        )
+        .expect("prepare recording query");
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
+        .expect("query recordings")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read recording rows");
+    rows.into_iter()
+        .map(|(recording_hex, object_hash)| {
+            let hash = lower_hex(&object_hash);
+            let path = project_root
+                .join("objects/b3")
+                .join(&hash[..2])
+                .join(format!("{}.xtf.zst", &hash[2..]));
+            let object = fs::read(path).expect("read immutable XTF object");
+            let expected = format!("b3:{hash}").parse::<ContentHash>().unwrap();
+            verify_compressed_segment(&object, expected).expect("verify XTF object");
+            (recording_hex, object)
+        })
+        .collect()
+}
+
+#[test]
+fn order_wait_deadline_reports_the_last_complete_segment_observation() {
+    use xtrace_domain::{ProjectId, RecordingId};
+    use xtrace_store::{XtfSegmentInput, encode_segment};
+
+    let root = temp_root();
+    let directory = root.path();
+    let diagnostic = directory.join(ORDER_WAIT_DIAGNOSTIC);
+    let connection = Connection::open(directory.join("metadata.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE recordings (recording_id BLOB PRIMARY KEY, status TEXT);
+             CREATE TABLE recording_segments (recording_id BLOB, segment_ordinal INTEGER, object_hash BLOB);
+             INSERT INTO recordings VALUES (X'AA', 'partial'), (X'BB', 'complete');
+             INSERT INTO recording_segments VALUES (X'AA', 0, X'00'), (X'BB', 1, X'00');",
+        )
+        .unwrap();
+    let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(100));
+    let add_complete_recording = |id, symbol: &str| {
+        let uuid = uuid::Uuid::from_u128(id);
+        let recording_id = RecordingId::from_uuid(uuid);
+        let encoded = encode_segment(&XtfSegmentInput {
+            project_id,
+            recording_id,
+            segment_ordinal: 0,
+            events: vec![XtfEventEnvelope {
+                recording_seq: 2,
+                event: Some(RecordingEvent {
+                    event_id: "request".into(),
+                    recording_seq: 2,
+                    symbol: symbol.into(),
+                    ..RecordingEvent::default()
+                }),
+            }],
+        })
+        .unwrap();
+        let hash = encoded.content_hash();
+        let hex = lower_hex(hash.as_bytes());
+        let objects = directory.join("objects/b3").join(&hex[..2]);
+        fs::create_dir_all(&objects).unwrap();
+        fs::write(objects.join(format!("{}.xtf.zst", &hex[2..])), encoded.compressed_bytes())
+            .unwrap();
+        let id = uuid.as_bytes().as_slice();
+        connection.execute("INSERT INTO recordings VALUES (?1, 'complete')", [id]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO recording_segments VALUES (?1, 0, ?2)",
+                (id, hash.as_bytes().as_slice()),
             )
-            .expect("prepare recording query");
-        let rows = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
-            .expect("query recordings")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read recording rows");
-        if rows.len() >= expected_count {
-            return rows
-                .into_iter()
-                .map(|(recording_hex, object_hash)| {
-                    let hash = lower_hex(&object_hash);
-                    let path = project_root
-                        .join("objects/b3")
-                        .join(&hash[..2])
-                        .join(format!("{}.xtf.zst", &hash[2..]));
-                    let object = fs::read(path).expect("read immutable XTF object");
-                    let expected = format!("b3:{hash}").parse::<ContentHash>().unwrap();
-                    verify_compressed_segment(&object, expected).expect("verify XTF object");
-                    (recording_hex, object)
-                })
-                .collect();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{expected_count} recordings were not persisted before deadline"
-        );
-        thread::sleep(Duration::from_millis(25));
+            .unwrap();
+    };
+    let assert_deadline = |phase, panic_message, record| {
+        let panic = std::panic::catch_unwind(|| {
+            wait_for_order_recordings_until(directory, phase, Instant::now(), Some(directory))
+        })
+        .expect_err("the recording wait must still fail at the deadline");
+        assert_eq!(panic.downcast_ref::<String>().unwrap().as_str(), panic_message);
+        assert_eq!(fs::read_to_string(&diagnostic).unwrap(), record);
+        fs::remove_file(&diagnostic).unwrap();
+    };
+
+    assert_deadline(
+        OrderWaitPhase::SuccessfulRequest,
+        "1 POST /orders recordings were not persisted before deadline",
+        "v1 successful-request 0 0\n",
+    );
+    for id in 1..=17 {
+        add_complete_recording(id, "http.request GET /__fixture/count");
     }
+    assert_deadline(
+        OrderWaitPhase::ErrorRequest,
+        "2 POST /orders recordings were not persisted before deadline",
+        "v1 error-request 16 0\n",
+    );
+    add_complete_recording(18, "http.request POST /orders");
+    assert_deadline(
+        OrderWaitPhase::AttestationMismatch,
+        "3 POST /orders recordings were not persisted before deadline",
+        "v1 attestation-mismatch 16 1\n",
+    );
+    assert_deadline(
+        OrderWaitPhase::ClassfileMutation,
+        "4 POST /orders recordings were not persisted before deadline",
+        "v1 classfile-mutation 16 1\n",
+    );
+    for id in 19..=21 {
+        add_complete_recording(id, "http.request POST /orders");
+    }
+    let orders = wait_for_order_recordings_until(
+        directory,
+        OrderWaitPhase::ClassfileMutation,
+        Instant::now(),
+        Some(directory),
+    );
+    assert_eq!(orders.len(), 4);
+    assert!(!diagnostic.exists(), "a successful wait must not create a deadline record");
 }
 
 fn decode_events(logical: &[u8]) -> Vec<RecordingEvent> {

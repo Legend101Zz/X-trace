@@ -657,26 +657,34 @@ class AdmissionDiagnostic:
     fields: dict[str, str | int | bool] = field(default_factory=dict)
 
 
+def _open_ci_diagnostic(directory: pathlib.Path, filename: str) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    root_fd = os.open(directory, flags | os.O_DIRECTORY)
+    try:
+        root = os.fstat(root_fd)
+        if root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700:
+            raise ValueError("CI diagnostic directory is not private")
+        fd = os.open(filename, flags, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise ValueError("CI diagnostic record is not private")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, index) -> list[AdmissionDiagnostic]:
     """Read bounded product records. Raw output is never a diagnostic source."""
     if directory is None:
         return []
     records = []
     try:
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-        root_fd = os.open(directory, flags | os.O_DIRECTORY)
-        try:
-            root = os.fstat(root_fd)
-            if root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700:
-                return []
-            fd = os.open("private-storage.jsonl", flags, dir_fd=root_fd)
-        finally:
-            os.close(root_fd)
-        with os.fdopen(fd, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
-                return []
+        with os.fdopen(_open_ci_diagnostic(directory, "private-storage.jsonl"), "rb") as stream:
             for _ in range(MAX_CI_RECORDS):
                 raw = stream.readline(MAX_CI_RECORD_BYTES + 1)
                 if not raw:
@@ -732,6 +740,45 @@ def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, 
     except (OSError, ValueError):
         return []
     return records
+
+
+SPRING_ORDER_WAIT_TEST = "premain_captures_real_spring_request_and_fails_open_without_leaking_canaries"
+SPRING_ORDER_WAIT_TARGET = {"crate": "xtrace-cli", "targetKind": "test", "targetName": "java_premain_spring"}
+SPRING_ORDER_WAIT_PHASES = {
+    "successful-request": 1, "error-request": 2, "attestation-mismatch": 3, "classfile-mutation": 4,
+}
+SPRING_ORDER_WAIT_ROW_LIMIT = 16
+SPRING_ORDER_WAIT_MAX_BYTES = 64
+SPRING_ORDER_WAIT_RECORD = re.compile(rb"v1 ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3])\n")
+
+
+def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index) -> dict:
+    """Rebuild a single deadline observation from the task's private diagnostic file."""
+    unavailable = {"status": "unavailable"}
+    if not metadata.rust_progress_test(SPRING_ORDER_WAIT_TEST, SPRING_ORDER_WAIT_TARGET, index):
+        return unavailable
+    try:
+        with os.fdopen(_open_ci_diagnostic(directory, "spring-premain-order-wait.txt"), "rb") as stream:
+            raw = stream.read(SPRING_ORDER_WAIT_MAX_BYTES + 1)
+    except (OSError, ValueError):
+        return unavailable
+    record = SPRING_ORDER_WAIT_RECORD.fullmatch(raw)
+    if record is None:
+        return unavailable
+    phase = record[1].decode("ascii")
+    expected = SPRING_ORDER_WAIT_PHASES.get(phase)
+    complete, matching = int(record[2]), int(record[3])
+    if expected is None or complete > SPRING_ORDER_WAIT_ROW_LIMIT or matching > complete or matching >= expected:
+        return unavailable
+    if complete == 0:
+        state = "no-complete-segment-rows"
+    elif matching == 0:
+        state = "no-matching-marker"
+    else:
+        state = "insufficient-matching-rows"
+    result = {"status": "observed", "phase": phase, "state": state, "expectedRows": expected,
+              "completeRows": complete, "completeRowsLimit": SPRING_ORDER_WAIT_ROW_LIMIT, "matchingRows": matching}
+    return unavailable if _private(_encoded(result).decode("ascii"), index, verified_identifier=True) else result
 
 
 def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]], list[str]]:
@@ -1318,6 +1365,8 @@ def finalize_run(args, *, cmd, log_path, metadata, diagnostic_directory, code, t
         frag["storeProfiles"] = store_profiles.collect(out)
     if status == "fail":
         frag["timedOut"] = timed_out
+        if suite == "rust" and diagnostic_directory is not None and rust_timing.is_test_command(cmd):
+            frag["springPremainOrderWait"] = spring_order_wait(diagnostic_directory, metadata, index)
         frag["failureDetails"] = (failure_details(
             text, timed_out, budget=_remaining_excerpt_budget(out, fragment_path), index=index, metadata=metadata,
             diagnostic_records=_ci_diagnostics(diagnostic_directory, metadata, index))

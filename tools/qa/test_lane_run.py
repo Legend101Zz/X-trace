@@ -1369,6 +1369,91 @@ class MergeTests(unittest.TestCase):
             self.assertIn("headSha", doc)
 
 
+class SpringPremainDiagnosticTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.metadata = lane_run._checkout_metadata(ROOT)
+
+    def run_floor_step(self, record, *, code=101, mode=0o600, metadata=None):
+        import contextlib
+        import io
+        import os
+        from tools.qa import release_floor
+        from tools.release import run_gates
+
+        gate = next(gate for gate in run_gates.GATES if gate.name == "rust-workspace")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            wrapped, = release_floor.instrumented_gates((gate,), root, 7200)
+            args = lane_run.parser().parse_args(wrapped.argv[4:])
+            recovery = lane_run.prepare_recovery(root)
+            public = io.StringIO()
+
+            def cargo(command, *, log, env, **kwargs):
+                directory = pathlib.Path(env["XTRACE_CI_DIAG_DIR"])
+                self.assertEqual(directory, recovery / "diagnostics")
+                if record is not None:
+                    path = directory / "spring-premain-order-wait.txt"
+                    path.write_bytes(record)
+                    path.chmod(mode)
+                # Even a valid-looking record in child output has no diagnostic provenance.
+                log.write(b"v1 error-request 2 1\ncaptured-value-731\n")
+                return subprocess.CompletedProcess(command, code), False, None
+
+            with contextlib.redirect_stdout(public), \
+                    mock.patch.dict(os.environ, {"XTRACE_LANE_RECOVERY_DIR": str(recovery)}), \
+                    mock.patch.object(lane_run, "_checkout_metadata", return_value=metadata or self.metadata), \
+                    mock.patch.object(lane_run.rust_timing, "run", side_effect=cargo):
+                rc = lane_run.cmd_run(args)
+            fragment = (root / "frag" / "rust__-__rust-workspace.json").read_text()
+            self.assertEqual(rc, code)
+            self.assertNotIn("captured-value-731", fragment + public.getvalue())
+            self.assertNotIn("v1 error-request 2 1", fragment + public.getvalue())
+            return json.loads(fragment), fragment + public.getvalue()
+
+    def test_failed_workspace_publishes_bounded_observations(self):
+        for phase, state, expected, complete, matching in (
+            ("successful-request", "no-complete-segment-rows", 1, 0, 0),
+            ("error-request", "no-matching-marker", 2, 16, 0),
+            ("attestation-mismatch", "insufficient-matching-rows", 3, 3, 2),
+            ("classfile-mutation", "insufficient-matching-rows", 4, 6, 3),
+        ):
+            with self.subTest(phase=phase):
+                fragment, _ = self.run_floor_step(f"v1 {phase} {complete} {matching}\n".encode())
+                self.assertEqual((fragment["status"], fragment["exitCode"], fragment["timedOut"]),
+                                 ("fail", 101, False))
+                self.assertEqual(fragment["springPremainOrderWait"], {
+                    "status": "observed", "phase": phase, "state": state, "expectedRows": expected,
+                    "completeRows": complete, "completeRowsLimit": 16, "matchingRows": matching,
+                })
+
+    def test_failed_workspace_withholds_unavailable_or_malformed_diagnostics(self):
+        valid = b"v1 successful-request 0 0\n"
+        for record, mode, metadata in (
+            (None, 0o600, None),
+            (valid, 0o644, None),
+            (valid, 0o600, lane_run.CheckoutMetadata({})),
+            (b"v1 captured-value 3 0\n", 0o600, None),
+            (b"v1 successful-request 99999 0\n", 0o600, None),
+            (b"v1 successful-request 17 0\n", 0o600, None),
+            (b"v1 error-request 0 1\n", 0o600, None),
+            (b"v1 error-request 2 2\n", 0o600, None),
+            (valid.rstrip(), 0o600, None),
+            (valid * 3, 0o600, None),
+            (valid + b"/fixture/customer.txt\nb3:0123456789abcdef\n", 0o600, None),
+        ):
+            with self.subTest(record=record, mode=mode, head=metadata is None):
+                fragment, public = self.run_floor_step(record, mode=mode, metadata=metadata)
+                self.assertEqual(fragment["springPremainOrderWait"], {"status": "unavailable"})
+                for value in ("captured-value", "99999", "/fixture/customer.txt", "b3:0123456789abcdef"):
+                    self.assertNotIn(value, public)
+
+    def test_successful_workspace_publishes_no_wait_failure(self):
+        fragment, _ = self.run_floor_step(None, code=0)
+        self.assertEqual((fragment["status"], fragment["exitCode"]), ("pass", 0))
+        self.assertNotIn("springPremainOrderWait", fragment)
+
+
 class RunTests(CheckoutFixture):
     def run_step(self, cmd, min_passed=0, timeout=60, max_ignored=-1, canaries=""):
         with tempfile.TemporaryDirectory() as d:

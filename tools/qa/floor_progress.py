@@ -63,6 +63,14 @@ def _profiles(directory, index):
     return {"status": "observed", "profiles": facts}
 
 
+def _spring_order_wait(directory, metadata, index):
+    try:
+        private_roots.admit_directory(directory)
+    except (OSError, private_roots.AdmissionError):
+        return UNAVAILABLE
+    return lane_run.spring_order_wait(directory / "diagnostics", metadata, index)
+
+
 def collect(checkpoint, repo, source_proofs, expected_gates):
     """Rebuild diagnostics from a verified source and its private supervisor state."""
     with os.fdopen(private_roots.open_private_file_read(checkpoint), "rb") as stream:
@@ -107,5 +115,6 @@ def collect(checkpoint, repo, source_proofs, expected_gates):
             result["rustGates"][gate] = {
                 "rustProgress": _rust_progress(directory, metadata, index) if started else UNAVAILABLE,
                 "storeProfiles": _profiles(directory / "frag", index) if started else UNAVAILABLE,
+                "springPremainOrderWait": _spring_order_wait(directory, metadata, index) if started else UNAVAILABLE,
             }
     return result
