@@ -540,9 +540,104 @@ def serial_frame_symbols(details: dict[str, dict], sent: list, burst: frozenset,
     return {sid: sorted(symbols) for sid, symbols in names.items()}
 
 
+def shared_burst_evidence(details: dict[str, dict], expectations: dict[str, list[dict]], sent: list,
+                          burst: frozenset, boundary: dict | None, serial_boundary: dict | None,
+                          evidence_ids: tuple[set[str], set[str]]) -> list[dict]:
+    """Check each shared route once using its live boundary's recording IDs."""
+    if boundary is None or (serial_boundary is not None and not serial_boundary["verified"]):
+        return []
+    serial_ids = set(serial_boundary["recordingIds"]) if serial_boundary is not None else set()
+    literals = frozenset(e["route"].rstrip("/") or "/" for exps in expectations.values()
+                         for e in exps if "{" not in e["route"])
+    status_ids, source_ids = evidence_ids
+    groups = []
+    for row in boundary.get("routes", []):
+        method, route = row["method"], row["route"]
+        owners = {sid for sid, m, path in sent if sid in burst and m == method and _path_matches(path, route, literals)}
+        if len(owners) < 2:
+            continue
+        checks = [e for sid in sorted(owners) for e in expectations.get(sid, [])
+                  if (e["method"], e["route"]) == (method, route)]
+        route_ids = set(row["recordingIds"]) - serial_ids
+        matched = {rid: details[rid] for rid in sorted(route_ids) if rid in details}
+        unread = route_ids - matched.keys()
+        problems = []
+        if row["requests"] != len(matched):
+            problems.append(f"burst-route-count-mismatch(requests {row['requests']}, recordings {len(matched)})")
+        if unread:
+            problems.append(f"burst-recording-detail-unavailable(missing {len(unread)})")
+        if not matched:
+            problems.append("no-recording-for-route")
+        partial = route_ids.intersection(boundary["partialRecordingIds"])
+        partial.update(rid for rid, d in matched.items() if d.get("completion") == "partial")
+        if partial:
+            problems.append("partial-recording")
+
+        observed_kinds = (*OBSERVED_OUTCOME_KINDS, "client_aborted", "unobserved")
+        outcomes = Counter()
+        for detail in matched.values():
+            kind = (detail.get("outcome") or {}).get("kind")
+            outcomes[recording_http_status(detail), kind if kind in observed_kinds else None] += 1
+        with_status = {rid for rid, d in matched.items() if any(outcome_matches(d, e) for e in checks)}
+        if checks and all("statuses" in e for e in checks):
+            expected = sorted((status for e in checks for status in e["statuses"]), key=str)
+            observed = sorted((recording_http_status(d) for d in matched.values()), key=str)
+            if Counter(expected) != Counter(observed):
+                problems.append(f"http-outcome-multiset-mismatch(expected {expected}, saw {observed})")
+        else:
+            # Mixed expectations cannot be checked per scenario without a request mapping.
+            outcome_rules = ("status", "statuses", "outcome", "exception")
+            if not checks or any(any(e.get(key) != checks[0].get(key) for key in outcome_rules) for e in checks[1:]):
+                problems.append("burst-outcome-expectations-differ")
+            if len(with_status) != len(matched):
+                problems.append(f"http-outcome-count-mismatch(expected {len(matched)}, observed {len(with_status)})")
+        need = sum(e.get("minCount", 1) for e in checks)
+        if len(with_status) < need:
+            problems.append(f"count-below-minimum(need {need}, have {len(with_status)})")
+        if any(kind not in OBSERVED_OUTCOME_KINDS for _, kind in outcomes):
+            problems.append("outcome-unobserved")
+        status_ids.update(with_status)
+
+        layers = sorted({layer for e in checks for layer in e.get("layers", [])})
+        different_frames = any(set(e.get("layers", [])) != set(checks[0].get("layers", []))
+                               or e.get("layerHints", {}) != checks[0].get("layerHints", {}) for e in checks[1:])
+        layer_report = {}
+        for layer in layers:
+            hints = [e.get("layerHints", {}).get(layer) for e in checks if layer in e.get("layers", [])]
+            have = sum(any(layer_frames(d, layer, hint) for hint in hints) for d in matched.values())
+            layer_report[layer] = {"recordingsWithFrame": have, "of": len(matched)}
+            if matched and (not have or (not different_frames and have < len(matched))):
+                problems.append(f"no-{layer}-frame")
+        if different_frames:
+            problems.append("burst-frame-expectations-differ")
+        with_source = set()
+        source_problems = {"no-source-file-line"} if unread else set()
+        for rid, detail in matched.items():
+            checks_for_source = [layer_source_ok(detail, e.get("layers", []), e.get("layerHints", {}))
+                                 for e in (checks or [{}])]
+            if any(ok for ok, _ in checks_for_source):
+                with_source.add(rid)
+            else:
+                states = {why for _, why in checks_for_source}
+                source_problems.add("source-binding-unacceptable" if "unacceptable" in states else
+                                    "source-binding-missing" if "missing" in states else "no-source-file-line")
+        source_ids.update(with_source)
+        problems.extend(sorted(source_problems))
+        groups.append({
+            "evidenceScope": "burst-route-group", "method": method, "route": route,
+            "requests": row["requests"], "recordingsMatchingRoute": len(matched),
+            "partialRecordings": len(partial), "recordingsWithStatus": len(with_status),
+            "outcomes": [{"httpStatus": status, "kind": kind, "recordings": count}
+                         for (status, kind), count in sorted(outcomes.items(), key=str)],
+            "layers": layer_report, "recordingsWithSource": len(with_source), "problems": problems,
+        })
+    return groups
+
+
 def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             sent: list[tuple[str | None, str, str]] | None = None, burst: frozenset = frozenset(),
-            boundary: dict[str, Any] | None = None, serial_boundary: dict[str, Any] | None = None) -> dict[str, Any]:
+            boundary: dict[str, Any] | None = None, serial_boundary: dict[str, Any] | None = None, *,
+            burst_evidence_ids: tuple[set[str], set[str]] | None = None) -> dict[str, Any]:
     """Expect a status or an exact `statuses` multiset per route, plus layers and source evidence.
 
     A verified serial boundary partitions serial IDs from the later burst. Burst routes can
@@ -555,7 +650,8 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
         if sent is not None and serial_boundary is not None else None
     serial_ids = set(serial_boundary["recordingIds"]) if serial_boundary is not None else set()
     burst_ids = set(boundary["recordingIds"]) - serial_ids if boundary is not None else set()
-    for sid, exps in expectations.items():
+    for sid in dict.fromkeys([*expectations, *sorted(burst)]):
+        exps = expectations.get(sid, [])
         is_burst = sid in burst
         items = []
         attributed_total = 0
@@ -565,11 +661,13 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             attribution = "campaign-wide"
             reqs = [r for r in (sent or []) if r[1] == e["method"] and _path_matches(r[2], e["route"], literal_routes)]
             check_route = not is_burst
+            burst_matches = {}
             if is_burst:
                 matched = []
+                owners = {r[0] for r in reqs if r[0] in burst}
                 if serial_boundary is not None and not serial_boundary["verified"]:
                     problems.append("serial-boundary-not-verified")
-                else:
+                elif len(owners) <= 1 or boundary is None:
                     if serial_boundary is not None and (boundary is None or not boundary["verified"]):
                         problems.append("burst-boundary-not-verified")
                     if boundary is not None:
@@ -578,12 +676,11 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                                             f"capacity drops {boundary['capacityDrops']}, unaccounted {boundary['unaccounted']})")
                         if boundary["capacityDrops"] or boundary["partialRecordingIds"]:
                             problems.append(f"burst-drops(capacity {boundary['capacityDrops']}, partial {len(boundary['partialRecordingIds'])})")
-                        owners = {r[0] for r in reqs if r[0] in burst}
-                        # A route shared across concurrent scenarios stays in the boundary report.
-                        check_route = sent is not None and (sid not in owners or len(owners) == 1)
+                        check_route = sent is not None
                         if owners == {sid}:
-                            matched = [d for rid, d in details.items() if rid in burst_ids
-                                       and recording_matches(d, e["method"], e["route"], literal_routes)]
+                            burst_matches = {rid: d for rid, d in details.items() if rid in burst_ids
+                                             and recording_matches(d, e["method"], e["route"], literal_routes)}
+                            matched = list(burst_matches.values())
             else:
                 matched = [d for d in details.values() if recording_matches(d, e["method"], e["route"], literal_routes)]
             if sent is not None and not is_burst:
@@ -693,6 +790,12 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 problems.append("source-binding-unacceptable" if "unacceptable" in why else
                                 "source-binding-missing" if "missing" in why else "no-source-file-line")
             if is_burst:
+                if burst_evidence_ids is not None and burst_matches:
+                    status_ids, source_ids = burst_evidence_ids
+                    status_details = {id(d) for d in with_status}
+                    source_details = {id(d) for d in src}
+                    status_ids.update(rid for rid, d in burst_matches.items() if id(d) in status_details)
+                    source_ids.update(rid for rid, d in burst_matches.items() if id(d) in source_details)
                 problems.append(f"attribution-ambiguous({REQUEST_CORRELATION_GAP})")
             if any(p.startswith("attribution-ambiguous") for p in problems):
                 attribution = "ambiguous"
@@ -701,7 +804,7 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                     "recordingsMatchingRoute": len(matched), "recordingsWithStatus": len(with_status),
                     "layers": layer_report, "recordingsWithSource": len(src), "problems": problems,
                     "passed": not problems}
-            if is_burst:
+            if is_burst and len(owners) <= 1:
                 item["evidenceScope"] = "burst-route-group"
             items.append(item)
         verdicts[sid] = {"passed": not is_burst and all(i["passed"] for i in items), "expectations": items,
@@ -712,14 +815,9 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
     return verdicts
 
 
-def problem_classes(verdicts: dict[str, Any]) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for v in verdicts.values():
-        for i in v["expectations"]:
-            for p in i["problems"]:
-                key = p.split("(")[0]
-                out[key] = out.get(key, 0) + 1
-    return out
+def problem_classes(verdicts: dict[str, Any], groups: list[dict] | None = None) -> dict[str, int]:
+    items = [item for v in verdicts.values() for item in v["expectations"]]
+    return dict(Counter(p.split("(")[0] for item in [*items, *(groups or [])] for p in item["problems"]))
 
 
 # ------------------------------------------------------------ canaries -------
@@ -809,12 +907,12 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     live_viewer = None
     started = time.time()
     boot_ms = None
+    burst = frozenset(sc.id for sc in scenarios if sc.kind == "concurrency")
     try:
         t0 = time.perf_counter()
         stack.up()
         boot_ms = round((time.perf_counter() - t0) * 1000)
         ordered = sorted(scenarios, key=lambda sc: sc.kind == "concurrency")
-        burst = frozenset(sc.id for sc in scenarios if sc.kind == "concurrency")
         if burst:
             live_viewer, ready = start_viewer(xtrace, project_dir, env, out_dir / "boundary-viewer.log")
             live_client = ViewerClient(ready["origin"])
@@ -872,6 +970,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
 
     api: dict[str, Any] = {"ok": False, "reason": "viewer not started", "recordings": [], "details": {}}
     verdicts: dict[str, Any] = {}
+    groups = []
+    burst_evidence_ids: tuple[set[str], set[str]] = (set(), set())
     viewer = None
     try:
         viewer, ready = start_viewer(xtrace, project_dir, env, out_dir / "viewer.log")
@@ -889,8 +989,10 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if viewer is not None:
             stop_process_group(viewer)
     if api["ok"]:
-        verdicts = analyze(api["details"], expectations, sent_log, frozenset(sc.id for sc in scenarios if sc.kind == "concurrency"),
-                           boundary, serial_boundary)
+        groups = shared_burst_evidence(api["details"], expectations, sent_log, burst, boundary, serial_boundary,
+                                       burst_evidence_ids)
+        verdicts = analyze(api["details"], expectations, sent_log, burst, boundary, serial_boundary,
+                           burst_evidence_ids=burst_evidence_ids if groups else None)
 
     baseline_fp: dict[str, str] = {}
     if baseline_receipt and baseline_receipt.exists():
@@ -918,6 +1020,14 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     boundaries_verified = (not any(sc.kind == "concurrency" for sc in scenarios)
                            or bool(serial_boundary and serial_boundary["verified"]
                                    and boundary and boundary["verified"]))
+    classes = problem_classes(verdicts, groups)
+    if groups:
+        # These diagnostics describe the whole burst boundary, including session-wide capacity drops.
+        if boundary["capacityDrops"] or boundary["partialRecordingIds"]:
+            classes["burst-drops"] = 1
+        if not boundary["verified"]:
+            classes["burst-boundary-not-verified"] = 1
+    scenario_items = [e for sid, v in verdicts.items() if not groups or sid not in burst for e in v["expectations"]]
     receipt = {
         "schemaVersion": 1, "kind": "instrumented_campaign_non_release", "project": project, "releaseAcceptance": False,
         "instrumented": True, "signed": False, "pin": pin, "syntheticDataOnly": True, "configurationAdaptations": adaptations,
@@ -927,9 +1037,9 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "attribution": "serial routes require exact counts before the verified boundary. "
                        "The burst boundary accounts for later recordings as a group. Individual burst correlation is missing.",
         "requestsSent": len(sent_log),
-        "problemClasses": problem_classes(verdicts), "scenarios": scen_out,
-        "recordingsWithSource": sum(e["recordingsWithSource"] for v in verdicts.values() for e in v["expectations"]),
-        "recordingsWithStatus": sum(e["recordingsWithStatus"] for v in verdicts.values() for e in v["expectations"]),
+        "problemClasses": classes, "scenarios": scen_out, "burstRouteGroups": groups,
+        "recordingsWithSource": len(burst_evidence_ids[1]) + sum(e["recordingsWithSource"] for e in scenario_items),
+        "recordingsWithStatus": len(burst_evidence_ids[0]) + sum(e["recordingsWithStatus"] for e in scenario_items),
         # A successful read after shutdown cannot repair a failed live boundary or
         # turn an unreached workload into a successful interleaved overhead run.
         # The result describes collection and workload. Recording verdicts judge isolation.

@@ -78,9 +78,10 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
     else:
         v = [s for s in sc if (s.get("recordingVerdict") or {}).get("passed")]
         pc = r.get("problemClasses", {})
+        problem_scope = "problems across scenario verdicts and shared burst routes" if r.get("burstRouteGroups") else "problems"
         out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) else "fail",
                     f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
-                    f"({api.get('recordings', 0)} recordings); problems: {json.dumps(pc, sort_keys=True)}"))
+                    f"({api.get('recordings', 0)} recordings); {problem_scope}: {json.dumps(pc, sort_keys=True)}"))
         n_src = r.get("recordingsWithSource", 0)
         bad_src = [k for k in ("no-source-file-line", "source-binding-unacceptable", "source-binding-missing") if pc.get(k)]
         out.append(("source-identity", "pass" if n_src > 0 and not bad_src else "fail",

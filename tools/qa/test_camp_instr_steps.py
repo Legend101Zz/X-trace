@@ -36,6 +36,22 @@ class T(unittest.TestCase):
                  "notes": {"launcherExitCode": 0}}
             self.assertEqual(by(s.instrumented_steps(r))["source-identity"][0], "fail", cls)
 
+    def test_shared_burst_diagnostics_reach_summary_without_crediting_scenarios(self):
+        r = {"scenarios": [sc("serial"), sc("burst-a", rec=False), sc("burst-b", rec=False)],
+             "api": {"ok": True, "recordings": 3},
+             "burstRouteGroups": [{"evidenceScope": "burst-route-group", "recordingsMatchingRoute": 2,
+                                   "recordingsWithSource": 0, "problems": ["source-binding-missing"]}],
+             "problemClasses": {"attribution-ambiguous": 2, "source-binding-missing": 1},
+             "recordingsWithSource": 1}
+        d = by(s.instrumented_steps(r))
+        self.assertEqual(d["instrumented-run"][0], "pass")
+        self.assertEqual(d["recordings-per-scenario"][0], "fail")
+        self.assertIn("1/3 scenarios", d["recordings-per-scenario"][1])
+        self.assertIn("shared burst routes", d["recordings-per-scenario"][1])
+        self.assertIn('"source-binding-missing": 1', d["recordings-per-scenario"][1])
+        self.assertEqual(d["source-identity"][0], "fail")
+        self.assertIn("source-binding-missing", d["source-identity"][1])
+
     def test_overhead_needs_five_repeats(self):
         agg = {"baseline": {"p50Ms": 1, "p95Ms": 2, "n": 14}, "instrumented": {"p50Ms": 2, "p95Ms": 3, "n": 14}, "p50Ratio": 2, "p95Ratio": 1.5}
         d = by(s.overhead_steps({"aggregate": agg}))

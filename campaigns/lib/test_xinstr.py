@@ -366,6 +366,10 @@ class T(unittest.TestCase):
         sent = [("a", "GET", "/vets"), ("a", "GET", "/vets"), ("b", "GET", "/owners/1")]
         v = xinstr.analyze(d, exp, sent, frozenset({"b"}))
         self.assertEqual(v["a"]["expectations"][0]["problems"], ["attribution-ambiguous(recordings 1, requests 2)"])
+        self.assertFalse(v["b"]["passed"])
+        self.assertEqual(v["b"]["attribution"], "ambiguous")
+        self.assertEqual(v["b"]["recordingsAttributed"], 0)
+        self.assertEqual(v["b"]["frameSymbols"], [])
 
     def test_template_only_burst_reports_the_missing_product_correlation(self):
         exp = {"burst": [{"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": []}]}
@@ -461,6 +465,101 @@ class T(unittest.TestCase):
                     item = verdict["expectations"][0]
                     self.assertEqual(item["recordingsMatchingRoute"], 2 if len(burst) == 1 else 0)
                     self.assertEqual(item["problems"], [BURST_CORRELATION_PROBLEM])
+
+    def test_shared_burst_route_reports_evidence_and_problems_once(self):
+        exp, _, _ = self.boundary_fixture()
+        exp["burst"][0]["layers"] = ["controller", "repository"]
+        exp["other-burst"] = exp["burst"]
+        burst = frozenset({"burst", "other-burst"})
+        sent = [(sid, "GET", "/owners/1?secret=private") for sid in sorted(burst)]
+        serial_details = {"serial": {**rec("GET", "/owners/{id}", 200), "completion": "complete"}}
+        serial = xinstr.burst_accounting(serial_details, [("serial", "GET", "/owners/2")], exp, {})
+        for problem in (None, "http-outcome-count-mismatch", "no-controller-frame", "source-binding-missing",
+                        "partial-recording"):
+            with self.subTest(problem=problem):
+                first = {**rec("GET", "/owners/{id}", 200), "completion": "complete"}
+                second = {**rec("GET", "/owners/{id}", 500 if problem == "http-outcome-count-mismatch" else 200,
+                                symbols=() if problem == "no-controller-frame"
+                                else ("OwnerController.showOwner", "OwnerRepository.findById")),
+                          "completion": "complete"}
+                if problem == "source-binding-missing":
+                    for event in second["events"]:
+                        event.pop("sourceBinding", None)
+                details = {**serial_details, "first": first, "second": second}
+                if problem == "partial-recording":
+                    first["completion"] = "partial"
+                    first["sessionContext"] = {"runtimeSessionId": "s", "rejectedRequests": "1"}
+                    del details["second"]
+                boundary = xinstr.burst_accounting(details, sent, exp, serial_details)
+                self.assertTrue(boundary["verified"])
+                verdicts = xinstr.analyze(details, exp, sent, burst, boundary, serial)
+                ids = (set(), set())
+                groups = xinstr.shared_burst_evidence(details, exp, sent, burst, boundary, serial, ids)
+                self.assertEqual(len(groups), 1)
+                group = groups[0]
+                self.assertEqual(group["evidenceScope"], "burst-route-group")
+                self.assertEqual((group["method"], group["route"], group["requests"]), ("GET", "/owners/{id}", 2))
+                self.assertNotIn("private", str(group))
+                partial = problem == "partial-recording"
+                bad_outcome = problem == "http-outcome-count-mismatch"
+                missing_frame = problem == "no-controller-frame"
+                missing_source = problem == "source-binding-missing"
+                n = 1 if partial else 2
+                self.assertEqual(group["recordingsMatchingRoute"], n)
+                self.assertEqual(group["partialRecordings"], int(partial))
+                self.assertEqual(boundary["capacityDrops"], int(partial))
+                self.assertEqual(group["outcomes"], [{"httpStatus": 200, "kind": "responded",
+                                                     "recordings": n - int(bad_outcome)}]
+                                 + ([{"httpStatus": 500, "kind": "responded", "recordings": 1}] if bad_outcome else []))
+                self.assertEqual(group["recordingsWithStatus"], n - int(bad_outcome))
+                self.assertEqual(group["layers"], {
+                    layer: {"recordingsWithFrame": n - int(missing_frame), "of": n}
+                    for layer in ("controller", "repository")})
+                self.assertEqual(group["recordingsWithSource"], n - int(missing_frame or missing_source))
+                self.assertEqual(ids[0], {"first"} if partial or bad_outcome else {"first", "second"})
+                self.assertEqual(ids[1], {"first"} if partial or missing_frame or missing_source else {"first", "second"})
+                self.assertEqual(bool(group["problems"]), problem is not None)
+                classes = xinstr.problem_classes({sid: verdicts[sid] for sid in burst}, groups)
+                self.assertEqual(classes["attribution-ambiguous"], 2)
+                if problem:
+                    self.assertEqual(classes[problem], 1)
+                if partial:
+                    self.assertEqual(classes["burst-route-count-mismatch"], 1)
+                for sid in burst:
+                    verdict = verdicts[sid]
+                    self.assertFalse(verdict["passed"])
+                    self.assertEqual(verdict["attribution"], "ambiguous")
+                    self.assertEqual(verdict["recordingsAttributed"], 0)
+                    self.assertEqual(verdict["frameSymbols"], [])
+                    item = verdict["expectations"][0]
+                    self.assertEqual(item["recordingsMatchingRoute"], 0)
+                    self.assertEqual(item["recordingsWithSource"], 0)
+                    self.assertEqual(item["problems"], [BURST_CORRELATION_PROBLEM])
+
+    def test_shared_outcome_multiset_uses_only_live_boundary_ids(self):
+        exp, _, details = self.boundary_fixture()
+        first = exp["burst"][0]
+        first.pop("status")
+        first["statuses"] = [200]
+        exp["other-burst"] = [{**first, "statuses": [302]}]
+        details["1"]["outcome"]["httpStatus"] = 302
+        burst = frozenset({"burst", "other-burst"})
+        sent = [(sid, "GET", "/owners/1") for sid in sorted(burst)]
+        boundary = xinstr.burst_accounting(details, sent, exp, {})
+        self.assertTrue(boundary["verified"])
+        ids = (set(), set())
+        groups = xinstr.shared_burst_evidence(details, exp, sent, burst, boundary, None, ids)
+        self.assertEqual(groups[0]["problems"], [])
+        self.assertEqual(ids, ({"0", "1"}, {"0", "1"}))
+
+        final = {"0": details["0"], "late": details["1"]}
+        ids = (set(), set())
+        groups = xinstr.shared_burst_evidence(final, exp, sent, burst, boundary, None, ids)
+        self.assertEqual(ids, ({"0"}, {"0"}))
+        self.assertEqual(xinstr.problem_classes({}, groups), {
+            "burst-route-count-mismatch": 1, "burst-recording-detail-unavailable": 1,
+            "http-outcome-multiset-mismatch": 1, "count-below-minimum": 1, "no-source-file-line": 1,
+        })
 
     def test_partial_accounting_polls_state_and_expiry_reports_exact_numbers(self):
         exp, sent, details = self.boundary_fixture()
@@ -678,8 +777,8 @@ class T(unittest.TestCase):
         import tempfile
         import xcamp
         from types import SimpleNamespace
-        for verified in (True, False):
-            with self.subTest(verified=verified), tempfile.TemporaryDirectory() as td:
+        for verified, shared in ((True, False), (False, False), (True, True)):
+            with self.subTest(verified=verified, shared=shared), tempfile.TemporaryDirectory() as td:
                 events = []
                 stack = mock.Mock(launcher_exit=0, base="http://127.0.0.1:1234")
                 stack.logs.return_value = ""
@@ -689,6 +788,11 @@ class T(unittest.TestCase):
                     return {"id": sc.id, "passed": True, "semanticEffectFingerprint": "fp", "requests": [], "elapsedMs": 1}
                 exp, _, details = self.boundary_fixture()
                 details["0"]["_openedAt"] = "2026-10-10T00:00:00Z"
+                burst_scenarios = [SimpleNamespace(id="burst", kind="concurrency")]
+                if shared:
+                    burst_scenarios.append(SimpleNamespace(id="other-burst", kind="concurrency"))
+                    exp["other-burst"] = exp["burst"]
+                    details["2"] = {**rec("GET", "/owners/{id}", 200, src=False), "completion": "complete"}
                 serial_details = {"0": details["0"]} if verified else {}
                 boundaries = []
 
@@ -699,7 +803,7 @@ class T(unittest.TestCase):
                         self.assertTrue(kwargs["require_complete"])
                         boundary = xinstr.burst_accounting(serial_details, args[2], exp, {})
                     else:
-                        self.assertEqual([r[0] for r in args[2]], ["burst"])
+                        self.assertEqual([r[0] for r in args[2]], [sc.id for sc in burst_scenarios])
                         self.assertEqual(args[5], deadline[0], "both phases share the existing budget")
                         boundary = xinstr.burst_accounting(details, args[2], exp, serial_details)
                     boundaries.append(boundary)
@@ -721,11 +825,12 @@ class T(unittest.TestCase):
                      mock.patch.object(xcamp, "run_scenario", side_effect=run):
                     receipt = xinstr.run_instrumented(
                         project="p", pin={}, make_stack=lambda _: stack,
-                        scenarios=[SimpleNamespace(id="serial", kind="business"), SimpleNamespace(id="burst", kind="concurrency")],
+                        scenarios=[SimpleNamespace(id="serial", kind="business"), *burst_scenarios],
                         out_dir=pathlib.Path(td) / "out", norm_extra=[], expectations=exp, xtrace="xtrace",
                         project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
                         canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
-                self.assertEqual(events, ["serial", "boundary", "burst", "boundary"] if verified else ["serial", "boundary"])
+                self.assertEqual(events, ["serial", "boundary", *[sc.id for sc in burst_scenarios], "boundary"]
+                                 if verified else ["serial", "boundary"])
                 self.assertEqual(receipt["notes"]["serialBoundary"], boundaries[0])
                 self.assertEqual(receipt["notes"]["serialBoundary"]["verified"], verified)
                 burst = next(s for s in receipt["scenarios"] if s["id"] == "burst")
@@ -734,13 +839,20 @@ class T(unittest.TestCase):
                     self.assertEqual(receipt["notes"]["burstBoundary"], boundaries[1])
                     self.assertTrue(receipt["notes"]["burstBoundary"]["verified"])
                     self.assertEqual(receipt["result"], "recorded")
-                    self.assertEqual(receipt["api"]["recordings"], 2)
+                    self.assertEqual(receipt["api"]["recordings"], 3 if shared else 2)
                     serial = next(s for s in receipt["scenarios"] if s["id"] == "serial")
                     self.assertTrue(serial["recordingVerdict"]["passed"])
                     self.assertTrue(burst["scenarioChecksPassed"])
                     self.assertEqual(burst["recordingVerdict"]["recordingsAttributed"], 0)
                     self.assertEqual(burst["recordingVerdict"]["expectations"][0]["problems"], [BURST_CORRELATION_PROBLEM])
-                    self.assertEqual(receipt["problemClasses"], {"attribution-ambiguous": 1})
+                    if shared:
+                        self.assertEqual(receipt["problemClasses"], {"attribution-ambiguous": 2, "no-source-file-line": 1})
+                        self.assertEqual(len(receipt["burstRouteGroups"]), 1)
+                        self.assertEqual(receipt["burstRouteGroups"][0]["problems"], ["no-source-file-line"])
+                        self.assertEqual(receipt["recordingsWithStatus"], 3)
+                        self.assertEqual(receipt["recordingsWithSource"], 2)
+                    else:
+                        self.assertEqual(receipt["problemClasses"], {"attribution-ambiguous": 1})
                 self.assertTrue(all("frameSymbols" in sc for sc in receipt["scenarios"]))
                 stack.down.assert_called_once()
                 if not verified:
