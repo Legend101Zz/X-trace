@@ -76,7 +76,7 @@ pub struct PreparedOp {
     pub binding_key: String,
     /// Effective state.
     pub state: EffectiveState,
-    /// Claims projection available.
+    /// Individual claim rows are available, possibly as a partial list.
     pub claims_available: bool,
     /// Merged parameters sorted by (location, name).
     pub params: Vec<PreparedParam>,
@@ -405,11 +405,13 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
     } else {
         (None, Vec::new())
     };
-    let mut catalog_summary = op.catalog_summary.clone().filter(|_| !claims_available);
+    let mut catalog_summary = op.catalog_summary.clone();
     if let Some(summary) = &mut catalog_summary {
         summary.handler_symbols.sort();
         summary.handler_symbols.dedup();
-        summary.handler_conflict |= summary.handler_symbols.len() > 1;
+        if !claims_available {
+            summary.handler_conflict |= summary.handler_symbols.len() > 1;
+        }
         summary.handler_symbols.retain(|symbol| {
             checked_handler_symbol(op, omissions, symbol, MAX_LEGACY_HANDLER_SYMBOL_BYTES).is_some()
         });
@@ -417,12 +419,11 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         summary.provenance.dedup();
         summary.limitation_codes.sort();
         summary.limitation_codes.dedup();
-        provenance.extend(summary.provenance.iter().cloned());
-        limitation_codes.extend(summary.limitation_codes.iter().cloned());
         // Even a singleton summary has no end line. Multiple claims also lack
         // the symbol/location associations, so none can be chosen as a winner.
-        let reason =
-            if let (1, Some(handler)) = (summary.claim_count, &mut summary.single_claim_handler) {
+        let location_supplied = summary.single_claim_handler.is_some();
+        let reason = match (summary.claim_count, summary.single_claim_handler.take()) {
+            (1, Some(mut handler)) => {
                 handler.line_end = None;
                 if safe_handler_path(op, omissions, &handler.path)
                     && checked_handler_symbol(
@@ -433,20 +434,26 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
                     )
                     .is_some()
                 {
-                    handlers.push(handler.clone());
+                    summary.single_claim_handler = Some(handler);
                 }
                 "source_end_line_unavailable"
-            } else {
-                summary.single_claim_handler = None;
-                "per_claim_locations_unavailable"
-            };
-        omit(omissions, &op.operation_id, "source".to_owned(), reason);
-        omit(
-            omissions,
-            &op.operation_id,
-            "confidence".to_owned(),
-            "per_claim_confidence_unavailable",
-        );
+            }
+            _ => "per_claim_locations_unavailable",
+        };
+        if !claims_available || location_supplied {
+            omit(omissions, &op.operation_id, "source".to_owned(), reason);
+        }
+        if !claims_available {
+            provenance.extend(summary.provenance.iter().cloned());
+            limitation_codes.extend(summary.limitation_codes.iter().cloned());
+            handlers.extend(summary.single_claim_handler.iter().cloned());
+            omit(
+                omissions,
+                &op.operation_id,
+                "confidence".to_owned(),
+                "per_claim_confidence_unavailable",
+            );
+        }
         if summary.handler_conflict {
             omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
         }
@@ -536,8 +543,19 @@ fn exact_claim_metadata(
     if handler_conflict {
         omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
     }
+    let projection = match op.catalog_summary.as_ref().map(|s| s.claim_count.cmp(&rows.len())) {
+        Some(std::cmp::Ordering::Greater) => {
+            omit(omissions, &op.operation_id, "claims".to_owned(), "claims_projection_partial");
+            "partial"
+        }
+        Some(std::cmp::Ordering::Less) => {
+            omit(omissions, &op.operation_id, "claims".to_owned(), "claim_count_mismatch");
+            "inconsistent"
+        }
+        _ => "available",
+    };
     let metadata = json!({
-        "claims_projection": "available",
+        "claims_projection": projection,
         "claim_count": rows.len(),
         "handler_symbols": safe_symbols,
         "handler_conflict": handler_conflict,
@@ -578,16 +596,29 @@ fn checked_handler_symbol<'a>(
     symbol: &'a str,
     max_bytes: usize,
 ) -> Option<&'a str> {
-    let safe = symbol.len() <= max_bytes
-        && !symbol.chars().any(|c| c == '/' || c == '\\' || c.is_control());
-    let matches_claim_bound =
-        max_bytes != MAX_CLAIM_HANDLER_SYMBOL_BYTES || (!symbol.is_empty() && symbol.is_ascii());
-    if safe && matches_claim_bound {
+    let safe = symbol.len() <= max_bytes && !symbol.chars().any(|c| c == '\\' || c.is_control());
+    let safe_shape = if max_bytes == MAX_CLAIM_HANDLER_SYMBOL_BYTES {
+        !symbol.is_empty()
+            && symbol.is_ascii()
+            && (!symbol.contains('/') || safe_symbolic_path(symbol))
+    } else {
+        !symbol.contains('/')
+    };
+    if safe && safe_shape {
         Some(symbol)
     } else {
         omit(omissions, &op.operation_id, "handler".to_owned(), "handler_symbol_invalid");
         None
     }
+}
+
+fn safe_symbolic_path(symbol: &str) -> bool {
+    let (path, member) = symbol.split_once('#').unwrap_or((symbol, ""));
+    // Restrict the path spelling so prefixed absolute paths, URLs and escaped
+    // path components cannot pass as repository-relative symbols.
+    !member.contains('/')
+        && xtrace_domain::is_safe_repo_relative_path(path)
+        && path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-$@+".contains(&b))
 }
 
 fn safe_handler_path(op: &OperationInput, omissions: &mut BTreeSet<Omission>, path: &str) -> bool {
@@ -608,7 +639,22 @@ pub(crate) fn catalog_metadata(op: &PreparedOp) -> Value {
     if !op.claims_available {
         metadata["claims_projection"] = json!("unavailable");
     }
-    if let Some(summary) = &op.catalog_summary {
+    if let Some(summary) = &op.catalog_summary
+        && op.claims_available
+    {
+        let mut aggregate = json!({
+            "claim_count": summary.claim_count,
+            "handler_symbols": summary.handler_symbols,
+            "handler_conflict": summary.handler_conflict,
+            "highest_confidence_basis_points": summary.highest_confidence_basis_points,
+            "provenance": summary.provenance,
+            "limitation_codes": summary.limitation_codes,
+        });
+        if let Some(handler) = &summary.single_claim_handler {
+            aggregate["single_claim_handler"] = handler_json(handler);
+        }
+        metadata["catalog_summary"] = aggregate;
+    } else if let Some(summary) = &op.catalog_summary {
         metadata["claim_count"] = json!(summary.claim_count);
         metadata["handler_symbols"] = json!(summary.handler_symbols);
         metadata["handler_conflict"] = json!(summary.handler_conflict);
@@ -617,10 +663,11 @@ pub(crate) fn catalog_metadata(op: &PreparedOp) -> Value {
         metadata["source_locations"] = json!("per-claim locations unavailable");
         metadata["claim_confidence"] = json!("not available per claim");
     }
-    if !op.provenance.is_empty() || op.catalog_summary.is_some() {
+    let summary_only = !op.claims_available && op.catalog_summary.is_some();
+    if !op.provenance.is_empty() || summary_only {
         metadata["provenance"] = json!(op.provenance);
     }
-    if !op.limitation_codes.is_empty() || op.catalog_summary.is_some() {
+    if !op.limitation_codes.is_empty() || summary_only {
         metadata["limitation_codes"] = json!(op.limitation_codes);
     }
     if let Some(bp) = op.confidence_bp {

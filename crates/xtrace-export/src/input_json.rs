@@ -231,10 +231,14 @@ fn catalog_summary(value: &Value, at: &str) -> Result<CatalogSummaryInput, Strin
             .collect::<Result<Vec<_>, _>>()
     };
     let count = n(o, "claim_count", at)?.ok_or_else(|| format!("{at}.claim_count: required"))?;
+    let handler_symbols = strings("handler_symbols")?;
+    let distinct_handlers = handler_symbols
+        .first()
+        .is_some_and(|first| handler_symbols.iter().any(|symbol| symbol != first));
     Ok(CatalogSummaryInput {
         claim_count: usize::try_from(count).map_err(|_| format!("{at}.claim_count: too large"))?,
-        handler_symbols: strings("handler_symbols")?,
-        handler_conflict: b(o, "handler_conflict", false, at)?,
+        handler_symbols,
+        handler_conflict: b(o, "handler_conflict", distinct_handlers, at)?,
         single_claim_handler: non_null(o, "single_claim_handler")
             .map(|value| handler(value, &format!("{at}.single_claim_handler")))
             .transpose()?,

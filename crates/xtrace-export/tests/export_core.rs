@@ -106,13 +106,32 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
     withheld["route_template"] = json!("/withheld");
     withheld["claims_available"] = json!(false);
     doc["operations"].as_array_mut().unwrap().push(withheld);
+    let mut partial = doc["operations"][0].clone();
+    partial["operation_id"] = json!("partial");
+    partial["route_template"] = json!("/partial");
+    partial["claims"].as_array_mut().unwrap().truncate(1);
+    doc["operations"].as_array_mut().unwrap().push(partial);
+    let mut consistent = doc["operations"][0].clone();
+    consistent["operation_id"] = json!("consistent");
+    consistent["route_template"] = json!("/consistent");
+    consistent["catalog_summary"]["claim_count"] = json!(3);
+    consistent["catalog_summary"]["provenance"].as_array_mut().unwrap().push(json!("runtime_hint"));
+    doc["operations"].as_array_mut().unwrap().push(consistent);
     let input = xtrace_export::input_json::parse(&doc).unwrap();
     assert!(input.operations[0].claims_available);
     assert!(!input.operations[1].claims_available);
     assert!(!input.operations[2].claims_available);
+    let aggregate = json!({
+        "claim_count": 2,
+        "handler_conflict": true, "handler_symbols": ["First.get", "Second.get"],
+        "highest_confidence_basis_points": 8200,
+        "provenance": ["adapter_registration", "static_analysis"],
+        "limitation_codes": ["missing_extent", "missing_schema"]
+    });
     let expected_legacy = json!({
         "operation_id": "legacy", "application_component": "", "binding_key": "",
-        "effective_state": "unknown", "claims_projection": "available", "claim_count": 3,
+        "effective_state": "unknown", "claims_projection": "inconsistent", "claim_count": 3,
+        "catalog_summary": aggregate,
         "handler_conflict": true, "handler_symbols": ["First.get", "Second.get"],
         "handlers": [first, second], "confidence_basis_points": 6500,
         "provenance": ["adapter_registration", "runtime_hint", "static_analysis"],
@@ -129,6 +148,21 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
                 "handler_symbol": null, "source_evidence": null}
         ]
     });
+    let expected_partial = json!({
+        "operation_id": "partial", "application_component": "", "binding_key": "",
+        "effective_state": "unknown", "claims_projection": "partial", "claim_count": 1,
+        "catalog_summary": aggregate,
+        "handler_conflict": false, "handler_symbols": ["Second.get"],
+        "handlers": [second], "confidence_basis_points": 6500,
+        "provenance": ["static_analysis"], "limitation_codes": ["missing_schema"],
+        "claims": [expected_legacy["claims"][1]]
+    });
+    let mut expected_consistent = expected_legacy.clone();
+    expected_consistent["operation_id"] = json!("consistent");
+    expected_consistent["claims_projection"] = json!("available");
+    expected_consistent["catalog_summary"]["claim_count"] = json!(3);
+    expected_consistent["catalog_summary"]["provenance"] =
+        json!(["adapter_registration", "runtime_hint", "static_analysis"]);
     let expected_summary = json!({
         "operation_id": "summary", "application_component": "", "binding_key": "",
         "effective_state": "unknown", "claims_projection": "unavailable", "claim_count": 2,
@@ -145,12 +179,14 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
         [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
     {
         let out = export(&input, &ExportRequest::new(format)).unwrap();
-        assert_eq!(out.operation_count, 3, "{format:?}");
+        assert_eq!(out.operation_count, 5, "{format:?}");
         let file = |path| text(out.files.iter().find(|f| f.path == path).unwrap());
         for (route, expected) in [
             ("legacy", &expected_legacy),
             ("summary", &expected_summary),
             ("withheld", &expected_withheld),
+            ("partial", &expected_partial),
+            ("consistent", &expected_consistent),
         ] {
             let postman = || {
                 let doc: Value = serde_json::from_str(file("collection.postman.json")).unwrap();
@@ -201,10 +237,26 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
             assert!(
                 out.omissions.iter().any(|o| o.operation_id == "withheld" && o.reason == reason)
             );
+            assert!(!out.omissions.iter().any(|o| {
+                ["legacy", "partial", "consistent"].contains(&o.operation_id.as_str())
+                    && o.reason == reason
+            }));
+        }
+        for (operation_id, reason) in
+            [("partial", "claims_projection_partial"), ("legacy", "claim_count_mismatch")]
+        {
             assert!(
-                !out.omissions.iter().any(|o| o.operation_id == "legacy" && o.reason == reason)
+                out.omissions.iter().any(|o| o.operation_id == operation_id && o.reason == reason)
+            );
+            assert!(
+                !out.omissions.iter().any(|o| o.operation_id == "consistent" && o.reason == reason)
             );
         }
+        assert!(
+            out.omissions
+                .iter()
+                .any(|o| o.operation_id == "partial" && o.reason == "handler_conflict_unresolved")
+        );
     }
 }
 
@@ -302,6 +354,7 @@ fn mixed_serialized_claims_retain_independent_handler_locations() {
     let claim = |id: &str| claims.iter().find(|c| c["claim_id"] == id).unwrap();
     assert_eq!(expected["provenance"], json!([""]));
     assert_eq!(expected["handler_conflict"], true);
+    assert_eq!(expected["catalog_summary"]["highest_confidence_basis_points"], Value::Null);
     assert!(expected.get("handlers").is_none());
     assert_eq!(
         expected["handler_symbols"],

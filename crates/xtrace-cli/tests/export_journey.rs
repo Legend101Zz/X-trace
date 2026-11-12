@@ -447,10 +447,12 @@ fn assert_refused(fx: &Fx, format: &str, needle: &str) {
 
 #[test]
 fn secret_shaped_handler_text_is_refused_by_every_format_with_the_policy_exit_code() {
-    let leaky = TRANSCRIPT.replace("OrderController.get", "password=hunter2hunter2");
-    let fx = project_with_catalog(&leaky);
-    for format in ["openapi", "postman", "curl", "bundle"] {
-        assert_refused(&fx, format, "hunter2");
+    for symbol in ["password=hunter2hunter2", "src/routes.js#password:hunter2hunter2"] {
+        let leaky = TRANSCRIPT.replace("OrderController.get", symbol);
+        let fx = project_with_catalog(&leaky);
+        for format in ["openapi", "postman", "curl", "bundle"] {
+            assert_refused(&fx, format, "hunter2");
+        }
     }
 }
 
@@ -866,6 +868,108 @@ fn claim_transcript(route: &str, symbols: &[String]) -> String {
     )
     .unwrap();
     transcript
+}
+
+#[test]
+fn export_persisted_path_bearing_handler_symbols_across_formats() {
+    use serde_json::json;
+
+    let relative = "src/routes.js#list";
+    let unsafe_symbols = [
+        ("/home/export-owner-private/routes.js#list", "export-owner-private"),
+        ("src/../traversal-private.js#list", "traversal-private"),
+        ("Q:/drive-private.js#list", "drive-private"),
+        (r"Q:\backslash-private.js#list", "backslash-private"),
+        (r"\\host\share\unc-private.js#list", "unc-private"),
+        ("src/routes.js#/embedded-private.js", "embedded-private"),
+        ("src/..#terminal-traversal", "terminal-traversal"),
+    ];
+    let symbols: Vec<_> = std::iter::once(relative)
+        .chain(unsafe_symbols.iter().map(|(symbol, _)| *symbol))
+        .map(str::to_owned)
+        .collect();
+    let fx = fx();
+    let src = fx.repo.join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("Handlers.java"), "// handler\n".repeat(symbols.len())).unwrap();
+    let analyzer = fx.write_analyzer(&claim_transcript("/handlers", &symbols));
+    let scan = fx.scan(&analyzer);
+    assert_eq!(scan.status.code(), Some(0), "{scan:?}");
+    let ids: Vec<_> = {
+        let connection = rusqlite::Connection::open(fx.database()).unwrap();
+        symbols
+            .iter()
+            .map(|symbol| {
+                let (id, claim) = stored_claim(&connection, symbol);
+                assert_eq!(claim["handler_symbol"], *symbol);
+                uuid::Uuid::from_slice(&id).unwrap().to_string()
+            })
+            .collect()
+    };
+
+    let mut expected = Value::Null;
+    for format in ["openapi", "postman", "curl", "bundle"] {
+        let out = fx.out_dir(&format!("handler-symbols-{format}"));
+        let result = fx.export(&["--format", format, "--output", out.to_str().unwrap()]);
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        assert!(
+            json(&result)["omissions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|omission| omission["reason"] == "handler_symbol_invalid")
+        );
+        let files = tree(&out);
+        for (name, bytes) in &files {
+            let text = std::str::from_utf8(bytes).unwrap();
+            for (_, fragment) in unsafe_symbols {
+                assert!(!text.contains(fragment), "{format} {name} leaked {fragment}");
+            }
+        }
+        let postman = || {
+            let collection: Value =
+                serde_json::from_str(&read(&out, "collection.postman.json")).unwrap();
+            comment_metadata(collection["item"][0]["request"]["description"].as_str().unwrap())
+                .unwrap()
+        };
+        let curl = || {
+            let (_, bytes) =
+                files.iter().find(|(name, _)| name.ends_with("-get-handlers.sh")).unwrap();
+            comment_metadata(std::str::from_utf8(bytes).unwrap()).unwrap()
+        };
+        let metadata = match format {
+            "openapi" => openapi_metadata(&out, "/handlers", "get"),
+            "postman" => postman(),
+            "curl" => curl(),
+            "bundle" => {
+                let block = xtrace_export::canonical::yaml(&json!({"x-xtrace": expected}))
+                    .lines()
+                    .map(|line| format!("      {line}\n"))
+                    .collect::<String>();
+                assert!(read(&out, "openapi.yaml").contains(&block));
+                assert_eq!(postman(), curl());
+                postman()
+            }
+            _ => unreachable!(),
+        };
+        if format == "openapi" {
+            assert_eq!(metadata["claims_projection"], "available");
+            assert_eq!(metadata["claim_count"], ids.len());
+            assert_eq!(metadata["handler_conflict"], true);
+            assert_eq!(metadata["handler_symbols"], json!([relative]));
+            let claims = metadata["claims"].as_array().unwrap();
+            assert_eq!(claims.len(), ids.len());
+            for (index, id) in ids.iter().enumerate() {
+                let row = claims.iter().find(|claim| claim["claim_id"] == *id).unwrap();
+                let symbol = if index == 0 { json!(relative) } else { Value::Null };
+                assert_eq!(row.get("handler_symbol"), Some(&symbol));
+                assert_eq!(row["source_evidence"][0]["relative_path"], "Handlers.java");
+                assert_eq!(row["source_evidence"][0]["start_line"], index + 1);
+            }
+            expected = metadata.clone();
+        }
+        assert_eq!(metadata, expected, "{format}");
+    }
 }
 
 #[test]
