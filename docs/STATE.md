@@ -1,7 +1,7 @@
 # X-trace: current state
 
 The one place for "where are we". Rewrite it (do not append) at the end of every working session. History lives in
-`docs/progress.md` and in git. Last updated: 2026-11-11.
+`docs/progress.md` and in git. Last updated: 2026-11-12.
 
 ## Release status
 
@@ -42,38 +42,45 @@ The Petclinic campaign in run `43024105219` passed 37 of 45 steps. The other eig
 
 ## Wave 3 handoff
 
-[Draft PR #70](https://github.com/Legend101Zz/X-trace/pull/70) tracks `wave/w3`; the tracker is
-[#69](https://github.com/Legend101Zz/X-trace/issues/69). Main remains at `f92f0bf`. Wave changes are not merged:
+[Draft PR #70](https://github.com/Legend101Zz/X-trace/pull/70) tracks `wave/w3` under
+[#69](https://github.com/Legend101Zz/X-trace/issues/69). Main remains at `f92f0bf`. The current batch is
+unmerged and awaits fresh exact-head Linux CI. `ef29c58` delivered the caught-panic source-line and workload-poison
+fixes.
 
-- `ef29c58` implements the two carried review minors. Independent review found no issues.
-- `94fa938` implements [#22](https://github.com/Legend101Zz/X-trace/issues/22) attach port and readiness
-  diagnostics. The Java attach-helper and four Rust test binaries compile; formatting and diff checks passed.
-  No tests ran locally. #22 remains open. Both readiness reviews are complete, with no blocker or major findings.
-  One review has no actionable findings. The other found a minor race at
-  `crates/xtrace-cli/tests/common/spring_readiness.rs:84`: stdout disconnect can be reported before the stderr
-  reader samples an already-produced diagnostic. The existing test drains stderr before formatting the failure.
-  Carry this to the next fix batch under the minor rule, preserving deadlines and bounded waiting on inherited pipes.
+- [#22](https://github.com/Legend101Zz/X-trace/issues/22) adds attach port and readiness diagnostics. The latest
+  local change also addresses the carried stderr reporting race with coordination capped by the original startup
+  deadline. Four CLI test binaries compile; formatting and diff checks passed. Review found no blocker or major;
+  one minor remains: the inherited-stderr regression does not cover the 250 ms grace cap with a longer caller
+  deadline. Carry a synchronized case that verifies readiness reports while stderr remains open and before that
+  deadline to the next fix batch. Runtime verification awaits CI. #22 remains open.
+- [#71](https://github.com/Legend101Zz/X-trace/issues/71) tracks the floor timeout diagnosis. The local diagnostics
+  change publishes bounded, validated gate, command and Rust progress and fixed store profiles through the existing
+  sanitize and upload path, separate from strict receipt acceptance. It cannot promise artifacts if the runner is
+  lost or teardown is skipped. Nine Python modules compile. Reviews found no blocker or major; one minor remains:
+  final failure-summary framing can leave `harnessResultObserved` false. Carry it to the next fix batch.
+- The local storage change replaces per-envelope SQL point queries for frame verification with one inclusive range
+  query per decoded segment in the existing read transaction. Source work-count analysis identified at least
+  1,958,576 point queries in the focused replay. Row checks, admission, snapshot, XTF verification, budgets and
+  whole-recording honesty remain in place. Store check, Clippy, library test compilation, formatting and diff checks
+  passed. Reviews found no blocker or major; one minor is that the counter checks the current range statement and
+  could miss a future additional statement. Carry it to the next fix batch. Runtime equivalence, the query-count
+  assertion and floor timing await CI; the effect of batching on floor runtime remains unmeasured.
 
-Post-merge main CI [43042206403](https://github.com/Legend101Zz/X-trace/actions/runs/43042206403), attempt 4,
-completed with four jobs failing setup on Ubuntu mirror DNS. In release-tool-tests, apt setup failed before tests;
-in the other three jobs, some earlier tests ran but later browser-dependent checks were not reached. These setup
-errors establish no product-test failure. Only the failed jobs were rerun as attempt 5, which is pending.
-The first wave CI [43057483505](https://github.com/Legend101Zz/X-trace/actions/runs/43057483505) on `6a46c76`
-likewise failed apt DNS setup in release-tool-tests before tests; it provides no green acceptance. Wave exact-head
-run [43059725537](https://github.com/Legend101Zz/X-trace/actions/runs/43059725537) is pending.
-Broader feature work and merge remain gated on green main and exact-head CI. No macOS CI is requested.
+Post-merge main CI [43042206403](https://github.com/Legend101Zz/X-trace/actions/runs/43042206403) attempt 5
+completed with Ubuntu DNS setup failures. Wave run
+[43061181831](https://github.com/Legend101Zz/X-trace/actions/runs/43061181831) attempt 2 passed
+release-tool-tests, main gates, Java 17/21, Node and the JDK 21/Node 24 floor (23/23). The JDK 17/Node 22
+floor hit the 120-minute job limit and `ci-ok` failed. Its sanitizer rejected an incomplete receipt and upload
+succeeded; the rejected summary's zero gate count does not establish that no tests ran. The focused store binary
+completed in 3202.711 seconds, compared with 2152.296 seconds focused and 2167.236 seconds workspace on the
+JDK 21 floor. A missing workspace fragment leaves the command active at cancellation unknown. The real timeout was
+not rerun. New regressions await CI; no local runtime tests ran and no deadlines or budgets changed.
 
-After infrastructure clears, finish [#3](https://github.com/Legend101Zz/X-trace/issues/3):
-
-1. [#32](https://github.com/Legend101Zz/X-trace/issues/32): exact export claims and a truthful policy digest.
-2. [#36](https://github.com/Legend101Zz/X-trace/issues/36): observed per-request burst correlation.
-3. [#52](https://github.com/Legend101Zz/X-trace/issues/52): bounded observed cause types, with an explicitly
-   scoped contract/ADR ticket.
-4. Then [#4](https://github.com/Legend101Zz/X-trace/issues/4), followed by #5 and #6 in parallel, #7, #8 and #9.
-
-Integrate and review the work, obtain exact-head Linux CI, and run a fresh packaged Petclinic campaign before
-assessing #3 acceptance. Close an issue only when every box has evidence on merged `main`. See `docs/INDEX.md`
-for the plans and release documents.
+To finish [#3](https://github.com/Legend101Zz/X-trace/issues/3), address #32 (exact export claims and policy
+digest), #36 (observed per-request burst correlation), and #52 (bounded observed cause types with a scoped
+contract/ADR ticket), then #4, #5 and #6 in parallel, #7, #8 and #9. Integrate and review the work, obtain
+exact-head Linux `ci-ok` and clean reviews, and run a fresh packaged Petclinic campaign before assessing #3.
+No fresh campaign has run for this batch. Close an issue only with evidence for every box on merged `main`.
 
 ## Petclinic accommodations and remaining evidence
 
@@ -97,7 +104,7 @@ Three green exact-head runs remain unestablished.
 
 ## Branches
 
-- `wave/w3` is based on main at `f92f0bf`; readiness reviews are complete and green CI is pending.
+- `wave/w3` is based on main at `f92f0bf`; the reviewed batch awaits fresh exact-head CI.
 - Wave branches (`wave/<n>`) are deleted after their merge and a green post-merge `main`.
 
 ## Waiting for the owner
