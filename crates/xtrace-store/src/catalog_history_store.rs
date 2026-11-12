@@ -12,9 +12,7 @@ use xtrace_application::catalog_discovery::history::{
     RevisionEntry, RunEntry,
 };
 use xtrace_application::{CatalogChangeKind, CatalogSourceAvailability, PortError, PortErrorKind};
-use xtrace_domain::catalog_discovery::{
-    ClaimSourceEvidence, MAX_CLAIM_SOURCE_EVIDENCE, MAX_DISCOVERY_RUN_CLAIMS,
-};
+use xtrace_domain::catalog_discovery::{ClaimSourceEvidence, MAX_CLAIM_SOURCE_EVIDENCE};
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     CatalogRevisionId, ContentHash, CorrelationId, OperationId, ProjectId, RunId, SourceRevisionId,
@@ -186,7 +184,6 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
         revision_id: CatalogRevisionId,
     ) -> Result<Vec<OperationView>, PortError> {
         let connection = self.store.lock().map_err(map_store)?;
-        let mut claims = load_claims(&connection, project_id, revision_id)?;
         let mut statement = connection
             .prepare(
                 "SELECT e.operation_id, e.operation_version_id, e.change_kind, e.source_availability, \
@@ -224,6 +221,7 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
         if rows.len() > MAX_REVISION_OPERATIONS {
             return Err(corrupt());
         }
+        let mut claims = load_claims(&connection, project_id, revision_id)?;
         let mut views = Vec::with_capacity(rows.len());
         for row in rows {
             let operation_id: OperationId = id(&row.0)?;
@@ -371,63 +369,77 @@ struct StoredClaimFields {
     source_evidence: Vec<ClaimSourceEvidence>,
 }
 
+#[derive(Default)]
+struct OperationClaims {
+    json_bytes: usize,
+    claims: Vec<([u8; 32], RevisionClaim)>,
+}
+
 fn load_claims(
     connection: &Connection,
     project_id: ProjectId,
     revision_id: CatalogRevisionId,
 ) -> Result<BTreeMap<OperationId, Vec<RevisionClaim>>, PortError> {
-    // Use the run's claim-count limit and the discovery store's per-claim JSON ceiling.
-    // Reject over-limit and missing rows without fetching oversized payloads or truncating.
+    // Match the discovery reader's per-operation limits. A revision can combine scopes.
+    const MAX_OPERATION_CLAIMS: usize = 4096;
+    const MAX_OPERATION_CLAIM_JSON_BYTES: usize = 4 * 1024 * 1024;
     const MAX_CLAIM_JSON_BYTES: i64 = 16 * 1024;
+    // Stream the revision index without a SQL sort of claim payloads. The operation cap
+    // and the count and byte ceilings below bound the rows retained for the whole revision.
     let mut statement = connection
         .prepare(
-            "SELECT rc.operation_id, rc.claim_id, \
+            "SELECT rc.operation_id, rc.claim_id, c.claim_digest, \
                     CASE WHEN length(CAST(c.canonical_json AS BLOB)) <= ?3 THEN c.canonical_json END \
              FROM catalog_revision_claims rc \
              LEFT JOIN catalog_claims c ON c.project_id = rc.project_id \
                  AND c.operation_id = rc.operation_id AND c.claim_id = rc.claim_id \
-             WHERE rc.project_id = ?1 AND rc.revision_id = ?2 \
-             ORDER BY rc.operation_id, c.claim_digest, rc.claim_id LIMIT ?4",
+             WHERE rc.project_id = ?1 AND rc.revision_id = ?2",
         )
         .map_err(map_sql)?;
-    let rows = statement
-        .query_map(
-            params![
-                bytes(&project_id),
-                bytes(&revision_id),
-                MAX_CLAIM_JSON_BYTES,
-                i64::try_from(MAX_DISCOVERY_RUN_CLAIMS + 1).map_err(|_| corrupt())?
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
+    let mut rows = statement
+        .query(params![bytes(&project_id), bytes(&revision_id), MAX_CLAIM_JSON_BYTES])
         .map_err(map_sql)?;
-    let mut by_operation: BTreeMap<OperationId, Vec<RevisionClaim>> = BTreeMap::new();
-    for (index, row) in rows.enumerate() {
-        let (operation, claim, json) = row.map_err(map_sql)?;
-        if index >= MAX_DISCOVERY_RUN_CLAIMS {
+    let mut by_operation = BTreeMap::<OperationId, OperationClaims>::new();
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        let operation_id = id(&row.get::<_, Vec<u8>>(0).map_err(map_sql)?)?;
+        let operation = by_operation.entry(operation_id).or_default();
+        if operation.claims.len() >= MAX_OPERATION_CLAIMS {
             return Err(corrupt());
         }
-        let fields: StoredClaimFields =
-            serde_json::from_str(&json.ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+        let json = row.get_ref(3).map_err(map_sql)?.as_str().map_err(|_| corrupt())?;
+        operation.json_bytes += json.len();
+        if operation.json_bytes > MAX_OPERATION_CLAIM_JSON_BYTES {
+            return Err(corrupt());
+        }
+        let fields: StoredClaimFields = serde_json::from_str(json).map_err(|_| corrupt())?;
         if fields.source_evidence.len() > MAX_CLAIM_SOURCE_EVIDENCE
             || fields.confidence_basis_points.is_some_and(|bp| bp > 10_000)
         {
             return Err(corrupt());
         }
-        by_operation.entry(id(&operation)?).or_default().push(RevisionClaim {
-            claim_id: id(&claim)?,
-            provenance: fields.provenance,
-            handler_symbol: fields.handler_symbol,
-            confidence_basis_points: fields.confidence_basis_points,
-            limitation_codes: fields.limitation_codes,
-            source_evidence: fields.source_evidence,
-        });
+        let digest =
+            row.get::<_, Vec<u8>>(2).map_err(map_sql)?.try_into().map_err(|_| corrupt())?;
+        operation.claims.push((
+            digest,
+            RevisionClaim {
+                claim_id: id(&row.get::<_, Vec<u8>>(1).map_err(map_sql)?)?,
+                provenance: fields.provenance,
+                handler_symbol: fields.handler_symbol,
+                confidence_basis_points: fields.confidence_basis_points,
+                limitation_codes: fields.limitation_codes,
+                source_evidence: fields.source_evidence,
+            },
+        ));
+        if by_operation.len() > MAX_REVISION_OPERATIONS {
+            return Err(corrupt());
+        }
     }
-    Ok(by_operation)
+    Ok(by_operation
+        .into_iter()
+        .map(|(id, mut operation)| {
+            // The history summary uses the first available location in claim digest order.
+            operation.claims.sort_unstable_by_key(|(digest, claim)| (*digest, claim.claim_id));
+            (id, operation.claims.into_iter().map(|(_, claim)| claim).collect())
+        })
+        .collect())
 }

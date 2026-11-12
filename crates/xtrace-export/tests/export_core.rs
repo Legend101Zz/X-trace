@@ -50,6 +50,150 @@ fn legacy_serialized_inputs_keep_summary_and_handler_gaps() {
     assert!(legacy.get("claims").is_none());
 }
 
+fn comment_metadata(text: &str) -> serde_json::Value {
+    let metadata = text
+        .lines()
+        .find_map(|line| line.trim_start_matches("# ").strip_prefix("x-xtrace catalog metadata: "))
+        .unwrap();
+    serde_json::from_str(metadata).unwrap()
+}
+
+#[test]
+fn mixed_serialized_claims_retain_independent_handler_locations() {
+    use serde_json::{Value, json};
+
+    let symbol = format!("{}.get", "A".repeat(508));
+    let oversized_symbol = "Z".repeat(513);
+    let evidence = json!({"kind": "runtime_hint", "relative_path": "Hint.java", "start_line": 8, "start_column": 1});
+    let input = xtrace_export::input_json::parse(&json!({
+        "operations": [{
+            "operation_id": "mixed", "method": "GET", "route_template": "/mixed",
+            "claims": [
+                {"claim_id": "conflicting", "handler_symbol": symbol,
+                    "handler": {"symbol": "Legacy.get", "path": "Legacy.java", "line_start": 4, "line_end": 6},
+                    "source_evidence": [evidence]},
+                {"claim_id": "evidence-only", "source_evidence": [evidence],
+                    "handler": {"symbol": "Legacy.hint", "path": "LegacyHint.java", "line_start": 12}},
+                {"claim_id": "symbol-only", "handler_symbol": "Current.get",
+                    "handler": {"symbol": "Legacy.other", "path": "LegacyOther.java", "line_start": 16}},
+                {"claim_id": "unsafe-path", "handler_symbol": "Safe.get",
+                    "handler": {"symbol": "Safe.get", "path": "../private-location.java", "line_start": 24}},
+                {"claim_id": "unsafe-symbol", "handler_symbol": oversized_symbol,
+                    "handler": {"symbol": "bad/symbol", "path": "UnsafeSymbol.java", "line_start": 28}}
+            ]
+        }]
+    }))
+    .unwrap();
+    let mut expected = Value::Null;
+    for format in
+        [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
+    {
+        let out = export(&input, &ExportRequest::new(format)).unwrap();
+        let file = |path| text(out.files.iter().find(|f| f.path == path).unwrap());
+        let postman = || {
+            let doc: Value = serde_json::from_str(file("collection.postman.json")).unwrap();
+            comment_metadata(doc["item"][0]["request"]["description"].as_str().unwrap())
+        };
+        let curl = || {
+            let recipe = out.files.iter().find(|f| f.path.ends_with("-get-mixed.sh")).unwrap();
+            comment_metadata(text(recipe))
+        };
+        let metadata = match format {
+            ExportFormat::OpenApi => {
+                let doc: Value = serde_json::from_str(file("openapi.json")).unwrap();
+                doc["paths"]["/mixed"]["get"]["x-xtrace"].clone()
+            }
+            ExportFormat::Postman => postman(),
+            ExportFormat::Curl => curl(),
+            ExportFormat::Bundle => {
+                let yaml = file("openapi.yaml");
+                for kept in [
+                    symbol.as_str(),
+                    "Legacy.java",
+                    "LegacyHint.java",
+                    "LegacyOther.java",
+                    "Hint.java",
+                ] {
+                    assert!(yaml.contains(kept), "bundle OpenAPI lost {kept}");
+                }
+                let readme = file("README.md");
+                assert!(
+                    readme.contains("available end lines and locations from conflicting claims")
+                );
+                assert!(readme.contains("producer assertions"));
+                assert_eq!(postman(), curl());
+                postman()
+            }
+        };
+        for f in &out.files {
+            for dropped in [
+                oversized_symbol.as_str(),
+                "bad/symbol",
+                "UnsafeSymbol.java",
+                "private-location.java",
+            ] {
+                assert!(!text(f).contains(dropped), "{} leaked unsafe input", f.path);
+            }
+        }
+        for reason in [
+            "handler_conflict_unresolved",
+            "handler_path_not_repo_relative",
+            "handler_symbol_invalid",
+        ] {
+            assert!(out.omissions.iter().any(|o| o.reason == reason), "{format:?} lost {reason}");
+        }
+        if format == ExportFormat::OpenApi {
+            expected = metadata.clone();
+        }
+        assert_eq!(metadata, expected);
+    }
+    let claims = expected["claims"].as_array().unwrap();
+    let claim = |id: &str| claims.iter().find(|c| c["claim_id"] == id).unwrap();
+    assert_eq!(expected["handler_conflict"], true);
+    assert!(expected.get("handlers").is_none());
+    assert_eq!(
+        expected["handler_symbols"],
+        json!([symbol, "Current.get", "Legacy.get", "Legacy.hint", "Legacy.other", "Safe.get"])
+    );
+    let conflicting = claim("conflicting");
+    assert_eq!(conflicting["handler_symbol"], symbol);
+    assert_eq!(
+        conflicting["handler_location"],
+        json!({"symbol": "Legacy.get", "path": "Legacy.java", "line_start": 4, "line_end": 6})
+    );
+    assert_eq!(conflicting["source_evidence"][0]["relative_path"], "Hint.java");
+    assert_eq!(conflicting["source_evidence"][0]["verification"], "unverified");
+    assert_eq!(claim("evidence-only")["handler_symbol"], Value::Null);
+    assert_eq!(
+        claim("evidence-only")["handler_location"],
+        json!({"symbol": "Legacy.hint", "path": "LegacyHint.java", "line_start": 12})
+    );
+    assert_eq!(claim("symbol-only")["handler_symbol"], "Current.get");
+    assert_eq!(claim("symbol-only")["handler_location"]["symbol"], "Legacy.other");
+    assert_eq!(claim("symbol-only")["source_evidence"], Value::Null);
+    assert!(claim("unsafe-path").get("handler_location").is_none());
+    assert!(claim("unsafe-symbol").get("handler_location").is_none());
+    assert_eq!(claim("unsafe-symbol")["handler_symbol"], Value::Null);
+}
+
+#[test]
+fn long_claim_symbols_still_pass_through_the_secret_gate() {
+    let mut input = spring_orders();
+    input.operations[0].claims[0].handler_symbol =
+        Some(format!("{}password=hunter2hunter2", "A".repeat(220)));
+    for format in
+        [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
+    {
+        assert!(
+            matches!(
+                export(&input, &ExportRequest::new(format)),
+                Err(xtrace_export::ExportError::SecretShaped { .. })
+            ),
+            "{format:?} accepted a secret-shaped symbol"
+        );
+    }
+}
+
 fn permute<T: Clone>(items: &[T], seed: u64) -> Vec<T> {
     let mut v = items.to_vec();
     let mut state = seed | 1;

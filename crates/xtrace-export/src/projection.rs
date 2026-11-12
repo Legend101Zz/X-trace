@@ -11,6 +11,10 @@ use crate::request::{
 };
 use crate::sanitize;
 
+const MAX_LEGACY_HANDLER_SYMBOL_BYTES: usize = 200;
+// ValidatedEndpointClaim's bound for a recorded handler symbol.
+const MAX_CLAIM_HANDLER_SYMBOL_BYTES: usize = 512;
+
 /// A disagreement between claims that is reported, never merged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Conflict {
@@ -400,11 +404,7 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         summary.handler_symbols.dedup();
         summary.handler_conflict |= summary.handler_symbols.len() > 1;
         summary.handler_symbols.retain(|symbol| {
-            let ok = valid_symbol(symbol);
-            if !ok {
-                omit(omissions, &op.operation_id, "handler".to_owned(), "handler_symbol_invalid");
-            }
-            ok
+            checked_handler_symbol(op, omissions, symbol, MAX_LEGACY_HANDLER_SYMBOL_BYTES).is_some()
         });
         summary.provenance.sort();
         summary.provenance.dedup();
@@ -433,37 +433,24 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
             omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
         }
     }
-    let mut handlers: Vec<HandlerInput> = claims.iter().filter_map(|c| c.handler.clone()).collect();
-    handlers.extend(catalog_summary.as_ref().and_then(|s| s.single_claim_handler.clone()));
-    handlers.sort_by(|a, b| {
-        (&a.path, a.line_start, &a.symbol).cmp(&(&b.path, b.line_start, &b.symbol))
-    });
-    handlers.dedup();
-    // Handler paths are source locations from claims: only repo-relative ones
-    // may leave the product (no absolute owner paths, `..`, backslashes).
-    handlers.retain(|h| {
-        let safe = xtrace_domain::is_safe_repo_relative_path(&h.path);
-        if !safe {
-            omit(
-                omissions,
-                &op.operation_id,
-                "handler".to_owned(),
-                "handler_path_not_repo_relative",
-            );
-        }
-        safe
-    });
-    // A symbol is a short identifier-like string; refuse path separators,
-    // control characters and oversize values.
-    handlers.retain(|h| {
-        let ok = valid_symbol(&h.symbol);
-        if !ok {
-            omit(omissions, &op.operation_id, "handler".to_owned(), "handler_symbol_invalid");
-        }
-        ok
-    });
-    if claim_metadata.is_some() {
-        handlers.clear();
+    let mut handlers = Vec::new();
+    if claim_metadata.is_none() {
+        handlers.extend(claims.iter().filter_map(|c| c.handler.clone()));
+        handlers.extend(catalog_summary.as_ref().and_then(|s| s.single_claim_handler.clone()));
+        handlers.sort_by(|a, b| {
+            (&a.path, a.line_start, &a.symbol).cmp(&(&b.path, b.line_start, &b.symbol))
+        });
+        handlers.dedup();
+        handlers.retain(|handler| {
+            safe_handler_path(op, omissions, &handler.path)
+                && checked_handler_symbol(
+                    op,
+                    omissions,
+                    &handler.symbol,
+                    MAX_LEGACY_HANDLER_SYMBOL_BYTES,
+                )
+                .is_some()
+        });
     }
     let request_media = claims.iter().filter_map(|c| c.request_body_media_type.clone()).min();
 
@@ -498,19 +485,28 @@ fn exact_claim_metadata(
     claims: &[&ClaimInput],
     omissions: &mut BTreeSet<Omission>,
 ) -> Value {
-    let mut symbols = BTreeSet::new();
+    let mut reported_symbols = BTreeSet::new();
+    let mut safe_symbols = BTreeSet::new();
     let mut rows = Vec::with_capacity(claims.len());
     for claim in claims {
-        let legacy_handler = claim
-            .handler
-            .as_ref()
-            .filter(|_| claim.source_evidence.is_none() && claim.handler_symbol.is_none());
-        let symbol = claim.handler_symbol.as_deref().or(legacy_handler.map(|h| h.symbol.as_str()));
-        symbols.extend(symbol);
-        let safe_symbol = symbol.filter(|symbol| valid_symbol(symbol));
-        if symbol.is_some() && safe_symbol.is_none() {
-            omit(omissions, &op.operation_id, "handler".to_owned(), "handler_symbol_invalid");
-        }
+        let persisted_symbol = claim.handler_symbol.as_deref();
+        reported_symbols.extend(persisted_symbol);
+        let safe_persisted_symbol = persisted_symbol.and_then(|symbol| {
+            checked_handler_symbol(op, omissions, symbol, MAX_CLAIM_HANDLER_SYMBOL_BYTES)
+        });
+        safe_symbols.extend(safe_persisted_symbol);
+        let safe_legacy_symbol = claim.handler.as_ref().and_then(|handler| {
+            reported_symbols.insert(handler.symbol.as_str());
+            checked_handler_symbol(op, omissions, &handler.symbol, MAX_LEGACY_HANDLER_SYMBOL_BYTES)
+        });
+        safe_symbols.extend(safe_legacy_symbol);
+        // A legacy-only row can still report its symbol. With new fields, the legacy
+        // symbol stays with its own location tuple.
+        let safe_symbol = if persisted_symbol.is_none() && claim.source_evidence.is_none() {
+            safe_legacy_symbol
+        } else {
+            safe_persisted_symbol
+        };
         let evidence = claim.source_evidence.as_ref().map(|items| {
             items.iter().map(|item| source_evidence_json(item, op, omissions)).collect::<Vec<_>>()
         });
@@ -522,23 +518,22 @@ fn exact_claim_metadata(
             "limitation_codes": claim.limitation_codes,
             "source_evidence": evidence,
         });
-        if let Some(handler) = legacy_handler
-            && valid_symbol(&handler.symbol)
-            && xtrace_domain::is_safe_repo_relative_path(&handler.path)
+        if let Some(handler) = &claim.handler
+            && safe_handler_path(op, omissions, &handler.path)
+            && safe_legacy_symbol.is_some()
         {
             row["handler_location"] = handler_json(handler);
         }
         rows.push(row);
     }
-    let handler_conflict = symbols.len() > 1;
+    let handler_conflict = reported_symbols.len() > 1;
     if handler_conflict {
         omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
     }
-    symbols.retain(|symbol| valid_symbol(symbol));
     json!({
         "claims_projection": "available",
         "claim_count": rows.len(),
-        "handler_symbols": symbols,
+        "handler_symbols": safe_symbols,
         "handler_conflict": handler_conflict,
         "claims": rows,
     })
@@ -570,8 +565,30 @@ fn source_evidence_json(
     value
 }
 
-fn valid_symbol(symbol: &str) -> bool {
-    symbol.len() <= 200 && !symbol.chars().any(|c| c == '/' || c == '\\' || c.is_control())
+fn checked_handler_symbol<'a>(
+    op: &OperationInput,
+    omissions: &mut BTreeSet<Omission>,
+    symbol: &'a str,
+    max_bytes: usize,
+) -> Option<&'a str> {
+    let safe = symbol.len() <= max_bytes
+        && !symbol.chars().any(|c| c == '/' || c == '\\' || c.is_control());
+    let matches_claim_bound =
+        max_bytes != MAX_CLAIM_HANDLER_SYMBOL_BYTES || (!symbol.is_empty() && symbol.is_ascii());
+    if safe && matches_claim_bound {
+        Some(symbol)
+    } else {
+        omit(omissions, &op.operation_id, "handler".to_owned(), "handler_symbol_invalid");
+        None
+    }
+}
+
+fn safe_handler_path(op: &OperationInput, omissions: &mut BTreeSet<Omission>, path: &str) -> bool {
+    let safe = xtrace_domain::is_safe_repo_relative_path(path);
+    if !safe {
+        omit(omissions, &op.operation_id, "handler".to_owned(), "handler_path_not_repo_relative");
+    }
+    safe
 }
 
 /// Catalog claim metadata carries the same associations, gaps and scope in every format.

@@ -803,7 +803,7 @@ fn secret_shaped_claim_evidence_is_refused_by_every_format() {
 /// Assemble a multi-scope revision from two real scans. Current scan scopes each
 /// publish their own revision; this fixture exercises the history port's wider
 /// revision representation without inventing operations or claim JSON.
-fn add_scope_to_revision(fx: &Fx, component: &str, binding: &str) -> String {
+fn add_scope_to_revision(fx: &Fx, component: &str, binding: &str, transcript: &str) -> String {
     let connection = rusqlite::Connection::open(fx.database()).unwrap();
     connection.pragma_update(None, "foreign_keys", true).unwrap();
     let original: Vec<u8> = connection
@@ -814,7 +814,7 @@ fn add_scope_to_revision(fx: &Fx, component: &str, binding: &str) -> String {
         )
         .unwrap();
     drop(connection);
-    let analyzer = fx.write_analyzer(TRANSCRIPT);
+    let analyzer = fx.write_analyzer(transcript);
     let scan = fx.scan_scope(&analyzer, component, binding);
     assert_eq!(scan.status.code(), Some(0), "{scan:?}");
     let connection = rusqlite::Connection::open(fx.database()).unwrap();
@@ -841,13 +841,160 @@ fn add_scope_to_revision(fx: &Fx, component: &str, binding: &str) -> String {
     uuid::Uuid::from_slice(&newer).unwrap().to_string()
 }
 
+fn claim_transcript(route: &str, symbols: &[String]) -> String {
+    use std::fmt::Write as _;
+
+    let mut transcript = TRANSCRIPT.lines().next().unwrap().to_owned();
+    transcript.push('\n');
+    for (index, symbol) in symbols.iter().enumerate() {
+        let line = index + 1;
+        let claim = serde_json::json!({
+            "type": "claim", "method": "GET", "routeParts": [route], "routeBasis": "literal",
+            "handler": symbol, "limitations": [],
+            "evidence": {"path": "Handlers.java", "startLine": line, "startColumn": 1,
+                         "endLine": line, "endColumn": 11}
+        });
+        writeln!(transcript, "{claim}").unwrap();
+    }
+    writeln!(
+        transcript,
+        "{}",
+        serde_json::json!({
+            "type": "end", "claims": symbols.len(), "filesScanned": 1, "complete": true,
+            "incompleteReasons": []
+        })
+    )
+    .unwrap();
+    transcript
+}
+
+#[test]
+fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
+    use xtrace_domain::catalog_discovery::MAX_DISCOVERY_RUN_CLAIMS;
+    use xtrace_domain::ids::Id as _;
+    use xtrace_domain::{ClaimId, ContentHash};
+
+    let fx = fx();
+    let src = fx.repo.join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("Handlers.java"), "// handler\n".repeat(MAX_DISCOVERY_RUN_CLAIMS)).unwrap();
+    let symbols: Vec<_> = (1..=MAX_DISCOVERY_RUN_CLAIMS).map(|i| format!("Fixture.h{i}")).collect();
+    let analyzer = fx.write_analyzer(&claim_transcript("/many", &symbols));
+    let scan = fx.scan(&analyzer);
+    assert_eq!(scan.status.code(), Some(0), "{scan:?}");
+    let long_symbol = format!("{}.get", "A".repeat(508));
+    let revision = add_scope_to_revision(
+        &fx,
+        "other-component",
+        "default",
+        &claim_transcript("/single", std::slice::from_ref(&long_symbol)),
+    );
+
+    let full = fx.out_dir("full");
+    let result = fx.export(&[
+        "--format",
+        "openapi",
+        "--revision",
+        &revision,
+        "--output",
+        full.to_str().unwrap(),
+    ]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(json(&result)["operationCount"], 2);
+    let many = openapi_metadata(&full, "/many", "get");
+    assert_eq!(many["claim_count"], MAX_DISCOVERY_RUN_CLAIMS);
+    assert_eq!(many["claims"].as_array().unwrap().len(), MAX_DISCOVERY_RUN_CLAIMS);
+    let single = openapi_metadata(&full, "/single", "get");
+    assert_eq!(single["claim_count"], 1);
+    assert_eq!(single["claims"][0]["handler_symbol"], long_symbol);
+    let selected_id = single["operation_id"].as_str().unwrap();
+    let selected = fx.out_dir("selected");
+    let result = fx.export(&[
+        "--format",
+        "openapi",
+        "--revision",
+        &revision,
+        "--operations",
+        selected_id,
+        "--output",
+        selected.to_str().unwrap(),
+    ]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(json(&result)["operationCount"], 1);
+    assert_eq!(openapi_metadata(&selected, "/single", "get"), single);
+    let spec: Value = serde_json::from_str(&read(&selected, "openapi.json")).unwrap();
+    assert_eq!(spec["paths"].as_object().unwrap().keys().collect::<Vec<_>>(), ["/single"]);
+
+    let mut connection = rusqlite::Connection::open(fx.database()).unwrap();
+    connection.pragma_update(None, "foreign_keys", true).unwrap();
+    let revision_id = uuid::Uuid::parse_str(&revision).unwrap();
+    let operation_id = uuid::Uuid::parse_str(many["operation_id"].as_str().unwrap()).unwrap();
+    let extra_id = ClaimId::new().as_uuid();
+    let extra_id = extra_id.as_bytes().as_slice();
+    let tx = connection.transaction().unwrap();
+    // The writer refuses oversized runs. Add one schema-valid row to exercise the read guard.
+    assert_eq!(tx.execute(
+        "INSERT INTO catalog_claims (claim_id, project_id, operation_id, claim_digest, canonical_bytes, canonical_json, first_revision_id, last_revision_id)
+         SELECT ?1, project_id, operation_id, ?2, canonical_bytes, canonical_json, first_revision_id, last_revision_id
+         FROM catalog_claims WHERE operation_id = ?3 ORDER BY claim_id LIMIT 1",
+        rusqlite::params![extra_id, ContentHash::of_bytes(extra_id).as_bytes().as_slice(), operation_id.as_bytes().as_slice()],
+    ).unwrap(), 1);
+    assert_eq!(
+        tx.execute(
+            "INSERT INTO catalog_revision_claims (project_id, revision_id, operation_id, claim_id)
+         SELECT project_id, ?1, operation_id, claim_id FROM catalog_claims WHERE claim_id = ?2",
+            rusqlite::params![revision_id.as_bytes().as_slice(), extra_id],
+        )
+        .unwrap(),
+        1
+    );
+    tx.commit().unwrap();
+    let assert_rejected = |name: &str| {
+        let out = fx.out_dir(name);
+        let result = fx.export(&[
+            "--format",
+            "openapi",
+            "--revision",
+            &revision,
+            "--output",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(result.status.code(), Some(5), "{result:?}");
+        assert!(result.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&result.stderr).unwrap();
+        assert_eq!(error["code"], "XTR-CLI-STORE-UNAVAILABLE");
+        assert!(
+            error["message"].as_str().unwrap().contains("catalog history evidence is inconsistent")
+        );
+        assert!(!out.exists());
+    };
+    assert_rejected("too-many-claims");
+
+    let tx = connection.transaction().unwrap();
+    assert_eq!(
+        tx.execute("DELETE FROM catalog_revision_claims WHERE claim_id = ?1", [extra_id]).unwrap(),
+        1
+    );
+    assert_eq!(
+        tx.execute("DELETE FROM catalog_claims WHERE claim_id = ?1", [extra_id]).unwrap(),
+        1
+    );
+    // JSON whitespace preserves the claim fields while exceeding only the operation byte cap.
+    assert_eq!(tx.execute(
+        "UPDATE catalog_claims SET canonical_json = canonical_json || ?1 WHERE operation_id = ?2",
+        rusqlite::params![" ".repeat(1024), operation_id.as_bytes().as_slice()],
+    ).unwrap(), MAX_DISCOVERY_RUN_CLAIMS);
+    tx.commit().unwrap();
+    assert_rejected("too-many-claim-bytes");
+}
+
 #[test]
 fn observations_keep_component_and_binding_scope_and_counts_match_each_format() {
     // Each axis must be checked independently. Canonical OpenAPI chooses the
     // unobserved scope first in both cases, so a route-only join fails visibly.
     for (component, binding) in [("a-component", "default"), ("spring-fixture", "a-binding")] {
         let fx = project_with_catalog(TRANSCRIPT);
-        let revision = add_scope_to_revision(&fx, component, binding);
+        let revision = add_scope_to_revision(&fx, component, binding, TRANSCRIPT);
         for format in ["openapi", "postman", "curl", "bundle"] {
             let out = fx.out_dir(&format!("scoped-{format}"));
             let result = fx.export(&[

@@ -88,11 +88,13 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
          openapi.yaml declares routes and required path parameters.\n\
          collection.postman.json contains requests with an empty baseUrl variable.\n\
          curl/ contains private shell recipes; all.sh only prints commands.\n\n\
-         Catalog state identifies declarations and linked observations. Handler conflicts\n\
-         and unavailable claim details are explicit. Single-claim handlers retain their\n\
-         source start line; end lines and multi-claim locations are unavailable. No request or\n\
-         response bodies were observed or retained. No trace objects or source snapshots\n\
-         are included. Nothing was sent or executed. Review recipes before running them.\n\n\
+         Catalog state identifies declarations and linked observations. Per-claim metadata\n\
+         retains recorded handler symbols, confidence, limitations and source evidence,\n\
+         including available end lines and locations from conflicting claims. Unknown fields\n\
+         and unavailable claim details are explicit. Source evidence reports unverified\n\
+         producer assertions. No request or response bodies were observed or retained.\n\
+         No trace objects or source snapshots are included. Nothing was sent or executed.\n\
+         Review recipes before running them.\n\n\
          manifest.json records revision, catalog hash, policy digest (null when unavailable),\n\
          file hashes, counts per format and omissions. OpenAPI can represent only one\n\
          operation per method and path; other scopes remain in Postman and cURL.\n\n\
