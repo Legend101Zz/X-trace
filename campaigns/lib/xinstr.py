@@ -540,26 +540,25 @@ def serial_frame_symbols(details: dict[str, dict], sent: list, burst: frozenset,
     return {sid: sorted(symbols) for sid, symbols in names.items()}
 
 
-def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[dict]], sent: list,
+def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[dict]],
                          burst: frozenset, boundary: dict | None, serial_boundary: dict | None,
                          evidence_ids: tuple[set[str], set[str]]) -> list[dict]:
     """Check each burst route once using its live boundary's recording IDs."""
     if boundary is None or (serial_boundary is not None and not serial_boundary["verified"]):
         return []
     serial_ids = set(serial_boundary["recordingIds"]) if serial_boundary is not None else set()
-    literals = frozenset(e["route"].rstrip("/") or "/" for exps in expectations.values()
-                         for e in exps if "{" not in e["route"])
     status_ids, source_ids = evidence_ids
     groups = []
     rows = {(row["method"], row["route"]): row for row in boundary["routes"]}
-    # Boundary rows cover sent requests. Expected routes with no requests still need a missing-recording diagnostic.
-    expected_routes = {(e["method"], e["route"]) for sid in burst for e in expectations.get(sid, [])}
-    for method, route in sorted(rows.keys() | expected_routes):
+    # A declaration contributes to the group even when its scenario sent no matching request.
+    route_checks: dict[tuple[str, str], list[dict]] = {}
+    for sid in sorted(burst):
+        for e in expectations.get(sid, []):
+            route_checks.setdefault((e["method"], e["route"]), []).append(e)
+    for method, route in sorted(rows.keys() | route_checks.keys()):
         row = rows.get((method, route))
         requests = row["requests"] if row is not None else 0
-        owners = {sid for sid, m, path in sent if sid in burst and m == method and _path_matches(path, route, literals)}
-        checks = [e for sid in sorted(owners or burst) for e in expectations.get(sid, [])
-                  if (e["method"], e["route"]) == (method, route)]
+        checks = route_checks.get((method, route), [])
         route_ids = set(row["recordingIds"]) - serial_ids if row is not None else set()
         # The reader leaves an HTTP error placeholder when the first detail page fails.
         matched = {rid: details[rid] for rid in sorted(route_ids) if rid in details and "_http" not in details[rid]}
@@ -582,8 +581,12 @@ def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[
             kind = (detail.get("outcome") or {}).get("kind")
             outcomes[recording_http_status(detail), kind if kind in observed_kinds else None] += 1
         with_status = {rid for rid, d in matched.items() if any(outcome_matches(d, e) for e in checks)}
+        need = sum(e.get("minCount", 1) for e in checks)
+        # Requests and declarations are separate lower bounds on the same recordings.
+        expected_recordings = max(requests, need)
         if checks and all("statuses" in e for e in checks):
             expected = sorted((status for e in checks for status in e["statuses"]), key=str)
+            expected_recordings = max(expected_recordings, len(expected))
             observed = sorted((recording_http_status(d) for d in matched.values()), key=str)
             if Counter(expected) != Counter(observed):
                 problems.append(f"http-outcome-multiset-mismatch(expected {expected}, saw {observed})")
@@ -594,7 +597,6 @@ def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[
                 problems.append("burst-outcome-expectations-differ")
             if len(with_status) != len(matched):
                 problems.append(f"http-outcome-count-mismatch(expected {len(matched)}, observed {len(with_status)})")
-        need = sum(e.get("minCount", 1) for e in checks)
         if len(with_status) < need:
             problems.append(f"count-below-minimum(need {need}, have {len(with_status)})")
         if any(kind not in OBSERVED_OUTCOME_KINDS for _, kind in outcomes):
@@ -614,6 +616,10 @@ def burst_route_evidence(details: dict[str, dict], expectations: dict[str, list[
         if different_frames:
             problems.append("burst-frame-expectations-differ")
         with_source = set()
+        # Missing boundary IDs and unreadable details for known IDs are separate evidence gaps.
+        missing = expected_recordings - len(route_ids)
+        if missing > 0:
+            problems.append(f"burst-boundary-recordings-missing(missing {missing})")
         source_problems = {"no-source-file-line"} if unread else set()
         for rid, detail in matched.items():
             checks_for_source = [layer_source_ok(detail, e.get("layers", []), e.get("layerHints", {}))
@@ -967,8 +973,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     finally:
         if viewer is not None:
             stop_process_group(viewer)
-    groups = burst_route_evidence(api["details"], expectations, sent_log, burst, boundary, serial_boundary,
-                                  burst_evidence_ids)
+    groups = burst_route_evidence(api["details"], expectations, burst, boundary, serial_boundary, burst_evidence_ids)
     if api["ok"]:
         verdicts = analyze(api["details"], expectations, sent_log, burst, boundary, serial_boundary)
 

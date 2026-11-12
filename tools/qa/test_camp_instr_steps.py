@@ -52,6 +52,36 @@ class T(unittest.TestCase):
         self.assertEqual(d["source-identity"][0], "fail")
         self.assertIn("source-binding-missing", d["source-identity"][1])
 
+    def test_missing_burst_boundary_recordings_fail_source_identity_with_other_sources(self):
+        for fully_dropped in (False, True):
+            with self.subTest(fully_dropped=fully_dropped):
+                observed = int(not fully_dropped)
+                scenarios = [sc("serial"), sc("burst-a", rec=False)]
+                problems = ["count-below-minimum(need 2, have 1)"]
+                if fully_dropped:
+                    problems = ["burst-route-count-mismatch(requests 1, recordings 0)", "no-recording-for-route",
+                                "count-below-minimum(need 1, have 0)"]
+                else:
+                    scenarios.append(sc("burst-b", rec=False))
+                problems.append("burst-boundary-recordings-missing(missing 1)")
+                classes = {"attribution-ambiguous": len(scenarios) - 1, **{p.split("(")[0]: 1 for p in problems}}
+                groups = [{"requests": 1, "recordingsMatchingRoute": observed,
+                           "recordingsWithSource": observed, "problems": problems}]
+                if fully_dropped:
+                    classes["burst-drops"] = 1
+                    groups.append({"requests": 1, "recordingsMatchingRoute": 1, "recordingsWithSource": 1, "problems": []})
+                sourced = 1 + sum(g["recordingsWithSource"] for g in groups)
+                r = {"scenarios": scenarios, "api": {"ok": True, "recordings": sourced},
+                     "burstRouteGroups": groups, "problemClasses": classes, "recordingsWithSource": sourced}
+                d = by(s.instrumented_steps(r))
+                self.assertEqual(d["instrumented-run"][0], "pass")
+                self.assertEqual(d["recordings-per-scenario"][0], "fail")
+                self.assertIn(f"1/{len(scenarios)} scenarios", d["recordings-per-scenario"][1])
+                self.assertIn('"burst-boundary-recordings-missing": 1', d["recordings-per-scenario"][1])
+                self.assertEqual(d["source-identity"][0], "fail")
+                self.assertIn(f"{sourced} recordings carry a matched .java file", d["source-identity"][1])
+                self.assertIn("burst-boundary-recordings-missing", d["source-identity"][1])
+
     def test_failed_readback_still_reports_unavailable_burst_details(self):
         r = {"scenarios": [sc("burst", rec=False)], "api": {"ok": False, "reason": "recordings list HTTP 503"},
              "burstRouteGroups": [{"problems": ["burst-recording-detail-unavailable(missing 2)", "no-source-file-line"]}],

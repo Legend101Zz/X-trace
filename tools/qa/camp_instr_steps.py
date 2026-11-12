@@ -76,7 +76,7 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
     problem_scope = "problems across scenario verdicts and burst route groups" if groups else "problems"
     problem_note = f"{problem_scope}: {json.dumps(pc, sort_keys=True)}"
     bad_src = [k for k in ("no-source-file-line", "source-binding-unacceptable", "source-binding-missing",
-                          "burst-recording-detail-unavailable") if pc.get(k)]
+                          "burst-recording-detail-unavailable", "burst-boundary-recordings-missing") if pc.get(k)]
     bad_src.extend(sorted({p for group in groups for p in group["problems"]
                            if p.startswith("no-") and p.endswith("-frame")}))
     source_note = f"; problems: {','.join(bad_src)}" if bad_src else ""
