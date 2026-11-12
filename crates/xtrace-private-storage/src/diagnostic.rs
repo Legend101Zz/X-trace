@@ -167,7 +167,7 @@ pub enum AdmissionOperation {
 }
 
 /// Privacy-safe facts about a failed admission. No error text or pathname is retained.
-#[derive(Clone, Copy, Eq, thiserror::Error)]
+#[derive(Clone, Copy, thiserror::Error)]
 #[error("operation={operation:?} kind={kind:?} raw_os_error={raw_os_error:?}")]
 pub struct AdmissionFailure {
     /// Failed operation, drawn from a fixed vocabulary.
@@ -187,6 +187,8 @@ impl PartialEq for AdmissionFailure {
             && self.raw_os_error == other.raw_os_error
     }
 }
+
+impl Eq for AdmissionFailure {}
 
 impl fmt::Debug for AdmissionFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
