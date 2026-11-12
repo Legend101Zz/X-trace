@@ -2247,14 +2247,20 @@ mod tests {
             assert!(!judge(&operation, &path, &directory));
             assert_linux_hooks_consumed();
             assert!(operation.judged.borrow().is_empty());
-            let PrivateStorageError::Admission(failure) = operation.failure(Step::AclState) else {
-                panic!("expected an admission refusal");
-            };
+            let error = operation.failure(Step::AclState);
+            let expected_operation =
+                if mutation == "missing" { Step::NamedMetadata } else { Step::Identity };
+            assert!(
+                matches!(error, PrivateStorageError::Admission(failure)
+                    if failure.operation == expected_operation),
+                "expected an admission refusal at {expected_operation:?}, got {error:?}"
+            );
             if mutation == "missing" {
-                assert_eq!(failure.operation, Step::NamedMetadata);
-                assert_eq!(failure.raw_os_error, Some(rustix::io::Errno::NOENT.raw_os_error()));
-            } else {
-                assert_eq!(failure.operation, Step::Identity);
+                assert!(
+                    matches!(error, PrivateStorageError::Admission(failure)
+                        if failure.raw_os_error == Some(rustix::io::Errno::NOENT.raw_os_error())),
+                    "expected ENOENT for a missing directory, got {error:?}"
+                );
             }
             if mutation == "private-mode" {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
