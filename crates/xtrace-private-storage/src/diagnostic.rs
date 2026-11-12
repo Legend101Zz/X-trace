@@ -1,11 +1,13 @@
 //! Admission diagnostics contain fixed vocabulary and numeric OS facts only.
 
-use std::io;
+use std::{fmt, io};
 
 /// Check sites, rather than paths, distinguish otherwise identical ACL-state refusals.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AdmissionSite {
     Snapshot,
+    #[cfg(target_os = "linux")]
+    ProbeSnapshot,
     ProbeState,
     MemoState,
     Filesystem,
@@ -13,10 +15,14 @@ pub(crate) enum AdmissionSite {
     Listing,
     #[cfg(target_os = "macos")]
     RecheckListing,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     RecheckAcl,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     RecheckState,
+    #[cfg(target_os = "linux")]
+    RecheckSnapshot,
+    #[cfg(target_os = "linux")]
+    RecheckProbe,
     #[cfg(target_os = "macos")]
     RecheckFilesystem,
 }
@@ -161,7 +167,7 @@ pub enum AdmissionOperation {
 }
 
 /// Privacy-safe facts about a failed admission. No error text or pathname is retained.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, thiserror::Error)]
 #[error("operation={operation:?} kind={kind:?} raw_os_error={raw_os_error:?}")]
 pub struct AdmissionFailure {
     /// Failed operation, drawn from a fixed vocabulary.
@@ -170,18 +176,60 @@ pub struct AdmissionFailure {
     pub kind: Option<io::ErrorKind>,
     /// OS error number, when the OS supplied one.
     pub raw_os_error: Option<i32>,
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    context: Option<AdmissionContext>,
+}
+
+impl PartialEq for AdmissionFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation == other.operation
+            && self.kind == other.kind
+            && self.raw_os_error == other.raw_os_error
+    }
+}
+
+impl Eq for AdmissionFailure {}
+
+impl fmt::Debug for AdmissionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut failure = formatter.debug_struct("AdmissionFailure");
+        failure
+            .field("operation", &self.operation)
+            .field("kind", &self.kind)
+            .field("raw_os_error", &self.raw_os_error);
+        // The default Linux test job captures Debug output without the artifact feature.
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        if let Some(context) = self.context {
+            failure.field("context", &context);
+        }
+        failure.finish()
+    }
 }
 
 impl AdmissionFailure {
+    const fn facts(
+        operation: AdmissionOperation,
+        kind: Option<io::ErrorKind>,
+        raw_os_error: Option<i32>,
+    ) -> Self {
+        Self {
+            operation,
+            kind,
+            raw_os_error,
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            context: None,
+        }
+    }
+
     pub(crate) fn check(operation: AdmissionOperation) -> Self {
-        let failure = Self { operation, kind: None, raw_os_error: None };
+        let failure = Self::facts(operation, None, None);
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
         ci::record(failure, None);
         failure
     }
 
     pub(crate) fn check_context(operation: AdmissionOperation, context: AdmissionContext) -> Self {
-        let failure = Self { operation, kind: None, raw_os_error: None };
+        let failure = Self::facts(operation, None, None);
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
         ci::record(failure, Some(context));
         // The context is not part of the returned error or the release diagnostic channel.
@@ -196,13 +244,19 @@ impl AdmissionFailure {
         failure
     }
 
-    pub(crate) fn io(operation: AdmissionOperation, error: impl Into<io::Error>) -> Self {
+    /// Build an I/O refusal from the error kind and errno, discarding the error text.
+    pub fn io(operation: AdmissionOperation, error: impl Into<io::Error>) -> Self {
         let error = error.into();
-        let failure =
-            Self { operation, kind: Some(error.kind()), raw_os_error: error.raw_os_error() };
+        let failure = Self::facts(operation, Some(error.kind()), error.raw_os_error());
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
         ci::record(failure, None);
         failure
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    pub(crate) fn with_context(mut self, context: Option<AdmissionContext>) -> Self {
+        self.context = context;
+        self
     }
 }
 
@@ -526,11 +580,11 @@ mod ci {
             let expected = concat!(module_path!(), "::record_shape_and_libtest_thread_name");
             let expected = expected.split_once("::").map_or(expected, |(_, name)| name);
             assert_eq!(std::thread::current().name(), Some(expected));
-            let failure = AdmissionFailure {
-                operation: AdmissionOperation::NamedMetadata,
-                kind: Some(std::io::ErrorKind::PermissionDenied),
-                raw_os_error: Some(13),
-            };
+            let failure = AdmissionFailure::facts(
+                AdmissionOperation::NamedMetadata,
+                Some(std::io::ErrorKind::PermissionDenied),
+                Some(13),
+            );
             let record = line(failure, Some(expected), None)?;
             let record = record.as_str()?;
             assert_eq!(
@@ -551,11 +605,7 @@ mod ci {
                 std::fs::read_to_string(directory.path().join("private-storage.jsonl"))?,
                 record.repeat(2)
             );
-            let absent = AdmissionFailure {
-                operation: AdmissionOperation::Deadline,
-                kind: None,
-                raw_os_error: None,
-            };
+            let absent = AdmissionFailure::facts(AdmissionOperation::Deadline, None, None);
             assert_eq!(
                 line(absent, None, None)?.as_str()?,
                 "{\"thread\":null,\"error\":\"Admission\",\"operation\":\"Deadline\",\"kind\":null,\"errno\":null}\n"
@@ -568,11 +618,7 @@ mod ci {
         -> Result<(), Box<dyn std::error::Error>> {
             let _sink = TestSinkGuard::enter()?;
             use crate::diagnostic::{AdmissionContext, AdmissionSite, ListingRefusal};
-            let failure = AdmissionFailure {
-                operation: AdmissionOperation::AclState,
-                kind: None,
-                raw_os_error: None,
-            };
+            let failure = AdmissionFailure::facts(AdmissionOperation::AclState, None, None);
             let context = AdmissionContext {
                 site: AdmissionSite::Snapshot,
                 changes: 3,
@@ -643,11 +689,7 @@ mod ci {
         #[test]
         fn test_sink_restores_nested_overrides_and_keeps_separate_budgets() -> std::io::Result<()> {
             let outer = TestSinkGuard::enter()?;
-            let failure = AdmissionFailure {
-                operation: AdmissionOperation::AclState,
-                kind: None,
-                raw_os_error: None,
-            };
+            let failure = AdmissionFailure::facts(AdmissionOperation::AclState, None, None);
             record(failure, None);
             {
                 let _inner = TestSinkGuard::enter()?;
@@ -818,11 +860,11 @@ mod ci {
             if std::env::var_os(CHILD).is_some() {
                 use rustix::process::{Resource, Rlimit, setrlimit};
                 setrlimit(Resource::Fsize, Rlimit { current: Some(4096), maximum: Some(4096) })?;
-                let original = AdmissionFailure {
-                    operation: AdmissionOperation::NamedMetadata,
-                    kind: Some(std::io::ErrorKind::PermissionDenied),
-                    raw_os_error: Some(13),
-                };
+                let original = AdmissionFailure::facts(
+                    AdmissionOperation::NamedMetadata,
+                    Some(std::io::ErrorKind::PermissionDenied),
+                    Some(13),
+                );
                 for _ in 0..MAX_RECORDS + 1 {
                     assert_eq!(
                         AdmissionFailure::io(
@@ -868,11 +910,11 @@ mod ci {
                     assert!(!contents.is_empty());
                     assert!(contents.len() <= 4096);
                     let expected = line(
-                        AdmissionFailure {
-                            operation: AdmissionOperation::NamedMetadata,
-                            kind: Some(std::io::ErrorKind::PermissionDenied),
-                            raw_os_error: Some(13),
-                        },
+                        AdmissionFailure::facts(
+                            AdmissionOperation::NamedMetadata,
+                            Some(std::io::ErrorKind::PermissionDenied),
+                            Some(13),
+                        ),
                         Some(concat!(
                             "diagnostic::ci::tests::",
                             "saturated_file_and_fsize_limit_preserve_original_admission"

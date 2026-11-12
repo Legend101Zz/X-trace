@@ -2013,11 +2013,10 @@ mod tests {
     #[test]
     fn attach_failure_output_contains_only_static_context_and_admission_facts() {
         use xtrace_private_storage::{AdmissionFailure, AdmissionOperation, PrivateStorageError};
-        let admission = PrivateStorageError::Admission(AdmissionFailure {
-            operation: AdmissionOperation::AccessAcl,
-            kind: Some(std::io::ErrorKind::PermissionDenied),
-            raw_os_error: Some(13),
-        });
+        let admission = PrivateStorageError::Admission(AdmissionFailure::io(
+            AdmissionOperation::AccessAcl,
+            std::io::Error::from_raw_os_error(13),
+        ));
         // Capture in a worker, just as the cache concurrency tests do.
         let failure = std::thread::spawn(move || {
             attach_result::<()>(|| {
