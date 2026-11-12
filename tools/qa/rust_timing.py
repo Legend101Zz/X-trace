@@ -24,6 +24,7 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 TEST_STATE = re.compile(r"^test (\S+) \.\.\.(?: (ok|FAILED|ignored))?$")
 TEST_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
 TEST_COUNTS = re.compile(r"^running [0-9]+ tests?$")
+TEST_RESULT = re.compile(RESULT.pattern + r" [0-9]+ measured; [0-9]+ filtered out(?:; finished in [0-9.]+s)?")
 TEST_OBSERVATIONS = {None: "start-reported", "ok": "ok", "FAILED": "failed", "ignored": "ignored"}
 
 
@@ -108,6 +109,7 @@ class Observations:
         self.test_rows = "closed"
         self.last_target = None
         self.last_test = None
+        self.progress_harness_result = False
 
     def _binary(self, value):
         """Reattest checkpoint identities with the same HEAD targets as live output."""
@@ -121,18 +123,22 @@ class Observations:
 
     def snapshot(self):
         """Bounded private state; active identity survives the event cap."""
-        return {"events": self.events, "omitted": self.omitted, "unverified": self.unverified,
-                "active": self.active, "harnessCompleted": self.harness_completed,
-                "compilation": self.compilation, "executionStarted": self.execution_started,
-                "lastTarget": self.last_target, "lastTest": self.last_test}
+        state = {"events": self.events, "omitted": self.omitted, "unverified": self.unverified,
+                 "active": self.active, "harnessCompleted": self.harness_completed,
+                 "compilation": self.compilation, "executionStarted": self.execution_started}
+        if self.verified_test is not None:
+            state.update(lastTarget=self.last_target, lastTest=self.last_test,
+                         progressHarnessResult=self.progress_harness_result)
+        return state
 
     @classmethod
-    def restore(cls, state, targets, private, *, verified_test=None):
+    def restore(cls, state, targets, private, *, verified_test=None, max_wall=None):
         """Rebuild only typed timing facts, never copy checkpoint fields to a fragment."""
         result = cls(targets, private, verified_test=verified_test)
 
         def seconds(value):
-            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            if (type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                    or (max_wall is not None and value > max_wall)):
                 raise ValueError("invalid timing offset")
             return value
 
@@ -157,6 +163,7 @@ class Observations:
             if type(state[key]) is not int or state[key] < 0:
                 raise ValueError("invalid timing count")
             setattr(result, key, state[key])
+
         def target(value):
             if value is None:
                 return None
@@ -172,8 +179,21 @@ class Observations:
         result.execution_started = optional(state["executionStarted"])
         if verified_test is not None:
             result.last_target = target(state["lastTarget"])
-            if result.active is not None and result.active != result.last_target:
+            if ((result.last_target is None) != (result.execution_started is None)
+                    or (state["active"] is not None and state["active"] != state["lastTarget"])
+                    or (result.last_target is not None and result.last_target[1] < result.execution_started)):
                 raise ValueError("inconsistent timing target")
+            if result.last_target is not None and not result.omitted:
+                last_start = next((row for row in reversed(result.events) if row["event"] == "start"), None)
+                binary, started = result.last_target
+                if (last_start is None or last_start["binary"] != binary
+                        or last_start["wallSeconds"] != round(started, 3)):
+                    raise ValueError("missing timing start")
+            harness_result = state["progressHarnessResult"]
+            if (type(harness_result) is not bool
+                    or (harness_result and (result.last_target is None or not result.harness_completed))):
+                raise ValueError("invalid progress harness state")
+            result.progress_harness_result = harness_result
             if (test := state["lastTest"]) is not None:
                 if (not isinstance(test, dict) or set(test) != {"name", "observation", "wallSeconds"}
                         or test["observation"] not in (*TEST_OBSERVATIONS.values(), "running-reported")
@@ -185,7 +205,7 @@ class Observations:
     def _observe_test(self, name, observation, wall):
         binary = self.last_target[0]
         if isinstance(binary, dict) and self.verified_test(name, binary):
-            self.last_test = {"name": name, "observation": observation, "wallSeconds": round(wall, 3)}
+            self.last_test = {"name": name, "observation": observation, "wallSeconds": wall}
             self.revision += 1
 
     def progress(self):
@@ -198,8 +218,9 @@ class Observations:
             "compilationFinishedSeconds": self.compilation,
             "lastBinary": ({"status": "unavailable"} if binary == UNVERIFIED else {
                 "status": "observed", "binary": binary, "startedSeconds": round(started, 3),
-                "harnessResultObserved": self.harness_completed,
-                "lastVerifiedTest": self.last_test or {"status": "unavailable"},
+                "harnessResultObserved": self.progress_harness_result,
+                "lastVerifiedTest": ({**self.last_test, "wallSeconds": round(self.last_test["wallSeconds"], 3)}
+                                     if self.last_test else {"status": "unavailable"}),
             }),
         }
 
@@ -253,17 +274,21 @@ class Observations:
             self.harness_completed = False
             self.test_rows = "waiting"
             self.last_test = None
+            self.progress_harness_result = False
             self._emit({"binary": binary, "event": "start", "wallSeconds": round(wall, 3)})
         elif RESULT.match(line):
             # A result is the harness's completion boundary, but destructors or
             # exit hooks may still hang. Keep its identity until Cargo advances.
             self._complete(wall, "libtest-result", retain=True)
+            if self.test_rows == "reading" and TEST_RESULT.fullmatch(line):
+                self.progress_harness_result = True
             self.test_rows = "closed"
             self.revision += 1
         elif self.verified_test is not None and self.active is not None and not self.harness_completed:
             if self.test_rows == "waiting" and TEST_COUNTS.fullmatch(line):
                 self.test_rows = "reading"
             elif line in {"failures:", "successes:"}:
+                # Default libtest capture prints payloads after these headings.
                 self.test_rows = "closed"
             elif self.test_rows == "reading":
                 if test := TEST_STATE.fullmatch(line):
@@ -305,15 +330,21 @@ def run(command, *, log, cwd, env, timeout, observations, checkpoint=None):
     revision = -1
 
     def persist():
-        nonlocal revision
+        nonlocal checkpoint, revision
         if checkpoint is not None and observations.revision != revision:
             # Replace a bounded snapshot atomically. A supervisor can use the
             # previous complete snapshot even if SIGKILL interrupts this write.
             payload = json.dumps({"started": started, "state": observations.snapshot()}).encode("ascii")
             temporary = checkpoint.with_suffix(".tmp")
-            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as stream:
-                stream.write(payload)
-            temporary.replace(checkpoint)
+            try:
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
+                temporary.replace(checkpoint)
+            except OSError:
+                if observations.verified_test is None:
+                    raise
+                checkpoint = None  # Leave the last complete floor checkpoint available.
             revision = observations.revision
 
     persist()
@@ -336,6 +367,9 @@ def run(command, *, log, cwd, env, timeout, observations, checkpoint=None):
                         chunk = os.read(key.fd, 65536)
                         if not chunk:
                             selector.unregister(key.fileobj)
+                            if pending and not oversized and observations.verified_test is None:
+                                observations.line(pending.decode("utf-8", "replace"), time.monotonic() - started)
+                                persist()
                             continue
                         log.write(chunk)
                         log.flush()  # supervisor recovery must see output before the wrapper exits

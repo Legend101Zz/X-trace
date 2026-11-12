@@ -1228,15 +1228,19 @@ def restore_timing_checkpoint(stream, metadata, index, *, progress=False):
     if len(raw) > MAX_TIMING_CHECKPOINT_BYTES:
         raise ValueError("oversize timing checkpoint")
     checkpoint = json.loads(raw)
+    if progress and (not isinstance(checkpoint, dict) or set(checkpoint) != {"started", "state"}):
+        raise ValueError("invalid timing checkpoint")
     started = checkpoint["started"]
     now = time.monotonic()
     if type(started) not in (int, float) or not math.isfinite(started) or not 0 <= started <= now:
         raise ValueError("invalid checkpoint clock")
+    wall = now - started
     observations = rust_timing.Observations.restore(
         checkpoint["state"], metadata.rust_targets,
         lambda value: index is None or _private(value, index, verified_identifier=True),
-        verified_test=(None if not progress else lambda name, binary: metadata.rust_progress_test(name, binary, index)))
-    return observations, now - started
+        verified_test=(None if not progress else lambda name, binary: metadata.rust_progress_test(name, binary, index)),
+        max_wall=math.ceil(wall * 1000) / 1000 if progress else None)
+    return observations, wall
 
 
 def recover_timeout(args, directory: pathlib.Path, metadata: CheckoutMetadata, duration: float) -> int:

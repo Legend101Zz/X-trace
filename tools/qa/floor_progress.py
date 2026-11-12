@@ -12,6 +12,7 @@ CHECKPOINT_NAME = "gate-progress.json"
 MAX_GATE_CHECKPOINT_BYTES = 4096
 RUST_TEST_GATES = frozenset({"rust-cli-spring-journey", "rust-focused", "rust-workspace"})
 SOURCE_FIELDS = ("head", "phaseBase", "workingTreeDigest", "phaseDiffSha256")
+COMMAND_OBSERVATIONS = ("selected", "started", "completed")
 UNAVAILABLE = {"status": "unavailable"}
 
 
@@ -27,8 +28,9 @@ class GateCheckpoint:
 
     def __call__(self, run_dir, gate, state, source):
         self.gates[gate] = state
-        payload = lane_run._encoded({"version": 1, "label": run_dir.name, "source": source,
-                                     "gates": list(self.gates.items())}) + b"\n"
+        payload = lane_run._encoded({
+            "version": 1, "label": run_dir.name, "source": source, "gates": list(self.gates.items()),
+        }) + b"\n"
         if len(payload) <= MAX_GATE_CHECKPOINT_BYTES:
             try:
                 private_roots.atomic_write_private(run_dir / CHECKPOINT_NAME, payload)
@@ -69,7 +71,7 @@ def collect(checkpoint, repo, source_proofs, expected_gates):
         return UNAVAILABLE
     record = json.loads(raw)
     run_dir = checkpoint.parent
-    if (set(record) != {"version", "label", "source", "gates"}
+    if (not isinstance(record, dict) or set(record) != {"version", "label", "source", "gates"}
             or type(record["version"]) is not int or record["version"] != 1
             or record["label"] != run_dir.name
             or record["source"] != {key: source_proofs[key] for key in SOURCE_FIELDS}):
@@ -81,8 +83,8 @@ def collect(checkpoint, repo, source_proofs, expected_gates):
     states = {}
     for position, (gate, row) in enumerate(zip(expected_gates, rows)):
         if (not isinstance(row, list) or len(row) != 2 or row[0] != gate
-                or row[1] not in ("selected", "started", "completed")
-                or position < len(rows) - 1 and row[1] != "completed"):
+                or row[1] not in COMMAND_OBSERVATIONS
+                or (position < len(rows) - 1 and row[1] != "completed")):
             return UNAVAILABLE
         states[gate] = row[1]
 

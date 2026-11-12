@@ -12,7 +12,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from tools.qa import lane_run, release_floor
+from tools.qa import floor_progress, lane_run, release_floor
 from tools.qa.test_lane_run import CheckoutFixture
 from tools.release import run_gates
 from tools.release.test_release_tools import own_process_snapshot
@@ -64,7 +64,8 @@ class FloorConfigurationTests(unittest.TestCase):
         original = run_gates.GATES
         executed = []
 
-        def run():
+        def run(*, gate_progress):
+            self.assertIsInstance(gate_progress, floor_progress.GateCheckpoint)
             self.assertIn("--cache-root", sys.argv)
             self.assertEqual(sys.argv[sys.argv.index("--command-timeout") + 1], "7200")
             executed.extend(run_gates.GATES)
@@ -146,6 +147,60 @@ class FloorSupervisorTests(unittest.TestCase):
         # The owned checkout is the fallback when no scratch root is configured.
         return tempfile.TemporaryDirectory(
             dir=os.environ.get("XTRACE_TEST_SCRATCH_ROOT") or pathlib.Path(__file__).resolve().parents[2])
+
+    def test_floor_store_profiles_are_isolated_per_gate(self):
+        with self.private_temporary_directory() as temporary:
+            root = pathlib.Path(temporary)
+            run_dir = root / "floor-1-jdk17-node22"
+            run_dir.mkdir(mode=0o700)
+            logs = run_dir / "logs"
+            logs.mkdir(mode=0o700)
+            gates = tuple(gate for gate in run_gates.GATES
+                          if gate.name in release_floor.RUST_TEST_GATES or gate.name == "rust-build")
+            floor_env = run_gates.build_task_env(
+                root, {"XTRACE_CI_PRIVATE_ROOT": "ambient-value"}, scratch=root / "tmp", home=root / "home")
+            self.assertNotIn("XTRACE_CI_PRIVATE_ROOT", floor_env)
+            expected = {}
+            checkpoint = floor_progress.GateCheckpoint()
+            proof = dict.fromkeys(floor_progress.SOURCE_FIELDS, "a" * 40)
+
+            def run(argv, *, env, log_path, command_observed, **kwargs):
+                gate = log_path.stem
+                command_observed("started")
+                if gate in release_floor.RUST_TEST_GATES:
+                    directory = pathlib.Path(env["XTRACE_CI_PRIVATE_ROOT"])
+                    self.assertEqual(directory, pathlib.Path(env["XTRACE_LANE_RECOVERY_DIR"]))
+                    self.assertEqual(directory, floor_progress.rust_directory(run_dir, gate))
+                    completed = len(expected) + 1
+                    expected[gate] = completed
+                    path = directory / "frag" / "store-singletons-progress.txt"
+                    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+                        stream.write(f"state=progress completed={completed} elapsed_ns=100\n")
+                else:
+                    self.assertNotIn("XTRACE_CI_PRIVATE_ROOT", env)
+                    self.assertNotIn("XTRACE_LANE_RECOVERY_DIR", env)
+                command_observed("completed")
+                return 0, 1
+
+            with mock.patch.object(run_gates, "GATES", gates), \
+                    mock.patch.object(run_gates, "_run", side_effect=run), \
+                    mock.patch.object(lane_run, "_checkout_metadata", return_value=lane_run.CheckoutMetadata({})), \
+                    release_floor.configured_floor(root, 7200):
+                for gate in run_gates.GATES:
+                    checkpoint(run_dir, gate.name, "selected", proof)
+                    run_gates._run(gate.argv, cwd=root, env=floor_env, log_path=logs / f"{gate.name}.log",
+                                   command_observed=lambda state: checkpoint(run_dir, gate.name, state, proof))
+                public = floor_progress.collect(run_dir / floor_progress.CHECKPOINT_NAME, root, proof,
+                                                tuple(gate.name for gate in gates))
+            self.assertEqual(set(public["rustGates"]), release_floor.RUST_TEST_GATES)
+            for gate, completed in expected.items():
+                self.assertEqual(public["rustGates"][gate]["storeProfiles"], {
+                    "status": "observed", "profiles": {"singletons": {
+                        "lastReport": {"state": "progress", "completed": completed, "elapsed_ns": 100},
+                    }},
+                })
+            self.assertEqual(list((root / "frag").glob("*.json")), [])
+            self.assertNotIn(str(root), json.dumps(public))
 
     def test_wrapper_timeout_preserves_its_completed_fragment(self):
         with self.private_temporary_directory() as temporary:

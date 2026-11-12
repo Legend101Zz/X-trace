@@ -18,7 +18,7 @@ import sys
 from dataclasses import replace
 
 from tools.qa import floor_progress, lane_run
-from tools.release import ci_floor, run_gates
+from tools.release import ci_floor, private_roots, run_gates
 
 RUST_TEST_GATES = floor_progress.RUST_TEST_GATES
 DIAGNOSTIC_FEATURE = "xtrace-private-storage/ci-diagnostics"
@@ -58,13 +58,18 @@ def configured_floor(root: pathlib.Path, timeout: int):
             return original_run(argv, **kwargs)
         # The parent survives _run's deadline and process-tree cleanup. Capture
         # HEAD metadata here too: recovery must not attest a changed working tree.
-        metadata = lane_run._checkout_metadata()
+        metadata = lane_run._checkout_metadata(kwargs["cwd"])
         env = dict(kwargs["env"])
+        directory = None
         if kwargs.get("command_observed") is not None:
             run_dir = kwargs["log_path"].parent.parent
-            directory = lane_run.prepare_recovery(root, directory=floor_progress.rust_directory(run_dir, args.step))
-            env["XTRACE_CI_PRIVATE_ROOT"] = str(directory)
-        else:
+            try:
+                directory = lane_run.prepare_recovery(root, directory=floor_progress.rust_directory(run_dir, args.step))
+            except (OSError, private_roots.AdmissionError):
+                pass  # Fall back to command-timeout recovery if floor progress cannot be prepared.
+            if directory is not None:
+                env["XTRACE_CI_PRIVATE_ROOT"] = str(directory)
+        if directory is None:
             directory = lane_run.prepare_recovery(root)
         kwargs["env"] = {**env, "XTRACE_LANE_RECOVERY_DIR": str(directory)}
         outcome = kwargs.get("outcome_report")
