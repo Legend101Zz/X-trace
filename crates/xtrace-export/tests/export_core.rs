@@ -47,7 +47,14 @@ fn legacy_serialized_inputs_keep_summary_and_handler_gaps() {
     assert_eq!(legacy["handlers"][0]["line_start"], 4);
     assert!(legacy["handlers"][0].get("line_end").is_none());
     assert!(legacy.get("confidence_basis_points").is_none());
-    assert!(legacy.get("claims").is_none());
+    assert_eq!(legacy["claims_projection"], "available");
+    assert_eq!(legacy["claim_count"], 1);
+    let claim = &legacy["claims"][0];
+    assert_eq!(claim["claim_id"], "legacy-claim");
+    assert_eq!(claim["handler_location"], legacy["handlers"][0]);
+    assert_eq!(claim.get("confidence_basis_points"), Some(&Value::Null));
+    assert_eq!(claim.get("source_evidence"), Some(&Value::Null));
+    assert_eq!(claim.get("handler_symbol"), Some(&Value::Null));
 }
 
 fn comment_metadata(text: &str) -> serde_json::Value {
@@ -56,6 +63,130 @@ fn comment_metadata(text: &str) -> serde_json::Value {
         .find_map(|line| line.trim_start_matches("# ").strip_prefix("x-xtrace catalog metadata: "))
         .unwrap();
     serde_json::from_str(metadata).unwrap()
+}
+
+#[test]
+fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
+    use serde_json::{Value, json};
+    use xtrace_export::canonical;
+
+    let first = json!({"symbol": "First.get", "path": "First.java", "line_start": 4});
+    let second =
+        json!({"symbol": "Second.get", "path": "Second.java", "line_start": 8, "line_end": 12});
+    let input = xtrace_export::input_json::parse(&json!({
+        "operations": [
+            {
+                "operation_id": "legacy", "method": "GET", "route_template": "/legacy",
+                "claims": [
+                    {"claim_id": "b", "provenance": "static_analysis",
+                        "confidence_basis_points": 6500, "limitation_codes": ["missing_schema"],
+                        "handler": second},
+                    {"claim_id": "a", "provenance": "adapter_registration",
+                        "confidence_basis_points": 8200, "limitation_codes": ["missing_extent"],
+                        "handler": first},
+                    {"claim_id": "c", "provenance": "runtime_hint"}
+                ]
+            },
+            {
+                "operation_id": "summary", "method": "GET", "route_template": "/summary",
+                "catalog_summary": {
+                    "claim_count": 2,
+                    "handler_symbols": ["Second.get", "First.get"],
+                    "highest_confidence_basis_points": 8200,
+                    "provenance": ["static_analysis", "adapter_registration"],
+                    "limitation_codes": ["missing_schema", "missing_extent"]
+                }
+            }
+        ]
+    }))
+    .unwrap();
+    let expected_legacy = json!({
+        "operation_id": "legacy", "application_component": "", "binding_key": "",
+        "effective_state": "unknown", "claims_projection": "available", "claim_count": 3,
+        "handler_conflict": true, "handler_symbols": ["First.get", "Second.get"],
+        "handlers": [first, second], "confidence_basis_points": 6500,
+        "provenance": ["adapter_registration", "runtime_hint", "static_analysis"],
+        "limitation_codes": ["missing_extent", "missing_schema"],
+        "claims": [
+            {"claim_id": "a", "provenance": "adapter_registration",
+                "confidence_basis_points": 8200, "limitation_codes": ["missing_extent"],
+                "handler_location": first, "handler_symbol": null, "source_evidence": null},
+            {"claim_id": "b", "provenance": "static_analysis",
+                "confidence_basis_points": 6500, "limitation_codes": ["missing_schema"],
+                "handler_location": second, "handler_symbol": null, "source_evidence": null},
+            {"claim_id": "c", "provenance": "runtime_hint",
+                "confidence_basis_points": null, "limitation_codes": [],
+                "handler_symbol": null, "source_evidence": null}
+        ]
+    });
+    let expected_summary = json!({
+        "operation_id": "summary", "application_component": "", "binding_key": "",
+        "effective_state": "unknown", "claims_projection": "unavailable", "claim_count": 2,
+        "handler_conflict": true, "handler_symbols": ["First.get", "Second.get"],
+        "highest_confidence_basis_points": 8200,
+        "provenance": ["adapter_registration", "static_analysis"],
+        "limitation_codes": ["missing_extent", "missing_schema"],
+        "source_locations": "per-claim locations unavailable",
+        "claim_confidence": "not available per claim"
+    });
+    for format in
+        [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
+    {
+        let out = export(&input, &ExportRequest::new(format)).unwrap();
+        assert_eq!(out.operation_count, 2, "{format:?}");
+        let file = |path| text(out.files.iter().find(|f| f.path == path).unwrap());
+        for (route, expected) in [("legacy", &expected_legacy), ("summary", &expected_summary)] {
+            let postman = || {
+                let doc: Value = serde_json::from_str(file("collection.postman.json")).unwrap();
+                let item = doc["item"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["name"] == format!("GET /{route}"))
+                    .unwrap();
+                comment_metadata(item["request"]["description"].as_str().unwrap())
+            };
+            let curl = || {
+                let recipe = out
+                    .files
+                    .iter()
+                    .find(|f| f.path.ends_with(&format!("-get-{route}.sh")))
+                    .unwrap();
+                comment_metadata(text(recipe))
+            };
+            let metadata = match format {
+                ExportFormat::OpenApi => {
+                    let doc: Value = serde_json::from_str(file("openapi.json")).unwrap();
+                    doc["paths"][format!("/{route}")]["get"]["x-xtrace"].clone()
+                }
+                ExportFormat::Postman => postman(),
+                ExportFormat::Curl => curl(),
+                ExportFormat::Bundle => {
+                    let metadata_yaml = canonical::yaml(&json!({"x-xtrace": expected}));
+                    let block = metadata_yaml
+                        .lines()
+                        .map(|line| format!("      {line}\n"))
+                        .collect::<String>();
+                    assert!(file("openapi.yaml").contains(&block), "bundle YAML for {route}");
+                    assert_eq!(postman(), curl());
+                    postman()
+                }
+            };
+            assert_eq!(&metadata, expected, "{format:?} {route}");
+        }
+        for reason in [
+            "claims_projection_unavailable",
+            "per_claim_locations_unavailable",
+            "per_claim_confidence_unavailable",
+        ] {
+            assert!(
+                out.omissions.iter().any(|o| o.operation_id == "summary" && o.reason == reason)
+            );
+            assert!(
+                !out.omissions.iter().any(|o| o.operation_id == "legacy" && o.reason == reason)
+            );
+        }
+    }
 }
 
 #[test]
@@ -149,6 +280,7 @@ fn mixed_serialized_claims_retain_independent_handler_locations() {
     }
     let claims = expected["claims"].as_array().unwrap();
     let claim = |id: &str| claims.iter().find(|c| c["claim_id"] == id).unwrap();
+    assert_eq!(expected["provenance"], json!([""]));
     assert_eq!(expected["handler_conflict"], true);
     assert!(expected.get("handlers").is_none());
     assert_eq!(
@@ -398,6 +530,9 @@ fn unsafe_handler_paths_are_dropped_and_listed_as_omissions() {
                 serde_json::Value::Object(m) => {
                     if let Some(x) = m.get("x-xtrace").and_then(|x| x.as_object()) {
                         assert!(!x.contains_key("handlers"), "handlers survived for {bad}");
+                        if let Some(claims) = x.get("claims").and_then(|c| c.as_array()) {
+                            assert!(claims.iter().all(|c| c.get("handler_location").is_none()));
+                        }
                     }
                     stack.extend(m.values());
                 }

@@ -86,7 +86,7 @@ pub struct PreparedOp {
     pub examples: Vec<PreparedExample>,
     /// Provenance labels, sorted unique.
     pub provenance: Vec<String>,
-    /// Lowest confidence across claims.
+    /// Lowest reported confidence for legacy-only claims.
     pub confidence_bp: Option<u16>,
     /// Limitation codes, sorted unique.
     pub limitation_codes: Vec<String>,
@@ -236,7 +236,9 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
     let path = normalize_path(&op.route_template);
     let mut claims: Vec<_> = op.claims.iter().filter(|_| op.claims_available).collect();
     claims.sort_by(|a, b| a.claim_id.cmp(&b.claim_id));
-    if !op.claims_available {
+    let claims_available =
+        op.claims_available && (!claims.is_empty() || op.catalog_summary.is_none());
+    if !claims_available {
         omit(omissions, &op.operation_id, "claims".to_owned(), "claims_projection_unavailable");
     }
 
@@ -394,11 +396,16 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
     let mut provenance: BTreeSet<String> = claims.iter().map(|c| c.provenance.clone()).collect();
     let mut limitation_codes: BTreeSet<String> =
         claims.iter().flat_map(|c| c.limitation_codes.iter().cloned()).collect();
-    let claim_metadata = (op.claims_available
-        && ((claims.is_empty() && op.catalog_summary.is_none())
-            || claims.iter().any(|c| c.source_evidence.is_some() || c.handler_symbol.is_some())))
-    .then(|| exact_claim_metadata(op, &claims, omissions));
-    let mut catalog_summary = op.catalog_summary.clone().filter(|_| claim_metadata.is_none());
+    // Keep the aggregate location list and minimum reported confidence for legacy consumers.
+    let legacy_only = !claims.is_empty()
+        && claims.iter().all(|c| c.source_evidence.is_none() && c.handler_symbol.is_none());
+    let (claim_metadata, mut handlers) = if claims_available {
+        let (metadata, handlers) = exact_claim_metadata(op, &claims, omissions, legacy_only);
+        (Some(metadata), handlers)
+    } else {
+        (None, Vec::new())
+    };
+    let mut catalog_summary = op.catalog_summary.clone().filter(|_| !claims_available);
     if let Some(summary) = &mut catalog_summary {
         summary.handler_symbols.sort();
         summary.handler_symbols.dedup();
@@ -417,6 +424,17 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         let reason =
             if let (1, Some(handler)) = (summary.claim_count, &mut summary.single_claim_handler) {
                 handler.line_end = None;
+                if safe_handler_path(op, omissions, &handler.path)
+                    && checked_handler_symbol(
+                        op,
+                        omissions,
+                        &handler.symbol,
+                        MAX_LEGACY_HANDLER_SYMBOL_BYTES,
+                    )
+                    .is_some()
+                {
+                    handlers.push(handler.clone());
+                }
                 "source_end_line_unavailable"
             } else {
                 summary.single_claim_handler = None;
@@ -433,25 +451,15 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
             omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
         }
     }
-    let mut handlers = Vec::new();
-    if claim_metadata.is_none() {
-        handlers.extend(claims.iter().filter_map(|c| c.handler.clone()));
-        handlers.extend(catalog_summary.as_ref().and_then(|s| s.single_claim_handler.clone()));
-        handlers.sort_by(|a, b| {
-            (&a.path, a.line_start, &a.symbol).cmp(&(&b.path, b.line_start, &b.symbol))
-        });
-        handlers.dedup();
-        handlers.retain(|handler| {
-            safe_handler_path(op, omissions, &handler.path)
-                && checked_handler_symbol(
-                    op,
-                    omissions,
-                    &handler.symbol,
-                    MAX_LEGACY_HANDLER_SYMBOL_BYTES,
-                )
-                .is_some()
-        });
-    }
+    handlers.sort_by(|a, b| {
+        (&a.path, a.line_start, &a.symbol, a.line_end).cmp(&(
+            &b.path,
+            b.line_start,
+            &b.symbol,
+            b.line_end,
+        ))
+    });
+    handlers.dedup();
     let request_media = claims.iter().filter_map(|c| c.request_body_media_type.clone()).min();
 
     PreparedOp {
@@ -461,15 +469,15 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         component: op.application_component.clone(),
         binding_key: op.binding_key.clone(),
         state: op.effective_state,
-        claims_available: op.claims_available,
+        claims_available,
         params,
         responses,
         examples: examples.into_iter().collect(),
         provenance: provenance.into_iter().collect(),
-        confidence_bp: if claim_metadata.is_some() {
-            None
-        } else {
+        confidence_bp: if legacy_only {
             claims.iter().filter_map(|c| c.confidence_basis_points).min()
+        } else {
+            None
         },
         limitation_codes: limitation_codes.into_iter().collect(),
         conflicts,
@@ -484,10 +492,12 @@ fn exact_claim_metadata(
     op: &OperationInput,
     claims: &[&ClaimInput],
     omissions: &mut BTreeSet<Omission>,
-) -> Value {
+    legacy_only: bool,
+) -> (Value, Vec<HandlerInput>) {
     let mut reported_symbols = BTreeSet::new();
     let mut safe_symbols = BTreeSet::new();
     let mut rows = Vec::with_capacity(claims.len());
+    let mut handlers = Vec::new();
     for claim in claims {
         let persisted_symbol = claim.handler_symbol.as_deref();
         reported_symbols.extend(persisted_symbol);
@@ -500,20 +510,13 @@ fn exact_claim_metadata(
             checked_handler_symbol(op, omissions, &handler.symbol, MAX_LEGACY_HANDLER_SYMBOL_BYTES)
         });
         safe_symbols.extend(safe_legacy_symbol);
-        // A legacy-only row can still report its symbol. With new fields, the legacy
-        // symbol stays with its own location tuple.
-        let safe_symbol = if persisted_symbol.is_none() && claim.source_evidence.is_none() {
-            safe_legacy_symbol
-        } else {
-            safe_persisted_symbol
-        };
         let evidence = claim.source_evidence.as_ref().map(|items| {
             items.iter().map(|item| source_evidence_json(item, op, omissions)).collect::<Vec<_>>()
         });
         let mut row = json!({
             "claim_id": claim.claim_id,
             "provenance": claim.provenance,
-            "handler_symbol": safe_symbol,
+            "handler_symbol": safe_persisted_symbol,
             "confidence_basis_points": claim.confidence_basis_points,
             "limitation_codes": claim.limitation_codes,
             "source_evidence": evidence,
@@ -523,6 +526,9 @@ fn exact_claim_metadata(
             && safe_legacy_symbol.is_some()
         {
             row["handler_location"] = handler_json(handler);
+            if legacy_only {
+                handlers.push(handler.clone());
+            }
         }
         rows.push(row);
     }
@@ -530,13 +536,14 @@ fn exact_claim_metadata(
     if handler_conflict {
         omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
     }
-    json!({
+    let metadata = json!({
         "claims_projection": "available",
         "claim_count": rows.len(),
         "handler_symbols": safe_symbols,
         "handler_conflict": handler_conflict,
         "claims": rows,
-    })
+    });
+    (metadata, handlers)
 }
 
 fn source_evidence_json(
@@ -592,46 +599,41 @@ fn safe_handler_path(op: &OperationInput, omissions: &mut BTreeSet<Omission>, pa
 }
 
 /// Catalog claim metadata carries the same associations, gaps and scope in every format.
-pub(crate) fn catalog_metadata(op: &PreparedOp) -> Option<Value> {
-    let mut metadata = json!({
-        "operation_id": op.operation_id,
-        "application_component": op.component,
-        "binding_key": op.binding_key,
-        "effective_state": op.state.name(),
-    });
-    if let Some(claims) = &op.claim_metadata {
-        metadata.as_object_mut()?.extend(claims.as_object()?.clone());
-        return Some(metadata);
-    }
+pub(crate) fn catalog_metadata(op: &PreparedOp) -> Value {
+    let mut metadata = op.claim_metadata.clone().unwrap_or_else(|| json!({}));
+    metadata["operation_id"] = json!(op.operation_id);
+    metadata["application_component"] = json!(op.component);
+    metadata["binding_key"] = json!(op.binding_key);
+    metadata["effective_state"] = json!(op.state.name());
     if !op.claims_available {
         metadata["claims_projection"] = json!("unavailable");
     }
-    let Some(summary) = &op.catalog_summary else {
-        return (!op.claims_available).then_some(metadata);
-    };
-    metadata.as_object_mut()?.extend(
-        json!({
-            "claims_projection": "unavailable",
-            "claim_count": summary.claim_count,
-            "handler_symbols": summary.handler_symbols,
-            "handler_conflict": summary.handler_conflict,
-            "highest_confidence_basis_points": summary.highest_confidence_basis_points,
-            "provenance": summary.provenance,
-            "limitation_codes": summary.limitation_codes,
-            "source_locations": "per-claim locations unavailable",
-            "claim_confidence": "not available per claim",
-        })
-        .as_object()?
-        .clone(),
-    );
+    if let Some(summary) = &op.catalog_summary {
+        metadata["claim_count"] = json!(summary.claim_count);
+        metadata["handler_symbols"] = json!(summary.handler_symbols);
+        metadata["handler_conflict"] = json!(summary.handler_conflict);
+        metadata["highest_confidence_basis_points"] =
+            json!(summary.highest_confidence_basis_points);
+        metadata["source_locations"] = json!("per-claim locations unavailable");
+        metadata["claim_confidence"] = json!("not available per claim");
+    }
+    if !op.provenance.is_empty() || op.catalog_summary.is_some() {
+        metadata["provenance"] = json!(op.provenance);
+    }
+    if !op.limitation_codes.is_empty() || op.catalog_summary.is_some() {
+        metadata["limitation_codes"] = json!(op.limitation_codes);
+    }
+    if let Some(bp) = op.confidence_bp {
+        metadata["confidence_basis_points"] = json!(bp);
+    }
     if !op.handlers.is_empty() {
         metadata["handlers"] = Value::Array(op.handlers.iter().map(handler_json).collect());
     }
-    Some(metadata)
+    metadata
 }
 
 /// An unknown extent is omitted, never replaced with the start line.
-pub(crate) fn handler_json(handler: &HandlerInput) -> Value {
+fn handler_json(handler: &HandlerInput) -> Value {
     let mut value = json!({"symbol": handler.symbol, "path": handler.path});
     if handler.line_start != 0 {
         value["line_start"] = json!(handler.line_start);

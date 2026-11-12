@@ -3,6 +3,7 @@
 # operation: op-list
 # route: GET /orders
 # catalog state: conflicted
+# x-xtrace catalog metadata: {"application_component":"orders","binding_key":"spring:GET /orders","claim_count":2,"claims":[{"claim_id":"c-list-a","confidence_basis_points":null,"handler_symbol":null,"limitation_codes":[],"provenance":"static_analysis","source_evidence":null},{"claim_id":"c-list-b","confidence_basis_points":null,"handler_symbol":null,"limitation_codes":[],"provenance":"adapter_registration","source_evidence":null}],"claims_projection":"available","effective_state":"conflicted","handler_conflict":false,"handler_symbols":[],"operation_id":"op-list","provenance":["adapter_registration","static_analysis"]}
 # recipe 001
 set -eu
 : "${BASE_URL:?set BASE_URL, for example http://127.0.0.1:8080}"

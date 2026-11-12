@@ -123,18 +123,14 @@ fn item(op: &PreparedOp, omissions: &mut Vec<Omission>) -> Result<Value, ExportE
     request.insert("url".into(), url);
     let observation =
         if op.state == crate::request::EffectiveState::Observed { "observed" } else { "inferred" };
-    let metadata = if let Some(value) = crate::projection::catalog_metadata(op) {
-        if let Some(path) = sanitize::gate(&value) {
-            return Err(ExportError::SecretShaped { path });
-        }
-        format!("\nx-xtrace catalog metadata: {value}")
-    } else {
-        String::new()
-    };
+    let metadata = crate::projection::catalog_metadata(op);
+    if let Some(path) = sanitize::gate(&metadata) {
+        return Err(ExportError::SecretShaped { path });
+    }
     request.insert(
         "description".into(),
         json!(format!(
-            "operation: {}\ncatalog state: {}\nx-xtrace-observation: {observation}{metadata}",
+            "operation: {}\ncatalog state: {}\nx-xtrace-observation: {observation}\nx-xtrace catalog metadata: {metadata}",
             op.operation_id,
             op.state.name()
         )),

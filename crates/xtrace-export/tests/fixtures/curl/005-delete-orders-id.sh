@@ -3,6 +3,7 @@
 # operation: op-delete
 # route: DELETE /orders/{id}
 # catalog state: registered
+# x-xtrace catalog metadata: {"application_component":"orders","binding_key":"spring:DELETE /orders/:id","claim_count":1,"claims":[{"claim_id":"c-delete","confidence_basis_points":null,"handler_symbol":null,"limitation_codes":[],"provenance":"static_analysis","source_evidence":null}],"claims_projection":"available","effective_state":"registered","handler_conflict":false,"handler_symbols":[],"operation_id":"op-delete","provenance":["static_analysis"]}
 # MUTATING: DELETE may change state on the target. Review it before running.
 # recipe 005
 set -eu

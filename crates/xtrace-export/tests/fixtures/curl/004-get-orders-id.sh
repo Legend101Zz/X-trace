@@ -3,6 +3,7 @@
 # operation: op-get-one
 # route: GET /orders/{id}
 # catalog state: registered
+# x-xtrace catalog metadata: {"application_component":"orders","binding_key":"spring:GET /orders/{id}","claim_count":1,"claims":[{"claim_id":"c-get-one","confidence_basis_points":9000,"handler_location":{"line_end":31,"line_start":20,"path":"src/main/java/demo/OrderController.java","symbol":"OrderController.get"},"handler_symbol":null,"limitation_codes":[],"provenance":"static_analysis","source_evidence":null}],"claims_projection":"available","confidence_basis_points":9000,"effective_state":"registered","handler_conflict":false,"handler_symbols":["OrderController.get"],"handlers":[{"line_end":31,"line_start":20,"path":"src/main/java/demo/OrderController.java","symbol":"OrderController.get"}],"operation_id":"op-get-one","provenance":["static_analysis"]}
 # recipe 004
 set -eu
 : "${BASE_URL:?set BASE_URL, for example http://127.0.0.1:8080}"

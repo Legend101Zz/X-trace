@@ -223,12 +223,11 @@ fn recipe(op: &PreparedOp, ordinal: u32) -> Result<Recipe, ExportError> {
     s.push_str(&format!("# operation: {}\n", comment_safe(&op.operation_id)));
     s.push_str(&format!("# route: {} {}\n", comment_safe(&op.method), comment_safe(&op.path)));
     s.push_str(&format!("# catalog state: {}\n", op.state.name()));
-    if let Some(metadata) = crate::projection::catalog_metadata(op) {
-        if let Some(path) = sanitize::gate(&metadata) {
-            return Err(ExportError::SecretShaped { path });
-        }
-        s.push_str(&format!("# x-xtrace catalog metadata: {metadata}\n"));
+    let metadata = crate::projection::catalog_metadata(op);
+    if let Some(path) = sanitize::gate(&metadata) {
+        return Err(ExportError::SecretShaped { path });
     }
+    s.push_str(&format!("# x-xtrace catalog metadata: {metadata}\n"));
     if mutating {
         s.push_str(&format!(
             "# MUTATING: {} may change state on the target. Review it before running.\n",
