@@ -1,7 +1,7 @@
 # X-trace: current state
 
 The one place for "where are we". Rewrite it (do not append) at the end of every working session. History lives in
-`docs/progress.md` and in git. Last updated: 2026-11-12.
+`docs/progress.md` and in git. Last updated 2026-11-19.
 
 ## Release status
 
@@ -42,39 +42,48 @@ The Petclinic campaign in run `43024105219` passed 37 of 45 steps. The other eig
 
 ## Wave 3 handoff
 
-[Draft PR #70](https://github.com/Legend101Zz/X-trace/pull/70) tracks `wave/w3` under
-[#69](https://github.com/Legend101Zz/X-trace/issues/69). Main remains at `f92f0bf`. The current batch is
-unmerged and awaits fresh exact-head Linux CI. `ef29c58` delivered the caught-panic source-line and workload-poison
-fixes.
+PR #70 merged on 2026-11-12 as `be441c59892e323287da10cf1dc7a495c6a615f7` under the owner's one-time
+waiver of the pre-merge CI requirement. The reviewed changes included Linux private-storage admission
+corrections and diagnostics for attach readiness, Spring shutdown, acknowledgement failures, and floor progress.
+#22 closed with attach readiness evidence and the waiver recorded.
+[PR #70](https://github.com/Legend101Zz/X-trace/pull/70) · [#22](https://github.com/Legend101Zz/X-trace/issues/22)
 
-- [#22](https://github.com/Legend101Zz/X-trace/issues/22) adds attach port and readiness diagnostics. The latest
-  local change also addresses the carried stderr reporting race with coordination capped by the original startup
-  deadline. Four CLI test binaries compile; formatting and diff checks passed. Review found no blocker or major;
-  one minor remains: the inherited-stderr regression does not cover the 250 ms grace cap with a longer caller
-  deadline. Carry a synchronized case that verifies readiness reports while stderr remains open and before that
-  deadline to the next fix batch. Runtime verification awaits CI. #22 remains open.
-- [#71](https://github.com/Legend101Zz/X-trace/issues/71) tracks the floor timeout diagnosis. The local diagnostics
-  change publishes bounded, validated gate, command and Rust progress and fixed store profiles through the existing
-  sanitize and upload path, separate from strict receipt acceptance. It cannot promise artifacts if the runner is
-  lost or teardown is skipped. Nine Python modules compile. Reviews found no blocker or major; one minor remains:
-  final failure-summary framing can leave `harnessResultObserved` false. Carry it to the next fix batch.
-- The local storage change replaces per-envelope SQL point queries for frame verification with one inclusive range
-  query per decoded segment in the existing read transaction. Source work-count analysis identified at least
-  1,958,576 point queries in the focused replay. Row checks, admission, snapshot, XTF verification, budgets and
-  whole-recording honesty remain in place. Store check, Clippy, library test compilation, formatting and diff checks
-  passed. Reviews found no blocker or major; one minor is that the counter checks the current range statement and
-  could miss a future additional statement. Carry it to the next fix batch. Runtime equivalence, the query-count
-  assertion and floor timing await CI; the effect of batching on floor runtime remains unmeasured.
+Linux `ci-ok` failed on that exact merged head. The JDK 21 / Node 24 floor passed all 23 gates. The JDK 17 /
+Node 22 floor passed 17 gates and failed the Rust workspace gate with six failing tests. The separate gates job
+also failed. [Main CI 43214553598](https://github.com/Legend101Zz/X-trace/actions/runs/43214553598)
 
-Post-merge main CI [43042206403](https://github.com/Legend101Zz/X-trace/actions/runs/43042206403) attempt 5
-completed with Ubuntu DNS setup failures. Wave run
-[43061181831](https://github.com/Legend101Zz/X-trace/actions/runs/43061181831) attempt 2 passed
-release-tool-tests, main gates, Java 17/21, Node and the JDK 21/Node 24 floor (23/23). The JDK 17/Node 22
-floor hit the 120-minute job limit and `ci-ok` failed. Its sanitizer rejected an incomplete receipt and upload
-succeeded; the rejected summary's zero gate count does not establish that no tests ran. The focused store binary
-completed in 3202.711 seconds, compared with 2152.296 seconds focused and 2167.236 seconds workspace on the
-JDK 21 floor. A missing workspace fragment leaves the command active at cancellation unknown. The real timeout was
-not rerun. New regressions await CI; no local runtime tests ran and no deadlines or budgets changed.
+- The gates job's store index retry test failed during fixture SQLite open with a private-storage permission
+  error. The log gives no underlying operation. The retry assertions were never reached.
+- The JDK 17 / Node 22 workspace CLI unit test failed while creating a private fixture directory. Its sanitized
+  admission record showed a ctime-only mismatch at the directory snapshot. The metadata writer and any connection to
+  the store fixture failure remain unknown.
+- The JDK 17 / Node 22 premain classfile-mutation phase observed three of four expected complete matching order
+  recordings after shutdown, with drain-expired and incomplete markers. The missing recording's failure stage
+  remains unresolved. Four redirect-source tests hit a complete-recording wait with no cause attributed.
+
+The store library test binary passed both Rust gates on both floors. It took about 3,022 seconds focused and
+2,918 seconds workspace on JDK 17 / Node 22, versus 2,041 and 2,052 seconds on JDK 21 / Node 24. On the
+JDK 17 / Node 22 focused gate, the `focused-singletons` recovery profile took about 1,739 seconds, with the
+largest recorded span totals in checkpoint publication (446 seconds) and connection-file admission (289 seconds).
+The `sparse` recovery profile took about 1,248 seconds, led by segment object publication (200 seconds) and
+segment SQL transactions (131 seconds). The profiles measure exclusive phase time on the profiled test thread.
+[Main CI 43214553598](https://github.com/Legend101Zz/X-trace/actions/runs/43214553598)
+
+PR #70 batched frame-verification SQL to one inclusive range query per decoded segment. Source analysis counted
+at least 1,958,576 point queries in the prior focused replay. The active operation during the earlier 120-minute
+timeout and the wall-time impact of batching remain unverified.
+[Earlier CI 43061181831](https://github.com/Legend101Zz/X-trace/actions/runs/43061181831/attempts/2)
+
+The later cancelled JDK 17 / Node 22 floor on `9763435` retained verified progress in the Rust workspace
+store binary. The `focused-singletons` profile last recorded 85,760 of 131,072 admissions, with
+`segment_sql_transaction` as its last active phase. The incomplete floor receipt was invalid.
+[Cancelled CI 43189678475](https://github.com/Legend101Zz/X-trace/actions/runs/43189678475)
+
+#71 requires bounded and verified cancellation evidence, source-grounded evidence of the costly test or phase,
+treatment of any supported cause, all original gates and budgets, and green Linux `ci-ok` on the exact reviewed
+head. The trackers cover the reliability follow-up and current CI outcome. #69 also tracks the carried minor
+review findings.
+[#71](https://github.com/Legend101Zz/X-trace/issues/71) · [#69](https://github.com/Legend101Zz/X-trace/issues/69)
 
 To finish [#3](https://github.com/Legend101Zz/X-trace/issues/3), address #32 (exact export claims and policy
 digest), #36 (observed per-request burst correlation), and #52 (bounded observed cause types with a scoped
@@ -93,8 +102,6 @@ The Wave 2 campaign reported these gaps; they are not passes for missing evidenc
 - Focused capture and exception message redaction have the reported privacy scope.
 - The campaign receipt was unsigned and non-release. Release acceptance needs accepted campaign receipts.
 
-The ctime-only admission refusal is still unexplained; diagnostics now attribute it.
-
 ## Known nondeterministic test (fix; never retry to green)
 
 [#14](https://github.com/Legend101Zz/X-trace/issues/14) remains open: the historical zombie lifecycle failure log lacks the
@@ -104,7 +111,11 @@ Three green exact-head runs remain unestablished.
 
 ## Branches
 
-- `wave/w3` is based on main at `f92f0bf`; the reviewed batch awaits fresh exact-head CI.
+- `w3/r10` at `92035672552c0f053d573f97fbd0b6263e430bdb` preserves #32 export work. OpenAPI still needs
+  full alternate operation metadata when scopes share a method and path.
+- `w3/r15` at `8658657d22e17573480cfd9d2a6cf16513c4b0ba` preserves #36 campaign harness work. Reconcile
+  the inherited export changes before integration.
+- `w3/r16` at `b504b19942a7ec8575a8de645665623730ccf753` preserves unreviewed private-admission test work.
 - Wave branches (`wave/<n>`) are deleted after their merge and a green post-merge `main`.
 
 ## Waiting for the owner
