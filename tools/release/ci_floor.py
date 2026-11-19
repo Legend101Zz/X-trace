@@ -1097,6 +1097,27 @@ def _runner_reason_code(text: Any) -> str:
     return "unclassified"
 
 
+# Publish only build task identifiers and failure categories from Gradle's own summary.
+_GRADLE_TASK_PATH = (
+    rb":(?:(?:agent-bootstrap|agent-runtime|attach-helper|spring-fixture|static-analyzer):)?"
+    rb"(?:clean|generateProto|compileJava|compileTestJava|test|jar|bootJar|installDist|"
+    rb"agentDist|attachHelperDist|javaPackDist|fixtureBootJar|generateSourceAttestation|snapshotFixtureSources)"
+)
+_GRADLE_TASK_LINE = re.compile(rb"> Task (" + _GRADLE_TASK_PATH + rb") FAILED")
+_GRADLE_TASK_ERROR = re.compile(rb"Execution failed for task '(" + _GRADLE_TASK_PATH + rb")'\.")
+_GRADLE_FAILURE_SIGNALS = (
+    (re.compile(rb"There (?:were failing tests|was a failing test)\b"), "test-failure"),
+    (re.compile(rb"Compilation failed\b"), "compilation-failure"),
+    (re.compile(rb"Dependency verification failed\b"), "dependency-verification"),
+    (re.compile(rb"Could not resolve (?:all (?:files|dependencies|artifacts)|\S+:\S+:\S+)"), "dependency-resolution"),
+    (re.compile(rb"Plugin \[id: [^\r\n]{1,500}\] was not found\b"), "plugin-resolution"),
+    (re.compile(rb"(?:Cannot find a Java installation|No matching toolchains found)\b"), "missing-toolchain"),
+    (re.compile(rb"Gradle build daemon disappeared unexpectedly\b"), "daemon-disappeared"),
+    (re.compile(rb"Could not (?:GET|HEAD) '[^'\r\n]{1,2048}'\. Received status code 429\b"), "http-429"),
+    (re.compile(rb"Could not (?:GET|HEAD) '[^'\r\n]{1,2048}'\. Received status code 5[0-9]{2}\b"), "http-5xx"),
+)
+
+
 _FAILED_TEST_LINE = re.compile(rb"^test (\S{1,400}) \.\.\. FAILED\s*$")
 _PANIC_SITE = re.compile(rb"panicked at (\S{1,400}?):(\d{1,9}):\d{1,9}")
 _ERROR_CODE = re.compile(rb'ErrorCode\("([^"\n]{0,400})"\)')
@@ -1149,7 +1170,7 @@ def _decode_ascii(raw: bytes) -> str | None:
 
 
 def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
-    """Failing test ids, panic sites, error codes and categories from a private cargo gate log.
+    """Read fixed Gradle signals or Cargo failure hints from an admitted private gate log.
 
     Every value must fully match a strict allowlist grammar (see the `_valid_*` helpers); anything
     else is dropped, never echoed. Panic message text is never published. Lists are bounded to
@@ -1159,6 +1180,10 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
     found: dict[str, list[str]] = {"failingTests": [], "panicSites": [], "errorCodes": [], "errorCategories": []}
     dropped = {key: 0 for key in found}
     compile_error = False
+    java = log_path.name == "java-strict.log"
+    gradle_failure_block = False
+    gradle_tasks: set[str] = set()
+    gradle_signals: set[str] = set()
 
     def add(key: str, raw: bytes, valid: Any, suffix: str = "") -> None:
         text = _decode_ascii(raw)
@@ -1182,12 +1207,28 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
         while total < 16 * 1024 * 1024:
             chunk = os.read(fd, 65536)
             if not chunk:
-                break
+                if not (java and pending):
+                    break
+                chunk = b"\n"  # Gradle can terminate without a final newline.
             total += len(chunk)
             pending += chunk
             *lines, pending = pending.split(b"\n")
             pending = pending[-4096:]
             for line in lines:
+                if java:
+                    line = line.rstrip(b"\r")
+                    if line.startswith(b"* "):
+                        gradle_failure_block = line == b"* What went wrong:"
+                    task = _GRADLE_TASK_LINE.fullmatch(line)
+                    if gradle_failure_block:
+                        reason = line.strip().removeprefix(b"> ")
+                        task = task or _GRADLE_TASK_ERROR.fullmatch(reason)
+                        for pattern, signal in _GRADLE_FAILURE_SIGNALS:
+                            if pattern.match(reason):
+                                gradle_signals.add(signal)
+                    if task:
+                        gradle_tasks.add(task[1].decode("ascii"))
+                    continue
                 match = _FAILED_TEST_LINE.match(line)
                 if match:
                     add("failingTests", match.group(1), _valid_test_id)
@@ -1204,7 +1245,15 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
         pass
     finally:
         os.close(fd)
-    hints: dict[str, Any] = {key: values for key, values in found.items() if values}
+    if java:
+        hints: dict[str, Any] = {
+            "gradleFailedTasks": sorted(gradle_tasks)[:MAX_FAILURE_HINTS],
+            "gradleFailureSignals": sorted(gradle_signals),
+        }
+        if len(gradle_tasks) > MAX_FAILURE_HINTS:
+            hints["hintsTruncated"] = {"gradleFailedTasks": len(gradle_tasks) - MAX_FAILURE_HINTS}
+        return hints
+    hints = {key: values for key, values in found.items() if values}
     truncated = {key: count for key, count in dropped.items() if count}
     if truncated:
         hints["hintsTruncated"] = truncated
