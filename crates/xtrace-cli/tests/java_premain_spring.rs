@@ -895,9 +895,12 @@ impl OrderWaitPhase {
         }
     }
 
-    fn diagnostic_session(self) -> Option<RuntimeSessionId> {
+    fn post_stop_segment_evidence(self, project_root: &Path) -> Option<&'static str> {
         match self {
-            Self::AttestationMismatch(id) | Self::ClassfileMutation(id) => id,
+            Self::AttestationMismatch(id) | Self::ClassfileMutation(id) => Some(
+                id.and_then(|id| incomplete_order_segment_evidence(project_root, id))
+                    .unwrap_or("unavailable"),
+            ),
             Self::SuccessfulRequest | Self::ErrorRequest => None,
         }
     }
@@ -950,9 +953,7 @@ fn wait_for_order_recordings_until(
             let complete_rows = complete_rows.min(ORDER_WAIT_ROW_LIMIT);
             let matching_rows = orders.len();
             let [incomplete, drain_expired, other_incomplete] = capture_markers.observations();
-            let segment_evidence = phase.diagnostic_session().map(|id| {
-                incomplete_order_segment_evidence(project_root, id).unwrap_or("unavailable")
-            });
+            let segment_evidence = phase.post_stop_segment_evidence(project_root);
             // The lane reads this one-shot record separately from libtest output. Use the
             // last poll's counts and keep a diagnostic I/O error from replacing the panic.
             if let Some(directory) = diagnostic_directory
@@ -1194,20 +1195,21 @@ fn order_wait_deadline_reports_the_last_complete_segment_observation() {
             symbol,
         );
     };
-    let assert_panic = |phase, markers: &CaptureMarkerScan, diagnostic_directory, panic_message| {
-        let panic = std::panic::catch_unwind(|| {
-            wait_for_order_recordings_until(
-                directory,
-                phase,
-                Instant::now(),
-                diagnostic_directory,
-                markers,
-            )
-        })
-        .expect_err("the recording wait must still fail at the deadline");
-        assert_eq!(panic.downcast_ref::<String>().unwrap().as_str(), panic_message);
-    };
-    let assert_deadline = |phase, markers, panic_message, record| {
+    let assert_panic =
+        |phase, markers: &CaptureMarkerScan, diagnostic_directory, panic_message: &str| {
+            let panic = std::panic::catch_unwind(|| {
+                wait_for_order_recordings_until(
+                    directory,
+                    phase,
+                    Instant::now(),
+                    diagnostic_directory,
+                    markers,
+                )
+            })
+            .expect_err("the recording wait must still fail at the deadline");
+            assert_eq!(panic.downcast_ref::<String>().unwrap().as_str(), panic_message);
+        };
+    let assert_deadline = |phase, markers, panic_message: &str, record| {
         assert_panic(phase, markers, Some(directory), panic_message);
         assert_eq!(fs::read_to_string(&diagnostic).unwrap(), record);
         fs::remove_file(&diagnostic).unwrap();
@@ -1263,6 +1265,14 @@ fn order_wait_deadline_reports_the_last_complete_segment_observation() {
         mismatch_message,
         "v3 attestation-mismatch 16 1 present present not-observed segment-without-terminal\n",
     );
+    let missing_session_id = daemon_session_id(&serde_json::json!({}));
+    assert_eq!(missing_session_id, None);
+    assert_deadline(
+        OrderWaitPhase::AttestationMismatch(missing_session_id),
+        &expired,
+        &mismatch_message.replace("segment-without-terminal", "unavailable"),
+        "v3 attestation-mismatch 16 1 present present not-observed unavailable\n",
+    );
     assert_panic(
         OrderWaitPhase::AttestationMismatch(Some(session_id)),
         &expired,
@@ -1279,14 +1289,24 @@ fn order_wait_deadline_reports_the_last_complete_segment_observation() {
     let partial = CaptureMarkerScan::default();
     partial.scan(CAPTURE_MARKERS[0]);
     partial.scan(CAPTURE_MARKERS[2]);
+    let mutation_message = "4 POST /orders recordings were not persisted before deadline \
+         (phase=classfile-mutation lastCompleteRows=16 completeRowsLimit=16 lastMatchingRows=1 \
+         captureIncomplete=present drainExpired=unavailable otherIncomplete=present \
+         incompleteOrderSegmentEvidence=segment-without-terminal)";
     assert_deadline(
         OrderWaitPhase::ClassfileMutation(Some(session_id)),
         &partial,
-        "4 POST /orders recordings were not persisted before deadline \
-         (phase=classfile-mutation lastCompleteRows=16 completeRowsLimit=16 lastMatchingRows=1 \
-         captureIncomplete=present drainExpired=unavailable otherIncomplete=present \
-         incompleteOrderSegmentEvidence=segment-without-terminal)",
+        mutation_message,
         "v3 classfile-mutation 16 1 present unavailable present segment-without-terminal\n",
+    );
+    let invalid_session_id =
+        daemon_session_id(&serde_json::json!({"runtime_session_id": "invalid-session-id"}));
+    assert_eq!(invalid_session_id, None);
+    assert_deadline(
+        OrderWaitPhase::ClassfileMutation(invalid_session_id),
+        &partial,
+        &mutation_message.replace("segment-without-terminal", "unavailable"),
+        "v3 classfile-mutation 16 1 present unavailable present unavailable\n",
     );
     for id in 19..=21 {
         add_complete_recording(id, "http.request POST /orders");
