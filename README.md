@@ -1,256 +1,46 @@
 # X-trace
 
-X-trace is a local-first capture-and-replay tool for HTTP services. The Rust
-workspace provides project storage, authenticated XTP ingestion, and a CLI for
-project setup, the foreground daemon, and an experimental direct-Java launch.
+X-trace helps you answer **“What happened inside my backend when this request arrived?”** It records how your application handles HTTP requests during local development. Pick an endpoint, open a recording, and follow the calls through your source in a browser or terminal.
 
-Status (2026-10-11): `main` also carries v0.01 work that is not accepted yet,
-including Node HTTP and Express capture, attach to a running JVM, `scan` and
-`catalog`, `record`/`stop`/`restart`, `doctor`, `tui` and a Canvas view;
-`export` writes OpenAPI, Postman, cURL and developer bundles from the persisted
-catalog. `exercise`, `retention`, `store` and `doctor --bundle` are still
-stubs (exit 9). None of it is a support claim: 0 of 55 v0.01 requirement rows
-are accepted. The paragraphs below describe the original Slice 1 tracer
-bullet. Current status: `docs/STATE.md`; release specification:
-`docs/releases/v0.01.md`.
+For example, when a developer submits the edit-owner form in Spring Petclinic, they can reopen that request and inspect the handler, the calls beneath it, and the outcome X-trace captured. A line is highlighted only when the recording contains an event for that line. Missing source, redacted values, and incomplete recordings are labeled so you can see where the evidence ends.
 
-`xtrace export --format openapi|postman|curl|bundle --output <DIR>` reads the
-latest catalog revision; use `--revision <UUID>` or repeat `--operations <ID>`
-to select entries. `--preview` renders and lists files without writing.
-OpenAPI 3.1 declares routes and required path parameters (`--yaml` selects YAML).
-Postman v2.1 contains requests with an empty `baseUrl` variable. cURL contains
-shell recipes with unresolved values as variables; `all.sh` only prints commands.
-A bundle contains `openapi.yaml`, the collection, `curl/`, a manifest with hashes
-and counts per format, and a README explaining provenance and omissions.
+## Release status
 
-Exports distinguish declarations from observations using component, binding,
-method and route. All known handler symbols and conflicts are retained. The
-catalog read port exposes summaries. Single-claim handlers keep their source
-start line; end lines, multi-claim locations and individual confidence are
-listed as unavailable. Highest confidence is named explicitly.
-OpenAPI lists duplicate method/path omissions; its count includes only the
-operations represented. No observed request or response bodies are exported.
-An unavailable policy digest is null in the bundle manifest with an omission.
+**0.0.1 is in development.** The project calls this first public release **v0.01** in its roadmap. As of November 19, 2026, there is no published package or selected release candidate. All 55 mandatory requirements still need formal acceptance. [Release tracker](https://github.com/Legend101Zz/X-trace/issues/1) · [Acceptance ledger](evidence/v0.01/requirements.json) · [Releases](https://github.com/Legend101Zz/X-trace/releases)
 
-The output parent must exist. A destination must be absent or empty, owned by
-the caller and private (0700); non-empty directories and symlinks are refused.
-Files are staged in a private sibling directory and published by one rename.
-Files use mode 0600, directories 0700. Nothing is sent or executed. Missing
-revisions or operation IDs exit 3, usage errors exit 2, and a secret-shaped
-value exits 8 before any output is written. All four formats are implemented.
+| Area | What works today | Work remaining for 0.0.1 |
+| --- | --- | --- |
+| Java recording | A packaged build captured Spring MVC requests in Petclinic. Replay checks covered source identity, executed lines, frame values, and reopening a recording. | Reliable capture through shutdown, broader Java framework coverage, and verification across supported launch and attach configurations. |
+| Node.js recording | The adapter implements Node HTTP and Express instrumentation. | Fastify, NestJS, authored TypeScript sources, and linking work across workers and child processes still need release evidence. |
+| Replay and export | The Petclinic campaign exercised both browser views, the terminal viewer, and local exports. OpenAPI describes routes, Postman produces a collection, cURL produces command recipes, and the developer bundle collects the exports with a manifest. | Catalog conflicts and history, export accuracy when scopes share a route, and replay accessibility and performance remain open. |
+| Distribution | Linux CI builds and checks development packages. | The release requires six real-application campaigns, fresh installs on Linux x86_64 and macOS arm64, and usability sessions with developers. |
 
-The Node 22 workspace under `adapters/node` is a protocol/conformance
-foundation only. Its private synthetic client can authenticate to the local
-daemon and prove a staged XTP recording reached selected-root XTF storage; it
-does not instrument Node applications or declare Node capture support. See
-`docs/development/setup.md` for the exact acceptance commands and boundary.
+The latest **Petclinic campaign** passed 37 of 45 checks on commit `7448048`. The other eight recorded limitations, including how load and overhead were measured. On the subsequent `main` commit `be441c5`, the JDK 21 / Node 24 Linux configuration passed all 23 release checks. The JDK 17 / Node 22 configuration and the main unit and integration job failed. [Petclinic results](https://github.com/Legend101Zz/X-trace/actions/runs/43201696564) · [CI results for that commit](https://github.com/Legend101Zz/X-trace/actions/runs/43214553598) · [Current CI](https://github.com/Legend101Zz/X-trace/actions/workflows/ci.yml?query=branch%3Amain)
 
-The Java workspace under `adapters/java` preserves that synthetic conformance
-client and adds an experimental launch-only tracer bullet. A JDK-only
-`premain`/bridge JAR loads a private runtime and captures one pinned Spring Boot
-4.1.1 fixture's `POST /orders` path through Spring MVC, three exact application
-methods, and H2 `executeUpdate()`. This is fixture evidence, not general Java,
-Spring, Spring Boot, Servlet, attach, or production capture support. The
-`POST /orders` identity is fixed by the exact fixture handler matcher; it is
-source-derived test metadata, not request-derived dynamic endpoint discovery.
-`xtrace run` is Unix-only and scoped to this exact fixture tracer bullet. It
-does not launch Gradle/Maven tasks, wrappers, application servers, or arbitrary
-process trees, and it does not add attach, discovery, browser replay, or broad
-Java compatibility.
+## Explore from source
 
-## Crate layout
+From an X-trace checkout with Rust and a C compiler installed, these commands show the available commands and capture options.
 
-| Crate               | Purpose                                                                |
-|---------------------|------------------------------------------------------------------------|
-| `xtrace-domain`     | IO-free entities, identifiers, errors, value vocabulary                |
-| `xtrace-application`| Commands, queries, ports, and the `Application` facade                 |
-| `xtrace-protocol`   | Generated XTP protobuf bindings and domain-DTO translation              |
-| `xtrace-store`      | Bundled SQLite store, migrations, and `ProjectRepository` adapter      |
-| `xtrace-daemon`     | Authenticated XTP ingress and experimental isolated loopback viewer     |
-| `xtrace-private-storage` | Owner-enforced private directory admission |
-| `xtrace-macos-acl`  | Safe macOS SDK ACL evidence; isolated unsafe FFI                         |
-| `xtrace-runtime`    | Runtime launch validation, agent injection, and process supervision    |
-| `xtrace-cli`        | Clap subcommands, project composition, output and path resolution       |
-| `xtrace-ingest`     | Recording assembler: per-recording sequence, lifecycle and idempotency checks |
-| `xtrace-tui`        | Terminal viewer library: pure update loop and a text-grid renderer      |
-| `xtrace-export`     | OpenAPI, Postman, cURL and bundle exports from a read catalog view      |
-| `xtrace-exercise`   | Exercise plans and previews (no networking yet)                         |
-
-Dependency direction follows `docs/plans/x-trace/02-architecture.md`:
-
-```text
-xtrace-cli       -> xtrace-application, xtrace-store, xtrace-daemon, xtrace-domain, xtrace-private-storage, xtrace-protocol, xtrace-runtime
-xtrace-runtime   -> xtrace-private-storage, xtrace-protocol, OS process launch and supervision policy
-xtrace-daemon    -> xtrace-application, xtrace-domain, xtrace-ingest, xtrace-private-storage, xtrace-protocol
-xtrace-store     -> xtrace-application, xtrace-domain, xtrace-private-storage, xtrace-protocol
-xtrace-ingest    -> xtrace-domain, xtrace-protocol
-xtrace-private-storage -> xtrace-macos-acl (macOS only)
-xtrace-macos-acl -> (leaf: SDK only)
-xtrace-protocol  -> xtrace-domain
-xtrace-application -> xtrace-domain
+```sh
+cargo run --locked -p xtrace-cli --bin xtrace -- --help
+cargo run --locked -p xtrace-cli --bin xtrace -- run --help
 ```
 
-The domain crate never imports generated types; every wire payload that crosses
-into domain DTOs flows through `xtrace-protocol::translate`.
+If you already have an initialized project with recordings, point the CLI at **that application's repository**. The first command lists its recordings. The second starts the local viewer and prints a short-lived, single-use URL. Open it in your browser and keep the command running while you explore.
 
-## Storage layout
-
-Project state lives under the resolved user-data home directory, not inside
-the repository:
-
-```text
-<resolved_data_home>/projects/<project-id>/metadata.sqlite3
+```sh
+project_dir="/absolute/path/to/your/recorded-project"
+cargo run --locked -p xtrace-cli --bin xtrace -- recording list --project-dir "$project_dir"
+cargo run --locked -p xtrace-cli --bin xtrace -- open --project-dir "$project_dir" --viewer --no-browser
 ```
 
-The resolved home is `XTRACE_DATA_HOME` when set to an absolute path, used
-directly as the application root. When the override is absent, the platform
-default documented in `crates/xtrace-cli/src/paths.rs` is used, and that
-default already lives under `xtrace/...` because the resolver appends the
-application folder itself. So an explicit `XTRACE_DATA_HOME` must not add
-another `xtrace` segment, and the platform defaults shown below already
-include the trailing `xtrace`:
+Recordings stay in the local X-trace data directory. The application repository holds a project pointer at `.xtrace/config.toml`. Treat the viewer URL as a temporary credential. For a first capture, the developer setup includes the Java agent build and a worked Spring example. [Spring capture walkthrough](docs/development/setup.md#experimental-xtrace-run) · [Local security model](docs/security-local.md)
 
-- macOS: `$HOME/Library/Application Support/xtrace`
-- Linux: `${XDG_DATA_HOME:-~/.local/share}/xtrace`
-- Windows: `%APPDATA%\xtrace`
+## Project documentation
 
-The repository owns a single atomic pointer at `.xtrace/config.toml`:
+- [Product design](docs/plans/x-trace/01-product.md) explains the intended endpoint-to-source workflow.
+- [Development tools](tools/dev/README.md) covers dependency setup, cache locations, and fast checks.
+- [Release specification](docs/releases/v0.01.md) lists the framework, platform, and usability commitments for 0.0.1.
+- [Documentation index](docs/INDEX.md) links the architecture, storage format, API, and design decisions.
 
-```toml
-schema_version = 1
-project_id = "0192..."
-data_home = "/Users/.../Library/Application Support/xtrace"
-```
-
-`xtrace init` writes the pointer after the database is fully initialized.
-`xtrace status` reads the pointer and emits an empty report when it is
-absent, without opening or creating any database file. `xtrace open` reads
-the pointer and resolves the database path under the user-data home.
-
-## Idempotent commands
-
-Every command accepts a client-generated idempotency key. The CLI
-auto-generates one (`xtrace-init-v1-<BLAKE3 hex of the canonical repository path>`;
-the older raw-path key is still recognised) so an
-unattended retry behaves as a replay. The application facade persists every
-receipt in the `command_receipts` table keyed by
-`(project_id, command_kind, idempotency_key)`:
-
-- Same key + same canonical input → return the original receipt verbatim.
-- Same key + different canonical input → `XTR-COMMAND-409` (`Conflict`).
-
-## Protobuf
-
-The build resolves `protoc` from `protoc-bin-vendored` and passes the
-absolute path to `prost_build::Config::protoc_executable`. It never inspects
-`PATH`, never sets `PROTOC`, and never installs a system `protoc`. CI runs a
-restricted-PATH build to verify the vendored path.
-
-## Quick start
-
-```bash
-# Prepare and validate the Node XTP workspace (Node 22+, npm)
-npm ci --prefix adapters/node
-npm run generate:check --prefix adapters/node
-npm test --prefix adapters/node
-
-# Verify dependencies, generate Java bindings, test, install the synthetic
-# client, and assemble the experimental premain agent and Spring fixture
-GRADLE_USER_HOME=/path/to/cache/gradle \
-  adapters/java/gradlew -p adapters/java --dependency-verification strict \
-  clean test installDist agentDist fixtureBootJar
-
-# Run the Rust suite, including both language-to-daemon persistence tests
-cargo build --workspace --all-features
-cargo test --workspace --all-features
-
-# Initialize, status, and open the spine against a temporary repo
-cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-smoke
-cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-smoke
-cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir /tmp/xtrace-smoke
-```
-
-Persisted recordings can be inspected through the bounded, read-only query
-surface:
-
-```bash
-cargo run -q -p xtrace-cli --bin xtrace -- recording list \
-  --project-dir /tmp/xtrace-smoke --limit 50
-cargo run -q -p xtrace-cli --bin xtrace -- recording show \
-  --project-dir /tmp/xtrace-smoke <recording-id> --limit 200
-```
-
-`list` is metadata-only, ordered by opening time and recording ID, and accepts
-the returned `next_after` recording ID for another page (default 50, maximum
-200). `show` verifies the touched XTF segments and returns an ordered event
-window (default 200, maximum 1,000 events, 256 KiB of compact event JSON, and
-16 MiB of verified compressed-plus-logical XTF input per call). If another
-segment would exceed the input budget, the response stops at the preceding
-event and returns a cursor; one codec-bounded first segment may be processed
-to ensure progress. Pass the versioned `next_cursor` back with `--cursor`; the
-cursor is bound to the selected project and recording. Sequence and monotonic
-values are decimal strings for JavaScript-safe precision. Raw interaction paths
-are omitted because persisted path segments may contain identifiers or tokens.
-Oversized display fields become `[truncated]`; oversized identity/relationship
-fields become `[unavailable]`. `field_truncations` records field names,
-original byte lengths, and replacement kinds without retaining source text.
-These projections contain persisted event metadata only: they do not expose
-captured values, source bodies, or completion semantics, and a `recording`
-status is not a completion claim.
-Opening read-only uses normal SQLite WAL coordination; SQLite may create its
-empty WAL/shared-memory coordination files when none exist, but query paths do
-not migrate or update logical store data, repository pointers, or project
-`last_opened` metadata.
-
-For an interactive, explicitly foreground browser session, use:
-
-```bash
-cargo run -q -p xtrace-cli --bin xtrace -- open \
-  --project-dir /tmp/xtrace-smoke --viewer --no-browser
-```
-
-The command prints a JSON readiness document containing a one-use 60-second
-URL, then stays in the foreground until Ctrl+C or SIGTERM. Copy the URL into a
-browser. Omitting `--no-browser` asks the operating system's fixed default
-browser launcher to open it. This mode does not reuse or discover another
-viewer process. It binds only to `127.0.0.1` on an OS-assigned port and uses a
-separate plain-HTTP listener from the XTP mTLS listener. The bootstrap secret
-is in the URL fragment, which browsers do not send to the server; the page
-removes it from history before a one-use exchange and then uses a browser-
-session HttpOnly, host-only, SameSite=Strict cookie backed by an in-memory
-15-minute server-side expiry. The cookie has no `Max-Age` or `Expires`, so the
-browser drops it when its session ends. `Secure` is omitted only
-because this experimental viewer is plain HTTP on loopback; exact Host and
-same-origin checks remain required. Do not share or save the readiness URL.
-This mode does not defend against hostile processes running as the same OS
-user: the readiness document prints the credential URL, and when browser
-launching is enabled the OS opener receives that URL in its argument vector.
-Use `--no-browser` where process-list disclosure matters, and treat readiness
-stdout as sensitive for the token's 60-second lifetime.
-
-The browser is a dense local Linear evidence viewer, not source replay. It
-shows persisted recording facts and ordered event metadata. Source locations,
-captured values, durations, and completion semantics remain explicitly
-unavailable; a persisted `GAP` is a metadata event and does not itself imply
-partiality or completion. Interaction path fields are omitted. Trace text is
-rendered as text, not HTML. The app does not store recordings or tokens in
-localStorage, sessionStorage, or IndexedDB. The browser cookie jar necessarily
-holds the non-persistent session cookie while the browser session is active.
-Static assets are embedded in the Rust daemon;
-`npm run check:embedded --prefix web/app` detects drift from the pinned Vite
-build, and `npm run check:api --prefix web/app` checks generated TypeScript
-against `schema/xtp-client/openapi.yaml`.
-
-`just test` and `just ci` prepare both language workspaces before Rust tests,
-so their daemon integration tests do not depend on ignored build output from
-another job or checkout. Without `just`, `tools/dev/prep.sh --adapters` does
-the same preparation; `tools/dev/README.md` describes the agent-friendly
-environment and fast checks.
-
-The status report on an uninitialized repository is a single JSON document
-that names no projects and reports `initialized: false` without touching
-the filesystem.
-
-## License
-
-Licensed under the MIT license (see `LICENSE`).
+X-trace uses the [MIT license](LICENSE).
