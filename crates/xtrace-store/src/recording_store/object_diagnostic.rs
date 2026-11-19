@@ -13,7 +13,7 @@ pub(super) enum ObjectIoSite {
     StagingRootOpenOrCreate,
     StagingRecordingOpenOrCreate,
     StagingDirectoryCreate,
-    StagingRecordingSync,
+    StagingRecordingRevalidate,
     ObjectProjectRootOpen,
     ObjectParentOpenOrCreate,
     ObjectParentRevalidate,
@@ -301,13 +301,13 @@ mod tests {
         }
 
         let scope = Scope::enter();
-        let result = private(ObjectIoSite::StagingRecordingSync, id, object_io_error, || {
+        let result = private(ObjectIoSite::StageFileParentSync, id, object_io_error, || {
             Err::<(), _>(PrivateStorageError::Operation)
         });
         assert!(matches!(result, Err(error) if error.code() == "XTR-STORE-OBJECT-IO"));
         assert_eq!(
             scope.report(1),
-            "iteration=1 operation=StagingRecordingSync error=Operation admission=unavailable kind=unavailable errno=unavailable context=unavailable"
+            "iteration=1 operation=StageFileParentSync error=Operation admission=unavailable kind=unavailable errno=unavailable context=unavailable"
         );
     }
 }

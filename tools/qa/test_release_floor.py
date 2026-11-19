@@ -128,9 +128,9 @@ class FloorEnvironmentTests(CheckoutFixture):
              " admission=unavailable kind=StorageFull errno=28 context=unavailable",
              site, "xtrace_store", {"iteration": 10000, "operation": "StageFileWrite", "privateStorageError": None,
                                     "admissionOperation": None, "kind": "StorageFull", "errno": 28, "context": None}),
-            ("acknowledgement object io iteration=1 operation=StagingRecordingSync error=Operation"
+            ("acknowledgement object io iteration=1 operation=StageFileParentSync error=Operation"
              " admission=unavailable kind=Other errno=unavailable context=unavailable",
-             site, "xtrace_store", {"iteration": 1, "operation": "StagingRecordingSync",
+             site, "xtrace_store", {"iteration": 1, "operation": "StageFileParentSync",
                                     "privateStorageError": "Operation", "admissionOperation": None,
                                     "kind": "Other", "errno": None, "context": None}),
             *journal_cases,

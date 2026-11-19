@@ -4499,7 +4499,14 @@ fn create_staging_files(
         correlation_id,
         recording_directory.create_private_child(&directory_name)
     )?;
-    object_io!(private, StagingRecordingSync, correlation_id, recording_directory.sync())?;
+    // create_private_child already synced this parent's new directory entry. Only
+    // admission reads have followed that barrier. Check the parent binding once more.
+    object_io!(
+        private,
+        StagingRecordingRevalidate,
+        correlation_id,
+        recording_directory.revalidate()
+    )?;
     let directory = staging.path().to_path_buf();
     drop(staging);
     Ok(StagingFiles {
