@@ -196,7 +196,7 @@ class FloorProgressTests(unittest.TestCase):
 
     def check_spring_deadline_summary(self, *, interrupt):
         gate = "rust-workspace"
-        valid = b"v2 attestation-mismatch 5 2 present present not-observed\n"
+        valid = b"v3 attestation-mismatch 5 2 present present not-observed segment-without-terminal\n"
         log_only = b"v2 error-request 2 1 present unavailable present\n"
         private_values = ("captured-value-731", "/fixture/customer.txt", "b3:0123456789abcdef",
                           "BODY_CANARY_1D3", "XTR-JAVA-CAPTURE-DRAIN-EXPIRED")
@@ -261,6 +261,7 @@ class FloorProgressTests(unittest.TestCase):
             "status": "observed", "phase": "attestation-mismatch", "state": "insufficient-matching-rows",
             "expectedRows": 3, "completeRows": 5, "completeRowsLimit": 16, "matchingRows": 2,
             "captureMarkers": {"incomplete": "present", "drainExpired": "present", "otherIncomplete": "not-observed"},
+            "incompleteOrderSegmentEvidence": "segment-without-terminal",
         }
         if interrupt:
             self.assertIn("owned process tree drained", (logs / f"{gate}.log").read_text())

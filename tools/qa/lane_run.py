@@ -768,11 +768,12 @@ SPRING_ORDER_WAIT_PHASES = {
     "successful-request": 1, "error-request": 2, "attestation-mismatch": 3, "classfile-mutation": 4,
 }
 SPRING_ORDER_WAIT_ROW_LIMIT = 16
-SPRING_ORDER_WAIT_MAX_BYTES = 96
+SPRING_ORDER_WAIT_MAX_BYTES = 128
 SPRING_MARKER_OBSERVATION = rb"(present|not-observed|unavailable)"
 SPRING_ORDER_WAIT_RECORD = re.compile(
-    rb"v2 ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3]) "
-    + b" ".join([SPRING_MARKER_OBSERVATION] * 3) + rb"\n"
+    rb"(v2|v3) ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3]) "
+    + b" ".join([SPRING_MARKER_OBSERVATION] * 3)
+    + rb"(?: (segment-without-terminal|segment-with-terminal|mixed|not-observed|unavailable))?\n"
 )
 
 
@@ -789,12 +790,21 @@ def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index
     record = SPRING_ORDER_WAIT_RECORD.fullmatch(raw)
     if record is None:
         return unavailable
-    phase = record[1].decode("ascii")
+    version, phase_bytes, complete_bytes, matching_bytes, incomplete, drain_expired, other_incomplete, segment = (
+        record.groups()
+    )
+    if (version == b"v3") != (segment is not None):
+        return unavailable
+    phase = phase_bytes.decode("ascii")
+    if segment is not None and phase not in ("attestation-mismatch", "classfile-mutation"):
+        return unavailable
     expected = SPRING_ORDER_WAIT_PHASES.get(phase)
-    complete, matching = int(record[2]), int(record[3])
+    complete, matching = int(complete_bytes), int(matching_bytes)
     if expected is None or complete > SPRING_ORDER_WAIT_ROW_LIMIT or matching > complete or matching >= expected:
         return unavailable
-    incomplete, drain_expired, other_incomplete = (value.decode("ascii") for value in record.groups()[3:])
+    incomplete, drain_expired, other_incomplete = (
+        value.decode("ascii") for value in (incomplete, drain_expired, other_incomplete)
+    )
     observations = {incomplete, drain_expired, other_incomplete}
     # All marker states come from one snapshot. An unseen marker is only
     # "not-observed" after EOF; until then its observation is unavailable.
@@ -810,6 +820,8 @@ def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index
               "completeRows": complete, "completeRowsLimit": SPRING_ORDER_WAIT_ROW_LIMIT, "matchingRows": matching,
               "captureMarkers": {"incomplete": incomplete, "drainExpired": drain_expired,
                                  "otherIncomplete": other_incomplete}}
+    if segment is not None:
+        result["incompleteOrderSegmentEvidence"] = segment.decode("ascii")
     return unavailable if _private(_encoded(result).decode("ascii"), index, verified_identifier=True) else result
 
 

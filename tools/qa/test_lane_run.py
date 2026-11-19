@@ -1434,6 +1434,16 @@ class SpringPremainDiagnosticTests(unittest.TestCase):
                     "captureMarkers": {"incomplete": incomplete, "drainExpired": drain, "otherIncomplete": other},
                 })
 
+    def test_failed_workspace_publishes_incomplete_order_segment_evidence(self):
+        for evidence in (
+            "segment-without-terminal", "segment-with-terminal", "mixed", "not-observed", "unavailable",
+        ):
+            with self.subTest(evidence=evidence):
+                record = f"v3 classfile-mutation 9 3 present present not-observed {evidence}\n"
+                fragment, public = self.run_floor_step(record.encode())
+                self.assertEqual(fragment["springPremainOrderWait"]["incompleteOrderSegmentEvidence"], evidence)
+                self.assertNotIn(record.strip(), public)
+
     def test_failed_workspace_withholds_unavailable_or_malformed_diagnostics(self):
         valid = b"v2 successful-request 0 0 present not-observed present\n"
         for record, mode, metadata in (
@@ -1450,6 +1460,11 @@ class SpringPremainDiagnosticTests(unittest.TestCase):
             (valid.replace(b"not-observed", b"captured-value"), 0o600, None),
             (valid.replace(b"not-observed present", b"not-observed unavailable"), 0o600, None),
             (valid.replace(b"not-observed ", b""), 0o600, None),
+            (b"v3 classfile-mutation 9 3 present present not-observed\n", 0o600, None),
+            (valid.rstrip() + b" segment-with-terminal\n", 0o600, None),
+            (b"v3 classfile-mutation 9 3 present present not-observed captured-value\n", 0o600, None),
+            (b"v3 classfile-mutation 9 3 present present not-observed mixed unavailable\n", 0o600, None),
+            (b"v3 error-request 9 1 present present not-observed mixed\n", 0o600, None),
             (valid.rstrip(), 0o600, None),
             (valid * 3, 0o600, None),
             (valid + b"/fixture/customer.txt\nb3:0123456789abcdef\n", 0o600, None),
@@ -1461,10 +1476,15 @@ class SpringPremainDiagnosticTests(unittest.TestCase):
                     self.assertNotIn(value, public)
 
     def test_canary_scan_still_checks_rebuilt_marker_observations(self):
-        fragment, public = self.run_floor_step(
-            b"v2 successful-request 0 0 present not-observed present\n", private_canary="not-observed")
-        self.assertEqual(fragment["springPremainOrderWait"], {"status": "unavailable"})
-        self.assertNotIn("not-observed", public)
+        for record, canary in (
+            (b"v2 successful-request 0 0 present not-observed present\n", "not-observed"),
+            (b"v3 classfile-mutation 9 3 present present not-observed segment-without-terminal\n",
+             "segment-without-terminal"),
+        ):
+            with self.subTest(canary=canary):
+                fragment, public = self.run_floor_step(record, private_canary=canary)
+                self.assertEqual(fragment["springPremainOrderWait"], {"status": "unavailable"})
+                self.assertNotIn(canary, public)
 
     def test_successful_workspace_publishes_no_wait_failure(self):
         fragment, _ = self.run_floor_step(None, code=0)
