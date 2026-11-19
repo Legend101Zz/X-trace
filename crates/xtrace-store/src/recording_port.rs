@@ -503,7 +503,11 @@ mod tests {
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
-        xtrace_private_storage::AdmittedPrivateRoot::open(&temp_base)
+        fixture_in(&temp_base)
+    }
+
+    fn fixture_in(temp_base: &std::path::Path) -> (tempfile::TempDir, SqliteStore, Project) {
+        xtrace_private_storage::AdmittedPrivateRoot::open(temp_base)
             .expect("admitted private test scratch");
         let directory = tempfile::Builder::new()
             .prefix("recording-port-")
@@ -1639,7 +1643,13 @@ mod tests {
     fn a_small_held_request_is_replayable_from_its_durable_journal_before_finish() {
         use xtrace_application::recording_queries::{RecordingCompletionEvidence, RecordingStatus};
 
-        let (directory, store, project) = fixture();
+        // Other store tests create and drop projects directly in the shared scratch.
+        // CI pre-creates a separate parent so their directory mutations cannot change
+        // the ancestors this test admits while sealing its first segment.
+        let (directory, store, project) = match std::env::var_os("XTRACE_TEST_PRIVATE_IO_ROOT") {
+            Some(root) => fixture_in(&std::path::Path::new(&root).join("held-request")),
+            None => fixture(),
+        };
         let persistence = Arc::new(SqliteRecordingPersistence::new(store, directory.path()));
         let capture = RecordingCaptureService::new(
             persistence,
@@ -1743,20 +1753,23 @@ mod tests {
             PortErrorKind::NotFound
         );
 
-        capture
-            .finish_recording(FinishRecording {
-                recording_id: anchor.recording_id,
-                final_recording_seq: 3,
-                duration_ns: Some(100),
-                event_digest: digest_of(&events),
-                drop_counts_by_priority: Default::default(),
-                unsupported_capability_codes: Vec::new(),
-                capacity_dropped_events: 0,
-                event_cap: xtrace_domain::STANDARD_EVENT_CAP as u64,
-                outcome: None,
-                response_summary: None,
-            })
-            .expect("finish acknowledged prefix");
+        #[cfg(all(unix, debug_assertions))]
+        let observation = crate::recording_store::object_diagnostic::Scope::enter();
+        let finish = capture.finish_recording(FinishRecording {
+            recording_id: anchor.recording_id,
+            final_recording_seq: 3,
+            duration_ns: Some(100),
+            event_digest: digest_of(&events),
+            drop_counts_by_priority: Default::default(),
+            unsupported_capability_codes: Vec::new(),
+            capacity_dropped_events: 0,
+            event_cap: xtrace_domain::STANDARD_EVENT_CAP as u64,
+            outcome: None,
+            response_summary: None,
+        });
+        #[cfg(all(unix, debug_assertions))]
+        let finish = finish.map_err(|error| (error, observation.report(1)));
+        finish.expect("finish acknowledged prefix");
         cross_project.project_id = project.id();
         let complete = reader.show_recording(&cross_project).expect("sealed events");
         assert_eq!(complete.status, RecordingStatus::Complete);

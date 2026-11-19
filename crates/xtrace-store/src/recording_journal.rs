@@ -16,18 +16,6 @@ use xtrace_protocol::xtf::XtfEventEnvelope;
 
 use super::*;
 
-// The parent module declares its wrapper after this module. Share its observer here.
-macro_rules! object_io {
-    ($source:ident, $site:ident, $id:expr, $call:expr) => {{
-        #[cfg(all(test, unix, debug_assertions))]
-        let result =
-            object_diagnostic::$source(object_diagnostic::ObjectIoSite::$site, $id, || $call);
-        #[cfg(not(all(test, unix, debug_assertions)))]
-        let result = ($call).map_err(|_| object_io_error($id));
-        result
-    }};
-}
-
 const LEGACY_MAGIC: &[u8; 8] = b"XTRTAIL1";
 const MAGIC: &[u8; 8] = b"XTRTAIL2";
 const BOUNDARY_BYTES: usize = HEADER_BYTES + 8 + 32;

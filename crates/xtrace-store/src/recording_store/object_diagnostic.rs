@@ -5,7 +5,7 @@ use std::{cell::Cell, fmt, io, marker::PhantomData, rc::Rc};
 use xtrace_domain::CorrelationId;
 use xtrace_private_storage::{AdmissionFailure, PrivateStorageError};
 
-use super::{RecordingStoreError, object_io_error};
+use super::RecordingStoreError;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ObjectIoSite {
@@ -64,6 +64,23 @@ pub(super) enum ObjectIoSite {
     JournalBinding,
     JournalCleanupMetadata,
     JournalCleanupRemove,
+    ManagedDirectoryOpen,
+    ManagedDirectoryRevalidate,
+    ManagedTreeOpen,
+    ManagedTreeChild,
+    ManagedTreeRevalidate,
+    ManagedFileParentOpen,
+    ManagedFileBinding,
+    PublishStagingRoot,
+    PublishStagingFile,
+    PublishStagingBinding,
+    PublishDestinationRoot,
+    PublishStagingRevalidate,
+    PublishDestinationRevalidate,
+    PublishHardLink,
+    PublishedFileOpen,
+    PublishedFileBinding,
+    PublishedDirectorySync,
     CommitFailpoint,
 }
 
@@ -143,10 +160,11 @@ fn observe(facts: Observation) {
 pub(super) fn private<T>(
     site: ObjectIoSite,
     correlation_id: CorrelationId,
+    mapped_error: fn(CorrelationId) -> RecordingStoreError,
     call: impl FnOnce() -> Result<T, PrivateStorageError>,
 ) -> Result<T, RecordingStoreError> {
     if !FIRST.with(|slot| matches!(slot.get(), Some(None))) {
-        return call().map_err(|_| object_io_error(correlation_id));
+        return call().map_err(|_| mapped_error(correlation_id));
     }
     let (result, discarded) = PrivateStorageError::with_io_diagnostic(call);
     result.map_err(|error| {
@@ -155,13 +173,14 @@ pub(super) fn private<T>(
             _ => discarded.map_or((None, None), |(kind, errno)| (Some(kind), errno)),
         };
         observe(Observation { site: Some(site), private_error: Some(error), kind, errno });
-        object_io_error(correlation_id)
+        mapped_error(correlation_id)
     })
 }
 
 pub(super) fn direct<T, E: Into<io::Error>>(
     site: ObjectIoSite,
     correlation_id: CorrelationId,
+    mapped_error: fn(CorrelationId) -> RecordingStoreError,
     call: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, RecordingStoreError> {
     call().map_err(|error| {
@@ -172,18 +191,19 @@ pub(super) fn direct<T, E: Into<io::Error>>(
             errno: error.raw_os_error(),
             ..Observation::default()
         });
-        object_io_error(correlation_id)
+        mapped_error(correlation_id)
     })
 }
 
 pub(super) fn missing<T, E>(
     site: ObjectIoSite,
     correlation_id: CorrelationId,
+    mapped_error: fn(CorrelationId) -> RecordingStoreError,
     call: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, RecordingStoreError> {
     call().map_err(|_| {
         observe(Observation { site: Some(site), ..Observation::default() });
-        object_io_error(correlation_id)
+        mapped_error(correlation_id)
     })
 }
 
@@ -193,7 +213,10 @@ pub(super) fn observe_failpoint() {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{COMMIT_FAILPOINT, COMMIT_FAILPOINT_FIRED, commit_failpoint};
+    use super::super::{
+        COMMIT_FAILPOINT, COMMIT_FAILPOINT_FIRED, atomic_install_error, commit_failpoint,
+        object_io_error,
+    };
     use super::*;
     use xtrace_private_storage::AdmissionOperation;
 
@@ -201,7 +224,7 @@ mod tests {
     fn first_object_io_survives_cleanup_and_other_threads_and_resets() {
         let inject = |site, error| {
             let id = CorrelationId::new();
-            let result = direct(site, id, || Err::<(), _>(error));
+            let result = direct(site, id, object_io_error, || Err::<(), _>(error));
             assert!(matches!(result, Err(failure) if failure.code() == "XTR-STORE-OBJECT-IO"
                 && failure.kind() == super::super::RecordingStoreErrorKind::Transport));
         };
@@ -242,6 +265,23 @@ mod tests {
     }
 
     #[test]
+    fn atomic_install_reports_the_syscall_kind_without_paths_or_changing_the_error_code() {
+        let scope = Scope::enter();
+        let result = direct(
+            ObjectIoSite::PublishHardLink,
+            CorrelationId::new(),
+            atomic_install_error,
+            || Err::<(), _>(io::Error::new(io::ErrorKind::PermissionDenied, "/private/path")),
+        );
+        assert!(matches!(result, Err(error) if error.code() == "XTR-STORE-ATOMIC-INSTALL"
+            && error.kind() == super::super::RecordingStoreErrorKind::Compatibility));
+        assert_eq!(
+            scope.report(1),
+            "iteration=1 operation=PublishHardLink error=unavailable admission=unavailable kind=PermissionDenied errno=unavailable context=unavailable"
+        );
+    }
+
+    #[test]
     fn private_storage_variant_and_only_available_facts_survive_mapping() {
         let id = CorrelationId::new();
         {
@@ -250,7 +290,7 @@ mod tests {
                 AdmissionOperation::NamedMetadata,
                 io::Error::new(io::ErrorKind::PermissionDenied, "identity-canary /private/path"),
             );
-            let result = private(ObjectIoSite::StagingProjectRootOpen, id, || {
+            let result = private(ObjectIoSite::StagingProjectRootOpen, id, object_io_error, || {
                 Err::<(), _>(PrivateStorageError::Admission(failure))
             });
             assert!(matches!(result, Err(error) if error.code() == "XTR-STORE-OBJECT-IO"));
@@ -261,7 +301,7 @@ mod tests {
         }
 
         let scope = Scope::enter();
-        let result = private(ObjectIoSite::StagingRecordingSync, id, || {
+        let result = private(ObjectIoSite::StagingRecordingSync, id, object_io_error, || {
             Err::<(), _>(PrivateStorageError::Operation)
         });
         assert!(matches!(result, Err(error) if error.code() == "XTR-STORE-OBJECT-IO"));
