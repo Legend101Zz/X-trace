@@ -104,6 +104,45 @@ class CiPullRequestTests(unittest.TestCase):
                             self.assertRegex(fast_path, r"(?m)^  exit 0\nfi$")
         self.assertEqual(installs, 3)
 
+    def test_floor_only_skips_apt_when_all_native_packages_are_installed(self):
+        steps = self.workflow["jobs"]["release-floor-linux-x86_64"]["steps"]
+        install = next(step["run"] for step in steps if "DEBIAN_FRONTEND" in step.get("run", ""))
+        # Descriptor 3 records the queries separately from dpkg's status output.
+        probes = r'''exec 3>&1
+dpkg() { [[ "$1" == --print-architecture ]] && echo amd64; }
+dpkg-query() {
+  [[ "$1" == -W && "$2" == '-f=${Status}' && "$3" == *:amd64 ]] || return 2
+  echo "checked ${3%:amd64}" >&3
+  if [[ "$3" == libgtk-3-0t64:amd64 && "$PACKAGE_STATE" != installed ]]; then
+    [[ "$PACKAGE_STATE" == partial ]] || return 1
+    echo 'install ok unpacked'
+  else
+    echo 'install ok installed'
+  fi
+}
+sudo() { echo "apt $*"; }
+'''
+
+        def provision(state):
+            result = subprocess.run(["bash", "-e", "-c", probes + install],
+                                    env={**os.environ, "PACKAGE_STATE": state}, capture_output=True,
+                                    text=True, check=True)
+            lines = result.stdout.splitlines()
+            checked = [line.removeprefix("checked ") for line in lines if line.startswith("checked ")]
+            apt = [line for line in lines if line.startswith("apt ")]
+            return checked, apt
+
+        packages, apt = provision("installed")
+        self.assertIn("libgtk-3-0t64", packages)
+        self.assertIn("lsof", packages)
+        self.assertEqual(apt, [])
+        for state in ("absent", "partial"):
+            with self.subTest(state=state):
+                _, apt = provision(state)
+                self.assertEqual(len(apt), 2)
+                self.assertTrue(apt[0].endswith(" update"))
+                self.assertEqual(apt[1].split(" install --yes ", 1)[1].split(), packages)
+
     def test_concurrency_cancels_only_pull_requests(self):
         self.assertEqual(self.workflow["concurrency"], {
             "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
