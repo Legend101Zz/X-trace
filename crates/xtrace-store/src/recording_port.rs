@@ -437,6 +437,11 @@ fn validate_xtf_event(
 }
 
 fn map_recording_error(error: RecordingStoreError) -> PortError {
+    #[cfg(all(test, unix, debug_assertions))]
+    crate::recording_store::object_diagnostic::returned_error(
+        error.correlation_id(),
+        error.admission_facts,
+    );
     let kind = match error.kind() {
         RecordingStoreErrorKind::Validation | RecordingStoreErrorKind::Permission => {
             PortErrorKind::Validation
@@ -504,6 +509,17 @@ mod tests {
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
         fixture_in(&temp_base)
+    }
+
+    // The guard outlives each fresh project and its cleanup. CI pre-admits a short
+    // parent outside both general temp and scratch used by other parallel store tests.
+    fn cardinality_fixture(
+        _workload: &std::sync::MutexGuard<'_, ()>,
+    ) -> (tempfile::TempDir, SqliteStore, Project) {
+        match std::env::var_os("XTRACE_TEST_CARDINALITY_SCRATCH") {
+            Some(base) => fixture_in(std::path::Path::new(&base)),
+            None => fixture(),
+        }
     }
 
     fn fixture_in(temp_base: &std::path::Path) -> (tempfile::TempDir, SqliteStore, Project) {
@@ -2157,6 +2173,12 @@ mod tests {
     }
 
     #[cfg(all(unix, debug_assertions))]
+    #[allow(clippy::panic, reason = "failed test reports only bounded admission facts")]
+    fn fail_singleton_admission(diagnostic: String) {
+        panic!("acknowledgement admission {diagnostic}");
+    }
+
+    #[cfg(all(unix, debug_assertions))]
     #[test]
     fn journal_sync_errors_prevent_acknowledgement_and_report_original_io_facts() {
         use crate::recording_store::object_diagnostic::Scope;
@@ -2218,10 +2240,10 @@ mod tests {
         use xtrace_application::recording_queries::RecordingCompletionEvidence;
 
         use crate::recording_store::work_profile::{Phase, WorkProfile};
-        let _workload =
+        let workload =
             CARDINALITY_WORKLOAD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let profile = WorkProfile::start("sparse", MAX_RECORDING_SEGMENTS as usize, false);
-        let (directory, store, project) = fixture();
+        let (directory, store, project) = cardinality_fixture(&workload);
         let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
         // Every adjacent pair crosses the ordinary two-second span boundary.
         let capture = RecordingCaptureService::new(
@@ -2320,7 +2342,7 @@ mod tests {
         use xtrace_application::recording::DEFAULT_SEGMENT_EVENTS;
         use xtrace_application::recording_queries::{RecordingCompletionEvidence, RecordingStatus};
 
-        let _workload =
+        let workload =
             CARDINALITY_WORKLOAD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let profile = WorkProfile::start(
             if focused { "focused-singletons" } else { "singletons" },
@@ -2331,7 +2353,7 @@ mod tests {
         // exercise every barrier without spending minutes flushing hardware.
         // The journal fault tests and macOS latency test retain real syncs.
         let _syncs = CountOnlySyncs::enter();
-        let (directory, store, project) = fixture();
+        let (directory, store, project) = cardinality_fixture(&workload);
         let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
         let capture = RecordingCaptureService::new(
             Arc::clone(&adapter),
@@ -2355,12 +2377,21 @@ mod tests {
         let mut phase = Phase::enter("admission_loop");
         for index in 0..count {
             let sequence = index as u64 + 2;
-            let receipt = capture
-                .record_events(RecordEvents {
+            let record = || {
+                capture.record_events(RecordEvents {
                     recording_id,
                     events: vec![event(sequence, &format!("event-{sequence}"))],
                 })
-                .unwrap_or_else(acknowledgement_failed);
+            };
+            #[cfg(all(unix, debug_assertions))]
+            let receipt = crate::recording_store::object_diagnostic::observe_acknowledgement(
+                index as u64 + 1,
+                record,
+                fail_singleton_admission,
+            );
+            #[cfg(not(all(unix, debug_assertions)))]
+            let receipt = record();
+            let receipt = receipt.unwrap_or_else(acknowledgement_failed);
             assert_eq!((receipt.accepted, receipt.dropped), (1, 0));
             published += receipt.persisted_segments;
             let expected_order = if receipt.persisted_segments != 0 {

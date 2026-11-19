@@ -1,4 +1,4 @@
-//! Test-only facts where segment object and journal errors lose their source.
+//! Test-only bounded facts for recording acknowledgement errors.
 
 use std::{cell::Cell, fmt, io, marker::PhantomData, rc::Rc};
 
@@ -7,8 +7,13 @@ use xtrace_private_storage::{AdmissionFailure, PrivateStorageError};
 
 use super::RecordingStoreError;
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum ObjectIoSite {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectIoSite {
+    BindingRootOpen,
+    BindingRootRevalidate,
+    BindingDatabaseValidate,
+    SqliteFileBinding,
+    SqlitePrivateFiles,
     StagingProjectRootOpen,
     StagingRootOpenOrCreate,
     StagingRecordingOpenOrCreate,
@@ -84,8 +89,8 @@ pub(super) enum ObjectIoSite {
     CommitFailpoint,
 }
 
-#[derive(Clone, Copy, Default)]
-struct Observation {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Observation {
     site: Option<ObjectIoSite>,
     private_error: Option<PrivateStorageError>,
     kind: Option<io::ErrorKind>,
@@ -95,6 +100,8 @@ struct Observation {
 thread_local! {
     // None means no acknowledgement is being observed on this thread.
     static FIRST: Cell<Option<Option<Observation>>> = const { Cell::new(None) };
+    // Scoped to one singleton call. A second mapped error leaves attribution ambiguous.
+    static ADMISSION: Cell<Option<AdmissionResult>> = const { Cell::new(None) };
 }
 
 pub(crate) struct Scope {
@@ -109,11 +116,25 @@ impl Scope {
 
     pub(crate) fn report(&self, iteration: u64) -> String {
         let facts = FIRST.with(|slot| slot.get().flatten()).unwrap_or_default();
-        let admission = match facts.private_error {
+        facts.report(iteration)
+    }
+}
+
+impl Observation {
+    pub(crate) fn admission(site: ObjectIoSite, error: PrivateStorageError) -> Self {
+        let (kind, errno) = match error {
+            PrivateStorageError::Admission(failure) => (failure.kind, failure.raw_os_error),
+            _ => (None, None),
+        };
+        Self { site: Some(site), private_error: Some(error), kind, errno }
+    }
+
+    fn report(self, iteration: u64) -> String {
+        let admission = match self.private_error {
             Some(PrivateStorageError::Admission(failure)) => Some(failure),
             _ => None,
         };
-        let error = match facts.private_error {
+        let error = match self.private_error {
             Some(PrivateStorageError::Admission(_)) => "Admission",
             Some(PrivateStorageError::Unavailable) => "Unavailable",
             Some(PrivateStorageError::InvalidName) => "InvalidName",
@@ -123,10 +144,10 @@ impl Scope {
         };
         format!(
             "iteration={iteration} operation={:?} error={error} admission={:?} kind={:?} errno={:?} context={}",
-            Available(facts.site),
+            Available(self.site),
             Available(admission.map(|failure| failure.operation)),
-            Available(facts.kind),
-            Available(facts.errno),
+            Available(self.kind),
+            Available(self.errno),
             AdmissionFailure::diagnostic_context(admission)
         )
     }
@@ -155,6 +176,61 @@ fn observe(facts: Observation) {
             slot.set(Some(Some(facts)));
         }
     });
+}
+
+#[derive(Clone, Copy, Default)]
+enum AdmissionResult {
+    #[default]
+    NoError,
+    One(CorrelationId, Option<Observation>),
+    Ambiguous,
+}
+
+pub(crate) fn returned_error(id: CorrelationId, facts: Option<Observation>) {
+    ADMISSION.with(|slot| {
+        slot.set(slot.get().map(|previous| match previous {
+            AdmissionResult::NoError => AdmissionResult::One(id, facts),
+            _ => AdmissionResult::Ambiguous,
+        }))
+    });
+}
+
+pub(crate) fn observe_acknowledgement<T>(
+    iteration: u64,
+    call: impl FnOnce() -> Result<T, xtrace_application::PortError>,
+    fail: impl FnOnce(String),
+) -> Result<T, xtrace_application::PortError> {
+    struct Restore(Option<AdmissionResult>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ADMISSION.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(ADMISSION.with(|slot| slot.replace(Some(AdmissionResult::NoError))));
+    let result = call();
+    if let Err(error) = &result
+        && error.message().starts_with("XTR-PRIVATE-STORAGE-UNAVAILABLE: ")
+    {
+        let facts = match ADMISSION.with(Cell::get) {
+            Some(AdmissionResult::One(id, facts)) if id == error.correlation_id() => facts,
+            _ => None,
+        };
+        fail(facts.unwrap_or_default().report(iteration));
+    }
+    result
+}
+
+pub(super) fn admission<T>(
+    site: ObjectIoSite,
+    id: CorrelationId,
+    mapped_error: fn(CorrelationId) -> RecordingStoreError,
+    call: impl FnOnce() -> Result<T, PrivateStorageError>,
+) -> Result<T, RecordingStoreError> {
+    call().map_err(|error| {
+        let mut mapped = mapped_error(id);
+        mapped.admission_facts = Some(Observation::admission(site, error));
+        mapped
+    })
 }
 
 pub(super) fn private<T>(
@@ -279,6 +355,43 @@ mod tests {
             scope.report(1),
             "iteration=1 operation=PublishHardLink error=unavailable admission=unavailable kind=PermissionDenied errno=unavailable context=unavailable"
         );
+    }
+
+    #[test]
+    fn handled_or_unrelated_refusals_cannot_supply_a_singleton_failure() {
+        use xtrace_application::{PortError, PortErrorKind};
+        let id = CorrelationId::new();
+        let failure = || {
+            PortError::new(
+                PortErrorKind::Validation,
+                "XTR-PRIVATE-STORAGE-UNAVAILABLE: refused",
+                id,
+            )
+        };
+        let facts =
+            Observation::admission(ObjectIoSite::BindingRootOpen, PrivateStorageError::InvalidName);
+        for (events, known) in [
+            (vec![(id, Some(facts))], true),
+            (vec![], false),
+            (vec![(CorrelationId::new(), Some(facts))], false),
+            (vec![(id, Some(facts)), (id, None)], false),
+        ] {
+            let mut report = String::new();
+            let result = observe_acknowledgement(
+                131_072,
+                || {
+                    for (id, observation) in events {
+                        returned_error(id, observation);
+                    }
+                    Err::<(), _>(failure())
+                },
+                |line| report = line,
+            );
+            assert!(result.is_err());
+            assert_eq!(report.contains("operation=BindingRootOpen error=InvalidName"), known);
+            assert_eq!(report.contains("operation=unavailable error=unavailable"), !known);
+            assert!(report.starts_with("iteration=131072 "));
+        }
     }
 
     #[test]

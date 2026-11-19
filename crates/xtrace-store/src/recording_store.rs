@@ -234,6 +234,8 @@ pub struct RecordingStoreError {
     message: &'static str,
     correlation_id: CorrelationId,
     source: Option<&'static str>,
+    #[cfg(all(test, unix, debug_assertions))]
+    pub(crate) admission_facts: Option<object_diagnostic::Observation>,
 }
 
 impl RecordingStoreError {
@@ -243,7 +245,15 @@ impl RecordingStoreError {
         message: &'static str,
         correlation_id: CorrelationId,
     ) -> Self {
-        Self { kind, code, message, correlation_id, source: None }
+        Self {
+            kind,
+            code,
+            message,
+            correlation_id,
+            source: None,
+            #[cfg(all(test, unix, debug_assertions))]
+            admission_facts: None,
+        }
     }
 
     fn with_source(mut self, source: &'static str) -> Self {
@@ -5210,6 +5220,15 @@ struct ProjectRootBinding {
     private_root: AdmittedPrivateRoot,
 }
 
+fn private_storage_unavailable(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Permission,
+        "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+        "private storage is unavailable",
+        correlation_id,
+    )
+}
+
 impl ProjectRootBinding {
     fn new(
         root: &Path,
@@ -5220,14 +5239,13 @@ impl ProjectRootBinding {
         let _phase = work_profile::Phase::enter("root_binding_admission");
         #[cfg(unix)]
         let _admission_caller = CallerGuard::enter(Caller::RootBinding);
-        let private_root = AdmittedPrivateRoot::open(root).map_err(|_| {
-            RecordingStoreError::new(
-                RecordingStoreErrorKind::Permission,
-                "XTR-PRIVATE-STORAGE-UNAVAILABLE",
-                "private storage is unavailable",
-                correlation_id,
-            )
-        })?;
+        let private_root = store_io!(
+            private_storage_unavailable,
+            admission,
+            BindingRootOpen,
+            correlation_id,
+            AdmittedPrivateRoot::open(root)
+        )?;
         if private_root.path() != root {
             return Err(RecordingStoreError::new(
                 RecordingStoreErrorKind::Validation,
@@ -5262,14 +5280,13 @@ impl ProjectRootBinding {
 
         #[cfg(unix)]
         {
-            self.private_root.revalidate().map_err(|_| {
-                RecordingStoreError::new(
-                    RecordingStoreErrorKind::Permission,
-                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
-                    "private storage is unavailable",
-                    correlation_id,
-                )
-            })?;
+            store_io!(
+                private_storage_unavailable,
+                admission,
+                BindingRootRevalidate,
+                correlation_id,
+                self.private_root.revalidate()
+            )?;
             let parent = self.database_path.parent().ok_or_else(|| {
                 RecordingStoreError::new(
                     RecordingStoreErrorKind::Validation,
@@ -5298,22 +5315,20 @@ impl ProjectRootBinding {
                 })?;
             // Descriptor-free: closing a second descriptor for the live SQLite database would
             // release SQLite's POSIX locks and let another process delete its WAL.
-            self.private_root.validate_regular_file(file_name).map_err(|_| {
-                RecordingStoreError::new(
-                    RecordingStoreErrorKind::Permission,
-                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
-                    "private storage is unavailable",
-                    correlation_id,
-                )
-            })?;
-            self.private_root.revalidate().map_err(|_| {
-                RecordingStoreError::new(
-                    RecordingStoreErrorKind::Permission,
-                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
-                    "private storage is unavailable",
-                    correlation_id,
-                )
-            })
+            store_io!(
+                private_storage_unavailable,
+                admission,
+                BindingDatabaseValidate,
+                correlation_id,
+                self.private_root.validate_regular_file(file_name)
+            )?;
+            store_io!(
+                private_storage_unavailable,
+                admission,
+                BindingRootRevalidate,
+                correlation_id,
+                self.private_root.revalidate()
+            )
         }
     }
 }
@@ -6012,6 +6027,10 @@ fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> Recordin
         ),
     };
     let mut mapped = RecordingStoreError::new(kind, code, message, correlation_id);
+    #[cfg(all(test, unix, debug_assertions))]
+    {
+        mapped.admission_facts = error.admission_facts;
+    }
     if let Some(source) = source {
         mapped = mapped.with_source(source);
     }

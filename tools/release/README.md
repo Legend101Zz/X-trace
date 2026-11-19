@@ -143,8 +143,9 @@ also records that obsolete `1.5.x` was not used.
 Run the stdlib-only tooling tests with an explicit existing scratch directory
 that has already passed the private-cache admission policy. The runner supplies
 `cache/tmp/t` for general temporary files and `XTRACE_TEST_SCRATCH_ROOT`,
-and `cache/tmp/p` for `XTRACE_TEST_PRIVATE_SCRATCH`. Both are admitted
-owner-private directories. Direct tooling-test invocations must set
+`cache/tmp/p` for `XTRACE_TEST_PRIVATE_SCRATCH`, and `cache/c` for the
+three serialized store cardinality workloads. All three are admitted owner-private
+directories. Direct tooling-test invocations must set
 `XTRACE_TEST_SCRATCH_ROOT` themselves.
 
 ```text

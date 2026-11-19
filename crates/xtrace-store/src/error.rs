@@ -53,6 +53,8 @@ pub struct StoreError {
     source: Option<String>,
     #[cfg(test)]
     test_diagnostic: Option<String>,
+    #[cfg(all(test, unix, debug_assertions))]
+    pub(crate) admission_facts: Option<crate::recording_store::object_diagnostic::Observation>,
 }
 
 impl StoreError {
@@ -70,6 +72,8 @@ impl StoreError {
             source: None,
             #[cfg(test)]
             test_diagnostic: None,
+            #[cfg(all(test, unix, debug_assertions))]
+            admission_facts: None,
         }
     }
 

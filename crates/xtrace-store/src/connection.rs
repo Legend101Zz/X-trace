@@ -238,6 +238,22 @@ fn sqlite_admission_error(
         "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
         correlation_id,
     );
+    #[cfg(all(test, unix, debug_assertions))]
+    let error = {
+        use crate::recording_store::object_diagnostic::{ObjectIoSite, Observation};
+        let mut error = error;
+        if _phase == "connection-lock" {
+            let site = match _check {
+                "binding" => Some(ObjectIoSite::SqliteFileBinding),
+                "database" | "wal" | "shm" | "journal" | "file-scan-parent" => {
+                    Some(ObjectIoSite::SqlitePrivateFiles)
+                }
+                _ => None,
+            };
+            error.admission_facts = site.map(|site| Observation::admission(site, _failure));
+        }
+        error
+    };
     // PrivateStorageError's Debug carries only fixed variants, admission context flags and
     // numeric OS facts. The call sites supply fixed labels, never database or sidecar paths.
     #[cfg(test)]
@@ -585,12 +601,8 @@ impl SqliteStore {
             &self.inner.private_database_name,
             &self.inner.private_database_file,
         ) {
-            root.validate_file_binding(name, file, false).map_err(|_| {
-                StoreError::new(
-                    StoreErrorKind::Permission,
-                    "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                    CorrelationId::new(),
-                )
+            root.validate_file_binding(name, file, false).map_err(|failure| {
+                sqlite_admission_error(CorrelationId::new(), "connection-lock", "binding", failure)
             })?;
             validate_sqlite_private_files(root, name, CorrelationId::new(), "connection-lock")?;
         }

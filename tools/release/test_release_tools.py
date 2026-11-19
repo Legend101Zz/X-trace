@@ -2789,9 +2789,8 @@ class RunnerTests(unittest.TestCase):
     def test_floor_refuses_insecure_existing_scratch_before_creating_run_state(self) -> None:
         scratch = self.cache / "tmp"
         scratch.mkdir(mode=0o700)
-        for leaf in ("p", "t"):
-            with self.subTest(leaf=leaf):
-                path = scratch / leaf
+        for path in (scratch / "p", scratch / "t", self.cache / "c"):
+            with self.subTest(leaf=path.name):
                 path.mkdir(mode=0o700)
                 path.chmod(0o755)
                 with self.assertRaises(private_roots.AdmissionError):
@@ -2834,8 +2833,10 @@ class RunnerTests(unittest.TestCase):
         for variable in ("TMPDIR", "TEMP", "TMP", "XTRACE_TEST_SCRATCH_ROOT"):
             self.assertEqual(env[variable], str(temp))  # type: ignore[index]
         self.assertEqual(env["XTRACE_TEST_PRIVATE_SCRATCH"], str(private))  # type: ignore[index]
+        cardinality = self.cache / "c"
+        self.assertEqual(env["XTRACE_TEST_CARDINALITY_SCRATCH"], str(cardinality))  # type: ignore[index]
         branches = (private_io / name for name in ("direct", "umask", "held-request", "catalog"))
-        for directory in (temp, private, private_io, *branches):
+        for directory in (temp, private, cardinality, private_io, *branches):
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
 
     def test_node_generate_normalizer_is_shared_canonical_and_symlink_safe(self) -> None:

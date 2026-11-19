@@ -2224,15 +2224,16 @@ def run(args: argparse.Namespace, *, gate_progress=None) -> int:
     logs_dir = run_dir / "logs"
     lease_root = cache / "leases"
     leases = [Lease(lease_root / name, args.lease_token, args.label) for name in LEASE_NAMES]
-    # Keep both paths short for Unix sockets and historical path-derived init keys.
+    # Short paths limit ancestor walks and leave room for Unix sockets and legacy init keys.
     floor_tmp = cache / "tmp" / "t"
     floor_private_scratch = cache / "tmp" / "p"
+    cardinality_scratch = cache / "c"
     # Inspect every existing named root before the first cache mutation. Missing
     # descendants are admitted through their nearest existing no-follow parent.
     private_roots.preflight_directory(cache, private_leaf=True)
     for name in CACHE_NAMES:
         private_roots.preflight_directory(cache / name, private_leaf=True)
-    for directory in (floor_tmp, floor_private_scratch):
+    for directory in (floor_tmp, floor_private_scratch, cardinality_scratch):
         private_roots.preflight_directory(directory, private_leaf=True)
     private_roots.preflight_directory(restricted_target, must_be_absent=True)
     private_roots.preflight_directory(release_root, private_leaf=True)
@@ -2303,11 +2304,12 @@ def run(args: argparse.Namespace, *, gate_progress=None) -> int:
         private_roots.admit_directory(floor_home, private_leaf=True)
         # Build tools and generic tempdirs churn their own leaf, outside the ancestry of
         # product-private fixtures. Reuse only owner-private leaves under the leased cache.
-        for directory in (floor_tmp, floor_private_scratch):
+        for directory in (floor_tmp, floor_private_scratch, cardinality_scratch):
             private_roots.ensure_private_directory(directory)
             private_roots_to_recheck.append(directory)
         env = build_task_env(cache, os.environ.copy(), scratch=floor_tmp, home=floor_home)
         env["XTRACE_TEST_PRIVATE_SCRATCH"] = str(floor_private_scratch)
+        env["XTRACE_TEST_CARDINALITY_SCRATCH"] = str(cardinality_scratch)
         # These fixtures admit every ancestor. Pre-create their separate parents outside
         # general scratch so parallel fixture creation and removal cannot mutate those ancestors.
         private_io_root = run_dir / "private-io"
