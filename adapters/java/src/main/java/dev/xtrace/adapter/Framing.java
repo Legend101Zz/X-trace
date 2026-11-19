@@ -1,5 +1,6 @@
 package dev.xtrace.adapter;
 
+import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.InvalidProtocolBufferException;
 import java.io.EOFException;
 import java.io.IOException;
@@ -23,13 +24,19 @@ public final class Framing {
   public static void write(OutputStream output, AgentEnvelope envelope, int limit)
       throws ClientException {
     validateLimit(limit);
-    byte[] body = envelope.toByteArray();
-    if (body.length == 0 || body.length > limit) {
+    int length = envelope.getSerializedSize();
+    if (length <= 0 || length > limit) {
       throw new ClientException("XTR-JAVA-FRAME", "outgoing envelope length is invalid");
     }
     try {
-      output.write(ByteBuffer.allocate(Integer.BYTES).putInt(body.length).array());
-      output.write(body);
+      // The session waits for an ACK after each frame. Emit the prefix and body together
+      // so an unbuffered TLS stream need not send a separate four-byte application write.
+      byte[] frame = new byte[Integer.BYTES + length];
+      ByteBuffer.wrap(frame).putInt(length);
+      CodedOutputStream body = CodedOutputStream.newInstance(frame, Integer.BYTES, length);
+      envelope.writeTo(body);
+      body.checkNoSpaceLeft();
+      output.write(frame);
       output.flush();
     } catch (IOException error) {
       throw new ClientException("XTR-JAVA-TRANSPORT", "daemon write failed", error);

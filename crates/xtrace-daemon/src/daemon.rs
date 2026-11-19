@@ -142,6 +142,16 @@ impl ShutdownSignal {
         let _ = self.rx.changed().await;
     }
 
+    /// A pending TLS write may stop partway through a frame only when the daemon
+    /// is closing the connection. Normal connection-local teardown still drains it.
+    async fn write_while_running<T>(&mut self, write: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = self.wait() => None,
+            result = write => Some(result),
+        }
+    }
+
     /// Returns `true` once the signal has been raised.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
@@ -230,7 +240,8 @@ async fn run_outbound_writer<W>(
                         correlation_token: String::new(),
                         payload: Some(frame.payload),
                     };
-                    if encoder.write_envelope(&envelope).await.is_err() {
+                    let write = shutdown.write_while_running(encoder.write_envelope(&envelope)).await;
+                    if !matches!(write, Some(Ok(()))) {
                         break;
                     }
                 }
@@ -509,6 +520,7 @@ async fn handle_connection(
                 let code = envelope_error_code(& err);
                 let _ = send_protocol_error_stream(
                     &mut tls_stream,
+                    &mut shutdown,
                     max_envelope_bytes,
                     code.as_str(),
                     &format!("{err}"),
@@ -545,6 +557,7 @@ async fn handle_connection(
     if let Err(err) = session.accept_adapter_hello(&first) {
         let _ = send_protocol_error_stream(
             &mut tls_stream,
+            &mut shutdown,
             max_envelope_bytes,
             err.code.as_str(),
             &err.detail,
@@ -565,6 +578,7 @@ async fn handle_connection(
         Err(err) => {
             let _ = send_protocol_error_stream(
                 &mut tls_stream,
+                &mut shutdown,
                 max_envelope_bytes,
                 err.code.as_str(),
                 &err.detail,
@@ -574,7 +588,14 @@ async fn handle_connection(
             return Ok(());
         }
     };
-    if let Err(err) = write_initial_envelope_stream(&mut tls_stream, &envelope).await {
+    let Some(hello_write) = shutdown
+        .write_while_running(write_initial_envelope_stream(&mut tls_stream, &envelope))
+        .await
+    else {
+        // The hello was not flushed. Leave the bootstrap artifact available.
+        return Ok(());
+    };
+    if let Err(err) = hello_write {
         match err {
             InitialEnvelopeWriteError::Io(_) => {
                 // A failure to write `DaemonHello` after a valid
@@ -976,6 +997,8 @@ where
         .map_err(|_| InitialEnvelopeWriteError::LengthOverflow(buf.len()))?;
     tls_stream.write_all(&len.to_be_bytes()).await?;
     tls_stream.write_all(&buf).await?;
+    // Flush the complete frame before a synchronous peer waits for the hello.
+    tls_stream.flush().await?;
     Ok(())
 }
 
@@ -1001,6 +1024,7 @@ where
 /// clients.
 async fn send_protocol_error_stream<S>(
     tls_stream: &mut S,
+    shutdown: &mut ShutdownSignal,
     max_envelope_bytes: u32,
     code: &str,
     message: &str,
@@ -1022,9 +1046,13 @@ where
             message: message.to_string(),
         })),
     };
-    write_initial_envelope_stream(tls_stream, &envelope)
-        .await
-        .map_err(|err| std::io::Error::other(format!("failed to write protocol error: {err}")))?;
+    if let Some(result) =
+        shutdown.write_while_running(write_initial_envelope_stream(tls_stream, &envelope)).await
+    {
+        result.map_err(|err| {
+            std::io::Error::other(format!("failed to write protocol error: {err}"))
+        })?;
+    }
     // The limit is advisory; the helper never exceeds it because the
     // envelope is bounded by the static `ProtocolError` payload size.
     let _ = max_envelope_bytes;
@@ -1377,6 +1405,88 @@ impl DaemonBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initial_hello_flushes_the_complete_frame_and_classifies_flush_failure_as_io() {
+        use crate::framing::{EnvelopeDecoder, test_writer::BufferedWriter};
+
+        let envelope = AgentEnvelope {
+            payload: Some(PayloadOneof::DaemonHello(Default::default())),
+            ..Default::default()
+        };
+        let mut writer = BufferedWriter::default();
+        write_initial_envelope_stream(&mut writer, &envelope).await.expect("write hello");
+        assert!(writer.pending.is_empty());
+        let mut reader = writer.delivered.as_slice();
+        let decoded =
+            EnvelopeDecoder::new(&mut reader, 1024).read_envelope().expect("complete frame");
+        assert!(matches!(decoded.payload, Some(PayloadOneof::DaemonHello(_))));
+        assert!(reader.is_empty());
+
+        let mut writer = BufferedWriter { fail_flush: true, ..Default::default() };
+        let error = write_initial_envelope_stream(&mut writer, &envelope).await.unwrap_err();
+        assert!(
+            matches!(error, InitialEnvelopeWriteError::Io(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[tokio::test]
+    async fn global_shutdown_interrupts_a_queued_frame_already_pending_on_flush() {
+        use crate::framing::test_writer::BufferedWriter;
+
+        let (shutdown_tx, shutdown) = shared_shutdown_channel();
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(OutboundFrame { payload: PayloadOneof::Ack(Default::default()) })
+            .await
+            .expect("queue ACK");
+        let flushing = Arc::new(tokio::sync::Notify::new());
+        let writer =
+            BufferedWriter { hold_flush: Some(Arc::clone(&flushing)), ..Default::default() };
+        let write = run_outbound_writer(
+            EnvelopeAsyncEncoder::new(writer, 1024),
+            rx,
+            1,
+            0,
+            [0; 16],
+            MonotonicClock::new(),
+            shutdown,
+        );
+        let stop = async {
+            flushing.notified().await;
+            shutdown_tx.send(true).expect("signal pending writer");
+        };
+        tokio::time::timeout(StdDuration::from_secs(5), async { tokio::join!(write, stop) })
+            .await
+            .expect("global shutdown preempts pending flush with the frame channel still open");
+    }
+
+    #[tokio::test]
+    async fn global_shutdown_interrupts_a_pre_split_protocol_error_pending_on_flush() {
+        use crate::framing::test_writer::BufferedWriter;
+
+        let (shutdown_tx, mut shutdown) = shared_shutdown_channel();
+        let flushing = Arc::new(tokio::sync::Notify::new());
+        let mut writer =
+            BufferedWriter { hold_flush: Some(Arc::clone(&flushing)), ..Default::default() };
+        let write = send_protocol_error_stream(
+            &mut writer,
+            &mut shutdown,
+            1024,
+            "test",
+            "test",
+            MonotonicClock::new(),
+        );
+        let stop = async {
+            flushing.notified().await;
+            shutdown_tx.send(true).expect("signal pending handshake writer");
+        };
+        let (result, ()) =
+            tokio::time::timeout(StdDuration::from_secs(5), async { tokio::join!(write, stop) })
+                .await
+                .expect("global shutdown preempts handshake flush");
+        result.expect("global shutdown is connection-local");
+        assert!(writer.delivered.is_empty());
+    }
 
     /// The exporter label is part of the protocol contract: both the
     /// daemon and the adapter feed it to `export_keying_material` so

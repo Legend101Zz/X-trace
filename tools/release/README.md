@@ -142,9 +142,11 @@ also records that obsolete `1.5.x` was not used.
 
 Run the stdlib-only tooling tests with an explicit existing scratch directory
 that has already passed the private-cache admission policy. The runner supplies
-its admitted `cache/tmp` as `XTRACE_TEST_SCRATCH_ROOT` to child test commands;
-direct test invocations must set that variable themselves. The tests do not
-fall back to writing beneath the user's home directory.
+`cache/tmp/t` for general temporary files and `XTRACE_TEST_SCRATCH_ROOT`,
+`cache/tmp/p` for `XTRACE_TEST_PRIVATE_SCRATCH`, and `cache/c` for the
+three serialized store cardinality workloads. All three are admitted owner-private
+directories. Direct tooling-test invocations must set
+`XTRACE_TEST_SCRATCH_ROOT` themselves.
 
 ```text
 XTRACE_TEST_SCRATCH_ROOT=/absolute/path/to/admitted/test-scratch PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.release.test_release_tools

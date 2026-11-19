@@ -27,9 +27,15 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Install Linux descriptor inspection tool
+      - name: Ensure Linux descriptor inspection tool is available
         timeout-minutes: 10
         run: |
+          # Probe the same binary used by the release suite before consulting a package mirror.
+          lsof_path=$(python3 -B -c 'from tools.release.run_gates import LSOF_BINARY; print(LSOF_BINARY or "")')
+          if [[ -x "$lsof_path" ]] && timeout -k 2s 10s "$lsof_path" -nP -a -p "$$" -d cwd -Fp >/dev/null 2>&1; then
+            echo "Using the runner's installed lsof"
+            exit 0
+          fi
           sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
             -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update

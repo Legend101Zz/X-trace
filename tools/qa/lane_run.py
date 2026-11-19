@@ -267,11 +267,21 @@ IO_ERROR_KINDS = frozenset({
     "Unsupported", "UnexpectedEof", "OutOfMemory", "InProgress", "Other", "Uncategorized",
 })
 SPARSE_ACK_TEST = "recording_port::tests::sparse_acknowledged_batches_hit_admission_before_becoming_unreadable"
+SINGLETON_ACK_TEST = "recording_port::tests::singleton_acknowledgements_at_focused_cap_recover_with_bounded_segments_and_pages"
+SMALL_SINGLETON_ACK_TEST = "recording_port::tests::two_thousand_forty_eight_singleton_batches_publish_only_two_segments"
+# Raw syntax, public field and maximum event count belong to the exact workload.
+ACKNOWLEDGEMENT_TESTS = {
+    SPARSE_ACK_TEST: ("object io", "acknowledgementObjectIo", 10_000),
+    SINGLETON_ACK_TEST: ("admission", "acknowledgementAdmission", 131_072),
+    SMALL_SINGLETON_ACK_TEST: ("admission", "acknowledgementAdmission", 2_048),
+}
+SINGLETON_ADMISSION_SITES = frozenset({
+    "BindingRootOpen", "BindingRootRevalidate", "BindingDatabaseValidate", "SqliteFileBinding", "SqlitePrivateFiles",
+})
 SPARSE_ACK_TARGET = {"crate": "xtrace-store", "targetKind": "lib", "targetName": "xtrace_store"}
 SPARSE_ACK_SOURCE = "crates/xtrace-store/src/recording_port.rs"
-SPARSE_ACK_PANIC = 'panic!("acknowledgement object io {diagnostic}");'
 OBJECT_IO_DIAGNOSTIC = re.compile(
-    r"acknowledgement object io iteration=([1-9][0-9]{0,4}) operation=([A-Za-z]+)"
+    r"acknowledgement (object io|admission) iteration=([1-9][0-9]{0,5}) operation=([A-Za-z]+)"
     r" error=([A-Za-z]+) admission=([A-Za-z]+) kind=([A-Za-z]+)"
     r" errno=(unavailable|-?[0-9]{1,10}) context=(unavailable|[A-Za-z0-9,()\-]+)"
 )
@@ -399,7 +409,7 @@ class CheckoutMetadata:
         self.admission_objects: set[str] = set()
         self.admission_callers: set[str] = set()
         self.object_io_sites: set[str] = set()
-        self.sparse_ack_panic_sites: set[str] = set()
+        self.ack_panic_sites: dict[str, set[str]] = {}
         self.java_files: dict[str, list[str]] = {}
         for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
@@ -422,8 +432,10 @@ class CheckoutMetadata:
             if name == "crates/xtrace-store/src/recording_store/object_diagnostic.rs":
                 self.object_io_sites = _diagnostic_variants(source, "ObjectIoSite")
             if name == SPARSE_ACK_SOURCE:
-                self.sparse_ack_panic_sites = {f"{name}:{number}" for number, line in
-                                              enumerate(source.splitlines(), 1) if line.strip() == SPARSE_ACK_PANIC}
+                for label in {entry[0] for entry in ACKNOWLEDGEMENT_TESTS.values()}:
+                    statement = f'panic!("acknowledgement {label} {{diagnostic}}");'
+                    self.ack_panic_sites[label] = {f"{name}:{number}" for number, line in
+                                                   enumerate(source.splitlines(), 1) if line.strip() == statement}
         self._read_rust_contexts(sources)
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
@@ -768,11 +780,13 @@ SPRING_ORDER_WAIT_PHASES = {
     "successful-request": 1, "error-request": 2, "attestation-mismatch": 3, "classfile-mutation": 4,
 }
 SPRING_ORDER_WAIT_ROW_LIMIT = 16
-SPRING_ORDER_WAIT_MAX_BYTES = 96
+SPRING_ORDER_WAIT_MAX_BYTES = 128
 SPRING_MARKER_OBSERVATION = rb"(present|not-observed|unavailable)"
 SPRING_ORDER_WAIT_RECORD = re.compile(
-    rb"v2 ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3]) "
-    + b" ".join([SPRING_MARKER_OBSERVATION] * 3) + rb"\n"
+    rb"(v2|v3|v4) ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3]) "
+    + b" ".join([SPRING_MARKER_OBSERVATION] * 3)
+    + rb"(?: (segment-without-terminal|segment-with-terminal|mixed|not-observed|unavailable))?"
+    + rb"(?: (queued-signals|pending-recording|start-in-flight|active-slot|no-work-observed))?\n"
 )
 
 
@@ -789,12 +803,24 @@ def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index
     record = SPRING_ORDER_WAIT_RECORD.fullmatch(raw)
     if record is None:
         return unavailable
-    phase = record[1].decode("ascii")
+    (version, phase_bytes, complete_bytes, matching_bytes, incomplete, drain_expired,
+     other_incomplete, segment, drain_state) = record.groups()
+    if (version in (b"v3", b"v4")) != (segment is not None):
+        return unavailable
+    if (version == b"v4") != (drain_state is not None):
+        return unavailable
+    if drain_state is not None and drain_expired != b"present":
+        return unavailable
+    phase = phase_bytes.decode("ascii")
+    if segment is not None and phase not in ("attestation-mismatch", "classfile-mutation"):
+        return unavailable
     expected = SPRING_ORDER_WAIT_PHASES.get(phase)
-    complete, matching = int(record[2]), int(record[3])
+    complete, matching = int(complete_bytes), int(matching_bytes)
     if expected is None or complete > SPRING_ORDER_WAIT_ROW_LIMIT or matching > complete or matching >= expected:
         return unavailable
-    incomplete, drain_expired, other_incomplete = (value.decode("ascii") for value in record.groups()[3:])
+    incomplete, drain_expired, other_incomplete = (
+        value.decode("ascii") for value in (incomplete, drain_expired, other_incomplete)
+    )
     observations = {incomplete, drain_expired, other_incomplete}
     # All marker states come from one snapshot. An unseen marker is only
     # "not-observed" after EOF; until then its observation is unavailable.
@@ -810,6 +836,10 @@ def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index
               "completeRows": complete, "completeRowsLimit": SPRING_ORDER_WAIT_ROW_LIMIT, "matchingRows": matching,
               "captureMarkers": {"incomplete": incomplete, "drainExpired": drain_expired,
                                  "otherIncomplete": other_incomplete}}
+    if segment is not None:
+        result["incompleteOrderSegmentEvidence"] = segment.decode("ascii")
+    if drain_state is not None:
+        result["sessionDrainState"] = drain_state.decode("ascii")
     return unavailable if _private(_encoded(result).decode("ascii"), index, verified_identifier=True) else result
 
 
@@ -894,16 +924,23 @@ def _rust_failure_name(name: str, metadata: CheckoutMetadata, index) -> str:
     return name if name in metadata.rust_tests and not _private(name, index, verified_identifier=True) else UNVERIFIED
 
 
-def _sparse_acknowledgement_io(line: str, metadata: CheckoutMetadata, index) -> dict | None:
-    """Rebuild typed facts from the one attested sparse acknowledgement panic."""
+def _acknowledgement_facts(line: str, metadata: CheckoutMetadata, index, label: str, limit: int) -> dict | None:
+    """Rebuild finite facts only for the verified panic site and workload."""
     match = OBJECT_IO_DIAGNOSTIC.fullmatch(line) if len(line) <= 512 else None
-    if match is None:
+    if match is None or match[1] != label:
         return None
     iteration, operation, error, admission, kind, errno, context = (
-        None if value == "unavailable" else value for value in match.groups())
+        None if value == "unavailable" else value for value in match.groups()[1:])
     iteration = int(iteration)
     errno = int(errno) if errno is not None else None
-    if (iteration > 10_000  # MAX_RECORDING_SEGMENTS bounds this test's loop
+    if label == "admission":
+        if operation is not None and (operation not in SINGLETON_ADMISSION_SITES or error is None):
+            return None
+        if error != "Admission" and (kind is not None or errno is not None):
+            return None
+    elif operation in SINGLETON_ADMISSION_SITES:
+        return None
+    if (iteration > limit
             or operation is not None and operation not in metadata.object_io_sites
             or error is not None and error not in metadata.error_variants
             or (error == "Admission") != (admission is not None)
@@ -953,7 +990,7 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
     section = None
     current = None
     ambiguous = None
-    sparse_ack_seen = False
+    acknowledgements_seen = set()
     for line_number, (line, allowed) in enumerate(zip(report.body, report.boundaries)):
         if allowed and (header := CARGO_SECTION.fullmatch(line)):
             section = header[1]
@@ -983,15 +1020,17 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
                         current["panicSites"].append(site)
                     if current["location"] == UNVERIFIED:
                         current["location"] = site
-                if (binary == SPARSE_ACK_TARGET and section == current["test"] == panic[1] == SPARSE_ACK_TEST
-                        and site in metadata.sparse_ack_panic_sites):
-                    if sparse_ack_seen:
-                        current.pop("acknowledgementObjectIo", None)
-                    elif line_number + 1 < len(report.body) and report.boundaries[line_number + 1]:
-                        facts = _sparse_acknowledgement_io(report.body[line_number + 1], metadata, index)
-                        if facts is not None:
-                            current["acknowledgementObjectIo"] = facts
-                    sparse_ack_seen = True
+                if (binary == SPARSE_ACK_TARGET and section == current["test"] == panic[1]
+                        and section in ACKNOWLEDGEMENT_TESTS):
+                    label, field, limit = ACKNOWLEDGEMENT_TESTS[section]
+                    if site in metadata.ack_panic_sites.get(label, ()):
+                        if section in acknowledgements_seen:
+                            current.pop(field, None)
+                        elif line_number + 1 < len(report.body) and report.boundaries[line_number + 1]:
+                            facts = _acknowledgement_facts(report.body[line_number + 1], metadata, index, label, limit)
+                            if facts is not None:
+                                current[field] = facts
+                        acknowledgements_seen.add(section)
         if current is not None and line.strip():
             current["withheldLines"] += 1
     return [*rows.values(), *([ambiguous] if ambiguous is not None else [])]
@@ -1164,7 +1203,10 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                        testUnverifiedReason=UnverifiedReason.EXCERPT_CAP.value)
     result: dict = {"failures": rows[:MAX_FAILING], "omitted": max(0, len(rows) - MAX_FAILING)}
     if observations:
-        result["observedDiagnostics"] = list(observations.values())[:MAX_FAILING]
+        # Rank only for eviction. Association with a verified failing thread is useful
+        # context, but cannot establish that the observation caused the failure.
+        ranked = sorted(enumerate(observations.values()), key=lambda item: item[1]["test"] == UNVERIFIED)
+        result["observedDiagnostics"] = [row for _, row in ranked[:MAX_FAILING]]
         result["diagnosticsOmitted"] = max(0, len(observations) - MAX_FAILING)
         for row in result["observedDiagnostics"]:
             while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["category"]:
@@ -1212,14 +1254,15 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                              "basis": "last harness observation; other running tests not observed",
                              "progress": list(progress), "progressWithheld": withheld,
                              "progressOmitted": progress_omitted}
-    # Preserve the timeout envelope when space runs short; drop failure rows first.
+    # Reduce supporting observations before primary failure rows. Keep the timeout
+    # envelope and consume the same byte budget for every kind of excerpt.
     while len(_encoded(result)) > budget:
-        if result["failures"]:
-            result["failures"].pop()
-            result["omitted"] += 1
-        elif result.get("observedDiagnostics"):
+        if result.get("observedDiagnostics"):
             result["observedDiagnostics"].pop()
             result["diagnosticsOmitted"] += 1
+        elif result["failures"]:
+            result["failures"].pop()
+            result["omitted"] += 1
         elif result.get("timeout", {}).get("progress"):
             result["timeout"]["progress"].pop(0)
             result["timeout"]["progressOmitted"] += 1
@@ -1230,6 +1273,10 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             return None
     if rows and not result["failures"] and not timed_out:
         return None
+    if observations:
+        # Publish survivors in their original order, including when all rows fit.
+        kept = ranked[:len(result["observedDiagnostics"])]
+        result["observedDiagnostics"] = [row for _, row in sorted(kept)]
     return result
 
 

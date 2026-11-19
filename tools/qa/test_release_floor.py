@@ -100,9 +100,8 @@ class FloorEnvironmentTests(CheckoutFixture):
         )
         metadata = lane_run.CheckoutMetadata({path: (repo / path).read_text() for path in paths})
         self.assertIn(lane_run.SPARSE_ACK_TEST, metadata.rust_tests)
-        self.assertEqual(len(metadata.sparse_ack_panic_sites), 1)
-        site = next(iter(metadata.sparse_ack_panic_sites))
-        test = lane_run.SPARSE_ACK_TEST
+        self.assertEqual(len(metadata.ack_panic_sites["object io"]), 1)
+        site = next(iter(metadata.ack_panic_sites["object io"]))
         valid = ("acknowledgement object io iteration=972 operation=StagingDirectoryCreate error=Admission"
                  " admission=AclState kind=unavailable errno=unavailable"
                  " context=ProbeState,1,NotChecked,Some(Directory),Some(-1),Some(false)")
@@ -122,15 +121,15 @@ class FloorEnvironmentTests(CheckoutFixture):
                 ("JournalSync", "StorageFull", 28),
             )
         ]
-        for payload, location, binary, published in (
+        sparse_cases = [
             (valid, site, "xtrace_store", expected),
             ("acknowledgement object io iteration=10000 operation=StageFileWrite error=unavailable"
              " admission=unavailable kind=StorageFull errno=28 context=unavailable",
              site, "xtrace_store", {"iteration": 10000, "operation": "StageFileWrite", "privateStorageError": None,
                                     "admissionOperation": None, "kind": "StorageFull", "errno": 28, "context": None}),
-            ("acknowledgement object io iteration=1 operation=StagingRecordingSync error=Operation"
+            ("acknowledgement object io iteration=1 operation=StageFileParentSync error=Operation"
              " admission=unavailable kind=Other errno=unavailable context=unavailable",
-             site, "xtrace_store", {"iteration": 1, "operation": "StagingRecordingSync",
+             site, "xtrace_store", {"iteration": 1, "operation": "StageFileParentSync",
                                     "privateStorageError": "Operation", "admissionOperation": None,
                                     "kind": "Other", "errno": None, "context": None}),
             *journal_cases,
@@ -142,8 +141,29 @@ class FloorEnvironmentTests(CheckoutFixture):
             (valid + " payload=CANARY", site, "xtrace_store", None),
             (valid, f"{lane_run.SPARSE_ACK_SOURCE}:1", "xtrace_store", None),
             (valid, site, "wrong_target", None),
-        ):
-            with self.subTest(payload=payload, site=location, binary=binary), tempfile.TemporaryDirectory() as tmp:
+        ]
+        cases = [(lane_run.SPARSE_ACK_TEST, "acknowledgementObjectIo", *case) for case in sparse_cases]
+        admission_site, = metadata.ack_panic_sites["admission"]
+        admission = valid.replace("object io", "admission").replace("StagingDirectoryCreate", "BindingRootRevalidate")
+        admission_expected = {**expected, "operation": "BindingRootRevalidate"}
+        unknown = ("acknowledgement admission iteration=1 operation=unavailable error=unavailable"
+                   " admission=unavailable kind=unavailable errno=unavailable context=unavailable")
+        unknown_expected = {**dict.fromkeys(expected), "iteration": 1}
+        for test, limit in ((lane_run.SINGLETON_ACK_TEST, 131_072), (lane_run.SMALL_SINGLETON_ACK_TEST, 2_048)):
+            self.assertIn(test, metadata.rust_tests)
+            cases.extend((test, "acknowledgementAdmission", payload, location, "xtrace_store", published)
+                         for payload, location, published in (
+                             (admission.replace("972", str(limit)), admission_site,
+                              {**admission_expected, "iteration": limit}),
+                             (admission.replace("972", str(limit + 1)), admission_site, None),
+                             (unknown, admission_site, unknown_expected),
+                             (admission.replace("BindingRootRevalidate", "StagingDirectoryCreate"), admission_site, None),
+                             (admission, site, None),
+                             (valid, admission_site, None),
+                             (admission + " PRIVATE-CANARY", admission_site, None),
+                         ))
+        for test, field, payload, location, binary, published in cases:
+            with self.subTest(test=test, payload=payload, site=location, binary=binary), tempfile.TemporaryDirectory() as tmp:
                 root = pathlib.Path(tmp)
                 raw = (f"Running unittests src/lib.rs (target/debug/deps/{binary}-0123456789abcdef)\n"
                        f"\nrunning 2 tests\ntest {test} ... FAILED\n"
@@ -178,12 +198,13 @@ class FloorEnvironmentTests(CheckoutFixture):
                         rows = json.loads(fragment)["failureDetails"]["failures"]
                         self.assertEqual(len(rows), 1)
                         self.assertEqual(rows[0]["test"], test)
-                        self.assertEqual(rows[0].get("acknowledgementObjectIo"), published)
+                        self.assertEqual(rows[0].get(field), published)
                         logged = [json.loads(line.removeprefix("lane failure "))
                                   for line in public.getvalue().splitlines() if line.startswith("lane failure ")]
                         self.assertEqual(logged, rows)
                         self.assertNotIn("CANARY", fragment + public.getvalue())
                         self.assertNotIn("acknowledgement object io", fragment + public.getvalue())
+                        self.assertNotIn("acknowledgement admission iteration", fragment + public.getvalue())
 
     def test_stripped_floor_environment_gets_directory_only_in_test_task(self):
         with tempfile.TemporaryDirectory() as temporary:

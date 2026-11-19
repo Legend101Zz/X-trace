@@ -1,19 +1,24 @@
-//! Test-only facts where segment object and journal errors lose their source.
+//! Test-only bounded facts for recording acknowledgement errors.
 
 use std::{cell::Cell, fmt, io, marker::PhantomData, rc::Rc};
 
 use xtrace_domain::CorrelationId;
 use xtrace_private_storage::{AdmissionFailure, PrivateStorageError};
 
-use super::{RecordingStoreError, object_io_error};
+use super::RecordingStoreError;
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum ObjectIoSite {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectIoSite {
+    BindingRootOpen,
+    BindingRootRevalidate,
+    BindingDatabaseValidate,
+    SqliteFileBinding,
+    SqlitePrivateFiles,
     StagingProjectRootOpen,
     StagingRootOpenOrCreate,
     StagingRecordingOpenOrCreate,
     StagingDirectoryCreate,
-    StagingRecordingSync,
+    StagingRecordingRevalidate,
     ObjectProjectRootOpen,
     ObjectParentOpenOrCreate,
     ObjectParentRevalidate,
@@ -64,11 +69,28 @@ pub(super) enum ObjectIoSite {
     JournalBinding,
     JournalCleanupMetadata,
     JournalCleanupRemove,
+    ManagedDirectoryOpen,
+    ManagedDirectoryRevalidate,
+    ManagedTreeOpen,
+    ManagedTreeChild,
+    ManagedTreeRevalidate,
+    ManagedFileParentOpen,
+    ManagedFileBinding,
+    PublishStagingRoot,
+    PublishStagingFile,
+    PublishStagingBinding,
+    PublishDestinationRoot,
+    PublishStagingRevalidate,
+    PublishDestinationRevalidate,
+    PublishHardLink,
+    PublishedFileOpen,
+    PublishedFileBinding,
+    PublishedDirectorySync,
     CommitFailpoint,
 }
 
-#[derive(Clone, Copy, Default)]
-struct Observation {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Observation {
     site: Option<ObjectIoSite>,
     private_error: Option<PrivateStorageError>,
     kind: Option<io::ErrorKind>,
@@ -78,6 +100,8 @@ struct Observation {
 thread_local! {
     // None means no acknowledgement is being observed on this thread.
     static FIRST: Cell<Option<Option<Observation>>> = const { Cell::new(None) };
+    // Scoped to one singleton call. A second mapped error leaves attribution ambiguous.
+    static ADMISSION: Cell<Option<AdmissionResult>> = const { Cell::new(None) };
 }
 
 pub(crate) struct Scope {
@@ -92,11 +116,25 @@ impl Scope {
 
     pub(crate) fn report(&self, iteration: u64) -> String {
         let facts = FIRST.with(|slot| slot.get().flatten()).unwrap_or_default();
-        let admission = match facts.private_error {
+        facts.report(iteration)
+    }
+}
+
+impl Observation {
+    pub(crate) fn admission(site: ObjectIoSite, error: PrivateStorageError) -> Self {
+        let (kind, errno) = match error {
+            PrivateStorageError::Admission(failure) => (failure.kind, failure.raw_os_error),
+            _ => (None, None),
+        };
+        Self { site: Some(site), private_error: Some(error), kind, errno }
+    }
+
+    fn report(self, iteration: u64) -> String {
+        let admission = match self.private_error {
             Some(PrivateStorageError::Admission(failure)) => Some(failure),
             _ => None,
         };
-        let error = match facts.private_error {
+        let error = match self.private_error {
             Some(PrivateStorageError::Admission(_)) => "Admission",
             Some(PrivateStorageError::Unavailable) => "Unavailable",
             Some(PrivateStorageError::InvalidName) => "InvalidName",
@@ -106,10 +144,10 @@ impl Scope {
         };
         format!(
             "iteration={iteration} operation={:?} error={error} admission={:?} kind={:?} errno={:?} context={}",
-            Available(facts.site),
+            Available(self.site),
             Available(admission.map(|failure| failure.operation)),
-            Available(facts.kind),
-            Available(facts.errno),
+            Available(self.kind),
+            Available(self.errno),
             AdmissionFailure::diagnostic_context(admission)
         )
     }
@@ -140,13 +178,69 @@ fn observe(facts: Observation) {
     });
 }
 
+#[derive(Clone, Copy, Default)]
+enum AdmissionResult {
+    #[default]
+    NoError,
+    One(CorrelationId, Option<Observation>),
+    Ambiguous,
+}
+
+pub(crate) fn returned_error(id: CorrelationId, facts: Option<Observation>) {
+    ADMISSION.with(|slot| {
+        slot.set(slot.get().map(|previous| match previous {
+            AdmissionResult::NoError => AdmissionResult::One(id, facts),
+            _ => AdmissionResult::Ambiguous,
+        }))
+    });
+}
+
+pub(crate) fn observe_acknowledgement<T>(
+    iteration: u64,
+    call: impl FnOnce() -> Result<T, xtrace_application::PortError>,
+    fail: impl FnOnce(String),
+) -> Result<T, xtrace_application::PortError> {
+    struct Restore(Option<AdmissionResult>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ADMISSION.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(ADMISSION.with(|slot| slot.replace(Some(AdmissionResult::NoError))));
+    let result = call();
+    if let Err(error) = &result
+        && error.message().starts_with("XTR-PRIVATE-STORAGE-UNAVAILABLE: ")
+    {
+        let facts = match ADMISSION.with(Cell::get) {
+            Some(AdmissionResult::One(id, facts)) if id == error.correlation_id() => facts,
+            _ => None,
+        };
+        fail(facts.unwrap_or_default().report(iteration));
+    }
+    result
+}
+
+pub(super) fn admission<T>(
+    site: ObjectIoSite,
+    id: CorrelationId,
+    mapped_error: fn(CorrelationId) -> RecordingStoreError,
+    call: impl FnOnce() -> Result<T, PrivateStorageError>,
+) -> Result<T, RecordingStoreError> {
+    call().map_err(|error| {
+        let mut mapped = mapped_error(id);
+        mapped.admission_facts = Some(Observation::admission(site, error));
+        mapped
+    })
+}
+
 pub(super) fn private<T>(
     site: ObjectIoSite,
     correlation_id: CorrelationId,
+    mapped_error: fn(CorrelationId) -> RecordingStoreError,
     call: impl FnOnce() -> Result<T, PrivateStorageError>,
 ) -> Result<T, RecordingStoreError> {
     if !FIRST.with(|slot| matches!(slot.get(), Some(None))) {
-        return call().map_err(|_| object_io_error(correlation_id));
+        return call().map_err(|_| mapped_error(correlation_id));
     }
     let (result, discarded) = PrivateStorageError::with_io_diagnostic(call);
     result.map_err(|error| {
@@ -155,13 +249,14 @@ pub(super) fn private<T>(
             _ => discarded.map_or((None, None), |(kind, errno)| (Some(kind), errno)),
         };
         observe(Observation { site: Some(site), private_error: Some(error), kind, errno });
-        object_io_error(correlation_id)
+        mapped_error(correlation_id)
     })
 }
 
 pub(super) fn direct<T, E: Into<io::Error>>(
     site: ObjectIoSite,
     correlation_id: CorrelationId,
+    mapped_error: fn(CorrelationId) -> RecordingStoreError,
     call: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, RecordingStoreError> {
     call().map_err(|error| {
@@ -172,18 +267,19 @@ pub(super) fn direct<T, E: Into<io::Error>>(
             errno: error.raw_os_error(),
             ..Observation::default()
         });
-        object_io_error(correlation_id)
+        mapped_error(correlation_id)
     })
 }
 
 pub(super) fn missing<T, E>(
     site: ObjectIoSite,
     correlation_id: CorrelationId,
+    mapped_error: fn(CorrelationId) -> RecordingStoreError,
     call: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, RecordingStoreError> {
     call().map_err(|_| {
         observe(Observation { site: Some(site), ..Observation::default() });
-        object_io_error(correlation_id)
+        mapped_error(correlation_id)
     })
 }
 
@@ -193,7 +289,10 @@ pub(super) fn observe_failpoint() {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{COMMIT_FAILPOINT, COMMIT_FAILPOINT_FIRED, commit_failpoint};
+    use super::super::{
+        COMMIT_FAILPOINT, COMMIT_FAILPOINT_FIRED, atomic_install_error, commit_failpoint,
+        object_io_error,
+    };
     use super::*;
     use xtrace_private_storage::AdmissionOperation;
 
@@ -201,7 +300,7 @@ mod tests {
     fn first_object_io_survives_cleanup_and_other_threads_and_resets() {
         let inject = |site, error| {
             let id = CorrelationId::new();
-            let result = direct(site, id, || Err::<(), _>(error));
+            let result = direct(site, id, object_io_error, || Err::<(), _>(error));
             assert!(matches!(result, Err(failure) if failure.code() == "XTR-STORE-OBJECT-IO"
                 && failure.kind() == super::super::RecordingStoreErrorKind::Transport));
         };
@@ -242,6 +341,60 @@ mod tests {
     }
 
     #[test]
+    fn atomic_install_reports_the_syscall_kind_without_paths_or_changing_the_error_code() {
+        let scope = Scope::enter();
+        let result = direct(
+            ObjectIoSite::PublishHardLink,
+            CorrelationId::new(),
+            atomic_install_error,
+            || Err::<(), _>(io::Error::new(io::ErrorKind::PermissionDenied, "/private/path")),
+        );
+        assert!(matches!(result, Err(error) if error.code() == "XTR-STORE-ATOMIC-INSTALL"
+            && error.kind() == super::super::RecordingStoreErrorKind::Compatibility));
+        assert_eq!(
+            scope.report(1),
+            "iteration=1 operation=PublishHardLink error=unavailable admission=unavailable kind=PermissionDenied errno=unavailable context=unavailable"
+        );
+    }
+
+    #[test]
+    fn handled_or_unrelated_refusals_cannot_supply_a_singleton_failure() {
+        use xtrace_application::{PortError, PortErrorKind};
+        let id = CorrelationId::new();
+        let failure = || {
+            PortError::new(
+                PortErrorKind::Validation,
+                "XTR-PRIVATE-STORAGE-UNAVAILABLE: refused",
+                id,
+            )
+        };
+        let facts =
+            Observation::admission(ObjectIoSite::BindingRootOpen, PrivateStorageError::InvalidName);
+        for (events, known) in [
+            (vec![(id, Some(facts))], true),
+            (vec![], false),
+            (vec![(CorrelationId::new(), Some(facts))], false),
+            (vec![(id, Some(facts)), (id, None)], false),
+        ] {
+            let mut report = String::new();
+            let result = observe_acknowledgement(
+                131_072,
+                || {
+                    for (id, observation) in events {
+                        returned_error(id, observation);
+                    }
+                    Err::<(), _>(failure())
+                },
+                |line| report = line,
+            );
+            assert!(result.is_err());
+            assert_eq!(report.contains("operation=BindingRootOpen error=InvalidName"), known);
+            assert_eq!(report.contains("operation=unavailable error=unavailable"), !known);
+            assert!(report.starts_with("iteration=131072 "));
+        }
+    }
+
+    #[test]
     fn private_storage_variant_and_only_available_facts_survive_mapping() {
         let id = CorrelationId::new();
         {
@@ -250,7 +403,7 @@ mod tests {
                 AdmissionOperation::NamedMetadata,
                 io::Error::new(io::ErrorKind::PermissionDenied, "identity-canary /private/path"),
             );
-            let result = private(ObjectIoSite::StagingProjectRootOpen, id, || {
+            let result = private(ObjectIoSite::StagingProjectRootOpen, id, object_io_error, || {
                 Err::<(), _>(PrivateStorageError::Admission(failure))
             });
             assert!(matches!(result, Err(error) if error.code() == "XTR-STORE-OBJECT-IO"));
@@ -261,13 +414,13 @@ mod tests {
         }
 
         let scope = Scope::enter();
-        let result = private(ObjectIoSite::StagingRecordingSync, id, || {
+        let result = private(ObjectIoSite::StageFileParentSync, id, object_io_error, || {
             Err::<(), _>(PrivateStorageError::Operation)
         });
         assert!(matches!(result, Err(error) if error.code() == "XTR-STORE-OBJECT-IO"));
         assert_eq!(
             scope.report(1),
-            "iteration=1 operation=StagingRecordingSync error=Operation admission=unavailable kind=unavailable errno=unavailable context=unavailable"
+            "iteration=1 operation=StageFileParentSync error=Operation admission=unavailable kind=unavailable errno=unavailable context=unavailable"
         );
     }
 }

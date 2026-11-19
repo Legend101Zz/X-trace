@@ -171,6 +171,10 @@ jobs:
           root="${RUNNER_TEMP:?}/xt"
           [ "${#root}" -le 40 ] || { echo "private root path too long"; exit 1; }
           mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          mkdir -m 700 "$root/c"
+          echo "XTRACE_TEST_CARDINALITY_SCRATCH=$root/c" >> "$GITHUB_ENV"
+          mkdir -m 700 "$root/private-io" "$root/private-io/direct" "$root/private-io/umask" "$root/private-io/held-request" "$root/private-io/catalog"
+          echo "XTRACE_TEST_PRIVATE_IO_ROOT=$root/private-io" >> "$GITHUB_ENV"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: cargo fmt

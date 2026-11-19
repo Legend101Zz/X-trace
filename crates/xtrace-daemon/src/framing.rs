@@ -153,7 +153,8 @@ impl<W: AsyncWrite + Unpin> EnvelopeAsyncEncoder<W> {
         }
         self.writer.write_all(&len.to_be_bytes()).await?;
         self.writer.write_all(&buf).await?;
-        Ok(())
+        // TLS may buffer writes; peers can wait for this frame before sending more.
+        self.writer.flush().await
     }
 }
 
@@ -205,6 +206,52 @@ impl<R: AsyncRead + Unpin> EnvelopeAsyncDecoder<R> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_writer {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    pub(crate) struct BufferedWriter {
+        pub(crate) pending: Vec<u8>,
+        pub(crate) delivered: Vec<u8>,
+        pub(crate) fail_flush: bool,
+        pub(crate) hold_flush: Option<std::sync::Arc<tokio::sync::Notify>>,
+    }
+
+    impl AsyncWrite for BufferedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.pending.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if let Some(entered) = &self.hold_flush {
+                entered.notify_one();
+                return Poll::Pending;
+            }
+            if self.fail_flush {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed")));
+            }
+            let pending = std::mem::take(&mut self.pending);
+            self.delivered.extend_from_slice(&pending);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use xtrace_protocol::envelope::{EnvelopeBuilder, xtp_payload_ctor};
@@ -222,6 +269,33 @@ mod tests {
                 status: "ok".to_string(),
             }),
         )
+    }
+
+    #[tokio::test]
+    async fn async_ack_flushes_the_complete_frame_and_propagates_flush_errors() {
+        use super::test_writer::BufferedWriter;
+        let envelope = AgentEnvelope {
+            payload: Some(xtp_payload_ctor::PayloadOneof::Ack(Default::default())),
+            ..Default::default()
+        };
+        let mut encoder = EnvelopeAsyncEncoder::new(BufferedWriter::default(), 1024);
+        encoder.write_envelope(&envelope).await.expect("write ACK");
+        let writer = encoder.writer_mut();
+        assert!(writer.pending.is_empty());
+        let mut reader = writer.delivered.as_slice();
+        let decoded =
+            EnvelopeDecoder::new(&mut reader, 1024).read_envelope().expect("complete frame");
+        assert!(matches!(decoded.payload, Some(xtp_payload_ctor::PayloadOneof::Ack(_))));
+        assert!(reader.is_empty());
+
+        let mut encoder = EnvelopeAsyncEncoder::new(
+            BufferedWriter { fail_flush: true, ..Default::default() },
+            1024,
+        );
+        assert_eq!(
+            encoder.write_envelope(&envelope).await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]

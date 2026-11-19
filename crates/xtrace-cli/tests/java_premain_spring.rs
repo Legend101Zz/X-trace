@@ -17,19 +17,21 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use prost::Message as _;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
+use rustix::fs::{Mode, OFlags, open};
 use serde_json::Value;
 use spring_readiness::ReadinessStderr;
 use tempfile::TempDir;
-use xtrace_domain::ContentHash;
+use xtrace_domain::ids::Id as _;
+use xtrace_domain::{ContentHash, RuntimeSessionId};
 use xtrace_protocol::generated::agent::{InteractionKind, RecordingEvent, RecordingEventKind};
 use xtrace_protocol::xtf::{XtfEventEnvelope, XtfHeader};
-use xtrace_store::verify_compressed_segment;
+use xtrace_store::{decode_compressed_segment, verify_compressed_segment};
 
 const CANARIES: &[&str] = &[
     "BODY_CANARY_1D3",
@@ -46,23 +48,46 @@ const CAPTURE_MARKERS: [&[u8]; 3] = [
     b"XTR-JAVA-CAPTURE-DRAIN-EXPIRED",
     b"XTR-JAVA-CAPTURE-OTHER-INCOMPLETE",
 ];
-const CAPTURE_SCAN_EOF: u8 = 1 << CAPTURE_MARKERS.len();
+const CAPTURE_SCAN_EOF: u16 = 1 << 15;
+
+// One fixed record per writer expiry. Multiple different states make the observation ambiguous.
+const DRAIN_STATES: [&str; 5] =
+    ["queued-signals", "pending-recording", "start-in-flight", "active-slot", "no-work-observed"];
+static DRAIN_STATE_MESSAGES: std::sync::LazyLock<[Vec<u8>; DRAIN_STATES.len()]> =
+    std::sync::LazyLock::new(|| {
+        DRAIN_STATES.map(|state| {
+            format!(r#"{{"code":"XTR-JAVA-DRAIN-STATE","state":"{state}"}}"#).into_bytes()
+        })
+    });
+
+fn capture_messages() -> impl Iterator<Item = &'static [u8]> {
+    CAPTURE_MARKERS.into_iter().chain(DRAIN_STATE_MESSAGES.iter().map(Vec::as_slice))
+}
 
 #[derive(Default)]
-struct CaptureMarkerScan(AtomicU8);
+struct CaptureMarkerScan(AtomicU16);
 
 impl CaptureMarkerScan {
     fn scan(&self, bytes: &[u8]) {
         let seen = self.0.load(Ordering::Relaxed);
         let mut observed = seen;
-        for (index, marker) in CAPTURE_MARKERS.iter().enumerate() {
+        for (index, marker) in capture_messages().enumerate() {
             let bit = 1 << index;
-            if seen & bit == 0 && bytes.windows(marker.len()).any(|window| window == *marker) {
+            if seen & bit == 0 && bytes.windows(marker.len()).any(|window| window == marker) {
                 observed |= bit;
             }
         }
         // The stderr reader is the sole writer. A deadline snapshots all bits together.
         self.0.store(observed, Ordering::Relaxed);
+    }
+
+    fn drain_state(&self) -> Option<&'static str> {
+        let states = (self.0.load(Ordering::Relaxed) & !CAPTURE_SCAN_EOF) >> CAPTURE_MARKERS.len();
+        if states.count_ones() == 1 {
+            Some(DRAIN_STATES[states.trailing_zeros() as usize])
+        } else {
+            None
+        }
     }
 
     fn observations(&self) -> [&'static str; CAPTURE_MARKERS.len()] {
@@ -394,8 +419,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         text(&valid_stderr.sample)
     );
 
-    let mut mismatch_daemon = start_quiet_daemon(&repo, &data_home);
-    let mismatch_bootstrap = mismatch_daemon.1.clone();
+    let (mut mismatch_daemon, mismatch_bootstrap, mismatch_session_id) =
+        start_quiet_daemon(&repo, &data_home);
     let manifest_mismatched_fixture = tamper_fixture_class_attestation(root.path(), &fixture);
     let mut mismatched = launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap);
     let mismatch_port = wait_for_fixture(&mut mismatched);
@@ -406,7 +431,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_scanned_clean("class mismatch fixture stderr", &mismatch_stderr);
     let mismatch_recordings = wait_for_order_recordings(
         &project_root,
-        OrderWaitPhase::AttestationMismatch,
+        OrderWaitPhase::AttestationMismatch(mismatch_session_id),
         &mismatch_markers,
     );
     let loaded_mismatch_logical = zstd::stream::decode_all(mismatch_recordings[2].1.as_slice())
@@ -419,10 +444,10 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_eq!(loaded_mismatch_frame.source_binding, 3);
     assert!(loaded_mismatch_frame.source.is_none());
     assert_canaries_absent("loaded-class mismatch XTF", &loaded_mismatch_logical);
-    signal_and_wait(&mut mismatch_daemon.0, "-INT");
+    signal_and_wait(&mut mismatch_daemon, "-INT");
 
-    let mut mutated_class_daemon = start_quiet_daemon(&repo, &data_home);
-    let mutated_class_bootstrap = mutated_class_daemon.1.clone();
+    let (mut mutated_class_daemon, mutated_class_bootstrap, mutation_session_id) =
+        start_quiet_daemon(&repo, &data_home);
     let mutated_class_fixture = mutate_fixture_classfile(root.path(), &fixture);
     let mut mutated_class =
         launch_fixture(&agent, &mutated_class_fixture, &mutated_class_bootstrap);
@@ -434,7 +459,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_scanned_clean("mutated class fixture stderr", &mutated_class_stderr);
     let class_mutation_recordings = wait_for_order_recordings(
         &project_root,
-        OrderWaitPhase::ClassfileMutation,
+        OrderWaitPhase::ClassfileMutation(mutation_session_id),
         &mutation_markers,
     );
     let class_mutation_recording_id = &class_mutation_recordings[3].0;
@@ -463,7 +488,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_eq!(class_mutation_event["source_binding"], "class_bytes_mismatch");
     assert!(class_mutation_event["source"].is_null());
     assert_canaries_absent("actual classfile mutation CLI", &class_mutation_show.stdout);
-    signal_and_wait(&mut mutated_class_daemon.0, "-INT");
+    signal_and_wait(&mut mutated_class_daemon, "-INT");
 
     let mut unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap);
     let unavailable_port = wait_for_fixture(&mut unavailable);
@@ -520,7 +545,10 @@ fn copy_fixture_sources(repo: &Path) {
     }
 }
 
-fn start_quiet_daemon(repo: &Path, data_home: &Path) -> (ManagedChild, PathBuf) {
+fn start_quiet_daemon(
+    repo: &Path,
+    data_home: &Path,
+) -> (ManagedChild, PathBuf, Option<RuntimeSessionId>) {
     let mut child = ManagedChild(
         Command::new(env!("CARGO_BIN_EXE_xtrace"))
             .args(["daemon", "--project-dir"])
@@ -538,7 +566,11 @@ fn start_quiet_daemon(repo: &Path, data_home: &Path) -> (ManagedChild, PathBuf) 
     let ready: Value = serde_json::from_str(&readiness).expect("mismatch daemon readiness JSON");
     let bootstrap =
         PathBuf::from(ready["bootstrap_path"].as_str().expect("mismatch bootstrap path"));
-    (child, bootstrap)
+    (child, bootstrap, daemon_session_id(&ready))
+}
+
+fn daemon_session_id(readiness: &Value) -> Option<RuntimeSessionId> {
+    readiness["runtime_session_id"].as_str().and_then(|id| id.parse().ok())
 }
 
 fn tamper_fixture_class_attestation(root: &Path, fixture: &Path) -> PathBuf {
@@ -872,8 +904,8 @@ fn wait_for_store_quiescence(project_root: &Path) {
 enum OrderWaitPhase {
     SuccessfulRequest,
     ErrorRequest,
-    AttestationMismatch,
-    ClassfileMutation,
+    AttestationMismatch(Option<RuntimeSessionId>),
+    ClassfileMutation(Option<RuntimeSessionId>),
 }
 
 impl OrderWaitPhase {
@@ -881,14 +913,25 @@ impl OrderWaitPhase {
         match self {
             Self::SuccessfulRequest => ("successful-request", 1),
             Self::ErrorRequest => ("error-request", 2),
-            Self::AttestationMismatch => ("attestation-mismatch", 3),
-            Self::ClassfileMutation => ("classfile-mutation", 4),
+            Self::AttestationMismatch(_) => ("attestation-mismatch", 3),
+            Self::ClassfileMutation(_) => ("classfile-mutation", 4),
+        }
+    }
+
+    fn post_stop_segment_evidence(self, project_root: &Path) -> Option<&'static str> {
+        match self {
+            Self::AttestationMismatch(id) | Self::ClassfileMutation(id) => Some(
+                id.and_then(|id| incomplete_order_segment_evidence(project_root, id))
+                    .unwrap_or("unavailable"),
+            ),
+            Self::SuccessfulRequest | Self::ErrorRequest => None,
         }
     }
 }
 
 const ORDER_WAIT_DIAGNOSTIC: &str = "spring-premain-order-wait.txt";
 const ORDER_WAIT_ROW_LIMIT: usize = 16;
+const ORDER_WAIT_COMPRESSED_BYTE_LIMIT: u64 = 256 * 1024;
 
 fn wait_for_order_recordings(
     project_root: &Path,
@@ -933,6 +976,7 @@ fn wait_for_order_recordings_until(
             let complete_rows = complete_rows.min(ORDER_WAIT_ROW_LIMIT);
             let matching_rows = orders.len();
             let [incomplete, drain_expired, other_incomplete] = capture_markers.observations();
+            let segment_evidence = phase.post_stop_segment_evidence(project_root);
             // The lane reads this one-shot record separately from libtest output. Use the
             // last poll's counts and keep a diagnostic I/O error from replacing the panic.
             if let Some(directory) = diagnostic_directory
@@ -942,20 +986,119 @@ fn wait_for_order_recordings_until(
                     .mode(0o600)
                     .open(directory.join(ORDER_WAIT_DIAGNOSTIC))
             {
+                let (version, extra_fields) =
+                    match (segment_evidence, capture_markers.drain_state()) {
+                        (Some(segment), Some(state)) if drain_expired == "present" => {
+                            ("v4", format!(" {segment} {state}"))
+                        }
+                        (Some(segment), _) => ("v3", format!(" {segment}")),
+                        (None, _) => ("v2", String::new()),
+                    };
                 let _ = writeln!(
                     file,
-                    "v2 {label} {complete_rows} {matching_rows} {incomplete} {drain_expired} {other_incomplete}"
+                    "{version} {label} {complete_rows} {matching_rows} {incomplete} \
+                     {drain_expired} {other_incomplete}{extra_fields}"
                 );
             }
+            let segment_detail = segment_evidence.map_or_else(String::new, |evidence| {
+                format!(" incompleteOrderSegmentEvidence={evidence}")
+            });
             panic!(
                 "{expected_count} POST /orders recordings were not persisted before deadline \
                  (phase={label} lastCompleteRows={complete_rows} completeRowsLimit={ORDER_WAIT_ROW_LIMIT} \
                  lastMatchingRows={matching_rows} captureIncomplete={incomplete} \
-                 drainExpired={drain_expired} otherIncomplete={other_incomplete})"
+                 drainExpired={drain_expired} otherIncomplete={other_incomplete}{segment_detail})"
             );
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// One best-effort read after the original deadline. A positive observation ties the
+/// fixture order to an immutable segment in this daemon session. An unsealed journal tail,
+/// a start without a segment, or a concurrent completion is outside this observation.
+fn incomplete_order_segment_evidence(
+    project_root: &Path,
+    session_id: RuntimeSessionId,
+) -> Option<&'static str> {
+    let connection = Connection::open_with_flags(
+        project_root.join("metadata.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .ok()?;
+    connection.busy_timeout(Duration::ZERO).ok()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT r.recording_id, r.project_id, s.object_hash,
+                    EXISTS (SELECT 1 FROM recording_terminal_evidence t
+                            WHERE t.recording_id = r.recording_id)
+             FROM recordings r JOIN recording_segments s ON s.recording_id = r.recording_id
+             WHERE r.runtime_session_id = ?1 AND r.status <> 'complete' AND s.segment_ordinal = 0
+             LIMIT ?2",
+        )
+        .ok()?;
+    let mut rows = statement
+        .query(rusqlite::params![session_id.as_uuid().as_bytes(), ORDER_WAIT_ROW_LIMIT + 1])
+        .ok()?;
+    let mut candidate_count = 0;
+    let mut compressed_bytes_left = ORDER_WAIT_COMPRESSED_BYTE_LIMIT;
+    let (mut without_terminal, mut with_terminal) = (false, false);
+    while let Some(row) = rows.next().ok()? {
+        candidate_count += 1;
+        if candidate_count > ORDER_WAIT_ROW_LIMIT {
+            return None;
+        }
+        let recording_id: [u8; 16] = row.get(0).ok()?;
+        let project_id: [u8; 16] = row.get(1).ok()?;
+        let object_hash: [u8; 32] = row.get(2).ok()?;
+        let has_terminal: bool = row.get(3).ok()?;
+        let expected = ContentHash::from_digest_bytes(&object_hash)?;
+        let path = segment_path(project_root, &object_hash);
+        let file = fs::File::from(
+            open(
+                path,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .ok()?,
+        );
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut object = Vec::new();
+        file.take(compressed_bytes_left + 1).read_to_end(&mut object).ok()?;
+        compressed_bytes_left =
+            compressed_bytes_left.checked_sub(u64::try_from(object.len()).ok()?)?;
+        // The XTF codec independently bounds the decompressed bytes of each candidate.
+        let segment = decode_compressed_segment(&object, expected).ok()?;
+        let verified = segment.verified();
+        if verified.recording_id().as_uuid().as_bytes() != &recording_id
+            || verified.project_id().as_uuid().as_bytes() != &project_id
+            || verified.segment_ordinal() != 0
+        {
+            return None;
+        }
+        if segment.events().iter().any(|envelope| {
+            envelope.event.as_ref().is_some_and(|event| {
+                event.kind == RecordingEventKind::RequestUpdate as i32
+                    && event.symbol == "http.request POST /orders"
+            })
+        }) {
+            with_terminal |= has_terminal;
+            without_terminal |= !has_terminal;
+        }
+    }
+    Some(match (without_terminal, with_terminal) {
+        (false, false) => "not-observed",
+        (true, false) => "segment-without-terminal",
+        (false, true) => "segment-with-terminal",
+        (true, true) => "mixed",
+    })
+}
+
+fn segment_path(project_root: &Path, object_hash: &[u8]) -> PathBuf {
+    let hash = lower_hex(object_hash);
+    project_root.join("objects/b3").join(&hash[..2]).join(format!("{}.xtf.zst", &hash[2..]))
 }
 
 fn read_complete_recordings(project_root: &Path) -> Vec<(String, Vec<u8>)> {
@@ -989,71 +1132,113 @@ fn read_complete_recordings(project_root: &Path) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-#[test]
-fn order_wait_deadline_reports_the_last_complete_segment_observation() {
+fn order_wait_test_store(root: &Path) -> Connection {
+    let connection = Connection::open(root.join("metadata.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE recordings (
+                recording_id BLOB PRIMARY KEY, project_id BLOB, runtime_session_id BLOB, status TEXT);
+             CREATE TABLE recording_segments (recording_id BLOB, segment_ordinal INTEGER, object_hash BLOB);
+             CREATE TABLE recording_terminal_evidence (recording_id BLOB PRIMARY KEY);",
+        )
+        .unwrap();
+    connection
+}
+
+fn add_order_wait_test_segment(
+    root: &Path,
+    connection: &Connection,
+    session_id: RuntimeSessionId,
+    id: u128,
+    status: &str,
+    kind: RecordingEventKind,
+    symbol: &str,
+) -> PathBuf {
     use xtrace_domain::{ProjectId, RecordingId};
     use xtrace_store::{XtfSegmentInput, encode_segment};
 
+    let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(100));
+    let recording_id = RecordingId::from_uuid(uuid::Uuid::from_u128(id));
+    let encoded = encode_segment(&XtfSegmentInput {
+        project_id,
+        recording_id,
+        segment_ordinal: 0,
+        events: vec![XtfEventEnvelope {
+            recording_seq: 2,
+            event: Some(RecordingEvent {
+                event_id: "request".into(),
+                recording_seq: 2,
+                kind: kind as i32,
+                symbol: symbol.into(),
+                ..RecordingEvent::default()
+            }),
+        }],
+    })
+    .unwrap();
+    let hash = encoded.content_hash();
+    let path = segment_path(root, hash.as_bytes());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, encoded.compressed_bytes()).unwrap();
+    connection
+        .execute(
+            "INSERT INTO recordings VALUES (?1, ?2, ?3, ?4)",
+            (
+                recording_id.as_uuid().as_bytes(),
+                project_id.as_uuid().as_bytes(),
+                session_id.as_uuid().as_bytes(),
+                status,
+            ),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO recording_segments VALUES (?1, 0, ?2)",
+            (recording_id.as_uuid().as_bytes(), hash.as_bytes()),
+        )
+        .unwrap();
+    path
+}
+
+#[test]
+fn order_wait_deadline_reports_the_last_complete_segment_observation() {
     let root = temp_root();
     let directory = root.path();
     let diagnostic = directory.join(ORDER_WAIT_DIAGNOSTIC);
-    let connection = Connection::open(directory.join("metadata.sqlite3")).unwrap();
+    let connection = order_wait_test_store(directory);
     connection
         .execute_batch(
-            "CREATE TABLE recordings (recording_id BLOB PRIMARY KEY, status TEXT);
-             CREATE TABLE recording_segments (recording_id BLOB, segment_ordinal INTEGER, object_hash BLOB);
-             INSERT INTO recordings VALUES (X'AA', 'partial'), (X'BB', 'complete');
+            "INSERT INTO recordings VALUES (X'AA', X'00', X'FF', 'partial'),
+                                           (X'BB', X'00', X'FF', 'complete');
              INSERT INTO recording_segments VALUES (X'AA', 0, X'00'), (X'BB', 1, X'00');",
         )
         .unwrap();
-    let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(100));
+    let session_id = RuntimeSessionId::from_uuid(uuid::Uuid::from_u128(200));
     let add_complete_recording = |id, symbol: &str| {
-        let uuid = uuid::Uuid::from_u128(id);
-        let recording_id = RecordingId::from_uuid(uuid);
-        let encoded = encode_segment(&XtfSegmentInput {
-            project_id,
-            recording_id,
-            segment_ordinal: 0,
-            events: vec![XtfEventEnvelope {
-                recording_seq: 2,
-                event: Some(RecordingEvent {
-                    event_id: "request".into(),
-                    recording_seq: 2,
-                    symbol: symbol.into(),
-                    ..RecordingEvent::default()
-                }),
-            }],
-        })
-        .unwrap();
-        let hash = encoded.content_hash();
-        let hex = lower_hex(hash.as_bytes());
-        let objects = directory.join("objects/b3").join(&hex[..2]);
-        fs::create_dir_all(&objects).unwrap();
-        fs::write(objects.join(format!("{}.xtf.zst", &hex[2..])), encoded.compressed_bytes())
-            .unwrap();
-        let id = uuid.as_bytes().as_slice();
-        connection.execute("INSERT INTO recordings VALUES (?1, 'complete')", [id]).unwrap();
-        connection
-            .execute(
-                "INSERT INTO recording_segments VALUES (?1, 0, ?2)",
-                (id, hash.as_bytes().as_slice()),
-            )
-            .unwrap();
+        add_order_wait_test_segment(
+            directory,
+            &connection,
+            session_id,
+            id,
+            "complete",
+            RecordingEventKind::RequestUpdate,
+            symbol,
+        );
     };
-    let assert_panic = |phase, markers: &CaptureMarkerScan, diagnostic_directory, panic_message| {
-        let panic = std::panic::catch_unwind(|| {
-            wait_for_order_recordings_until(
-                directory,
-                phase,
-                Instant::now(),
-                diagnostic_directory,
-                markers,
-            )
-        })
-        .expect_err("the recording wait must still fail at the deadline");
-        assert_eq!(panic.downcast_ref::<String>().unwrap().as_str(), panic_message);
-    };
-    let assert_deadline = |phase, markers, panic_message, record| {
+    let assert_panic =
+        |phase, markers: &CaptureMarkerScan, diagnostic_directory, panic_message: &str| {
+            let panic = std::panic::catch_unwind(|| {
+                wait_for_order_recordings_until(
+                    directory,
+                    phase,
+                    Instant::now(),
+                    diagnostic_directory,
+                    markers,
+                )
+            })
+            .expect_err("the recording wait must still fail at the deadline");
+            assert_eq!(panic.downcast_ref::<String>().unwrap().as_str(), panic_message);
+        };
+    let assert_deadline = |phase, markers, panic_message: &str, record| {
         assert_panic(phase, markers, Some(directory), panic_message);
         assert_eq!(fs::read_to_string(&diagnostic).unwrap(), record);
         fs::remove_file(&diagnostic).unwrap();
@@ -1082,6 +1267,15 @@ fn order_wait_deadline_reports_the_last_complete_segment_observation() {
         "v2 error-request 16 0 not-observed not-observed not-observed\n",
     );
     add_complete_recording(18, "http.request POST /orders");
+    add_order_wait_test_segment(
+        directory,
+        &connection,
+        session_id,
+        30,
+        "recording",
+        RecordingEventKind::RequestUpdate,
+        "http.request POST /orders",
+    );
     let expired = CaptureMarkerScan::default();
     let mut stderr = vec![b'x'; 4094];
     stderr.extend_from_slice(CAPTURE_MARKERS[0]);
@@ -1092,39 +1286,151 @@ fn order_wait_deadline_reports_the_last_complete_segment_observation() {
     assert_eq!(scanned.leaked_canaries, ["BODY_CANARY_1D3"]);
     let mismatch_message = "3 POST /orders recordings were not persisted before deadline \
         (phase=attestation-mismatch lastCompleteRows=16 completeRowsLimit=16 lastMatchingRows=1 \
-        captureIncomplete=present drainExpired=present otherIncomplete=not-observed)";
+        captureIncomplete=present drainExpired=present otherIncomplete=not-observed \
+         incompleteOrderSegmentEvidence=segment-without-terminal)";
     assert_deadline(
-        OrderWaitPhase::AttestationMismatch,
+        OrderWaitPhase::AttestationMismatch(Some(session_id)),
         &expired,
         mismatch_message,
-        "v2 attestation-mismatch 16 1 present present not-observed\n",
+        "v3 attestation-mismatch 16 1 present present not-observed segment-without-terminal\n",
     );
-    assert_panic(OrderWaitPhase::AttestationMismatch, &expired, None, mismatch_message);
+    expired.scan(br#"{"code":"XTR-JAVA-DRAIN-STATE","state":"pending-recording"}"#);
+    assert_deadline(
+        OrderWaitPhase::AttestationMismatch(Some(session_id)),
+        &expired,
+        mismatch_message,
+        "v4 attestation-mismatch 16 1 present present not-observed segment-without-terminal pending-recording\n",
+    );
+    let missing_session_id = daemon_session_id(&serde_json::json!({}));
+    assert_eq!(missing_session_id, None);
+    assert_deadline(
+        OrderWaitPhase::AttestationMismatch(missing_session_id),
+        &expired,
+        &mismatch_message.replace("segment-without-terminal", "unavailable"),
+        "v4 attestation-mismatch 16 1 present present not-observed unavailable pending-recording\n",
+    );
+    assert_panic(
+        OrderWaitPhase::AttestationMismatch(Some(session_id)),
+        &expired,
+        None,
+        mismatch_message,
+    );
     let missing = directory.join("missing-diagnostic-directory");
-    assert_panic(OrderWaitPhase::AttestationMismatch, &expired, Some(&missing), mismatch_message);
+    assert_panic(
+        OrderWaitPhase::AttestationMismatch(Some(session_id)),
+        &expired,
+        Some(&missing),
+        mismatch_message,
+    );
     let partial = CaptureMarkerScan::default();
     partial.scan(CAPTURE_MARKERS[0]);
     partial.scan(CAPTURE_MARKERS[2]);
-    assert_deadline(
-        OrderWaitPhase::ClassfileMutation,
-        &partial,
-        "4 POST /orders recordings were not persisted before deadline \
+    let mutation_message = "4 POST /orders recordings were not persisted before deadline \
          (phase=classfile-mutation lastCompleteRows=16 completeRowsLimit=16 lastMatchingRows=1 \
-         captureIncomplete=present drainExpired=unavailable otherIncomplete=present)",
-        "v2 classfile-mutation 16 1 present unavailable present\n",
+         captureIncomplete=present drainExpired=unavailable otherIncomplete=present \
+         incompleteOrderSegmentEvidence=segment-without-terminal)";
+    assert_deadline(
+        OrderWaitPhase::ClassfileMutation(Some(session_id)),
+        &partial,
+        mutation_message,
+        "v3 classfile-mutation 16 1 present unavailable present segment-without-terminal\n",
+    );
+    let invalid_session_id =
+        daemon_session_id(&serde_json::json!({"runtime_session_id": "invalid-session-id"}));
+    assert_eq!(invalid_session_id, None);
+    assert_deadline(
+        OrderWaitPhase::ClassfileMutation(invalid_session_id),
+        &partial,
+        &mutation_message.replace("segment-without-terminal", "unavailable"),
+        "v3 classfile-mutation 16 1 present unavailable present unavailable\n",
     );
     for id in 19..=21 {
         add_complete_recording(id, "http.request POST /orders");
     }
     let orders = wait_for_order_recordings_until(
         directory,
-        OrderWaitPhase::ClassfileMutation,
+        OrderWaitPhase::ClassfileMutation(None),
         Instant::now(),
         Some(directory),
         &unavailable,
     );
     assert_eq!(orders.len(), 4);
     assert!(!diagnostic.exists(), "a successful wait must not create a deadline record");
+}
+
+#[test]
+fn incomplete_order_segment_evidence_is_verified_session_bound_and_limited() {
+    let root = temp_root();
+    let directory = root.path();
+    let connection = order_wait_test_store(directory);
+    let session = RuntimeSessionId::from_uuid(uuid::Uuid::from_u128(200));
+    let other = RuntimeSessionId::from_uuid(uuid::Uuid::from_u128(201));
+    let marker = "http.request POST /orders";
+    let add = |session, id, status, kind, symbol| {
+        add_order_wait_test_segment(directory, &connection, session, id, status, kind, symbol)
+    };
+    let observe = || incomplete_order_segment_evidence(directory, session);
+
+    add(other, 1, "recording", RecordingEventKind::RequestUpdate, marker);
+    add(session, 2, "complete", RecordingEventKind::RequestUpdate, marker);
+    add(session, 3, "partial", RecordingEventKind::Response, marker);
+    add(
+        session,
+        4,
+        "partial",
+        RecordingEventKind::RequestUpdate,
+        "http.request GET /__fixture/count",
+    );
+    assert_eq!(observe(), Some("not-observed"));
+
+    add(session, 5, "recording", RecordingEventKind::RequestUpdate, marker);
+    assert_eq!(observe(), Some("segment-without-terminal"));
+    connection
+        .execute(
+            "UPDATE recordings SET status = 'partial' WHERE recording_id = ?1",
+            [uuid::Uuid::from_u128(5).as_bytes()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO recording_terminal_evidence VALUES (?1)",
+            [uuid::Uuid::from_u128(5).as_bytes()],
+        )
+        .unwrap();
+    assert_eq!(observe(), Some("segment-with-terminal"));
+
+    let path = add(session, 6, "recording", RecordingEventKind::RequestUpdate, marker);
+    assert_eq!(observe(), Some("mixed"));
+    let valid_bytes = fs::read(&path).unwrap();
+    fs::write(&path, b"invalid compressed segment BODY_CANARY_1D3").unwrap();
+    assert_eq!(observe(), None);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(ORDER_WAIT_COMPRESSED_BYTE_LIMIT + 1)
+        .unwrap();
+    assert_eq!(observe(), None);
+    fs::write(path, valid_bytes).unwrap();
+
+    let filler = |id| {
+        add(
+            session,
+            id,
+            "recording",
+            RecordingEventKind::RequestUpdate,
+            "http.request GET /__fixture/count",
+        )
+    };
+    // Four current-session candidates already have first segments; the complete and foreign rows
+    // do not spend the diagnostic scan's allowance.
+    let first_over_limit = 7 + u128::try_from(ORDER_WAIT_ROW_LIMIT - 4).unwrap();
+    for id in 7..first_over_limit {
+        filler(id);
+    }
+    assert_eq!(observe(), Some("mixed"));
+    filler(first_over_limit);
+    assert_eq!(observe(), None);
 }
 
 #[test]
@@ -1136,9 +1442,18 @@ fn capture_marker_scan_finds_each_marker_split_across_reads_beyond_the_sample() 
         stderr.resize(boundary - 1, b'x');
         stderr.extend_from_slice(marker);
     }
+    let state = br#"{"code":"XTR-JAVA-DRAIN-STATE","state":"queued-signals"}"#;
+    let boundary = (stderr.len() / 4096 + 1) * 4096;
+    stderr.resize(boundary - state.len() + 1, b'x');
+    stderr.extend_from_slice(state);
     let scanned = drain_scanned_with_lines(&mut stderr.as_slice(), 16, None, Some(&markers));
     assert_eq!(scanned.sample, b"xxxxxxxxxxxxxxxx");
     assert_eq!(markers.observations(), ["present", "present", "present"]);
+    assert_eq!(markers.drain_state(), Some("queued-signals"));
+    markers.scan(br#"{"code":"XTR-JAVA-DRAIN-STATE","state":"queued-signals-private"}"#);
+    assert_eq!(markers.drain_state(), Some("queued-signals"));
+    markers.scan(br#"{"code":"XTR-JAVA-DRAIN-STATE","state":"active-slot"}"#);
+    assert_eq!(markers.drain_state(), None, "conflicting session observations are ambiguous");
 }
 
 fn decode_events(logical: &[u8]) -> Vec<RecordingEvent> {
@@ -1298,9 +1613,7 @@ fn drain_scanned_with_lines(
     let overlap = CANARIES
         .iter()
         .map(|canary| canary.len())
-        .chain(
-            CAPTURE_MARKERS.iter().filter(|_| capture_markers.is_some()).map(|marker| marker.len()),
-        )
+        .chain(capture_messages().filter(|_| capture_markers.is_some()).map(<[u8]>::len))
         .max()
         .unwrap_or_default()
         .saturating_sub(1);

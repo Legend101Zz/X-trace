@@ -355,7 +355,7 @@ impl AdmittedPrivateRoot {
         &self.path
     }
 
-    /// Creates and admits a new owner-only child directory relative to this descriptor.
+    /// Creates an owner-only child, syncs this parent directory, and admits the new child.
     pub fn create_private_child(&self, name: &str) -> Result<Self, PrivateStorageError> {
         self.create_private_child_until(name, &self.operation())
     }
@@ -378,7 +378,7 @@ impl AdmittedPrivateRoot {
         self.revalidate_until(op)?;
         rustix::fs::mkdirat(&self.directory, name, rustix::fs::Mode::from_raw_mode(0o700))
             .map_err(|error| PrivateStorageError::Operation.discard_io(error))?;
-        self.revalidate_until(op)?;
+        // sync_until revalidates the parent after mkdirat, immediately before its fsync.
         self.sync_until(op)?;
         let child = rustix::fs::openat(
             &self.directory,
@@ -1864,9 +1864,9 @@ mod tests {
             // were busy in and which these counts now exclude.
             assert!(probes <= directories + 2, "{probes} probes for {directories} directories");
         } else {
-            // Five revalidations of the parent (each directories + 3) and the child's admission
-            // (3 probes), with no memo.
-            assert_eq!(probes, 5 * (directories + 3) + 3);
+            // Four parent checks: before mkdir, before fsync, after openat, and after child
+            // admission. Each costs directories + 3 probes; the child's own admission costs 3.
+            assert_eq!(probes, 4 * (directories + 3) + 3);
         }
     }
 

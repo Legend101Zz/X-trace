@@ -11,6 +11,8 @@
     reason = "integration tests assert on fixed fixtures and checked SQL results"
 )]
 
+use std::{path::PathBuf, sync::OnceLock};
+
 use rusqlite::{Connection, params, types::Value};
 use uuid::Uuid;
 use xtrace_private_storage::AdmittedPrivateRoot;
@@ -22,16 +24,44 @@ fn uuid7() -> Vec<u8> {
     Uuid::now_v7().as_bytes().to_vec()
 }
 
-/// Private scratch directory (owner-only, admitted) the store requires; the leased runner exports
-/// `XTRACE_TEST_PRIVATE_SCRATCH` for it.
-fn fresh_database() -> (AdmittedPrivateRoot, Connection) {
-    let scratch = std::path::PathBuf::from(
-        std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-            .expect("XTRACE_TEST_PRIVATE_SCRATCH must point to private test storage"),
-    );
-    let root = AdmittedPrivateRoot::open(&scratch).expect("private scratch is admitted");
-    let name = format!("catalog-link-{}-{}", std::process::id(), Uuid::now_v7());
-    let dir = root.create_private_child(&name).expect("private child");
+struct CatalogCases {
+    preserve: AdmittedPrivateRoot,
+    repeat: AdmittedPrivateRoot,
+    routes: AdmittedPrivateRoot,
+    limits: AdmittedPrivateRoot,
+    links: AdmittedPrivateRoot,
+    bytes: AdmittedPrivateRoot,
+}
+
+fn catalog_cases() -> &'static CatalogCases {
+    // Create all parents before any test opens its database. Creating or dropping one test's
+    // files then changes only its own branch, while the six migration cases still run in parallel.
+    static CASES: OnceLock<CatalogCases> = OnceLock::new();
+    CASES.get_or_init(|| {
+        let scratch = match std::env::var_os("XTRACE_TEST_PRIVATE_IO_ROOT") {
+            Some(base) => PathBuf::from(base).join("catalog"),
+            None => PathBuf::from(
+                std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                    .expect("XTRACE_TEST_PRIVATE_SCRATCH must point to private test storage"),
+            ),
+        };
+        let root = AdmittedPrivateRoot::open(&scratch).expect("private scratch is admitted");
+        let name = format!("catalog-link-{}-{}", std::process::id(), Uuid::now_v7());
+        let family = root.create_private_child(&name).expect("private catalog fixture");
+        let branch = |name| family.create_private_child(name).expect("private case parent");
+        CatalogCases {
+            preserve: branch("preserve"),
+            repeat: branch("repeat"),
+            routes: branch("routes"),
+            limits: branch("limits"),
+            links: branch("links"),
+            bytes: branch("bytes"),
+        }
+    })
+}
+
+fn fresh_database(parent: &AdmittedPrivateRoot) -> (AdmittedPrivateRoot, Connection) {
+    let dir = parent.create_private_child("db").expect("private database directory");
     let path = dir.path().join("xtrace.sqlite3");
     drop(SqliteStore::open(&path, OpenOptions::default()).expect("store opens and migrates"));
     let connection = Connection::open(&path).expect("raw connection");
@@ -104,7 +134,7 @@ fn apply_v9(connection: &mut Connection) {
 
 #[test]
 fn migration_v9_preserves_v3_operations_and_sidecar_bytes() {
-    let (_dir, mut connection) = fresh_database();
+    let (_dir, mut connection) = fresh_database(&catalog_cases().preserve);
     let seed = seed_v3_rows(&connection);
     let operations_before = snapshot(&connection, "operations", "operation_id");
     let sidecar_before = snapshot(&connection, "recording_endpoint_observations", "recording_id");
@@ -134,7 +164,7 @@ fn migration_v9_preserves_v3_operations_and_sidecar_bytes() {
 
 #[test]
 fn migration_v9_is_repeatable_on_its_own_output() {
-    let (_dir, mut connection) = fresh_database();
+    let (_dir, mut connection) = fresh_database(&catalog_cases().repeat);
     seed_v3_rows(&connection);
     apply_v9(&mut connection);
     let operations = snapshot(&connection, "operations", "operation_id");
@@ -146,7 +176,7 @@ fn migration_v9_is_repeatable_on_its_own_output() {
 
 #[test]
 fn migration_v9_accepts_general_routes_and_links_with_a_bound_tuple() {
-    let (_dir, mut connection) = fresh_database();
+    let (_dir, mut connection) = fresh_database(&catalog_cases().routes);
     let seed = seed_v3_rows(&connection);
     apply_v9(&mut connection);
 
@@ -189,7 +219,7 @@ fn migration_v9_accepts_general_routes_and_links_with_a_bound_tuple() {
 
 #[test]
 fn migration_v9_keeps_structural_limits_and_new_reason_codes() {
-    let (_dir, mut connection) = fresh_database();
+    let (_dir, mut connection) = fresh_database(&catalog_cases().limits);
     let seed = seed_v3_rows(&connection);
     apply_v9(&mut connection);
     let insert = |method: &str, route: &str, component: &str| {
@@ -230,7 +260,7 @@ fn migration_v9_keeps_structural_limits_and_new_reason_codes() {
 
 #[test]
 fn migration_v9_rejects_links_that_skip_the_foreign_key_through_nulls() {
-    let (_dir, mut connection) = fresh_database();
+    let (_dir, mut connection) = fresh_database(&catalog_cases().links);
     let seed = seed_v3_rows(&connection);
     apply_v9(&mut connection);
     let recording = uuid7();
@@ -267,7 +297,7 @@ fn migration_v9_rejects_links_that_skip_the_foreign_key_through_nulls() {
 
 #[test]
 fn migration_v9_counts_route_length_in_bytes_and_rejects_nul() {
-    let (_dir, mut connection) = fresh_database();
+    let (_dir, mut connection) = fresh_database(&catalog_cases().bytes);
     let seed = seed_v3_rows(&connection);
     apply_v9(&mut connection);
     let insert = |route: &str| {

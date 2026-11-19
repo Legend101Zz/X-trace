@@ -35,9 +35,15 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Install Linux descriptor inspection tool
+      - name: Ensure Linux descriptor inspection tool is available
         timeout-minutes: 10
         run: |
+          # Probe the same binary used by the release suite before consulting a package mirror.
+          lsof_path=$(python3 -B -c 'from tools.release.run_gates import LSOF_BINARY; print(LSOF_BINARY or "")')
+          if [[ -x "$lsof_path" ]] && timeout -k 2s 10s "$lsof_path" -nP -a -p "$$" -d cwd -Fp >/dev/null 2>&1; then
+            echo "Using the runner's installed lsof"
+            exit 0
+          fi
           sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
             -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
@@ -108,20 +114,34 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - name: Install release-floor system prerequisites
+      - name: Ensure release-floor system prerequisites are available
         timeout-minutes: 10
         run: |
+          packages=(
+            lsof
+            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64
+            libcairo2 libcups2t64 libdrm2 libgbm1 libglib2.0-0t64
+            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1
+            libxext6 libxfixes3 libxrandr2 libxkbcommon0 libxshmfence1 libgtk-3-0t64
+          )
+          architecture=$(dpkg --print-architecture)
+          all_installed() {
+            local package status
+            for package in "${packages[@]}"; do
+              status=$(dpkg-query -W -f='${Status}' "$package:$architecture" 2>/dev/null) || return 1
+              [[ "$status" == "install ok installed" ]] || return 1
+            done
+          }
+          if all_installed; then
+            echo "All release-floor system packages are installed"
+            exit 0
+          fi
           sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
             -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
           sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-            -o DPkg::Lock::Timeout=60 install --yes \
-            lsof \
-            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-            libcairo2 libcups2t64 libdrm2 libgbm1 libglib2.0-0t64 \
-            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 \
-            libxext6 libxfixes3 libxrandr2 libxkbcommon0 libxshmfence1 libgtk-3-0t64
+            -o DPkg::Lock::Timeout=60 install --yes "${packages[@]}"
       - name: Select private root path
         # The runner context is not available in job-level `env`; derive the
         # path from the shell-level runner variable and export it here.
@@ -395,6 +415,10 @@ jobs:
           set -euo pipefail
           root="${RUNNER_TEMP:?}/xt"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/frag" "$root/frag/ci-diag"
+          mkdir -m 700 "$root/c"
+          echo "XTRACE_TEST_CARDINALITY_SCRATCH=$root/c" >> "$GITHUB_ENV"
+          mkdir -m 700 "$root/private-io" "$root/private-io/direct" "$root/private-io/umask" "$root/private-io/held-request" "$root/private-io/catalog"
+          echo "XTRACE_TEST_PRIVATE_IO_ROOT=$root/private-io" >> "$GITHUB_ENV"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: Format gate (stable rustfmt, no nightly-only keys)

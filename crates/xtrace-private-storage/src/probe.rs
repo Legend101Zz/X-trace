@@ -1621,10 +1621,14 @@ mod tests {
     }
 
     fn fixture() -> tempfile::TempDir {
+        fixture_in(&std::env::temp_dir())
+    }
+
+    fn fixture_in(parent: &Path) -> tempfile::TempDir {
         // tempfile defaults to 0777 & !umask; public admission requires a 0700 leaf.
         tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
+            .tempdir_in(parent)
             .expect("fixture directory")
     }
 
@@ -2276,7 +2280,15 @@ mod tests {
         for mask in ["000", "022", "077"] {
             // umask belongs to the process: change it only in a child, never under parallel
             // tests. Reuse both metadata/ACL hooks and every private-I/O assertion below.
-            let output = std::process::Command::new("/bin/sh")
+            let mut child = std::process::Command::new("/bin/sh");
+            if let Some(root) = std::env::var_os("XTRACE_TEST_PRIVATE_IO_ROOT") {
+                // The child runs the same test body. Its tempdir is disjoint from the direct
+                // run even when libtest schedules this wrapper and that test concurrently.
+                child
+                    .env_remove("XTRACE_TEST_PRIVATE_IO_ROOT")
+                    .env("TMPDIR", Path::new(&root).join("umask"));
+            }
+            let output = child
                 .args(["-c", "umask \"$1\"; shift; exec \"$@\"", "private-fixture", mask])
                 .arg(&executable)
                 .args([
@@ -2304,9 +2316,13 @@ mod tests {
     fn linux_private_io_and_sync_survive_sibling_activity_in_an_ancestor() {
         use std::io::Write as _;
 
+        // Admission traverses every ancestor, so a unique child of a busy TMPDIR is
+        // insufficient. Only the hook should mutate this fixture's ancestors during I/O.
+        let base = std::env::var_os("XTRACE_TEST_PRIVATE_IO_ROOT")
+            .map_or_else(std::env::temp_dir, |root| Path::new(&root).join("direct"));
         for between_reads in [true, false] {
             for operation in ["open", "create", "sync", "rename", "mkdir", "remove"] {
-                let fixture = fixture();
+                let fixture = fixture_in(&base);
                 let parent = crate::AdmittedPrivateRoot::open(fixture.path()).expect("parent");
                 let root = parent.create_private_child("private").expect("private leaf");
                 root.create_private_child("empty").expect("empty child");

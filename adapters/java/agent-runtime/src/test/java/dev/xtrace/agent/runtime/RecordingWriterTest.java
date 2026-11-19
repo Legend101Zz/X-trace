@@ -174,6 +174,7 @@ class RecordingWriterTest {
       writer.start();
       try {
         transport.await(RecordingStarted.class);
+        transport.await(EventBatch.class);
       } finally {
         writer.close();
       }
@@ -182,7 +183,9 @@ class RecordingWriterTest {
     assertTrue(writer.incompleteWasReported());
     assertTrue(transport.closed.get());
     assertTrue(transport.finishes.isEmpty());
-    assertIncompleteDiagnostic(diagnostics, "XTR-JAVA-CAPTURE-DRAIN-EXPIRED");
+    assertEquals(2, diagnostics.size());
+    assertIncompleteDiagnostic(diagnostics.subList(0, 1), "XTR-JAVA-CAPTURE-DRAIN-EXPIRED");
+    assertEquals("{\"code\":\"XTR-JAVA-DRAIN-STATE\",\"state\":\"pending-recording\"}", diagnostics.get(1));
   }
 
   @Test
@@ -202,9 +205,10 @@ class RecordingWriterTest {
       }
     });
 
-    assertEquals(2, diagnostics.size());
+    assertEquals(3, diagnostics.size());
     assertIncompleteDiagnostic(diagnostics.subList(0, 1), "XTR-JAVA-CAPTURE-OTHER-INCOMPLETE");
     assertEquals("{\"code\":\"XTR-JAVA-CAPTURE-DRAIN-EXPIRED\"}", diagnostics.get(1));
+    assertEquals("{\"code\":\"XTR-JAVA-DRAIN-STATE\",\"state\":\"pending-recording\"}", diagnostics.get(2));
   }
 
   @Test
