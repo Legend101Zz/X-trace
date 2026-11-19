@@ -2786,7 +2786,25 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(failed)
         self.assertEqual(error, "quiescent wait failed: KeyboardInterrupt")
 
+    def test_floor_refuses_insecure_existing_scratch_before_creating_run_state(self) -> None:
+        scratch = self.cache / "tmp"
+        scratch.mkdir(mode=0o700)
+        for leaf in ("p", "t"):
+            with self.subTest(leaf=leaf):
+                path = scratch / leaf
+                path.mkdir(mode=0o700)
+                path.chmod(0o755)
+                with self.assertRaises(private_roots.AdmissionError):
+                    run_gates.run(self.args())
+                self.assertFalse((self.cache / "release-gates").exists())
+                path.rmdir()
+
     def test_floor_builds_its_environment_with_the_shared_allowlist_and_private_home(self) -> None:
+        temp = self.cache / "tmp" / "t"
+        private = self.cache / "tmp" / "p"
+        private.parent.mkdir(mode=0o700)
+        private.mkdir(mode=0o700)
+        private_identity = private.stat().st_ino
         gate = run_gates.Gate("env-probe", ("true",))
         captured: dict[str, object] = {}
 
@@ -2812,7 +2830,12 @@ class RunnerTests(unittest.TestCase):
         private_io = pathlib.Path(env["XTRACE_TEST_PRIVATE_IO_ROOT"])  # type: ignore[index]
         self.assertEqual(private_io, self.cache / "release-gates" / "P00-test" / "private-io")
         self.assertFalse(private_io.is_relative_to(pathlib.Path(env["TMPDIR"])))  # type: ignore[index]
-        for directory in (private_io, private_io / "direct", private_io / "umask", private_io / "held-request"):
+        self.assertEqual(private.stat().st_ino, private_identity)
+        for variable in ("TMPDIR", "TEMP", "TMP", "XTRACE_TEST_SCRATCH_ROOT"):
+            self.assertEqual(env[variable], str(temp))  # type: ignore[index]
+        self.assertEqual(env["XTRACE_TEST_PRIVATE_SCRATCH"], str(private))  # type: ignore[index]
+        branches = (private_io / name for name in ("direct", "umask", "held-request", "catalog"))
+        for directory in (temp, private, private_io, *branches):
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
 
     def test_node_generate_normalizer_is_shared_canonical_and_symlink_safe(self) -> None:

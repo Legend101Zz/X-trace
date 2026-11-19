@@ -2224,11 +2224,16 @@ def run(args: argparse.Namespace, *, gate_progress=None) -> int:
     logs_dir = run_dir / "logs"
     lease_root = cache / "leases"
     leases = [Lease(lease_root / name, args.lease_token, args.label) for name in LEASE_NAMES]
+    # Keep both paths short for Unix sockets and historical path-derived init keys.
+    floor_tmp = cache / "tmp" / "t"
+    floor_private_scratch = cache / "tmp" / "p"
     # Inspect every existing named root before the first cache mutation. Missing
     # descendants are admitted through their nearest existing no-follow parent.
     private_roots.preflight_directory(cache, private_leaf=True)
     for name in CACHE_NAMES:
         private_roots.preflight_directory(cache / name, private_leaf=True)
+    for directory in (floor_tmp, floor_private_scratch):
+        private_roots.preflight_directory(directory, private_leaf=True)
     private_roots.preflight_directory(restricted_target, must_be_absent=True)
     private_roots.preflight_directory(release_root, private_leaf=True)
     private_roots.preflight_directory(run_dir, must_be_absent=True)
@@ -2296,13 +2301,22 @@ def run(args: argparse.Namespace, *, gate_progress=None) -> int:
         floor_home = cache / "tmp" / f"{args.label}-home"
         private_roots.ensure_private_directory(floor_home, must_create=True)
         private_roots.admit_directory(floor_home, private_leaf=True)
-        env = build_task_env(cache, os.environ.copy(), scratch=cache / "tmp", home=floor_home)
+        # Build tools and generic tempdirs churn their own leaf, outside the ancestry of
+        # product-private fixtures. Reuse only owner-private leaves under the leased cache.
+        for directory in (floor_tmp, floor_private_scratch):
+            private_roots.ensure_private_directory(directory)
+            private_roots_to_recheck.append(directory)
+        env = build_task_env(cache, os.environ.copy(), scratch=floor_tmp, home=floor_home)
+        env["XTRACE_TEST_PRIVATE_SCRATCH"] = str(floor_private_scratch)
         # These fixtures admit every ancestor. Pre-create their separate parents outside
         # general scratch so parallel fixture creation and removal cannot mutate those ancestors.
         private_io_root = run_dir / "private-io"
         private_roots.ensure_private_directory(private_io_root, must_create=True)
-        for name in ("direct", "umask", "held-request"):
-            private_roots.ensure_private_directory(private_io_root / name, must_create=True)
+        private_roots_to_recheck.append(private_io_root)
+        for name in ("direct", "umask", "held-request", "catalog"):
+            directory = private_io_root / name
+            private_roots.ensure_private_directory(directory, must_create=True)
+            private_roots_to_recheck.append(directory)
         env["XTRACE_TEST_PRIVATE_IO_ROOT"] = str(private_io_root)
         manifest["workingTreeDigestBefore"] = dirty_start
         manifest["phaseDiffSha256Before"] = _hash(diff_start)
