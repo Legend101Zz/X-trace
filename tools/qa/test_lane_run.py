@@ -205,6 +205,29 @@ class FailureDetailsTests(CheckoutFixture):
         self.assertEqual(row["category"][:4], ["Admission", "Deadline", 1, 200])
         self.assertEqual(len(row["category"]), lane_run.MAX_CATEGORIES)
 
+    def test_diagnostic_count_cap_keeps_late_failing_thread_in_observed_order(self):
+        unrelated = [f"case{i}" for i in range(lane_run.MAX_FAILING + 1)]
+        records = self.records(*(self.diagnostic(name) for name in unrelated),
+                               self.diagnostic("fails", operation="OwnershipAndMode"))
+        detail = lane_run.failure_details(self.cargo(name="fails"), False, diagnostic_records=records)
+        observations = detail["observedDiagnostics"]
+        self.assertEqual([row["thread"] for row in observations[:-1]],
+                         unrelated[:lane_run.MAX_FAILING - 1])
+        self.assertEqual(observations[-1], {"test": "fails", "relevance": "unknown",
+                                           "category": ["Admission", "OwnershipAndMode"]})
+        self.assertEqual(detail["diagnosticsOmitted"], 2)
+        self.assertEqual([row["test"] for row in detail["failures"]], ["fails"])
+
+    def test_diagnostic_byte_cap_preserves_failure_and_associated_observation(self):
+        text = self.cargo(name="fails")
+        associated = self.diagnostic("fails", operation="OwnershipAndMode")
+        expected = lane_run.failure_details(text, False, diagnostic_records=self.records(associated))
+        expected["diagnosticsOmitted"] = 2
+        budget = len(lane_run._encoded(expected))
+        records = self.records(self.diagnostic("first"), self.diagnostic("second"), associated)
+        detail = lane_run.failure_details(text, False, budget=budget, diagnostic_records=records)
+        self.assertEqual(detail, expected)
+
     def test_duplicate_test_names_across_binaries_cannot_attribute_observations(self):
         text = ("running 1 test\ntest first ... ok\n"
                 "test result: ok. 1 passed; 0 failed; 0 ignored\n"

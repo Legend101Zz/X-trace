@@ -2297,6 +2297,12 @@ def run(args: argparse.Namespace, *, gate_progress=None) -> int:
         private_roots.ensure_private_directory(floor_home, must_create=True)
         private_roots.admit_directory(floor_home, private_leaf=True)
         env = build_task_env(cache, os.environ.copy(), scratch=cache / "tmp", home=floor_home)
+        # The controlled sibling-mutation fixture traverses every ancestor. Keep both
+        # copies outside general scratch and pre-create their separate parents before cargo.
+        private_io_root = run_dir / "private-io"
+        for directory in (private_io_root, private_io_root / "direct", private_io_root / "umask"):
+            private_roots.ensure_private_directory(directory, must_create=True)
+        env["XTRACE_TEST_PRIVATE_IO_ROOT"] = str(private_io_root)
         manifest["workingTreeDigestBefore"] = dirty_start
         manifest["phaseDiffSha256Before"] = _hash(diff_start)
         recheck_private_roots()

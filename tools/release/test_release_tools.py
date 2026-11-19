@@ -2809,6 +2809,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(env["HOME"], str(self.cache / "tmp" / "P00-test-home"))  # type: ignore[index]
         self.assertTrue((self.cache / "tmp" / "P00-test-home").is_dir())
         self.assertEqual(env["CARGO_HOME"], str(self.cache / "cargo"))  # type: ignore[index]
+        private_io = pathlib.Path(env["XTRACE_TEST_PRIVATE_IO_ROOT"])  # type: ignore[index]
+        self.assertEqual(private_io, self.cache / "release-gates" / "P00-test" / "private-io")
+        self.assertFalse(private_io.is_relative_to(pathlib.Path(env["TMPDIR"])))  # type: ignore[index]
+        for directory in (private_io, private_io / "direct", private_io / "umask"):
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
 
     def test_node_generate_normalizer_is_shared_canonical_and_symlink_safe(self) -> None:
         node = shutil.which("node")

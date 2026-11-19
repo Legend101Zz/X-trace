@@ -1176,7 +1176,10 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                        testUnverifiedReason=UnverifiedReason.EXCERPT_CAP.value)
     result: dict = {"failures": rows[:MAX_FAILING], "omitted": max(0, len(rows) - MAX_FAILING)}
     if observations:
-        result["observedDiagnostics"] = list(observations.values())[:MAX_FAILING]
+        # Rank only for eviction. Association with a verified failing thread is useful
+        # context, but cannot establish that the observation caused the failure.
+        ranked = sorted(enumerate(observations.values()), key=lambda item: item[1]["test"] == UNVERIFIED)
+        result["observedDiagnostics"] = [row for _, row in ranked[:MAX_FAILING]]
         result["diagnosticsOmitted"] = max(0, len(observations) - MAX_FAILING)
         for row in result["observedDiagnostics"]:
             while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["category"]:
@@ -1224,14 +1227,15 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                              "basis": "last harness observation; other running tests not observed",
                              "progress": list(progress), "progressWithheld": withheld,
                              "progressOmitted": progress_omitted}
-    # Preserve the timeout envelope when space runs short; drop failure rows first.
+    # Reduce supporting observations before primary failure rows. Keep the timeout
+    # envelope and consume the same byte budget for every kind of excerpt.
     while len(_encoded(result)) > budget:
-        if result["failures"]:
-            result["failures"].pop()
-            result["omitted"] += 1
-        elif result.get("observedDiagnostics"):
+        if result.get("observedDiagnostics"):
             result["observedDiagnostics"].pop()
             result["diagnosticsOmitted"] += 1
+        elif result["failures"]:
+            result["failures"].pop()
+            result["omitted"] += 1
         elif result.get("timeout", {}).get("progress"):
             result["timeout"]["progress"].pop(0)
             result["timeout"]["progressOmitted"] += 1
@@ -1242,6 +1246,10 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             return None
     if rows and not result["failures"] and not timed_out:
         return None
+    if observations:
+        # Publish survivors in their original order, including when all rows fit.
+        kept = ranked[:len(result["observedDiagnostics"])]
+        result["observedDiagnostics"] = [row for _, row in sorted(kept)]
     return result
 
 
