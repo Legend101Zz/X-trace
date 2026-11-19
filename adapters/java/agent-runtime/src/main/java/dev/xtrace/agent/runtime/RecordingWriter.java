@@ -145,7 +145,9 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         if (stopping.get() || shutdownDrained()) break;
         if (shutdownExpired()) {
           drainExpired = true;
+          String state = sessionDrainState();
           reportIncomplete(IncompleteReason.DRAIN_EXPIRED);
+          System.err.println("{\"code\":\"XTR-JAVA-DRAIN-STATE\",\"state\":\"" + state + "\"}");
           break;
         }
         QueueSignal signal = queue.poll(POLL_INTERVAL);
@@ -916,6 +918,16 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         && queue.isEmpty()
         && recordings.isEmpty()
         && sink.activeRecordings() == 0;
+  }
+
+  // Sampled by the writer at expiry. These session-wide checks name the first observed work,
+  // not a request or the cause of the delay. Producers can still finish between reads.
+  private String sessionDrainState() {
+    if (!queue.isEmpty()) return "queued-signals";
+    if (!recordings.isEmpty()) return "pending-recording";
+    if (!sink.startAdmissionsDrained()) return "start-in-flight";
+    if (sink.activeRecordings() > 0) return "active-slot";
+    return "no-work-observed";
   }
 
   private boolean shutdownExpired() {

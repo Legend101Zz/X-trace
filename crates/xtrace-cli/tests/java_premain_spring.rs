@@ -17,7 +17,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -48,23 +48,46 @@ const CAPTURE_MARKERS: [&[u8]; 3] = [
     b"XTR-JAVA-CAPTURE-DRAIN-EXPIRED",
     b"XTR-JAVA-CAPTURE-OTHER-INCOMPLETE",
 ];
-const CAPTURE_SCAN_EOF: u8 = 1 << CAPTURE_MARKERS.len();
+const CAPTURE_SCAN_EOF: u16 = 1 << 15;
+
+// One fixed record per writer expiry. Multiple different states make the observation ambiguous.
+const DRAIN_STATES: [&str; 5] =
+    ["queued-signals", "pending-recording", "start-in-flight", "active-slot", "no-work-observed"];
+static DRAIN_STATE_MESSAGES: std::sync::LazyLock<[Vec<u8>; DRAIN_STATES.len()]> =
+    std::sync::LazyLock::new(|| {
+        DRAIN_STATES.map(|state| {
+            format!(r#"{{"code":"XTR-JAVA-DRAIN-STATE","state":"{state}"}}"#).into_bytes()
+        })
+    });
+
+fn capture_messages() -> impl Iterator<Item = &'static [u8]> {
+    CAPTURE_MARKERS.into_iter().chain(DRAIN_STATE_MESSAGES.iter().map(Vec::as_slice))
+}
 
 #[derive(Default)]
-struct CaptureMarkerScan(AtomicU8);
+struct CaptureMarkerScan(AtomicU16);
 
 impl CaptureMarkerScan {
     fn scan(&self, bytes: &[u8]) {
         let seen = self.0.load(Ordering::Relaxed);
         let mut observed = seen;
-        for (index, marker) in CAPTURE_MARKERS.iter().enumerate() {
+        for (index, marker) in capture_messages().enumerate() {
             let bit = 1 << index;
-            if seen & bit == 0 && bytes.windows(marker.len()).any(|window| window == *marker) {
+            if seen & bit == 0 && bytes.windows(marker.len()).any(|window| window == marker) {
                 observed |= bit;
             }
         }
         // The stderr reader is the sole writer. A deadline snapshots all bits together.
         self.0.store(observed, Ordering::Relaxed);
+    }
+
+    fn drain_state(&self) -> Option<&'static str> {
+        let states = (self.0.load(Ordering::Relaxed) & !CAPTURE_SCAN_EOF) >> CAPTURE_MARKERS.len();
+        if states.count_ones() == 1 {
+            Some(DRAIN_STATES[states.trailing_zeros() as usize])
+        } else {
+            None
+        }
     }
 
     fn observations(&self) -> [&'static str; CAPTURE_MARKERS.len()] {
@@ -963,12 +986,18 @@ fn wait_for_order_recordings_until(
                     .mode(0o600)
                     .open(directory.join(ORDER_WAIT_DIAGNOSTIC))
             {
-                let (version, segment_field) = segment_evidence
-                    .map_or(("v2", String::new()), |evidence| ("v3", format!(" {evidence}")));
+                let (version, extra_fields) =
+                    match (segment_evidence, capture_markers.drain_state()) {
+                        (Some(segment), Some(state)) if drain_expired == "present" => {
+                            ("v4", format!(" {segment} {state}"))
+                        }
+                        (Some(segment), _) => ("v3", format!(" {segment}")),
+                        (None, _) => ("v2", String::new()),
+                    };
                 let _ = writeln!(
                     file,
                     "{version} {label} {complete_rows} {matching_rows} {incomplete} \
-                     {drain_expired} {other_incomplete}{segment_field}"
+                     {drain_expired} {other_incomplete}{extra_fields}"
                 );
             }
             let segment_detail = segment_evidence.map_or_else(String::new, |evidence| {
@@ -1265,13 +1294,20 @@ fn order_wait_deadline_reports_the_last_complete_segment_observation() {
         mismatch_message,
         "v3 attestation-mismatch 16 1 present present not-observed segment-without-terminal\n",
     );
+    expired.scan(br#"{"code":"XTR-JAVA-DRAIN-STATE","state":"pending-recording"}"#);
+    assert_deadline(
+        OrderWaitPhase::AttestationMismatch(Some(session_id)),
+        &expired,
+        mismatch_message,
+        "v4 attestation-mismatch 16 1 present present not-observed segment-without-terminal pending-recording\n",
+    );
     let missing_session_id = daemon_session_id(&serde_json::json!({}));
     assert_eq!(missing_session_id, None);
     assert_deadline(
         OrderWaitPhase::AttestationMismatch(missing_session_id),
         &expired,
         &mismatch_message.replace("segment-without-terminal", "unavailable"),
-        "v3 attestation-mismatch 16 1 present present not-observed unavailable\n",
+        "v4 attestation-mismatch 16 1 present present not-observed unavailable pending-recording\n",
     );
     assert_panic(
         OrderWaitPhase::AttestationMismatch(Some(session_id)),
@@ -1406,9 +1442,18 @@ fn capture_marker_scan_finds_each_marker_split_across_reads_beyond_the_sample() 
         stderr.resize(boundary - 1, b'x');
         stderr.extend_from_slice(marker);
     }
+    let state = br#"{"code":"XTR-JAVA-DRAIN-STATE","state":"queued-signals"}"#;
+    let boundary = (stderr.len() / 4096 + 1) * 4096;
+    stderr.resize(boundary - state.len() + 1, b'x');
+    stderr.extend_from_slice(state);
     let scanned = drain_scanned_with_lines(&mut stderr.as_slice(), 16, None, Some(&markers));
     assert_eq!(scanned.sample, b"xxxxxxxxxxxxxxxx");
     assert_eq!(markers.observations(), ["present", "present", "present"]);
+    assert_eq!(markers.drain_state(), Some("queued-signals"));
+    markers.scan(br#"{"code":"XTR-JAVA-DRAIN-STATE","state":"queued-signals-private"}"#);
+    assert_eq!(markers.drain_state(), Some("queued-signals"));
+    markers.scan(br#"{"code":"XTR-JAVA-DRAIN-STATE","state":"active-slot"}"#);
+    assert_eq!(markers.drain_state(), None, "conflicting session observations are ambiguous");
 }
 
 fn decode_events(logical: &[u8]) -> Vec<RecordingEvent> {
@@ -1568,9 +1613,7 @@ fn drain_scanned_with_lines(
     let overlap = CANARIES
         .iter()
         .map(|canary| canary.len())
-        .chain(
-            CAPTURE_MARKERS.iter().filter(|_| capture_markers.is_some()).map(|marker| marker.len()),
-        )
+        .chain(capture_messages().filter(|_| capture_markers.is_some()).map(<[u8]>::len))
         .max()
         .unwrap_or_default()
         .saturating_sub(1);

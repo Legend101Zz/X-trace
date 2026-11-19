@@ -1470,6 +1470,16 @@ class SpringPremainDiagnosticTests(unittest.TestCase):
                 self.assertEqual(fragment["springPremainOrderWait"]["incompleteOrderSegmentEvidence"], evidence)
                 self.assertNotIn(record.strip(), public)
 
+    def test_failed_workspace_publishes_only_finite_session_drain_states(self):
+        for state in ("queued-signals", "pending-recording", "start-in-flight", "active-slot", "no-work-observed"):
+            with self.subTest(state=state):
+                record = f"v4 classfile-mutation 9 3 present present not-observed not-observed {state}\n"
+                fragment, public = self.run_floor_step(record.encode())
+                observed = fragment["springPremainOrderWait"]
+                self.assertEqual(observed["sessionDrainState"], state)
+                self.assertEqual(observed["incompleteOrderSegmentEvidence"], "not-observed")
+                self.assertNotIn(record.strip(), public)
+
     def test_failed_workspace_withholds_unavailable_or_malformed_diagnostics(self):
         valid = b"v2 successful-request 0 0 present not-observed present\n"
         for record, mode, metadata in (
@@ -1491,6 +1501,10 @@ class SpringPremainDiagnosticTests(unittest.TestCase):
             (b"v3 classfile-mutation 9 3 present present not-observed captured-value\n", 0o600, None),
             (b"v3 classfile-mutation 9 3 present present not-observed mixed unavailable\n", 0o600, None),
             (b"v3 error-request 9 1 present present not-observed mixed\n", 0o600, None),
+            (b"v4 classfile-mutation 9 3 present present not-observed mixed captured-value\n", 0o600, None),
+            (b"v4 classfile-mutation 9 3 present not-observed not-observed mixed active-slot\n", 0o600, None),
+            (b"v4 classfile-mutation 9 3 present present not-observed mixed\n", 0o600, None),
+            (b"v3 classfile-mutation 9 3 present present not-observed mixed active-slot\n", 0o600, None),
             (valid.rstrip(), 0o600, None),
             (valid * 3, 0o600, None),
             (valid + b"/fixture/customer.txt\nb3:0123456789abcdef\n", 0o600, None),
@@ -1506,6 +1520,8 @@ class SpringPremainDiagnosticTests(unittest.TestCase):
             (b"v2 successful-request 0 0 present not-observed present\n", "not-observed"),
             (b"v3 classfile-mutation 9 3 present present not-observed segment-without-terminal\n",
              "segment-without-terminal"),
+            (b"v4 classfile-mutation 9 3 present present not-observed mixed pending-recording\n",
+             "pending-recording"),
         ):
             with self.subTest(canary=canary):
                 fragment, public = self.run_floor_step(record, private_canary=canary)

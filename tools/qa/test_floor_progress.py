@@ -320,6 +320,9 @@ class FloorProgressTests(unittest.TestCase):
                     "completeRows": complete, "completeRowsLimit": 16, "matchingRows": matching,
                     "captureMarkers": dict(zip(("incomplete", "drainExpired", "otherIncomplete"), markers)),
                 })
+        with_state = valid.replace(b"v3 ", b"v4 ").rstrip() + b" queued-signals\n"
+        private_roots.atomic_write_private(record, with_state)
+        self.assertEqual(observation(), {**expected, "sessionDrainState": "queued-signals"})
         private_roots.atomic_write_private(record, valid)
         record.chmod(0o644)
         self.assertEqual(observation(), floor_progress.UNAVAILABLE)

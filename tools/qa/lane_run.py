@@ -771,9 +771,10 @@ SPRING_ORDER_WAIT_ROW_LIMIT = 16
 SPRING_ORDER_WAIT_MAX_BYTES = 128
 SPRING_MARKER_OBSERVATION = rb"(present|not-observed|unavailable)"
 SPRING_ORDER_WAIT_RECORD = re.compile(
-    rb"(v2|v3) ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3]) "
+    rb"(v2|v3|v4) ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3]) "
     + b" ".join([SPRING_MARKER_OBSERVATION] * 3)
-    + rb"(?: (segment-without-terminal|segment-with-terminal|mixed|not-observed|unavailable))?\n"
+    + rb"(?: (segment-without-terminal|segment-with-terminal|mixed|not-observed|unavailable))?"
+    + rb"(?: (queued-signals|pending-recording|start-in-flight|active-slot|no-work-observed))?\n"
 )
 
 
@@ -790,10 +791,13 @@ def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index
     record = SPRING_ORDER_WAIT_RECORD.fullmatch(raw)
     if record is None:
         return unavailable
-    version, phase_bytes, complete_bytes, matching_bytes, incomplete, drain_expired, other_incomplete, segment = (
-        record.groups()
-    )
-    if (version == b"v3") != (segment is not None):
+    (version, phase_bytes, complete_bytes, matching_bytes, incomplete, drain_expired,
+     other_incomplete, segment, drain_state) = record.groups()
+    if (version in (b"v3", b"v4")) != (segment is not None):
+        return unavailable
+    if (version == b"v4") != (drain_state is not None):
+        return unavailable
+    if drain_state is not None and drain_expired != b"present":
         return unavailable
     phase = phase_bytes.decode("ascii")
     if segment is not None and phase not in ("attestation-mismatch", "classfile-mutation"):
@@ -822,6 +826,8 @@ def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index
                                  "otherIncomplete": other_incomplete}}
     if segment is not None:
         result["incompleteOrderSegmentEvidence"] = segment.decode("ascii")
+    if drain_state is not None:
+        result["sessionDrainState"] = drain_state.decode("ascii")
     return unavailable if _private(_encoded(result).decode("ascii"), index, verified_identifier=True) else result
 
 
