@@ -216,7 +216,10 @@ class FailureDetailsTests(CheckoutFixture):
         self.assertEqual(observations[-1], {"test": "fails", "relevance": "unknown",
                                            "category": ["Admission", "OwnershipAndMode"]})
         self.assertEqual(detail["diagnosticsOmitted"], 2)
-        self.assertEqual([row["test"] for row in detail["failures"]], ["fails"])
+        outcome, panic = detail["failures"]
+        self.assertEqual((outcome["test"], outcome["kind"]), ("fails", "exit"))
+        self.assertEqual((panic["test"], panic["kind"], panic["testUnverifiedReason"], panic["panicSites"]),
+                         (lane_run.UNVERIFIED, "panic", "ambiguous-panic-block", []))
 
     def test_diagnostic_byte_cap_preserves_failure_and_associated_observation(self):
         text = self.cargo(name="fails")
