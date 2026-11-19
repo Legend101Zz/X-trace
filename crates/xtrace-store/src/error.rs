@@ -51,6 +51,8 @@ pub struct StoreError {
     message: String,
     correlation_id: CorrelationId,
     source: Option<String>,
+    #[cfg(test)]
+    test_diagnostic: Option<String>,
 }
 
 impl StoreError {
@@ -61,7 +63,14 @@ impl StoreError {
         message: impl Into<String>,
         correlation_id: CorrelationId,
     ) -> Self {
-        Self { kind, message: message.into(), correlation_id, source: None }
+        Self {
+            kind,
+            message: message.into(),
+            correlation_id,
+            source: None,
+            #[cfg(test)]
+            test_diagnostic: None,
+        }
     }
 
     /// Returns the categorical classification.
@@ -92,6 +101,13 @@ impl StoreError {
     #[must_use]
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    /// Keep unit-test failure facts in Debug without changing the public error accessors.
+    #[cfg(test)]
+    pub(crate) fn with_test_diagnostic(mut self, diagnostic: String) -> Self {
+        self.test_diagnostic = Some(diagnostic);
         self
     }
 

@@ -227,41 +227,55 @@ struct StoreInner {
     recording_writer: Mutex<()>,
 }
 
+fn sqlite_admission_error(
+    correlation_id: CorrelationId,
+    _phase: &'static str,
+    _check: &'static str,
+    _failure: PrivateStorageError,
+) -> StoreError {
+    let error = StoreError::new(
+        StoreErrorKind::Permission,
+        "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+        correlation_id,
+    );
+    // PrivateStorageError's Debug carries only fixed variants, admission context flags and
+    // numeric OS facts. The call sites supply fixed labels, never database or sidecar paths.
+    #[cfg(test)]
+    let error =
+        error.with_test_diagnostic(format!("phase={_phase} check={_check} failure={_failure:?}"));
+    error
+}
+
 fn validate_sqlite_private_files(
     root: &AdmittedPrivateRoot,
     database_name: &str,
     correlation_id: CorrelationId,
+    phase: &'static str,
 ) -> Result<(), StoreError> {
     #[cfg(unix)]
     let _admission_caller = CallerGuard::enter(Caller::SqliteFiles);
-    let mut names = Vec::with_capacity(4);
+    const FILE_ROLES: [(&str, &str); 4] =
+        [("", "database"), ("-wal", "wal"), ("-shm", "shm"), ("-journal", "journal")];
+    let mut names = Vec::with_capacity(FILE_ROLES.len());
     names.push(database_name.to_owned());
-    for suffix in ["-wal", "-shm", "-journal"] {
+    for &(suffix, check) in &FILE_ROLES[1..] {
         let name = format!("{database_name}{suffix}");
         if name.len() > 255 {
-            return Err(StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+            return Err(sqlite_admission_error(
                 correlation_id,
+                phase,
+                check,
+                PrivateStorageError::InvalidName,
             ));
         }
         names.push(name);
     }
-    for name in names {
-        root.validate_optional_private_file(&name).map_err(|_| {
-            StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                correlation_id,
-            )
-        })?;
+    for (name, (_, check)) in names.into_iter().zip(FILE_ROLES) {
+        root.validate_optional_private_file(&name)
+            .map_err(|failure| sqlite_admission_error(correlation_id, phase, check, failure))?;
     }
-    root.revalidate().map_err(|_| {
-        StoreError::new(
-            StoreErrorKind::Permission,
-            "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-            correlation_id,
-        )
+    root.revalidate().map_err(|failure| {
+        sqlite_admission_error(correlation_id, phase, "file-scan-parent", failure)
     })
 }
 
@@ -308,17 +322,12 @@ impl SqliteStore {
                 bootstrap,
             ));
         }
-        let private_root = AdmittedPrivateRoot::open(parent).map_err(|_| {
-            StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                bootstrap,
-            )
-        })?;
+        let private_root = AdmittedPrivateRoot::open(parent)
+            .map_err(|failure| sqlite_admission_error(bootstrap, "open", "parent", failure))?;
         let database_name = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
             StoreError::new(StoreErrorKind::Validation, "database file name is invalid", bootstrap)
         })?;
-        validate_sqlite_private_files(&private_root, database_name, bootstrap)?;
+        validate_sqlite_private_files(&private_root, database_name, bootstrap, "before-prepare")?;
         let prepared_file = if options.read_only() || options.must_exist() {
             private_root.open_regular_file(database_name)
         } else {
@@ -337,20 +346,12 @@ impl SqliteStore {
                 "database file name is invalid",
                 bootstrap,
             ),
-            _ => StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                bootstrap,
-            ),
+            failure => sqlite_admission_error(bootstrap, "prepare", "database", failure),
         })?;
-        private_root.revalidate().map_err(|_| {
-            StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                bootstrap,
-            )
+        private_root.revalidate().map_err(|failure| {
+            sqlite_admission_error(bootstrap, "after-prepare", "parent", failure)
         })?;
-        validate_sqlite_private_files(&private_root, database_name, bootstrap)?;
+        validate_sqlite_private_files(&private_root, database_name, bootstrap, "after-prepare")?;
         // When `must_exist` is set we open the file with read-write
         // flags only so SQLite refuses to create the file. This closes
         // the `path.exists()`-then-`Connection::open` race in which a
@@ -378,30 +379,18 @@ impl SqliteStore {
             )
             .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?
         };
-        private_root.validate_file_binding(database_name, &prepared_file, false).map_err(|_| {
-            StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                bootstrap,
-            )
-        })?;
+        private_root.validate_file_binding(database_name, &prepared_file, false).map_err(
+            |failure| sqlite_admission_error(bootstrap, "after-open", "binding", failure),
+        )?;
         // Descriptor-free: closing a second descriptor for a database SQLite already has
         // open would release SQLite's POSIX locks.
-        private_root.validate_regular_file(database_name).map_err(|_| {
-            StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                bootstrap,
-            )
+        private_root.validate_regular_file(database_name).map_err(|failure| {
+            sqlite_admission_error(bootstrap, "after-open", "named-database", failure)
         })?;
-        private_root.revalidate().map_err(|_| {
-            StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                bootstrap,
-            )
+        private_root.revalidate().map_err(|failure| {
+            sqlite_admission_error(bootstrap, "after-open", "parent", failure)
         })?;
-        validate_sqlite_private_files(&private_root, database_name, bootstrap)?;
+        validate_sqlite_private_files(&private_root, database_name, bootstrap, "after-open")?;
         Self::from_connection_with_private_root(
             connection,
             Some(path.to_path_buf()),
@@ -509,14 +498,10 @@ impl SqliteStore {
         if let (Some(root), Some(name), Some(file)) =
             (&private_root, &private_database_name, &private_database_file)
         {
-            root.validate_file_binding(name, file, false).map_err(|_| {
-                StoreError::new(
-                    StoreErrorKind::Permission,
-                    "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                    bootstrap,
-                )
+            root.validate_file_binding(name, file, false).map_err(|failure| {
+                sqlite_admission_error(bootstrap, "before-bootstrap", "binding", failure)
             })?;
-            validate_sqlite_private_files(root, name, bootstrap)?;
+            validate_sqlite_private_files(root, name, bootstrap, "before-bootstrap")?;
         } else if private_root.is_some()
             || private_database_name.is_some()
             || private_database_file.is_some()
@@ -544,14 +529,10 @@ impl SqliteStore {
         if let (Some(root), Some(name), Some(file)) =
             (&private_root, &private_database_name, &private_database_file)
         {
-            root.validate_file_binding(name, file, false).map_err(|_| {
-                StoreError::new(
-                    StoreErrorKind::Permission,
-                    "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                    bootstrap,
-                )
+            root.validate_file_binding(name, file, false).map_err(|failure| {
+                sqlite_admission_error(bootstrap, "after-bootstrap", "binding", failure)
             })?;
-            validate_sqlite_private_files(root, name, bootstrap)?;
+            validate_sqlite_private_files(root, name, bootstrap, "after-bootstrap")?;
         }
         let bootstrap_snapshot =
             StoreBootstrap { database_path, schema_version, busy_timeout: options.busy_timeout };
@@ -611,7 +592,7 @@ impl SqliteStore {
                     CorrelationId::new(),
                 )
             })?;
-            validate_sqlite_private_files(root, name, CorrelationId::new())?;
+            validate_sqlite_private_files(root, name, CorrelationId::new(), "connection-lock")?;
         }
         Ok(guard)
     }
@@ -873,7 +854,7 @@ mod tests {
     fn unsafe_parent_is_rejected_before_sqlite_creates_or_mutates_files() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let parent = tempdir().join("unsafe-parent");
+        let parent = tempdir().join("unsafe-parent-path-canary");
         std::fs::create_dir(&parent).expect("create fixture parent");
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
             .expect("make fixture parent deliberately traversable");
@@ -882,6 +863,20 @@ mod tests {
         let error = SqliteStore::open(&database, OpenOptions::default())
             .expect_err("unsafe parent must fail before opening SQLite");
         assert_eq!(error.kind(), StoreErrorKind::Permission);
+        assert_eq!(
+            error.message(),
+            "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)"
+        );
+        assert_eq!(error.source(), None);
+        let debug = format!("{error:?}");
+        assert!(
+            debug.contains(concat!(
+                "phase=open check=parent failure=Admission(AdmissionFailure { ",
+                "operation: OwnershipAndMode, kind: None, raw_os_error: None",
+            )),
+            "missing parent admission facts: {debug}",
+        );
+        assert!(!debug.contains("unsafe-parent-path-canary"), "the diagnostic omits fixture paths");
         assert!(!database.exists(), "admission failure must not create the database");
         assert_eq!(
             std::fs::metadata(&parent).expect("parent metadata").permissions().mode() & 0o777,
@@ -918,7 +913,7 @@ mod tests {
         canary.sync_all().expect("sync canary");
         drop(canary);
 
-        let database = private_dir.path().join("metadata.sqlite3");
+        let database = private_dir.path().join("wal-path-canary.sqlite3");
         let sidecar = PathBuf::from(format!("{}-wal", database.display()));
         symlink(private_dir.path().join(canary_name), &sidecar)
             .expect("create unsafe sidecar link");
@@ -927,6 +922,13 @@ mod tests {
         let error = SqliteStore::open(&database, OpenOptions::default())
             .expect_err("unsafe WAL sidecar must fail before SQLite open");
         assert_eq!(error.kind(), StoreErrorKind::Permission);
+        assert_eq!(error.source(), None);
+        let debug = format!("{error:?}");
+        assert!(
+            debug.contains("phase=before-prepare check=wal failure=Unavailable"),
+            "missing WAL admission facts: {debug}",
+        );
+        assert!(!debug.contains("wal-path-canary"), "the diagnostic omits fixture paths");
         assert!(!database.exists(), "refusal must happen before main database creation");
         assert_eq!(
             std::fs::read(private_dir.path().join(canary_name)).expect("re-read canary"),
