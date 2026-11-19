@@ -96,6 +96,12 @@ class CiPullRequestTests(unittest.TestCase):
                         self.assertIn("-o APT::Update::Error-Mode=any update", run)
                         self.assertIn("install --yes", run)
                         self.assertIn("lsof", run)
+                        if job_id == "release-tool-tests":
+                            fast_path, _ = run.split("sudo -n", 1)
+                            self.assertIn("from tools.release.run_gates import LSOF_BINARY", fast_path)
+                            self.assertIn('if [[ -x "$lsof_path" ]] && timeout -k 2s 10s "$lsof_path" '
+                                          '-nP -a -p "$$" -d cwd -Fp', fast_path)
+                            self.assertRegex(fast_path, r"(?m)^  exit 0\nfi$")
         self.assertEqual(installs, 3)
 
     def test_concurrency_cancels_only_pull_requests(self):
