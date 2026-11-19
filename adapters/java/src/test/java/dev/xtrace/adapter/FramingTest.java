@@ -1,5 +1,6 @@
 package dev.xtrace.adapter;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -31,6 +32,47 @@ final class FramingTest {
           }
         };
     assertEquals(expected, Framing.read(fragmented, 1024));
+  }
+
+  @Test
+  void writesTheBoundedPrefixAndBodyTogetherBeforeFlushing() throws Exception {
+    class CountingOutput extends ByteArrayOutputStream {
+      int writes;
+      int flushes;
+
+      @Override
+      public void write(byte[] buffer, int offset, int length) {
+        writes++;
+        super.write(buffer, offset, length);
+      }
+
+      @Override
+      public void write(int value) {
+        writes++;
+        super.write(value);
+      }
+
+      @Override
+      public void flush() {
+        assertEquals(1, writes);
+        flushes++;
+      }
+    }
+    CountingOutput output = new CountingOutput();
+    AgentEnvelope envelope = AgentEnvelope.newBuilder().setMessageId("frame".repeat(100)).build();
+    byte[] body = envelope.toByteArray();
+    assertThrows(ClientException.class, () -> Framing.write(output, envelope, body.length - 1));
+    assertThrows(
+        ClientException.class, () -> Framing.write(output, AgentEnvelope.getDefaultInstance(), 1));
+    assertEquals(0, output.writes);
+    assertEquals(0, output.flushes);
+
+    Framing.write(output, envelope, body.length);
+    byte[] expected = ByteBuffer.allocate(Integer.BYTES + body.length).putInt(body.length)
+        .put(body).array();
+    assertArrayEquals(expected, output.toByteArray());
+    assertEquals(1, output.writes);
+    assertEquals(1, output.flushes);
   }
 
   @Test
