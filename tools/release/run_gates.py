@@ -2315,7 +2315,7 @@ def run(args: argparse.Namespace, *, gate_progress=None) -> int:
         private_io_root = run_dir / "private-io"
         private_roots.ensure_private_directory(private_io_root, must_create=True)
         private_roots_to_recheck.append(private_io_root)
-        for name in ("direct", "umask", "held-request", "catalog"):
+        for name in ("direct", "umask", "held-request", "catalog", "first-attach"):
             directory = private_io_root / name
             private_roots.ensure_private_directory(directory, must_create=True)
             private_roots_to_recheck.append(directory)

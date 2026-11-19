@@ -418,6 +418,7 @@ jobs:
           mkdir -m 700 "$root/c"
           echo "XTRACE_TEST_CARDINALITY_SCRATCH=$root/c" >> "$GITHUB_ENV"
           mkdir -m 700 "$root/private-io" "$root/private-io/direct" "$root/private-io/umask" "$root/private-io/held-request" "$root/private-io/catalog"
+          mkdir -m 700 "$root/private-io/first-attach"
           echo "XTRACE_TEST_PRIVATE_IO_ROOT=$root/private-io" >> "$GITHUB_ENV"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"

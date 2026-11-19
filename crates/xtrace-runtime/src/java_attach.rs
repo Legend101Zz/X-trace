@@ -1655,30 +1655,38 @@ mod tests {
 
     /// A private cache directory under the gate-provided owner-enforcing scratch root.
     struct CacheFixture {
-        _scratch: tempfile::TempDir,
+        scratch: tempfile::TempDir,
         cache: PathBuf,
     }
 
-    fn cache_fixture() -> CacheFixture {
-        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+    fn private_scratch() -> PathBuf {
+        std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .map(PathBuf::from)
-            .expect("the gate must provide an owner-enforced private scratch root");
-        attach_result(|| admit_private_directory(&scratch))
+            .expect("the gate must provide an owner-enforced private scratch root")
+    }
+
+    fn cache_fixture() -> CacheFixture {
+        cache_fixture_in(&private_scratch())
+    }
+
+    fn cache_fixture_in(scratch: &Path) -> CacheFixture {
+        attach_result(|| admit_private_directory(scratch))
             .expect("gate-provided scratch admission");
-        let holder = private_tempdir_in(&scratch).expect("temporary private cache under scratch");
+        let holder = private_tempdir_in(scratch).expect("temporary private cache under scratch");
         let cache = holder.path().join("cache");
         std::fs::create_dir(&cache).expect("cache directory");
         std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700))
             .expect("private cache mode");
-        CacheFixture { _scratch: holder, cache }
+        CacheFixture { scratch: holder, cache }
     }
 
     /// Creates a tagged source pack and returns its validated handle plus the owning directory.
     fn tagged_source(tag: &str) -> (tempfile::TempDir, JavaAttachPack) {
-        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-            .map(PathBuf::from)
-            .expect("the gate must provide an owner-enforced private scratch root");
-        let source = private_tempdir_in(&scratch).expect("temporary source pack under scratch");
+        tagged_source_in(&private_scratch(), tag)
+    }
+
+    fn tagged_source_in(scratch: &Path, tag: &str) -> (tempfile::TempDir, JavaAttachPack) {
+        let source = private_tempdir_in(scratch).expect("temporary source pack under scratch");
         make_pack_tagged(source.path(), tag);
         let pack = JavaAttachPack::validate(source.path()).expect("verified source pack");
         (source, pack)
@@ -1949,19 +1957,30 @@ mod tests {
 
     #[test]
     fn concurrent_first_attaches_race_to_create_the_cache_layout() {
+        // Only these four workers should change this cache's ancestry during the race.
+        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_IO_ROOT")
+            .map(|root| PathBuf::from(root).join("first-attach"))
+            .unwrap_or_else(private_scratch);
+        // The CI receipt associates bounded diagnostics with libtest's test name.
+        let worker_name = std::thread::current().name().unwrap_or("first-attach").to_owned();
         for _ in 0..8 {
-            let fixture = cache_fixture();
-            let sources =
-                (0..4).map(|index| tagged_source(&format!("first-{index}"))).collect::<Vec<_>>();
+            let fixture = cache_fixture_in(&scratch);
+            let sources = (0..4)
+                .map(|index| tagged_source_in(fixture.scratch.path(), &format!("first-{index}")))
+                .collect::<Vec<_>>();
             std::thread::scope(|scope| {
                 let handles = sources
                     .iter()
                     .map(|(_, pack)| {
                         let cache = &fixture.cache;
-                        scope.spawn(move || {
-                            let (outcome, admission) = capture_attach(|| pack.snapshot_into(cache));
-                            (outcome.map(|_| ()), admission)
-                        })
+                        std::thread::Builder::new()
+                            .name(worker_name.clone())
+                            .spawn_scoped(scope, move || {
+                                let (outcome, admission) =
+                                    capture_attach(|| pack.snapshot_into(cache));
+                                (outcome.map(|_| ()), admission)
+                            })
+                            .expect("spawn attach worker")
                     })
                     .collect::<Vec<_>>();
                 for handle in handles {
