@@ -469,12 +469,47 @@ class CiFloorEvidenceTests(unittest.TestCase):
         with mock.patch.object(ci_floor.private_roots, "open_private_file_read", side_effect=private_roots.AdmissionError("x")):
             self.assertEqual(ci_floor._gate_failure_hints(pathlib.Path("/synthetic/log")), {})
 
-    def _hints_for(self, raw: bytes) -> dict:
+    def _hints_for(self, raw: bytes, log_name: str = "log") -> dict:
         r, w = os.pipe()
         os.write(w, raw)
         os.close(w)
         with mock.patch.object(ci_floor.private_roots, "open_private_file_read", return_value=r):
-            return ci_floor._gate_failure_hints(pathlib.Path("/synthetic/log"))
+            return ci_floor._gate_failure_hints(pathlib.Path("/synthetic") / log_name)
+
+    def test_java_gate_reports_known_tasks_and_fixed_failure_signals(self) -> None:
+        raw = (
+            b"> Task :agent-runtime:test FAILED\r\n"
+            b"* What went wrong:\n"
+            b"Execution failed for task ':agent-runtime:test'.\n"
+            b"> There were failing tests. See the report at: file:///private/report\n"
+            b"* Try:\n> Gradle build daemon disappeared unexpectedly\n"
+            b"> Task :private-user:test FAILED\n"
+            b"test secret::private ... FAILED\n"
+            b"* What went wrong:\n"
+            b"Execution failed for task ':compileJava'.\n"
+            b"  > Could not resolve all files for configuration ':private-user'.\n"
+            b"    > Could not GET 'https://private-user/private'. Received status code 503 from server: private"
+        )
+        self.assertEqual(self._hints_for(raw, "java-strict.log"), {
+            "gradleFailedTasks": [":agent-runtime:test", ":compileJava"],
+            "gradleFailureSignals": ["dependency-resolution", "http-5xx", "test-failure"],
+        })
+        self.assertNotIn("gradleFailureSignals", self._hints_for(raw))
+
+    def test_java_gate_requires_a_gradle_failure_section_for_reason_codes(self) -> None:
+        for reason, expected in (
+            (b"Dependency verification failed for configuration ':secret'.", "dependency-verification"),
+            (b"Plugin [id: 'hidden', version: '1'] was not found in any sources", "plugin-resolution"),
+            (b"Cannot find a Java installation on your machine matching: {languageVersion=17}", "missing-toolchain"),
+            (b"Could not HEAD 'https://hidden'. Received status code 429 from server: slow down", "http-429"),
+            (b"Compilation failed; see private compiler output", "compilation-failure"),
+            (b"Gradle build daemon disappeared unexpectedly (private detail)", "daemon-disappeared"),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(self._hints_for(reason, "java-strict.log")["gradleFailureSignals"], [])
+                self.assertEqual(self._hints_for(b"* What went wrong:\n> " + reason, "java-strict.log"), {
+                    "gradleFailedTasks": [], "gradleFailureSignals": [expected],
+                })
 
     def test_gate_failure_hints_drop_adversarial_values_in_every_field(self) -> None:
         bad_tests = ["a b", "crate::t password=hunter2", "user:pw@host", "../x", "caf\u00e9::t", "{\"k\":1}", "deadbeef0123/x", "9lead", "a" * 129]
