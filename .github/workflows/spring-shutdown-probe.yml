@@ -1,0 +1,90 @@
+name: spring-shutdown-probe
+on:
+  push:
+    branches: [diagnostic/spring-shutdown-20261124]
+permissions:
+  contents: read
+jobs:
+  premain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - java: 17
+            node: 22
+          - java: 21
+            node: 24
+    env:
+      PROBE_SOURCE: da3a1db56ce348c3fd716e6e7cb5aaedfa2cc8b0
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: gradle
+          cache-dependency-path: |
+            adapters/java/build.gradle.kts
+            adapters/java/settings.gradle.kts
+            adapters/java/gradle.lockfile
+            adapters/java/*/build.gradle.kts
+            adapters/java/*/gradle.lockfile
+            adapters/java/gradle/verification-metadata.xml
+            adapters/java/gradle/wrapper/gradle-wrapper.properties
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-java-client-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-java-client-cargo-
+      - name: Verify source and admit private runner storage
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          umask 077
+          root="${RUNNER_TEMP:?}/xf"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+          mkdir -m 700 "$root/frag"
+          printf '{"sourceSha":"%s","java":%s,"node":%s,"fullFloor":false,"releaseAcceptance":false}\n' \
+            "$PROBE_SOURCE" "${{ matrix.java }}" "${{ matrix.node }}" >"$root/frag/probe-source.json"
+      - name: Build locked agent and Spring fixture
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m tools.qa.lane_run run --suite java --step fixture-build \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --cwd adapters/java -- ./gradlew --dependency-verification strict clean installDist agentDist fixtureBootJar
+      - name: Verify premain recording and shutdown journey
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m tools.qa.lane_run run --suite rust --step premain-shutdown \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --ci-diagnostics --min-passed 1 --max-ignored 0 -- \
+            cargo test --locked --all-features --features xtrace-private-storage/ci-diagnostics \
+              -p xtrace-cli --test java_premain_spring
+      - name: Upload sanitized probe results
+        if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: spring-probe-jdk${{ matrix.java }}-${{ github.run_id }}
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
+          if-no-files-found: error
+          retention-days: 14
