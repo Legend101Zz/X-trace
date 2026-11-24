@@ -69,6 +69,8 @@ unchanged link count ([job 138644398443](https://github.com/Legend101Zz/X-trace/
 The JDK 17 / Node 22 floor's Rust-focused run reported 542 passed and one failed at store append line 2876,
 after 16 gates passed; six gates were unreached. The same thread observed ctime-only parent depth -1, whose
 relevance is unknown ([artifact 14948864687](https://github.com/Legend101Zz/X-trace/actions/runs/45439415391/artifacts/14948864687)).
+Same-head push [run 45450072458](https://github.com/Legend101Zz/X-trace/actions/runs/45450072458) passed aggregate
+`ci-ok` and both floors at 23/23, giving two of the three required passes and not qualifying the head for merge.
 
 Focused Java [run 45451866422](https://github.com/Legend101Zz/X-trace/actions/runs/45451866422) passed 24
 direct commands, 12 per scratch layout, with 97 tests each; [run 45457094207](https://github.com/Legend101Zz/X-trace/actions/runs/45457094207)
