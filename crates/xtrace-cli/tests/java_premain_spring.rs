@@ -31,7 +31,7 @@ use xtrace_domain::ids::Id as _;
 use xtrace_domain::{ContentHash, RuntimeSessionId};
 use xtrace_protocol::generated::agent::{InteractionKind, RecordingEvent, RecordingEventKind};
 use xtrace_protocol::xtf::{XtfEventEnvelope, XtfHeader};
-use xtrace_store::{decode_compressed_segment, verify_compressed_segment};
+use xtrace_store::{DecodedXtfSegment, decode_compressed_segment, verify_compressed_segment};
 
 const CANARIES: &[&str] = &[
     "BODY_CANARY_1D3",
@@ -423,7 +423,11 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         start_quiet_daemon(&repo, &data_home);
     let manifest_mismatched_fixture = tamper_fixture_class_attestation(root.path(), &fixture);
     let mut mismatched = launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap);
-    let mismatch_port = wait_for_fixture(&mut mismatched);
+    let mismatch_port = wait_for_recorded_fixture(
+        &mut mismatched,
+        &project_root,
+        mismatch_session_id.expect("attestation fixture daemon session identity"),
+    );
     assert_eq!(post_order(mismatch_port).status, 201);
     let mismatch_markers = Arc::clone(&mismatched.capture_markers);
     let (mismatch_stdout, mismatch_stderr) = mismatched.stop();
@@ -451,7 +455,11 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let mutated_class_fixture = mutate_fixture_classfile(root.path(), &fixture);
     let mut mutated_class =
         launch_fixture(&agent, &mutated_class_fixture, &mutated_class_bootstrap);
-    let mutated_class_port = wait_for_fixture(&mut mutated_class);
+    let mutated_class_port = wait_for_recorded_fixture(
+        &mut mutated_class,
+        &project_root,
+        mutation_session_id.expect("classfile fixture daemon session identity"),
+    );
     assert_eq!(post_order(mutated_class_port).status, 201, "mutated class remains loadable");
     let mutation_markers = Arc::clone(&mutated_class.capture_markers);
     let (mutated_class_stdout, mutated_class_stderr) = mutated_class.stop();
@@ -763,6 +771,33 @@ fn launch_fixture(agent: &Path, fixture: &Path, bootstrap: &Path) -> CapturedPro
 
 fn wait_for_fixture(process: &mut CapturedProcess) -> u16 {
     let deadline = Instant::now() + Duration::from_secs(30);
+    wait_for_fixture_until(process, deadline)
+}
+
+fn wait_for_recorded_fixture(
+    process: &mut CapturedProcess,
+    project_root: &Path,
+    session_id: RuntimeSessionId,
+) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let port = wait_for_fixture_until(process, deadline);
+    // Readiness itself is captured. Verify a complete readiness GET in this session before
+    // the order, keeping its recording work outside the unchanged shutdown drain budget.
+    loop {
+        assert!(Instant::now() < deadline, "Spring readiness recording did not complete");
+        let complete = completed_fixture_readiness(project_root, session_id)
+            .expect("could not verify Spring readiness recording");
+        assert!(Instant::now() < deadline, "Spring readiness recording did not complete");
+        if complete {
+            return port;
+        }
+        thread::sleep(
+            Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn wait_for_fixture_until(process: &mut CapturedProcess, deadline: Instant) -> u16 {
     let port = spring_readiness::wait_for_fixture(
         &process.stdout_lines,
         deadline,
@@ -1052,32 +1087,13 @@ fn incomplete_order_segment_evidence(
         let project_id: [u8; 16] = row.get(1).ok()?;
         let object_hash: [u8; 32] = row.get(2).ok()?;
         let has_terminal: bool = row.get(3).ok()?;
-        let expected = ContentHash::from_digest_bytes(&object_hash)?;
-        let path = segment_path(project_root, &object_hash);
-        let file = fs::File::from(
-            open(
-                path,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .ok()?,
-        );
-        if !file.metadata().ok()?.is_file() {
-            return None;
-        }
-        let mut object = Vec::new();
-        file.take(compressed_bytes_left + 1).read_to_end(&mut object).ok()?;
-        compressed_bytes_left =
-            compressed_bytes_left.checked_sub(u64::try_from(object.len()).ok()?)?;
-        // The XTF codec independently bounds the decompressed bytes of each candidate.
-        let segment = decode_compressed_segment(&object, expected).ok()?;
-        let verified = segment.verified();
-        if verified.recording_id().as_uuid().as_bytes() != &recording_id
-            || verified.project_id().as_uuid().as_bytes() != &project_id
-            || verified.segment_ordinal() != 0
-        {
-            return None;
-        }
+        let segment = read_verified_first_segment(
+            project_root,
+            &recording_id,
+            &project_id,
+            &object_hash,
+            &mut compressed_bytes_left,
+        )?;
         if segment.events().iter().any(|envelope| {
             envelope.event.as_ref().is_some_and(|event| {
                 event.kind == RecordingEventKind::RequestUpdate as i32
@@ -1099,6 +1115,101 @@ fn incomplete_order_segment_evidence(
 fn segment_path(project_root: &Path, object_hash: &[u8]) -> PathBuf {
     let hash = lower_hex(object_hash);
     project_root.join("objects/b3").join(&hash[..2]).join(format!("{}.xtf.zst", &hash[2..]))
+}
+
+fn read_verified_first_segment(
+    project_root: &Path,
+    recording_id: &[u8; 16],
+    project_id: &[u8; 16],
+    object_hash: &[u8; 32],
+    compressed_bytes_left: &mut u64,
+) -> Option<DecodedXtfSegment> {
+    let expected = ContentHash::from_digest_bytes(object_hash)?;
+    let file = fs::File::from(
+        open(
+            segment_path(project_root, object_hash),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?,
+    );
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut object = Vec::new();
+    file.take(*compressed_bytes_left + 1).read_to_end(&mut object).ok()?;
+    *compressed_bytes_left =
+        compressed_bytes_left.checked_sub(u64::try_from(object.len()).ok()?)?;
+    // The XTF codec independently bounds the decompressed bytes of each candidate.
+    let segment = decode_compressed_segment(&object, expected).ok()?;
+    let verified = segment.verified();
+    if verified.recording_id().as_uuid().as_bytes() != recording_id
+        || verified.project_id().as_uuid().as_bytes() != project_id
+        || verified.segment_ordinal() != 0
+    {
+        return None;
+    }
+    Some(segment)
+}
+
+fn completed_fixture_readiness(project_root: &Path, session_id: RuntimeSessionId) -> Option<bool> {
+    let candidates = (|| {
+        let connection = Connection::open_with_flags(
+            project_root.join("metadata.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(Duration::ZERO)?;
+        let mut statement = connection.prepare(
+            "SELECT r.recording_id, r.project_id, s.object_hash
+             FROM recordings r JOIN recording_segments s ON s.recording_id = r.recording_id
+             WHERE r.runtime_session_id = ?1 AND r.status = 'complete' AND s.segment_ordinal = 0
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![session_id.as_uuid().as_bytes(), ORDER_WAIT_ROW_LIMIT + 1],
+            |row| {
+                Ok((
+                    row.get::<_, [u8; 16]>(0)?,
+                    row.get::<_, [u8; 16]>(1)?,
+                    row.get::<_, [u8; 32]>(2)?,
+                ))
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    })();
+    let candidates = match candidates {
+        Ok(candidates) => candidates,
+        Err(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            return Some(false);
+        }
+        Err(_) => return None,
+    };
+    if candidates.len() > ORDER_WAIT_ROW_LIMIT {
+        return None;
+    }
+    let mut compressed_bytes_left = ORDER_WAIT_COMPRESSED_BYTE_LIMIT;
+    let mut matched = false;
+    for (recording_id, project_id, object_hash) in candidates {
+        let segment = read_verified_first_segment(
+            project_root,
+            &recording_id,
+            &project_id,
+            &object_hash,
+            &mut compressed_bytes_left,
+        )?;
+        matched |= segment.events().iter().any(|envelope| {
+            envelope.event.as_ref().is_some_and(|event| {
+                event.kind == RecordingEventKind::RequestUpdate as i32
+                    && event.symbol == "http.request GET /__fixture/count"
+            })
+        });
+    }
+    Some(matched)
 }
 
 fn read_complete_recordings(project_root: &Path) -> Vec<(String, Vec<u8>)> {
@@ -1356,6 +1467,55 @@ fn order_wait_deadline_reports_the_last_complete_segment_observation() {
     );
     assert_eq!(orders.len(), 4);
     assert!(!diagnostic.exists(), "a successful wait must not create a deadline record");
+}
+
+#[test]
+fn fixture_readiness_requires_verified_complete_request_in_the_current_session() {
+    let root = temp_root();
+    let directory = root.path();
+    let connection = order_wait_test_store(directory);
+    let session = RuntimeSessionId::from_uuid(uuid::Uuid::from_u128(200));
+    let other = RuntimeSessionId::from_uuid(uuid::Uuid::from_u128(201));
+    let marker = "http.request GET /__fixture/count";
+    let add = |session, id, status, kind, symbol| {
+        add_order_wait_test_segment(directory, &connection, session, id, status, kind, symbol)
+    };
+    let observe = || completed_fixture_readiness(directory, session);
+
+    assert_eq!(observe(), Some(false));
+    add(other, 1, "complete", RecordingEventKind::RequestUpdate, marker);
+    add(session, 2, "complete", RecordingEventKind::RequestUpdate, "http.request POST /orders");
+    add(session, 3, "recording", RecordingEventKind::RequestUpdate, marker);
+    add(session, 4, "partial", RecordingEventKind::RequestUpdate, marker);
+    add(session, 5, "complete", RecordingEventKind::Response, marker);
+    add(
+        session,
+        6,
+        "complete",
+        RecordingEventKind::RequestUpdate,
+        "http.request GET /__fixture/count-extra",
+    );
+    assert_eq!(observe(), Some(false));
+
+    let path = add(session, 7, "complete", RecordingEventKind::RequestUpdate, marker);
+    let before = database_state(&directory.join("metadata.sqlite3"));
+    assert_eq!(observe(), Some(true));
+    assert_eq!(database_state(&directory.join("metadata.sqlite3")), before);
+    connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    assert_eq!(observe(), Some(false), "a live writer lock leaves readiness pending");
+    connection.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(observe(), Some(true));
+    let valid_bytes = fs::read(&path).unwrap();
+    fs::write(&path, b"invalid compressed segment BODY_CANARY_1D3").unwrap();
+    assert_eq!(observe(), None);
+    fs::write(path, valid_bytes).unwrap();
+    connection
+        .execute(
+            "UPDATE recordings SET project_id = zeroblob(16) WHERE recording_id = ?1",
+            [uuid::Uuid::from_u128(7).as_bytes()],
+        )
+        .unwrap();
+    assert_eq!(observe(), None, "the segment must match its persisted project identity");
 }
 
 #[test]

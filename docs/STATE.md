@@ -37,6 +37,18 @@ original 11 Node and web gates under the floor supervisor and private environmen
 and 20 contrast pairs, passed. It omitted the Java and Rust prerequisite workloads. It is neither a full-floor pass
 nor evidence of the cause of the earlier failure.
 
+[PR #75 CI 45374832325](https://github.com/Legend101Zz/X-trace/actions/runs/45374832325) on the previous
+reviewed head did not pass: the JDK 21 / Node 24 floor stopped at `rust-workspace` with exit 101 after 17 gates
+passed; five later gates were not reached. Rust reported 1,225 tests passed and one failed. `web-tests` passed
+on both tuples, and the JDK 17 / Node 22 floor passed 23/23 gates. The general and separate Java and Node jobs
+passed. The failing `java_premain_spring` classfile-mutation phase observed 3 of 4 orders, incomplete/drain expired
+and session-wide queued signals; no order segment evidence was observed. The gate command did not time out. These observations do not establish the cause.
+
+The fixture has a sequencing gap: an instrumented readiness GET could overlap the target order's shutdown window.
+A candidate preserves the GET, original deadline, immediate post-order signal and post-stop assertions; its success
+is not established by the reviewed run. The earlier run below also observed 3 of 4 in this phase on JDK 17, so the
+root cause remains unproven.
+
 Earlier [main CI 43214553598](https://github.com/Legend101Zz/X-trace/actions/runs/43214553598) after PR #70
 had separate private-storage admission and Java recording failures; their historical causes were not all established.
 #71 closed on evidence from PR #73's exact reviewed head and both full floors; the subsequent main run above failed
