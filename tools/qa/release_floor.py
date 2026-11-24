@@ -49,7 +49,7 @@ def configured_floor(root: pathlib.Path, timeout: int):
     original = run_gates.GATES
     original_run = run_gates._run
     configured = instrumented_gates(original, root, timeout)
-    web_test_argv = next(gate.argv for gate in original if gate.name == "web-tests")
+    web_test_argv = next((gate.argv for gate in original if gate.name == "web-tests"), None)
     wrapped = {gate.argv: lane_run.parser().parse_args(gate.argv[4:])
                for gate in configured if gate.name in RUST_TEST_GATES}
 
