@@ -1,0 +1,124 @@
+name: web-floor-probe
+
+on:
+  push:
+    branches: [diagnostic/web-floor-20261124]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PROBE_SOURCE: bc3cfb57b1307372dc2d7bf933a044c36147b990
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.23.4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Run pinned Node and web gates with the floor supervisor
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          export PROBE_ROOT="$RUNNER_TEMP/xf"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$PROBE_ROOT"
+          lsof -nP -a -p "$$" -d cwd -Fp >/dev/null 2>&1
+          set +e
+          python3 -B - >"$PROBE_ROOT/probe-runner.log" 2>&1 <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          from tools.release import ci_floor, private_roots, run_gates
+
+          root = pathlib.Path(os.environ["PROBE_ROOT"])
+          repo = pathlib.Path.cwd()
+          for name in ("home", "tmp", "private", "cardinality", "logs"):
+              private_roots.ensure_private_directory(root / name)
+          env = run_gates.build_task_env(root, os.environ.copy(), home=root / "home", scratch=root / "tmp")
+          env["XTRACE_TEST_PRIVATE_SCRATCH"] = str(root / "private")
+          env["XTRACE_TEST_CARDINALITY_SCRATCH"] = str(root / "cardinality")
+          selected = [
+              gate for gate in run_gates.GATES
+              if gate.name.startswith(("node-", "web-"))
+          ]
+          summary = {"sourceSha": os.environ["PROBE_SOURCE"], "node": "22.23.4",
+                     "gates": [], "fullFloor": False, "releaseAcceptance": False}
+          for gate in selected:
+              path = root / "logs" / f"{gate.name}.log"
+              try:
+                  code, _ = run_gates._run(
+                      gate.argv, cwd=repo / gate.cwd, env=env, timeout=7200,
+                      log_path=path, provenance=True,
+                  )
+              except (run_gates.UncertainProcessTree, run_gates.AttemptedGateFailure):
+                  summary["gates"].append({"gate": gate.name, "supervision": "failed"})
+                  code = 1
+                  break
+              summary["gates"].append({"gate": gate.name, "exitCode": code})
+              if gate.name == "web-tests":
+                  # Observe only fixed phrases and counts. Raw npm output stays private.
+                  fd = private_roots.open_private_file_read(path)
+                  with os.fdopen(fd, "rb") as stream:
+                      payload = stream.read(1024 * 1024 + 1)
+                  if len(payload) <= 1024 * 1024:
+                      clean = re.sub(rb"\x1b\[[0-9;]*m", b"", payload)
+                      facts = {
+                          "vitest-failed-files": rb"(?m)^ +Test Files +[0-9]+ failed\b",
+                          "vitest-failed-tests": rb"(?m)^ +Tests +[0-9]+ failed\b",
+                          "vitest-assertion-error": rb"(?m)^AssertionError:",
+                          "vitest-timeout": rb"(?m)^Error: Test timed out in [0-9]+ms\.",
+                          "vitest-unhandled": rb"(?m)^Vitest caught [0-9]+ unhandled errors? during the test run\.",
+                          "contrast-policy-error": rb"(?m)^Error: .{0,250}WCAG AA requires (?:4\.5|3):1",
+                          "contrast-passed": rb"(?m)^contrast \(WCAG AA\): 20 token pairs pass\r?$",
+                      }
+                      summary["webObservations"] = [
+                          key for key, pattern in facts.items() if re.search(pattern, clean)
+                      ]
+                      for key, pattern in {
+                          "passedVitestFiles": rb"(?m)^ +Test Files +([0-9]{1,5}) passed\b",
+                          "passedVitestTests": rb"(?m)^ +Tests +([0-9]{1,5}) passed\b",
+                      }.items():
+                          match = re.search(pattern, clean)
+                          if match:
+                              summary[key] = int(match[1])
+                  if code:
+                      hints = ci_floor._gate_failure_hints(path)
+                      summary["webFailureHints"] = {
+                          key: value for key, value in hints.items()
+                          if key.startswith("web") and key in {"webFailedStage", "webFailureSignals"}
+                      }
+              if code:
+                  break
+          (root / "web-probe-summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
+          sys.exit(1 if code else 0)
+          PY
+          result=$?
+          set -e
+          if [[ -f "$PROBE_ROOT/web-probe-summary.json" ]]; then
+            cat "$PROBE_ROOT/web-probe-summary.json"
+          else
+            echo "Probe stopped before a sanitized summary was available."
+          fi
+          exit "$result"
+      - name: Upload sanitized probe summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: web-floor-probe-summary
+          path: ${{ runner.temp }}/xf/web-probe-summary.json
+          if-no-files-found: error
+          retention-days: 14
