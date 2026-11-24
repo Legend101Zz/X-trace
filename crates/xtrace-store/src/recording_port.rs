@@ -2861,7 +2861,15 @@ mod tests {
         per_segment: usize,
         finish: bool,
     ) -> Persisted {
-        let (directory, store, project) = fixture();
+        persist_with_fixture(events, per_segment, finish, fixture())
+    }
+
+    fn persist_with_fixture(
+        events: &[AcceptedRecordingEvent<XtfEventEnvelope>],
+        per_segment: usize,
+        finish: bool,
+        (directory, store, project): (tempfile::TempDir, SqliteStore, Project),
+    ) -> Persisted {
         let recording_id = RecordingId::new();
         let adapter = SqliteRecordingPersistence::new(store.clone(), directory.path());
         adapter.begin_recording(&begin(project.id(), recording_id)).expect("begin");
@@ -3329,7 +3337,23 @@ mod tests {
         capacity_dropped_events: u64,
         outcome: Option<xtrace_domain::RecordingOutcome>,
     ) -> Persisted {
-        let persisted = persist(events, per_segment, false);
+        persist_finished_with_fixture(
+            events,
+            per_segment,
+            capacity_dropped_events,
+            outcome,
+            fixture(),
+        )
+    }
+
+    fn persist_finished_with_fixture(
+        events: &[AcceptedRecordingEvent<XtfEventEnvelope>],
+        per_segment: usize,
+        capacity_dropped_events: u64,
+        outcome: Option<xtrace_domain::RecordingOutcome>,
+        fixture: (tempfile::TempDir, SqliteStore, Project),
+    ) -> Persisted {
+        let persisted = persist_with_fixture(events, per_segment, false, fixture);
         let adapter = SqliteRecordingPersistence::new(persisted.store.clone(), &persisted.root);
         let last = events.last().map_or(1, |event| event.recording_seq);
         adapter
@@ -3436,9 +3460,10 @@ mod tests {
             BindingRole, CapturedValue as Wire, CapturedValueTruncated, NameOrigin, ValueBinding,
             captured_value::Value as V,
         };
-        // Incompressible-ish payloads so that declared logical + compressed bytes pass the
-        // 16 MiB verification bound: the recording is sealed Partial WITHOUT hashing, and the
-        // read surface must name that cause (never a silent Partial).
+        let workload =
+            CARDINALITY_WORKLOAD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Incompressible-ish payloads put declared logical + compressed bytes beyond
+        // the 16 MiB read bound while remaining within the 512 MiB finish bound.
         let heavy = |sequence: u64| {
             let mut accepted = node(sequence, &format!("h{sequence}"), "", K_ENTER);
             accepted.payload.event.as_mut().expect("event").bindings = (0..8_u32)
@@ -3468,7 +3493,8 @@ mod tests {
             accepted
         };
         let events: Vec<_> = (2..=3_001_u64).map(heavy).collect();
-        let persisted = persist_finished_with(&events, 100, 0, None);
+        let persisted =
+            persist_finished_with_fixture(&events, 100, 0, None, cardinality_fixture(&workload));
         let window = window(&persisted, 10, None);
         // Declared bytes pass the 16 MiB WINDOW bound but sit far under the 512 MiB finish
         // bound, so the finish verified the digest and the recording is Complete.
@@ -3492,7 +3518,7 @@ mod tests {
             .expect("status");
         assert_eq!(status, "complete");
         // a normal complete recording carries no such reason
-        let small = persist(&tree(), 4, true);
+        let small = persist_with_fixture(&tree(), 4, true, cardinality_fixture(&workload));
         assert!(
             !window_reasons(&small).iter().any(|reason| reason == "verification_budget_exceeded")
         );
