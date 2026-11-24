@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      PROBE_SOURCE: bc3cfb57b1307372dc2d7bf933a044c36147b990
+      PROBE_SOURCE: f60057b98b330cb45765b2d1ec78dd0c9f3aed83
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -43,6 +43,7 @@ jobs:
           import re
           import sys
           from tools.release import ci_floor, private_roots, run_gates
+          from tools.qa import release_floor
 
           root = pathlib.Path(os.environ["PROBE_ROOT"])
           repo = pathlib.Path.cwd()
@@ -60,10 +61,11 @@ jobs:
           for gate in selected:
               path = root / "logs" / f"{gate.name}.log"
               try:
-                  code, _ = run_gates._run(
-                      gate.argv, cwd=repo / gate.cwd, env=env, timeout=7200,
-                      log_path=path, provenance=True,
-                  )
+                  with release_floor.configured_floor(root, 7200):
+                      code, _ = run_gates._run(
+                          gate.argv, cwd=repo / gate.cwd, env=env, timeout=7200,
+                          log_path=path, provenance=True,
+                      )
               except (run_gates.UncertainProcessTree, run_gates.AttemptedGateFailure):
                   summary["gates"].append({"gate": gate.name, "supervision": "failed"})
                   code = 1
@@ -103,8 +105,101 @@ jobs:
                       }
               if code:
                   break
+          # Diagnostic fault injection after the unchanged gates. Use disposable runner files and
+          # record only fixed outcomes. This is never release-floor or product acceptance.
+          faults_ok = True
+          if code == 0:
+              web_gate = next(gate for gate in selected if gate.name == "web-tests")
+              summaries = []
+              case_path = repo / "web/app/src/xtrace-hosted-fault-probe.test.ts"
+              stylesheet = repo / "web/app/src/style.css"
+              original_css = stylesheet.read_bytes()
+              for stage, signal in (("vitest", "test-failure"), ("contrast", "contrast-rule")):
+                  run_dir = root / "release-gates" / f"floor-probe-{stage}"
+                  log_path = run_dir / "logs/web-tests.log"
+                  private_roots.ensure_private_directory(run_dir.parent)
+                  private_roots.ensure_private_directory(run_dir)
+                  private_roots.ensure_private_directory(log_path.parent)
+                  try:
+                      if stage == "vitest":
+                          with case_path.open("x") as case:
+                              case.write("import { test, expect } from 'vitest';\n"
+                                         "test('synthetic diagnostic failure', () => {\n"
+                                         "  expect('PRIVATE-FAULT-SENTINEL').toBe('expected');\n"
+                                         "});\n")
+                      else:
+                          changed, count = re.subn(
+                              rb"--quiet: #[a-fA-F0-9]{6};", b"--quiet: #111416;", original_css,
+                          )
+                          if count != 1:
+                              sys.exit(2)
+                          stylesheet.write_bytes(changed)
+                      settle = {}
+                      provenance = {}
+                      with release_floor.configured_floor(root, 7200):
+                          observed_code, observed_duration = run_gates._run(
+                              web_gate.argv, cwd=repo / web_gate.cwd, env=env, timeout=7200,
+                              log_path=log_path, provenance=True, settle_report=settle,
+                              provenance_report=provenance,
+                          )
+                      proof = {
+                          "headBefore": summary["sourceSha"], "headAfter": summary["sourceSha"],
+                          "workingTreeDigestBefore": "a" * 64, "workingTreeDigestAfter": "a" * 64,
+                          "phaseDiffSha256Before": "b" * 64, "phaseDiffSha256After": "b" * 64,
+                      }
+                      gate = {
+                          **proof, "name": "web-tests", "status": "failed",
+                          "argv": list(web_gate.argv), "cwd": web_gate.cwd, "exitCode": observed_code,
+                          "durationSeconds": observed_duration,
+                          "log": "logs/web-tests.log",
+                          "logSha256": ci_floor._private_file_sha256(log_path),
+                      }
+                      if settle:
+                          gate["naturalExitSettle"] = settle
+                      if provenance:
+                          gate["provenance"] = provenance
+                      names = ci_floor.EXPECTED_GATE_NAMES
+                      boundary = names.index("web-tests")
+                      receipt = {
+                          **proof, "schemaVersion": 1, "label": run_dir.name, "decision": "failed",
+                          "gates": [
+                              gate if i == boundary else {
+                                  **proof, "name": name, "status": "passed" if i < boundary else "unreached",
+                              }
+                              for i, name in enumerate(names)
+                          ],
+                      }
+                      private_roots.atomic_write_private(
+                          run_dir / "receipt.json", json.dumps(receipt).encode() + b"\n",
+                      )
+                      result = ci_floor._describe_runner_failure(
+                          root, run_dir.name, validated_failed_receipt=receipt,
+                      )
+                      hints = result.get("webFailureSignals", [])
+                      valid_signals = {"test-failure", "timeout", "unhandled-error", "contrast-rule"}
+                      safe_hints = sorted(set(hints) & valid_signals)
+                      subcommand = result.get("webFailedSubcommand")
+                      subcommand = subcommand if subcommand in {"vitest", "contrast"} else "unknown"
+                      contrast_after_vitest_failure = (stage == "vitest" and
+                          b"contrast (WCAG AA): 20 token pairs pass" in log_path.read_bytes())
+                      passed = (
+                          observed_code == 1 and subcommand == stage and signal in safe_hints
+                          and not contrast_after_vitest_failure
+                          and "PRIVATE-FAULT-SENTINEL" not in json.dumps(result)
+                      )
+                      summaries.append({
+                          "scenario": stage, "gateExitCode": observed_code, "failedSubcommand": subcommand,
+                          "signals": safe_hints, "expectedOutcome": passed,
+                      })
+                      faults_ok = faults_ok and passed
+                  finally:
+                      if stage == "vitest":
+                          case_path.unlink(missing_ok=True)
+                      else:
+                          stylesheet.write_bytes(original_css)
+              summary["syntheticFailureChecks"] = summaries
           (root / "web-probe-summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
-          sys.exit(1 if code else 0)
+          sys.exit(1 if code or not faults_ok else 0)
           PY
           result=$?
           set -e
