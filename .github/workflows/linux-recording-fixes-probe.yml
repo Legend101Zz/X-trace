@@ -1,0 +1,110 @@
+name: linux-recording-fixes-probe
+on:
+  push:
+    branches: [diagnostic/linux-recording-fixes-20261124]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: express-22
+            node: 22
+          - suite: express-24
+            node: 24
+          - suite: storage
+            node: 22
+    name: verify (${{ matrix.suite }})
+    env:
+      PROBE_SOURCE: 83e5817a8017ae9409cfd56704bb72d382925d3b
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-recording-fixes-${{ matrix.suite }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-java-client-cargo-${{ hashFiles('**/Cargo.lock') }}
+            ${{ runner.os }}-java-client-cargo-
+      - name: Verify source and set up private runner directories
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          umask 077
+          root="${RUNNER_TEMP:?}/xf"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/frag" "$root/c"
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_CARDINALITY_SCRATCH=$root/c" >> "$GITHUB_ENV"
+          printf '{"sourceSha":"%s","suite":"%s","fullFloor":false,"releaseAcceptance":false}\n' \
+            "$PROBE_SOURCE" "${{ matrix.suite }}" >"$root/frag/probe-source.json"
+      - name: Build the locked Node adapter
+        if: matrix.suite != 'storage'
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m tools.qa.lane_run run --suite node --step prepare-adapter \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            -- bash -ec 'npm ci --prefix adapters/node && npm run build --prefix adapters/node'
+      - name: Exercise the real Express 4 and Express 5 CLI journeys
+        if: matrix.suite != 'storage'
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m tools.qa.lane_run run --suite rust --step express-journey \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --ci-diagnostics --min-passed 2 --max-ignored 0 -- \
+            cargo test --locked --all-features --features xtrace-private-storage/ci-diagnostics \
+              -p xtrace-cli --test node_express_journey
+      - name: Exercise private-storage unit tests and admission regressions
+        if: matrix.suite == 'storage'
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m tools.qa.lane_run run --suite rust --step private-storage \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --ci-diagnostics --min-passed 1 --max-ignored 0 -- \
+            cargo test --locked --all-features -p xtrace-private-storage --lib
+      - name: Verify full-history Finish and unchanged sparse journal recovery workload
+        if: matrix.suite == 'storage' && !cancelled()
+        run: |
+          set -euo pipefail
+          umask 077
+          run_case() {
+            python3 -B -m tools.qa.lane_run run --suite rust --step "$1" \
+              --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+              --ci-diagnostics --min-passed 1 --max-ignored 0 -- \
+              cargo test --locked --all-features --features xtrace-private-storage/ci-diagnostics \
+                -p xtrace-store --lib "$2" -- --exact
+          }
+          history=0
+          sparse=0
+          run_case full-history recording_port::tests::capacity_drops_at_a_full_history_require_an_absent_adapter_digest || history=$?
+          run_case sparse-journal recording_port::tests::sparse_acknowledged_batches_hit_admission_before_becoming_unreadable || sparse=$?
+          [[ "$history" == 0 && "$sparse" == 0 ]]
+      - name: Upload sanitized probe results
+        if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: recording-fixes-${{ matrix.suite }}-${{ github.run_id }}
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
+          if-no-files-found: error
+          retention-days: 14
