@@ -1,7 +1,7 @@
 # X-trace: current state
 
 The one place for "where are we". Rewrite it (do not append) at the end of every working session. History lives in
-`docs/progress.md` and in git. Last updated 2026-11-24.
+`docs/progress.md` and in git. Last updated 2026-11-25.
 
 ## Release status
 
@@ -58,6 +58,28 @@ readiness, before requests; the failure category is withheld. The JDK 21 floor f
 a sparse acknowledgement: `JournalOpenOrCreate` admission `Deadline` at iteration 3557. Spring passed in that
 job. These findings do not establish historical causes or candidate success.
 
+On [PR #75](https://github.com/Legend101Zz/X-trace/pull/75) exact head
+`83e5817a8017ae9409cfd56704bb72d382925d3b`, [run 45439415391](https://github.com/Legend101Zz/X-trace/actions/runs/45439415391/attempts/1)
+attempt 1 passed both floors, 23/23 gates each. Receipts were verified before the GitHub rerun removed the
+artifact ZIPs; the original [JDK 17 / Node 22](https://github.com/Legend101Zz/X-trace/actions/runs/45439415391/job/138606574032)
+and [JDK 21 / Node 24](https://github.com/Legend101Zz/X-trace/actions/runs/45439415391/job/138606574416)
+job links remain. Attempt 2 was red: the standalone JDK 17 job ran `cargo test --locked -p xtrace-runtime` and
+reported 96 passed and one failed on first attach, with `AclState`/`ProbeSnapshot` ctime-only depth 0 and
+unchanged link count ([job 138644398443](https://github.com/Legend101Zz/X-trace/actions/runs/45439415391/job/138644398443)).
+The JDK 17 / Node 22 floor's Rust-focused run reported 542 passed and one failed at store append line 2876,
+after 16 gates passed; six gates were unreached. The same thread observed ctime-only parent depth -1, whose
+relevance is unknown ([artifact 14948864687](https://github.com/Legend101Zz/X-trace/actions/runs/45439415391/artifacts/14948864687)).
+
+Focused Java [run 45451866422](https://github.com/Legend101Zz/X-trace/actions/runs/45451866422) passed 24
+direct commands, 12 per scratch layout, with 97 tests each; [run 45457094207](https://github.com/Legend101Zz/X-trace/actions/runs/45457094207)
+passed 12 after the original Gradle/CLI precursors with cold caches. Neither reproduced the failure; its cause
+remains open. The separately reviewed store candidate `1bb2ae3abc4b865d8823ff33f2e07180fb05bbfa` passed its
+named focused [run 45455858650](https://github.com/Legend101Zz/X-trace/actions/runs/45455858650), preserving the
+workloads, and still needs integration into the next coherent head. These focused runs do not establish a full
+CI pass. See #69 handoff comments
+[7139591259](https://github.com/Legend101Zz/X-trace/issues/69#issuecomment-7139591259) and
+[7140221334](https://github.com/Legend101Zz/X-trace/issues/69#issuecomment-7140221334).
+
 Earlier [main CI 43214553598](https://github.com/Legend101Zz/X-trace/actions/runs/43214553598) after PR #70
 had separate private-storage admission and Java recording failures; their historical causes were not all established.
 #71 closed on evidence from PR #73's exact reviewed head and both full floors; the subsequent main run above failed
@@ -65,8 +87,10 @@ before Rust. Do not infer that main is green or that every historical intermitte
 
 ## Next work
 
-1. Resolve the current red main based on evidence. Preserve every gate, assertion and budget; an unreached gate is
-   not a pass. Verify the exact reviewed head and post-merge main under ADR 0012 before new feature work.
+1. Resolve the current red main based on evidence. Batch the reviewed store candidate with an evidence-supported
+   Java follow-up in the next coherent head. Preserve every gate, assertion and budget; an
+   unreached gate is not a pass. Verify the exact reviewed head and post-merge main under ADR 0012 before new
+   feature work.
 2. Continue [#69](https://github.com/Legend101Zz/X-trace/issues/69) and
    [#3](https://github.com/Legend101Zz/X-trace/issues/3): finish #32 export claims and policy digest, integrate
    #36's observed burst-correlation harness with honest ambiguity where individual correlation is unavailable, and
