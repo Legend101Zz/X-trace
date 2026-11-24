@@ -1,0 +1,145 @@
+name: first-attach direct command scratch diagnostic
+
+on:
+  push:
+    branches: [diagnostic/java-first-attach-20261124]
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scratch: [standalone, dedicated-first-attach]
+    env:
+      CARGO_TERM_COLOR: always
+      DIAGNOSTIC_CONFIG: ${{ matrix.scratch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Initialize sanitized receipt before toolchain setup
+        run: |
+          umask 077
+          mkdir -m 700 "${RUNNER_TEMP:?}/attach-receipt"
+          python3 -B - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          receipt = {"schema": 1, "source_sha": os.environ["GITHUB_SHA"],
+                     "config": os.environ["DIAGNOSTIC_CONFIG"], "repetitions_planned": 12,
+                     "status": "other", "stage": "toolchain-or-setup", "runs": []}
+          Path(os.environ["RUNNER_TEMP"], "attach-receipt", "summary.json").write_text(
+              json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          PYCODE
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - name: Repeat the unchanged complete direct runtime command
+        run: |
+          # No test filter, thread override, nocapture, feature change or success retry.
+          # Both arms run exactly twelve times; every failure remains in the verdict.
+          python3 -B - <<'PYCODE'
+          import json, os, re, subprocess, sys
+          from pathlib import Path
+
+          receipt_path = Path(os.environ["RUNNER_TEMP"], "attach-receipt", "summary.json")
+          receipt = json.loads(receipt_path.read_text())
+          labels = ("open-packs", "open-state", "revalidate-packs", "revalidate-state", "incoming-root")
+          receipt.update(stage="source-preflight", java_major=17,
+                         command="cargo test --locked -p xtrace-runtime",
+                         scope="direct-command-and-scratch-layouts",
+                         gradle_cli_precursors=False, full_ci=False,
+                         phase_counts={label: 0 for label in labels},
+                         repetition_counts={"pass": 0, "test-failure": 0, "other": 0})
+
+          def save():
+              receipt_path.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+
+          def git(*args):
+              return subprocess.run(["git", *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+          save()
+          try:
+              head = git("rev-parse", "HEAD")
+              ancestor = git("merge-base", "--is-ancestor", "83e5817a8017ae9409cfd56704bb72d382925d3b", "HEAD")
+              blob = git("hash-object", "crates/xtrace-runtime/src/java_attach.rs")
+              if (head.returncode or head.stdout.decode().strip() != os.environ["GITHUB_SHA"]
+                      or ancestor.returncode or blob.returncode
+                      or blob.stdout.decode().strip() != "81ac2c7b3b47c2861dc929671f3446076e21c7b6"):
+                  raise RuntimeError()
+              receipt["stage"] = "scratch-setup"
+              save()
+              # Match standalone Java CI's private root and leave PRIVATE_IO_ROOT unset in its arm.
+              root = Path(os.environ["RUNNER_TEMP"], "xt")
+              root.mkdir(mode=0o700)
+              for child in ("tmp", "priv"):
+                  (root / child).mkdir(mode=0o700)
+              env = os.environ.copy()
+              env.update(TMPDIR=str(root / "tmp"), XTRACE_TEST_PRIVATE_SCRATCH=str(root / "priv"))
+              env.pop("XTRACE_TEST_PRIVATE_IO_ROOT", None)
+              if env["DIAGNOSTIC_CONFIG"] == "dedicated-first-attach":
+                  (root / "private-io").mkdir(mode=0o700)
+                  (root / "private-io" / "first-attach").mkdir(mode=0o700)
+                  env["XTRACE_TEST_PRIVATE_IO_ROOT"] = str(root / "private-io")
+              receipt["stage"] = "runtime"
+              save()
+              summary = re.compile(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed;", re.MULTILINE)
+              for repetition in range(1, 13):
+                  # Raw output stays private on the ephemeral runner and is never printed/uploaded.
+                  log = root / ("runtime-%02d.log" % repetition)
+                  with log.open("wb") as output:
+                      result = subprocess.run(["cargo", "test", "--locked", "-p", "xtrace-runtime"],
+                                              env=env, stdout=output, stderr=subprocess.STDOUT)
+                  raw = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text(errors="replace"))
+                  matches = summary.findall(raw)
+                  passed = sum(int(row[1]) for row in matches)
+                  failed = sum(int(row[2]) for row in matches)
+                  outcome = ("pass" if result.returncode == 0 and passed > 0 and failed == 0
+                             else "test-failure" if result.returncode != 0 and failed > 0 else "other")
+                  target_block = re.search(
+                      r"^---- java_attach::tests::concurrent_first_attaches_race_to_create_the_cache_layout stdout ----\n"
+                      r"(.*?)(?=^---- [^\n]+ stdout ----$|^failures:$|\Z)",
+                      raw, re.MULTILINE | re.DOTALL)
+                  target_output = target_block.group(1) if target_block else ""
+                  phases = {label: len(re.findall(r"^first-attach admission phase: " + re.escape(label) + r"$",
+                                                  target_output, re.MULTILINE)) for label in labels}
+                  observed_shape = bool(result.returncode != 0 and re.search(
+                      r"Admission\(AdmissionFailure \{ operation: AclState, kind: None, raw_os_error: None, "
+                      r"context: AdmissionContext \{ site: ProbeSnapshot, changes: 1, "
+                      r"listing: NotChecked, object: Some\(Directory\), "
+                      r"component_depth: Some\(0\), nlink_changed: Some\(false\) \} \}\)", target_output))
+                  receipt["runs"].append({"repetition": repetition, "outcome": outcome,
+                                          "observed_acl_probe_ctime_only_directory_depth0": observed_shape,
+                                          "passed": passed, "failed": failed, "phase_counts": phases})
+                  receipt["repetition_counts"][outcome] += 1
+                  for label in labels:
+                      receipt["phase_counts"][label] += phases[label]
+                  save()
+              receipt["status"] = ("other" if receipt["repetition_counts"]["other"] else
+                                   "test-failure" if receipt["repetition_counts"]["test-failure"] else "pass")
+              receipt["stage"] = "complete"
+          except Exception:
+              # Never serialize exceptions: they can contain fixture paths or unknown tool output.
+              receipt["status"] = "other"
+          save()
+          print("Diagnostic status: " + receipt["status"])
+          sys.exit(0 if receipt["status"] == "pass" else 1)
+          PYCODE
+      - name: Upload only the allowlisted receipt, including on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: first-attach-${{ matrix.scratch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/attach-receipt/summary.json
+          if-no-files-found: error
+          retention-days: 14
