@@ -49,6 +49,15 @@ A candidate preserves the GET, original deadline, immediate post-order signal an
 is not established by the reviewed run. The earlier run below also observed 3 of 4 in this phase on JDK 17, so the
 root cause remains unproven.
 
+The subsequent repeat batch produced one full exact-head pass in three: [run 45406286260](https://github.com/Legend101Zz/X-trace/actions/runs/45406286260)
+attempt 1 passed both floors at 23/23 gates. In attempt 2, the JDK 17 floor failed while receiving Express 4
+readiness, before requests; the failure category is withheld. The JDK 21 floor failed in the Rust-focused
+`capacity_drops…` test at Finish, line 1091. The same test also observed
+`AclState`/`Snapshot` ctime-only immediate-parent depth -1 at Finish/RootBinding; their association is unknown.
+[Run 45421543777](https://github.com/Legend101Zz/X-trace/actions/runs/45421543777) failed in general gates on
+a sparse acknowledgement: `JournalOpenOrCreate` admission `Deadline` at iteration 3557. Spring passed in that
+job. These findings do not establish historical causes or candidate success.
+
 Earlier [main CI 43214553598](https://github.com/Legend101Zz/X-trace/actions/runs/43214553598) after PR #70
 had separate private-storage admission and Java recording failures; their historical causes were not all established.
 #71 closed on evidence from PR #73's exact reviewed head and both full floors; the subsequent main run above failed

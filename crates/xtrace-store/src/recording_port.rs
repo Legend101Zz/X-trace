@@ -499,7 +499,7 @@ mod tests {
 
     // These cardinality workloads prove recovery and readability, not success under
     // competing bulk I/O. Keep their real admissions (including the 750 ms budget)
-    // and segment fsyncs, but do not run the three heavy workloads together.
+    // and segment fsyncs, but do not run these heavy workloads together.
     // Each workload owns its fixture, so later workloads can recover a poisoned guard.
     static CARDINALITY_WORKLOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1055,7 +1055,9 @@ mod tests {
     #[test]
     fn capacity_drops_at_a_full_history_require_an_absent_adapter_digest() {
         use xtrace_application::recording::MAX_RECORDED_EVENTS;
-        let (directory, store, project) = fixture();
+        let workload =
+            CARDINALITY_WORKLOAD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (directory, store, project) = cardinality_fixture(&workload);
         let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
         let reader = SqliteRecordingReader::new(store, directory.path());
         let last_kept = 1 + MAX_RECORDED_EVENTS as u64;

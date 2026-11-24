@@ -924,7 +924,36 @@ impl AdmittedPrivateRoot {
         }
         validate_child_name(name)?;
         let op = &self.operation();
-        self.named_regular_file_exists_until(name, op)?;
+        self.revalidate_until(op)?;
+        // Keep the absolute lookup: later binding checks need this complete path to be
+        // representable, so a dirfd lookup alone could create a file they cannot validate.
+        match std::fs::symlink_metadata(self.path.join(name)) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(PrivateStorageError::Unavailable),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let named_root = std::fs::symlink_metadata(&self.path)
+                    .map_err(|_| PrivateStorageError::Unavailable)?;
+                if !named_root.is_dir()
+                    || !self.identity.same_directory(FileIdentity::from_metadata(&named_root))
+                {
+                    return Err(PrivateStorageError::Unavailable);
+                }
+                // Confirm absence in the held directory without repeating the ancestor
+                // policy walk. Full file and root binding checks still follow the open.
+                match rustix::fs::statat(
+                    &self.directory,
+                    name,
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                ) {
+                    Ok(stat)
+                        if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                            == rustix::fs::FileType::RegularFile => {}
+                    Err(error) if error == rustix::io::Errno::NOENT => {}
+                    _ => return Err(PrivateStorageError::Unavailable),
+                }
+            }
+            Err(_) => return Err(PrivateStorageError::Unavailable),
+        }
         let opened = rustix::fs::openat(
             &self.directory,
             name,
@@ -937,6 +966,9 @@ impl AdmittedPrivateRoot {
         let (file, created) = match opened {
             Ok(opened) => (File::from(opened), false),
             Err(error) if error == rustix::io::Errno::NOENT => {
+                if op.expired() {
+                    return Err(PrivateStorageError::check(Step::Deadline));
+                }
                 let created = rustix::fs::openat(
                     &self.directory,
                     name,
@@ -1898,6 +1930,50 @@ mod tests {
             // Each existing component is admitted (3 probes), then one final revalidation.
             assert_eq!(open_or_create, 3 * directories + (directories + 3));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_or_create_private_file_uses_four_root_checks_for_absent_and_existing_entries() {
+        let leaf = nested_leaf();
+        let directories = directory_count(leaf.path());
+        let created = probes_during(|| {
+            leaf.open_or_create_private_file("bounded").expect("create private file");
+        });
+        let reopened = probes_during(|| {
+            leaf.open_or_create_private_file("bounded").expect("reopen private file");
+        });
+        // One check before the descriptor-relative lookup, two bracketing file binding,
+        // and one final check. Absence needs no additional path-based lookup revalidation.
+        assert_eq!(created, 4 * (directories + 3));
+        assert_eq!(reopened, 4 * (directories + 3));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_or_create_private_file_refuses_unrepresentable_path_before_creation() {
+        let mut leaf = nested_leaf();
+        let component = "a".repeat(200);
+        // Linux accepts an absolute pathname of at most 4095 bytes, excluding its NUL.
+        // Keep the directory representable while making a legal child's full path too long.
+        let name = "b".repeat(255);
+        while leaf.path().as_os_str().len() < 4096 - name.len() {
+            leaf = leaf.create_private_child(&component).expect("extend private root");
+        }
+        assert!(leaf.path().as_os_str().len() < 4096);
+        let path_error = std::fs::symlink_metadata(leaf.path().join(&name))
+            .expect_err("complete child pathname exceeds PATH_MAX");
+        assert_eq!(path_error.raw_os_error(), Some(rustix::io::Errno::NAMETOOLONG.raw_os_error()));
+        assert!(leaf.open_or_create_private_file(&name).is_err());
+        assert_eq!(
+            rustix::fs::statat(
+                &leaf.directory,
+                name.as_str(),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW
+            )
+            .expect_err("failed admission must not create a child"),
+            rustix::io::Errno::NOENT
+        );
     }
 
     #[test]
