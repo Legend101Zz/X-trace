@@ -1,0 +1,53 @@
+name: read-bound fixture probe
+on:
+  push:
+    branches: [diagnostic/read-bound-fixture-20261124]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      PROBE_SOURCE: 1bb2ae3abc4b865d8823ff33f2e07180fb05bbfa
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - name: Verify exact candidate and admit private scratch
+        run: |
+          set -euo pipefail
+          [[ "$PROBE_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          umask 077
+          root="${RUNNER_TEMP:?}/xf"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/frag" "$root/c"
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_CARDINALITY_SCRATCH=$root/c" >> "$GITHUB_ENV"
+          printf '{"sourceSha":"%s","suite":"read-bound-fixture","fullFloor":false,"releaseAcceptance":false}\n' \
+            "$PROBE_SOURCE" >"$root/frag/probe-source.json"
+      - name: Exercise only the unchanged read-bound Finish fixture
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m tools.qa.lane_run run --suite rust --step read-bound-fixture \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --ci-diagnostics --min-passed 1 --max-ignored 0 -- \
+            cargo test --locked --all-features --features xtrace-private-storage/ci-diagnostics \
+              -p xtrace-store --lib \
+              recording_port::tests::finish_between_read_bound_and_finish_bound_still_verifies_complete -- --exact
+      - name: Upload only sanitized source evidence and test receipt
+        if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: read-bound-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
+          if-no-files-found: error
+          retention-days: 14
