@@ -59,7 +59,10 @@ Keep the existing observed operation and disposition projections. Broaden the op
 projection's structural bounds and, on the first successful runtime link, mirror the existing
 catalog operation with the same UUID and fingerprint. Static scan alone does not populate the
 observed listing. Preserve the existing `spring-orders-v1` rule and its fixture alias. Enforce the
-project and complete endpoint tuple in the operation link FK. Add a nullable
+project and complete endpoint tuple in the operation link FK. Runtime links also carry the
+matched fingerprint as a consistency witness. Composite FKs ensure the same fingerprint is
+present on both the observed alias and the exact canonical catalog tuple. Legacy and unmatched
+rows keep a null witness. Add a nullable
 `catalog_revision_id` to the observation sidecar. A separate eligibility table binds the scanner's
 positive route decision to the immutable project/revision/operation member. A new runtime link
 must reference both the project-scoped revision and that eligible member. A qualified unmatched result
