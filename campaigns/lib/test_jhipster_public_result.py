@@ -702,7 +702,7 @@ class CollectSinks(unittest.TestCase):
     def test_malformed_cli_capture_field_stays_red_with_no_capture_marker_counts(self):
         for markers in ({"private": "malformed"}, None, ""):
             with self.subTest(markers=type(markers).__name__), tempfile.TemporaryDirectory(dir=self.root) as tmp:
-                root = Path(tmp)
+                root = pathlib.Path(tmp)
                 api = root / "campaign/java/jhipster/instrumented-1/api"
                 api.mkdir(parents=True)
                 (api / "recording-rec-1.json").write_text(json.dumps({
