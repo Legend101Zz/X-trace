@@ -47,15 +47,18 @@ const inspector = () => screen.getByRole('tabpanel', { name: 'evidence', hidden:
 describe('replay wiring in the app', () => {
   let responseDetail = detail;
   let responseLinked = linked;
+  let secondDetail: typeof detail | null = null;
   beforeEach(() => {
     responseDetail = detail;
     responseLinked = linked;
+    secondDetail = null;
     window.history.replaceState(null, '', '/viewer#token=t');
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const path = route(input);
       if (path === '/api/v1/auth/exchange') return json({ authenticated: true });
       if (path.startsWith('/api/v1/endpoints?')) return json(endpoints);
       if (path.includes('/recordings') && path.includes('/endpoints/')) return json(responseLinked);
+      if (path.startsWith(`/api/v1/recordings/${recordingB}?`) && secondDetail) return json(secondDetail);
       if (path.startsWith('/api/v1/recordings/')) return json(responseDetail);
       throw new Error(`Unexpected request ${path}`);
     }));
@@ -251,5 +254,30 @@ describe('replay wiring in the app', () => {
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
     expect(await within(inspector()).findByText('event-1')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Controller\.create/ })).toHaveAttribute('aria-current', 'true');
+  });
+  it('switches and closes recording tabs by keyboard while restoring the selected event', async () => {
+    responseLinked = { ...linked, items: [...linked.items, { ...linked.items[0], recordingId: recordingB }] };
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Audit\.write/ }));
+    expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
+    secondDetail = { ...detail, recordingId: recordingB, events: [{ ...events[0], eventId: 'other-recording-event' }] };
+    fireEvent.click(screen.getByRole('tab', { name: 'recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
+    expect(await within(inspector()).findByText('other-recording-event')).toBeInTheDocument();
+
+    const tabs = screen.getByRole('tablist', { name: 'Open recordings' });
+    const first = within(tabs).getByRole('tab', { name: new RegExp(recordingA) });
+    const second = within(tabs).getByRole('tab', { name: new RegExp(recordingB) });
+    second.focus();
+    responseDetail = detail;
+    fireEvent.keyDown(second, { key: 'ArrowLeft' });
+    expect(first).toHaveFocus();
+    expect(first).toHaveAttribute('aria-selected', 'true');
+    expect(await within(inspector()).findByText('event-4')).toBeInTheDocument();
+
+    fireEvent.keyDown(first, { key: 'Delete' });
+    expect(within(tabs).queryByRole('tab', { name: new RegExp(recordingA) })).not.toBeInTheDocument();
+    expect(second).toHaveAttribute('aria-selected', 'true');
+    await waitFor(() => expect(second).toHaveFocus());
   });
 });

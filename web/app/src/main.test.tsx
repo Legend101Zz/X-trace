@@ -47,7 +47,7 @@ function defaultFetch(input: RequestInfo | URL) {
   if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response(endpoints));
   if (path.includes('/recordings?unmatched=true')) return Promise.resolve(response(unmatched));
   if (path.includes('/api/v1/endpoints/') && path.includes('/recordings')) return Promise.resolve(response(linked));
-  if (path.startsWith('/api/v1/recordings/')) return Promise.resolve(response(detail(path.split('/')[4])));
+  if (path.startsWith('/api/v1/recordings/')) return Promise.resolve(response(detail(path.split('?')[0].split('/')[4])));
   throw new Error(`Unexpected request ${path}`);
 }
 
@@ -134,7 +134,7 @@ describe('endpoint-first recording viewer', () => {
       if (path === '/api/v1/auth/exchange') return Promise.resolve(response({ authenticated: true }));
       if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response(endpoints));
       if (path.includes('/recordings?unmatched=true')) return new Promise((resolve) => { resolveUnmatched = resolve; });
-      if (path.startsWith('/api/v1/recordings/')) return Promise.resolve(response(detail(path.split('/')[4], 'stale-unmatched-selection')));
+      if (path.startsWith('/api/v1/recordings/')) return Promise.resolve(response(detail(path.split('?')[0].split('/')[4], 'stale-unmatched-selection')));
       throw new Error(`Unexpected request ${path}`);
     });
     render(<App />);
@@ -218,6 +218,7 @@ describe('endpoint-first recording viewer', () => {
     fireEvent.click(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
     await waitFor(() => expect(resolveFirst).toBeDefined());
+    expect(screen.queryByLabelText('Recording summary')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
     expect(await screen.findByText('newer-recording-detail')).toBeInTheDocument();
     await act(async () => { resolveFirst?.(response(detail(recordingA, 'stale-recording-detail'))); });

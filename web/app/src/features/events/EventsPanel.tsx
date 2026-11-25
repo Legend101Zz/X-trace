@@ -1,13 +1,15 @@
-import type { Detail, ReplayEvent } from '../../types';
+import type { Detail, Endpoint, ReplayEvent } from '../../types';
 import { ErrorState } from '../common/ErrorState';
 import { CanvasView } from '../canvas/CanvasView';
 import type { NavAction } from '../../replay/navigation';
 import type { ReplayMode } from '../../replay/state';
+import { nsToLabel } from '../../replay/outcome';
 import { OutcomeBanner } from './OutcomeBanner';
 
 export interface EventsPanelProps {
   active: boolean;
   selectedRecording: string;
+  endpoint: Endpoint | null;
   detail: Detail | null;
   detailBusy: boolean;
   detailError: string;
@@ -23,12 +25,22 @@ export interface EventsPanelProps {
   onNavigateKey: (action: NavAction) => void;
 }
 
-export function EventsPanel({ active, selectedRecording, detail, detailBusy, detailError, selectedEvent, selectionUnavailable, olderEventsReleased, onRefresh, onPickEvent, onNextWindow, mode, onMode, onSelectFrame, onNavigateKey }: EventsPanelProps) {
+export function EventsPanel({ active, selectedRecording, endpoint, detail, detailBusy, detailError, selectedEvent, selectionUnavailable, olderEventsReleased, onRefresh, onPickEvent, onNextWindow, mode, onMode, onSelectFrame, onNavigateKey }: EventsPanelProps) {
   return <section className="pane" role="tabpanel" id="events-panel" aria-labelledby="events-tab" data-active={active} aria-label="Ordered event window">
         <div className="pane-head center-head"><div className="center-title"><div className="eyebrow">Linear event window</div><h1>{selectedRecording || 'Select a recording'}</h1></div><button className="button" onClick={onRefresh} disabled={detailBusy}>Refresh</button></div>
         {detailError ? <ErrorState message={detailError} onRetry={onRefresh} /> : null}
         {!selectedRecording && !detailError ? <div className="empty"><strong>No recording selected</strong><p>Choose a linked or unmatched recording from the left pane.</p></div> : null}
-        {detail ? <OutcomeBanner detail={detail} /> : null}
+        {detail ? <>
+          <div className="recording-bar" aria-label="Recording summary">
+            <span className="recording-bar-field">{endpoint ? `${endpoint.method} ${endpoint.routeTemplate}` : 'Not linked to an endpoint'}</span>
+            <span>{detail.outcome?.httpStatus == null ? 'HTTP status unavailable' : `HTTP ${detail.outcome.httpStatus}`}</span>
+            <span>{detail.completion === 'unavailable' ? 'Completion unavailable' : `Recording ${detail.completion}`}</span>
+            <span>{detail.durationNs == null ? 'Duration unavailable' : `Duration ${nsToLabel(detail.durationNs)}`}</span>
+            <span>Capture mode not reported</span>
+            {selectedEvent ? <span className="recording-bar-field">Step {selectedEvent.sequence}{selectedEvent.symbol ? ` · ${selectedEvent.symbol}` : ''}</span> : null}
+          </div>
+          <OutcomeBanner detail={detail} />
+        </> : null}
         {selectionUnavailable ? <p className="window-retention">{selectionUnavailable}</p> : null}
         {detail && detail.events.length ? <div className="mode-switch" role="group" aria-label="Replay view">
           <button className="button" aria-pressed={mode === 'linear'} onClick={() => onMode('linear')}>Linear</button>

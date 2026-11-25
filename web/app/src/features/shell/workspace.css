@@ -1,0 +1,89 @@
+.shell.viewer-shell { grid-template-rows: 48px auto minmax(0, 1fr) auto; }
+.shell > .topbar { grid-row: 1; }
+.shell > .recording-tabs { grid-row: 2; }
+.shell > .viewer-workspace { grid-row: 3; }
+.shell > .viewer-preferences { grid-row: 4; }
+.viewer-workspace { position: relative; }
+.workspace-requests, .workspace-inspector, .workspace-code, .steps-and-code,
+.viewer-workspace .pane, .workspace-code-body { min-width: 0; min-height: 0; }
+.workspace-requests, .workspace-inspector { display: flex; flex-direction: column; }
+.workspace-requests > .pane, .workspace-inspector > .pane { flex: 1; }
+.workspace-code, .panel-splitter, .collapsed-panel, .reset-panels { display: none; }
+.workspace-code-body { padding: 12px; overflow-wrap: anywhere; }
+.workspace-code-body > p { margin-top: 8px; }
+.viewer-workspace .pane { background: var(--bg); }
+.recording-tabs { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 8px; border-bottom: 1px solid var(--line); background: var(--chrome); }
+.recording-tabs-list { display: flex; min-width: 0; flex: 1; gap: 4px; overflow: auto; }
+.open-recording { min-height: 44px; min-width: 44px; max-width: 20rem; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 4px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); }
+.open-recording[aria-selected='true'] { background: var(--select); border-color: var(--amber); }
+.open-recording:focus-visible { outline-offset: -2px; }
+.shell > .viewer-preferences { justify-content: space-between; align-items: center; gap: 8px; }
+.recording-bar { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 12px; color: var(--text); background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; overflow-wrap: anywhere; }
+.recording-bar .recording-bar-field { overflow-wrap: anywhere; min-width: 0; }
+.phone-back-to-step { display: none; }
+.recording-why > summary { display: list-item; padding: 8px 12px; color: var(--amber); cursor: pointer; }
+.recording-why > summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+@media (max-width: 1023px), (pointer: coarse) { .recording-why > summary { min-height: 44px; } }
+
+@media (min-width: 861px) {
+  .shell.viewer-shell { height: 100dvh; }
+  .workspace.viewer-workspace { grid-template-columns: minmax(0, var(--requests-size)) 8px minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); grid-template-rows: minmax(0, 1fr) auto; }
+  .steps-and-code { display: grid; grid-template-columns: minmax(0, 1fr) 8px minmax(0, var(--code-size)); }
+  .workspace-code { display: block; background: var(--bg); overflow: auto; }
+  .reset-panels { display: block; grid-row: 2; grid-column: 1 / -1; justify-self: end; margin: 8px; }
+  .workspace-requests[data-collapsed='true'] > .pane,
+  .workspace-inspector[data-collapsed='true'] > .pane { display: none; }
+  .collapsed-panel { display: block; min-height: 44px; padding: 0 4px; writing-mode: vertical-rl; }
+}
+
+@media (min-width: 861px), (min-width: 700px) and (max-width: 860px) {
+  .panel-splitter { position: relative; flex: 0 0 auto; min-width: 0; min-height: 0; background: var(--line-strong); touch-action: none; cursor: col-resize; }
+  .panel-splitter:focus-visible { outline-offset: -2px; background: var(--amber); }
+  .panel-splitter::before { content: ''; position: absolute; inset: 0; }
+}
+
+@media (min-width: 861px) {
+  .panel-splitter { display: block; }
+}
+
+@media (max-width: 860px) {
+  .shell.viewer-shell { grid-template-rows: 48px auto minmax(0, 1fr) auto 44px; }
+  .shell > .workspace.viewer-workspace { grid-row: 3; }
+  .shell > .tabs { grid-row: 5; }
+  .workspace.viewer-workspace { grid-template-columns: minmax(0, 1fr); }
+  .workspace-requests, .steps-and-code, .workspace-inspector { display: none; }
+  .viewer-workspace[data-pane='recordings'] > .workspace-requests,
+  .viewer-workspace[data-pane='events'] > .steps-and-code,
+  .viewer-workspace[data-pane='evidence'] > .workspace-inspector { display: flex; flex-direction: column; }
+  .phone-back-to-step { display: block; margin: 8px 12px; }
+}
+
+@media (min-width: 700px) and (max-width: 860px) {
+  .viewer-workspace[data-pane='events'] { grid-template-rows: minmax(0, 1fr) 16px minmax(0, var(--inspector-size)) auto; height: min(68dvh, 680px); }
+  .viewer-workspace[data-pane='events'] > :is(.panel-splitter--inspector, .reset-panels) { display: block; }
+  .viewer-workspace[data-pane='events'] > .panel-splitter--inspector { cursor: row-resize; }
+  .viewer-workspace[data-pane='events'] > .workspace-inspector { display: flex; overflow: auto; }
+  .viewer-workspace[data-pane='events'] > .workspace-inspector .pane { display: flex; }
+  .viewer-workspace[data-pane='events'] > .workspace-inspector[data-collapsed='true'] .pane { display: none; }
+  .viewer-workspace[data-pane='events'] > .workspace-inspector[data-collapsed='true'] .collapsed-panel { display: block; min-height: 44px; }
+  .viewer-workspace[data-pane='events'] .phone-back-to-step { display: none; }
+}
+
+@media (pointer: coarse) {
+  .panel-splitter::before { min-width: 44px; left: 50%; transform: translateX(-50%); z-index: 1; }
+  .panel-splitter--inspector::before { min-height: 44px; }
+}
+
+@media (min-width: 700px) and (max-width: 860px) and (pointer: coarse) {
+  .panel-splitter--inspector::before { inset: 50% 0 auto; transform: translateY(-50%); }
+}
+
+.request-tree { list-style: none; margin: 4px 0; padding: 0 8px; overflow: auto; }
+.request-branch { margin-left: 8px; padding-left: 4px; border-left: 1px solid var(--line-strong); }
+.request-search { margin: 8px 12px 4px; font-size: 13px; }
+.request-search-input { min-width: 0; margin: 0 12px 8px; padding: 6px; color: var(--text); background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.request-search-input:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.recording-arrival { display: inline-block; color: var(--amber); margin-top: 4px; font: 12px var(--mono); }
+@media (max-width: 1023px), (pointer: coarse) { .request-search-input { min-height: 44px; } }
+
+.recording-tabs > .button { flex: 0 0 auto; }
