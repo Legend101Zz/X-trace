@@ -891,6 +891,8 @@ fn recheck_linux_directory_acl(
 #[cfg(target_os = "linux")]
 fn read_acl_attribute(directory: &File, name: &str) -> Result<Option<Vec<u8>>, rustix::io::Errno> {
     let mut value = vec![0_u8; 16 * 1024];
+    #[cfg(feature = "spawn-counter")]
+    crate::spawn_counter::record_linux_acl_probe(crate::spawn_counter::LinuxAclProbe::Directory);
     match rustix::fs::fgetxattr(directory, name, value.as_mut_slice()) {
         Ok(length) => {
             value.truncate(length);
@@ -1153,6 +1155,8 @@ pub(crate) fn named_file_acl_admits(
     _operation: &Operation,
 ) -> bool {
     let mut value = [0_u8; 16 * 1024];
+    #[cfg(feature = "spawn-counter")]
+    crate::spawn_counter::record_linux_acl_probe(crate::spawn_counter::LinuxAclProbe::NamedFile);
     match rustix::fs::lgetxattr(path, "system.posix_acl_access", value.as_mut_slice()) {
         Ok(_) => false,
         Err(error) => error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA,
@@ -1192,6 +1196,8 @@ pub(crate) fn acl_admits_file(
     _operation: &Operation,
 ) -> bool {
     let mut value = [0_u8; 16 * 1024];
+    #[cfg(feature = "spawn-counter")]
+    crate::spawn_counter::record_linux_acl_probe(crate::spawn_counter::LinuxAclProbe::DescriptorFile);
     match rustix::fs::fgetxattr(file, "system.posix_acl_access", value.as_mut_slice()) {
         Ok(_) => false,
         Err(error) => error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA,

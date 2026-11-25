@@ -24,6 +24,8 @@ flock_admission flock_wait flock_revalidate journal_sync checkpoint_sync directo
 journal_directory_admission publication_rwlock_wait journal_retry_load writer_wait
 journal_validation tail_file_admission connection_wait_and_admission journal_sql_validation
 snapshot_write_wait journal_append checkpoint_prepare tail_binding_admission checkpoint_publish
+checkpoint_bind_pending checkpoint_admit_target checkpoint_revalidate_before_rename
+checkpoint_rename checkpoint_bind_published checkpoint_directory_sync_dispatch checkpoint_directory_sync checkpoint_revalidate_after_sync
 segment_validation segment_root_admission segment_commit segment_journal_cleanup
 tail_validation tail_root_admission checkpoint_mutex_wait journal_tail
 """.split())
@@ -38,6 +40,9 @@ STATE = re.compile(rf"state=(?P<state>started|progress|returned|unwinding) "
                    rf"completed=(?P<completed>{NUMBER}) elapsed_ns=(?P<elapsed_ns>{NUMBER})")
 MEASUREMENT = re.compile(r"phase=(?P<phase>[a-z_]{1,64}) " + " ".join(
     rf"{key}=(?P<{key}>{NUMBER})" for key in ("spans", "total_ns", "max_ns", "acl_probes")))
+
+LINUX_ACL_COUNTS = re.compile(" ".join(
+    rf"linux_acl_{key}=(?P<{key}>{NUMBER})" for key in ("directory", "named_file", "descriptor_file")))
 
 
 def _read(path: pathlib.Path, *, tail: bool = False) -> bytes:
@@ -92,6 +97,8 @@ def collect(directory: pathlib.Path) -> dict:
         for line in _read(progress, tail=True).splitlines(keepends=True):
             if state := _record(line, STATE):
                 profile["lastReport"] = state
+            elif linux_acl_counts := _record(line, LINUX_ACL_COUNTS):
+                profile["linuxAclProbes"] = linux_acl_counts
             elif measurement := _record(line, MEASUREMENT):
                 phases[measurement.pop("phase")] = measurement
         if phases:

@@ -8,6 +8,8 @@ use std::io::{Seek as _, SeekFrom, Write as _};
 use std::time::Instant;
 
 use xtrace_private_storage::spawn_counter::ls_spawns_on_this_thread;
+#[cfg(target_os = "linux")]
+use xtrace_private_storage::spawn_counter::{linux_acl_probe_counts, set_linux_acl_probe_counting};
 
 thread_local! {
     static PROFILE: RefCell<Option<Profile>> = const { RefCell::new(None) };
@@ -22,6 +24,8 @@ struct Measurement {
 }
 
 struct Profile {
+    #[cfg(unix)]
+    checkpoint_detail: bool,
     started: Instant,
     changed: Instant,
     probes: u64,
@@ -79,6 +83,14 @@ impl Profile {
             )
             .expect("write work measurements");
         }
+        #[cfg(target_os = "linux")]
+        if let Some([directory, named_file, descriptor_file]) = linux_acl_probe_counts() {
+            writeln!(
+                self.history,
+                "linux_acl_directory={directory} linux_acl_named_file={named_file} linux_acl_descriptor_file={descriptor_file}",
+            )
+            .expect("write Linux ACL probe counts");
+        }
         self.changed = Instant::now();
     }
 }
@@ -106,8 +118,15 @@ impl WorkProfile {
                     .open(directory.join(format!("store-{name}-{suffix}.txt")))
                     .expect("create numeric work artifact")
             };
+            #[cfg(unix)]
+            let checkpoint_detail = std::env::var_os("XTRACE_CHECKPOINT_PROFILE_DETAIL")
+                .is_some_and(|value| value == "1");
+            #[cfg(target_os = "linux")]
+            set_linux_acl_probe_counting(checkpoint_detail);
             let now = Instant::now();
             let mut profile = Profile {
+                #[cfg(unix)]
+                checkpoint_detail,
                 started: now,
                 changed: now,
                 probes: ls_spawns_on_this_thread(),
@@ -143,6 +162,8 @@ impl Drop for WorkProfile {
         PROFILE.with(|slot| {
             if let Some(mut profile) = slot.take() {
                 profile.report(if std::thread::panicking() { "unwinding" } else { "returned" });
+                #[cfg(target_os = "linux")]
+                set_linux_acl_probe_counting(false);
             }
         });
     }
@@ -152,6 +173,27 @@ impl Drop for WorkProfile {
 pub(crate) struct Phase(Option<&'static str>);
 
 impl Phase {
+    pub(crate) fn directory_sync_name() -> &'static str {
+        PROFILE.with(|slot| {
+            if slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|profile| profile.active == "checkpoint_directory_sync_dispatch")
+            {
+                "checkpoint_directory_sync"
+            } else {
+                "directory_sync"
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn checkpoint_detail(name: &'static str) -> Option<Self> {
+        let enabled = PROFILE
+            .with(|slot| slot.borrow().as_ref().is_some_and(|profile| profile.checkpoint_detail));
+        enabled.then(|| Self::enter(name))
+    }
+
     pub(crate) fn enter(name: &'static str) -> Self {
         Self(PROFILE.with(|slot| {
             slot.borrow_mut().as_mut().map(|profile| {

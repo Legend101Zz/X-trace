@@ -186,7 +186,7 @@ fn durable_sync(
     let _phase = work_profile::Phase::enter(match _kind {
         SyncKind::Journal => "journal_sync",
         SyncKind::Checkpoint => "checkpoint_sync",
-        SyncKind::Directory => "directory_sync",
+        SyncKind::Directory => work_profile::Phase::directory_sync_name(),
     });
     #[cfg(test)]
     let count_only = COUNT_ONLY_SYNCS.with(|enabled| enabled.get());
@@ -447,6 +447,8 @@ fn publish_boundary(
         // The flock already owns an admitted descriptor for this directory.
         // Use that same inode for rename and sync, retaining source/target
         // admission and post-rename binding checks plus Apple's full sync.
+        #[cfg(test)]
+        let mut detail = work_profile::Phase::checkpoint_detail("checkpoint_bind_pending");
         object_io!(
             private,
             CheckpointPendingBinding,
@@ -456,26 +458,50 @@ fn publish_boundary(
         // The old target is discarded, not read. Stat-only admission already
         // checks owner, mode, ACL, filesystem, link count and stable identity.
         // Opening it and validating it twice more adds no publication evidence.
+        #[cfg(test)]
+        if let Some(phase) = detail.as_mut() {
+            phase.switch("checkpoint_admit_target");
+        }
         object_io!(
             private,
             CheckpointTargetAdmission,
             id,
             root.validate_optional_private_file(&name)
         )?;
+        #[cfg(test)]
+        if let Some(phase) = detail.as_mut() {
+            phase.switch("checkpoint_revalidate_before_rename");
+        }
         object_io!(private, CheckpointDirectoryRevalidate, id, root.revalidate())?;
+        #[cfg(test)]
+        if let Some(phase) = detail.as_mut() {
+            phase.switch("checkpoint_rename");
+        }
         object_io!(
             direct,
             CheckpointRename,
             id,
             rustix::fs::renameat(&directory, pending.as_str(), &directory, name.as_str())
         )?;
+        #[cfg(test)]
+        if let Some(phase) = detail.as_mut() {
+            phase.switch("checkpoint_bind_published");
+        }
         object_io!(
             private,
             CheckpointPublishedBinding,
             id,
             root.validate_file_binding(&name, file, false)
         )?;
+        #[cfg(test)]
+        if let Some(phase) = detail.as_mut() {
+            phase.switch("checkpoint_directory_sync_dispatch");
+        }
         object_io!(direct, CheckpointDirectorySync, id, sync_directory_descriptor(&directory))?;
+        #[cfg(test)]
+        if let Some(phase) = detail.as_mut() {
+            phase.switch("checkpoint_revalidate_after_sync");
+        }
         object_io!(private, CheckpointDirectoryRevalidate, id, root.revalidate())
     }
     #[cfg(not(unix))]
