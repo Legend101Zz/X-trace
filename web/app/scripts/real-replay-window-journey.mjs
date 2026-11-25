@@ -89,7 +89,15 @@ try {
   const tab = (id) => page.getByRole('tablist', { name: 'Open recordings' }).getByRole('tab', { name: new RegExp(id) });
   const switchPane = async (name) => {
     const pane = page.getByRole('tab', { name, exact: true });
-    if (await pane.isVisible()) await pane.click();
+    if (await pane.isVisible()) {
+      await pane.click();
+    } else if (name === 'Requests') {
+      const drawer = page.locator('#header-requests');
+      if (await drawer.isVisible() && await drawer.getAttribute('aria-expanded') === 'false') {
+        await drawer.click();
+        await expect(drawer).toHaveAttribute('aria-expanded', 'true');
+      }
+    }
   };
   const steps = page.locator('#events-panel .event');
   const windows = page.getByRole('region', { name: 'Loaded event window' });
