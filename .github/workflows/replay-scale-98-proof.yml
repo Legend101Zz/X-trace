@@ -1,0 +1,79 @@
+name: Measured synthetic embedded viewer
+on:
+  push:
+    branches: [codex/replay-scale-98-proof]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 0c32a8f68dbd7d752830431ccf70da41e59d4575
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Verify embedded viewer and install pinned Chromium
+        working-directory: web/app
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = 0c32a8f68dbd7d752830431ccf70da41e59d4575
+          node --check ../../tools/qa/replay_scale_browser.mjs
+          npm ci >"$RUNNER_TEMP/npm-ci.log" 2>&1
+          npm run check:embedded >"$RUNNER_TEMP/embedded.log" 2>&1
+          npx --no-install playwright install --with-deps chromium >"$RUNNER_TEMP/chromium.log" 2>&1
+      - name: Verify 10000 stored frames and measure five browser journeys
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/report"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          export XTRACE_SCALE_FIXTURE_MANIFEST="$root/priv/manifest.json"
+          python3 -B -m tools.qa.lane_run run --suite rust --step scale --min-passed 1 --max-ignored 0 --out "$root/fragments" -- \
+            cargo test --locked -p xtrace-cli --test replay_scale synthetic_ten_thousand_frames_are_complete_ordered_and_navigable -- --exact --nocapture
+          rc=0
+          node tools/qa/replay_scale_browser.mjs --manifest "$XTRACE_SCALE_FIXTURE_MANIFEST" \
+            --xtrace "$PWD/target/debug/xtrace" --source-sha 0c32a8f68dbd7d752830431ccf70da41e59d4575 --provenance source-built \
+            --later-pages 12 --cdp-heap --out "$root/priv/browser.json" >"$root/priv/driver.log" 2>&1 || rc=$?
+          python3 -B - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "xt"
+          path = root / "priv/browser.json"
+          if not path.is_file() or not path.stat().st_size:
+              raise SystemExit("Driver produced no measurement receipt")
+          data = json.loads(path.read_bytes())
+          assert data["kind"] == "synthetic_replay_scale_browser" and data["synthetic"] is True
+          assert data["provenance"]["declaredSourceSha"] == "0c32a8f68dbd7d752830431ccf70da41e59d4575"
+          assert len(data["samples"]) == 5
+          # The reviewed driver emits bounded stage codes and measured numbers. Only this file is retained.
+          for sample in data["samples"]:
+              assert re.fullmatch(r"[a-z0-9_]+", sample["stage"])
+              assert sample["status"] in ("exercised", "failed")
+          (root / "report/browser-metrics.json").write_text(json.dumps(data, indent=2) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              print("Source-built synthetic 10,000-frame viewer. Product 0c32a8f68dbd7d752830431ccf70da41e59d4575.", file=summary)
+              print("\n| Sample | Outcome | Last stage | Initial ms | Over 1500 ms |", file=summary)
+              print("|---|---|---|---|---|", file=summary)
+              for sample in data["samples"]:
+                  initial = sample["initial"] or {}
+                  print("|", sample["sample"], "|", sample["status"], "|", sample["stage"], "|",
+                        initial.get("elapsedMs", "unobserved"), "|", initial.get("over1500Ms", "unobserved"), "|", file=summary)
+          PY
+          exit "$rc"
+      - name: Retain the measurement receipt
+        if: ${{ !cancelled() && hashFiles('tools/qa/replay_scale_browser.mjs') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: synthetic-browser-metrics
+          path: ${{ runner.temp }}/xt/report/browser-metrics.json
+          if-no-files-found: error
+          retention-days: 7
