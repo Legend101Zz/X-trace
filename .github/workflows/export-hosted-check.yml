@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      PROBE_SOURCE: d83680dda3a148bb5a37e0f52fdb0b96863a9a89
+      PROBE_SOURCE: e6b4fba87b182f397e5598f2bf58c529330a1098
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
