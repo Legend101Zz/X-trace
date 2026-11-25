@@ -1,0 +1,44 @@
+name: Backend campaign metadata proof
+on:
+  push:
+    branches: [diagnostic/backend-campaign-meta-20261125]
+permissions:
+  contents: read
+env:
+  PROBE_SOURCE: 617cab4d31a343c91b8e025e64135128975999b6
+  CARGO_TERM_COLOR: never
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact backend batch
+        run: |
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          mkdir -p "$RUNNER_TEMP/lane-frag"
+          printf '{"sourceSha":"%s","suite":"meta","fullFloor":false}\n' "$PROBE_SOURCE" > "$RUNNER_TEMP/lane-frag/source.json"
+      - name: Workflow structure lint
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step workflow-lint \
+            --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m tools.qa.workflow_lint .github/workflows/ci.yml .github/workflows/package.yml .github/workflows/lane.yml .github/workflows/campaigns.yml
+      - name: Lane tool unit tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step qa-unit-tests --min-passed 100 --max-ignored 0 \
+            --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m unittest discover -s tools/qa -p "test_*.py"
+      - name: Campaign library unit tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step campaign-lib-unit-tests --min-passed 15 --max-ignored 0 \
+            --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m unittest discover -s campaigns/lib -p "test_*.py"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: lane-frag-meta
+          path: ${{ runner.temp }}/lane-frag
+          if-no-files-found: ignore
+          retention-days: 14
+          overwrite: true
