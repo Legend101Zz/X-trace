@@ -235,9 +235,9 @@ describe('replay wiring in the app', () => {
     fireEvent.keyDown(window, { altKey: true, key: 'ArrowDown' });
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
     expect(live()).toHaveTextContent('Event 5 selected');
-    fireEvent.click(within(inspector()).getByRole('button', { name: 'Previous', exact: true }));
+    fireEvent.click(within(inspector()).getByRole('button', { name: /^Previous$/ }));
     expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
-    fireEvent.click(within(inspector()).getByRole('button', { name: 'Next', exact: true }));
+    fireEvent.click(within(inspector()).getByRole('button', { name: /^Next$/ }));
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
     showEvents();
     fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
