@@ -3,6 +3,69 @@ import { expect } from '@playwright/test';
 
 const viewports = [[320, 640], [736, 900], [1024, 768], [1440, 900]];
 
+export async function jumpToLoadedSequence(page, sequence) {
+  const controls = page.getByRole('region', { name: 'Loaded event window' });
+  await controls.getByRole('textbox', { name: 'Loaded event sequence', exact: true }).fill(sequence);
+  await controls.getByRole('button', { name: 'Go to event', exact: true }).press('Enter');
+  const current = page.locator('#events-panel .event[aria-current="true"]');
+  await expect(current).toBeFocused();
+  await expect(current.locator('.event-seq')).toHaveText(sequence);
+}
+
+/** Sweep the full loaded list, comparing every mounted position against independent API order. */
+export async function verifyMountedWindow(page, expected) {
+  const list = page.getByRole('list', { name: 'Loaded replay steps' });
+  await expect(page.getByText(`${expected.length} ordered events`, { exact: true })).toBeVisible();
+  const covered = new Set();
+  for (let sweep = 0; sweep <= expected.length && covered.size < expected.length; sweep += 1) {
+    const mounted = await list.evaluate(async (element, reset) => {
+      const body = element.closest('.steps-content');
+      const owner = body && getComputedStyle(body).overflowY === 'auto' ? body : element.closest('#events-panel');
+      if (reset) owner.scrollTop = 0;
+      else owner.scrollTop += Math.max(1, Math.floor(owner.clientHeight * 0.75));
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return Array.from(element.querySelectorAll('[data-step-sequence]'), (row) => ({
+        sequence: row.dataset.stepSequence,
+        position: Number(row.getAttribute('aria-posinset')),
+        count: Number(row.getAttribute('aria-setsize')),
+      }));
+    }, sweep === 0);
+    assert.ok(mounted.length > 0 && mounted.length <= 80, 'Steps obeys the mounted row cap');
+    for (const { sequence, position, count } of mounted) {
+      assert.ok(count === expected.length && expected[position - 1] === sequence, 'mounted position and sequence match the read API');
+      covered.add(position);
+    }
+  }
+  assert.equal(covered.size, expected.length, 'scrolling exposes every API event in the loaded window');
+}
+
+async function pageWithoutMovingAnchor(page, button, expectedCount) {
+  const current = page.locator('#events-panel .event[aria-current="true"]');
+  await current.scrollIntoViewIfNeeded();
+  const list = page.getByRole('list', { name: 'Loaded replay steps' });
+  const anchor = () => list.evaluate((element) => {
+    const body = element.closest('.steps-content');
+    const owner = body && getComputedStyle(body).overflowY === 'auto' ? body : element.closest('#events-panel');
+    const viewport = owner.getBoundingClientRect();
+    for (const row of element.querySelectorAll('[data-step-sequence]')) {
+      const box = row.getBoundingClientRect();
+      if (box.bottom > viewport.top && box.top < viewport.bottom) {
+        return { sequence: row.dataset.stepSequence, offset: box.top - viewport.top };
+      }
+    }
+    return null;
+  });
+  const original = await anchor();
+  assert.ok(original, 'the loaded list has a visible scroll anchor');
+  await button.evaluate((node) => node.focus({ preventScroll: true }));
+  await page.keyboard.press('Enter');
+  await expect(page.getByText(`${expectedCount} ordered events`, { exact: true })).toBeVisible();
+  await expect.poll(async () => {
+    const now = await anchor();
+    return now?.sequence === original.sequence && Math.abs(now.offset - original.offset) <= 2;
+  }).toBe(true);
+}
+
 /**
  * The supplied opener uses a real persisted recording, opens a noninitial
  * window with both server continuations, and returns independently read API
@@ -14,21 +77,17 @@ export async function verifyReplayWindowNavigation(page, openInterior) {
     const { earlier, current, later, selected } = await openInterior(page);
     assert.ok(earlier.length && current.includes(selected) && later.length, 'fixture must have both real adjacent pages and a selected event');
     const controls = page.getByRole('region', { name: 'Loaded event window' });
-    const order = () => page.locator('#events-panel .event-seq').allTextContents();
     const selection = () => page.locator('#events-panel .event[aria-current="true"] .event-seq').textContent();
-    const matches = async (expected) => JSON.stringify(await order()) === JSON.stringify(expected);
-    assert.ok(await matches(current), 'the visible starting window matches the read API');
+    await verifyMountedWindow(page, current);
     const previous = controls.getByRole('button', { name: 'Load earlier', exact: true });
-    await previous.press('Enter');
-    await expect.poll(() => matches([...earlier, ...current])).toBe(true);
+    await pageWithoutMovingAnchor(page, previous, earlier.length + current.length);
+    await verifyMountedWindow(page, [...earlier, ...current]);
     assert.ok(await selection() === selected, 'earlier paging preserves the selected event');
-    await controls.getByRole('button', { name: 'Load later', exact: true }).press('Enter');
-    await expect.poll(() => matches([...earlier, ...current, ...later])).toBe(true);
+    const next = controls.getByRole('button', { name: 'Load later', exact: true });
+    await pageWithoutMovingAnchor(page, next, earlier.length + current.length + later.length);
+    await verifyMountedWindow(page, [...earlier, ...current, ...later]);
     assert.ok(await selection() === selected, 'later paging preserves the selected event');
-    const form = controls.getByRole('textbox', { name: 'Loaded event sequence', exact: true });
-    await form.fill(earlier[0]);
-    await controls.getByRole('button', { name: 'Go to event', exact: true }).press('Enter');
-    await expect(page.locator('#events-panel .event[aria-current="true"]')).toBeFocused();
+    await jumpToLoadedSequence(page, earlier[0]);
     assert.ok(await selection() === earlier[0], 'a loaded predecessor event is keyboard-selectable');
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
       `replay window controls fit at ${width}px`);
