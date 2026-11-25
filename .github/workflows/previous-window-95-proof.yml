@@ -1,0 +1,46 @@
+name: Backward window contract proof
+on:
+  push:
+    branches: [codex/previous-window-95-proof]
+permissions:
+  contents: read
+jobs:
+  cursor-windows:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 168806a6a3345b8f4c483bf5a314bbc9d0c8ddd8
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Verify exact product and formatting
+        run: |
+          test "$(git rev-parse HEAD)" = 168806a6a3345b8f4c483bf5a314bbc9d0c8ddd8
+          cargo fmt --all -- --check
+      - name: Verify query, storage and viewer HTTP
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          lane() {
+            python3 -B -m tools.qa.lane_run run --suite rust --out "$root/fragments" "$@"
+          }
+          focused() {
+            lane --step "$1" --min-passed "$2" --max-ignored 0 -- cargo test --locked -p "$3" --lib "$4"
+          }
+          lane --step cursor-clippy -- cargo clippy --locked --message-format=json -p xtrace-application -p xtrace-store -p xtrace-daemon -p xtrace-cli --tests -- -D warnings
+          focused application 2 xtrace-application recording_queries::tests::
+          focused verified-pages 5 xtrace-store backward_windows
+          focused forward-input-budget 1 xtrace-store verified_input_budget_pages_large_segments_losslessly
+          focused journal-boundary 1 xtrace-store a_small_held_request_is_replayable_from_its_durable_journal_before_finish
+          focused verification-queries 2 xtrace-store frame_verification_
+          focused forward-projection 1 xtrace-store projection_response_byte_limit_continues_within_a_segment
+          focused anchor-budget 1 xtrace-store around_window_trim_keeps_anchor
+          focused http 1 xtrace-daemon stored_line_cursors_reach_http_in_execution_order_across_pages_and_segments
+          echo 'Checked product 168806a6a3345b8f4c483bf5a314bbc9d0c8ddd8. Focused tests over the production query, persisted recording store and viewer HTTP route.' >> "$GITHUB_STEP_SUMMARY"
