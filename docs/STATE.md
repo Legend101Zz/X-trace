@@ -17,10 +17,14 @@ The one place for "where are we". Rewrite it (do not append) at the end of every
 
 ## Main and CI baseline
 
-Verified `origin/main` at `bc3cfb57b1307372dc2d7bf933a044c36147b990`, merge of
-[PR #74](https://github.com/Legend101Zz/X-trace/pull/74); #73 merged as `fb01e4da` before it. At this baseline
-there was no open PR. Issues #45, #53, #71 and #72 were closed; #69, #3, #14, #32, #36, #52, #57 and #68
-remained open. Check GitHub again before acting; this is a measured baseline, not a live status feed.
+[PR #75](https://github.com/Legend101Zz/X-trace/pull/75) merged as
+`117fa172705e70d25f88078083570c4488f82fe9`. Its reviewed head `c945ac6` passed three full Linux runs, with
+23 of 23 gates on both floors in each run. The [main push](https://github.com/Legend101Zz/X-trace/actions/runs/45592659843/attempts/1)
+first failed the JDK 17 floor during dependency resolution. A cold-cache probe identified Maven Central;
+a second probe passed, and the specific error remains unknown. The [failed-job rerun](https://github.com/Legend101Zz/X-trace/actions/runs/45592659843/attempts/2)
+passed the JDK 17 floor and restored `ci-ok`. The JDK 21 floor passed 23 of 23 in attempt 1. See the
+[#69 checkpoint](https://github.com/Legend101Zz/X-trace/issues/69#issuecomment-7163247515) for the recovery.
+Check GitHub for newer changes before acting.
 
 [Main CI 44669637782](https://github.com/Legend101Zz/X-trace/actions/runs/44669637782) is red: the JDK 17 /
 Node 22 floor's `web-tests` gate exited 1 after 12 gates passed; ten later gates were not reached. The available
@@ -99,9 +103,10 @@ before Rust. Do not infer that main is green or that every historical intermitte
 
 ## Next work
 
-1. Resolve the current red main based on evidence. Verify the combined PR #75 head with three full Linux
-   `ci-ok` passes. If first attach fails again, capture the fixed phase label when available before choosing a
-   repair. Preserve every gate, assertion and budget. Verify post-merge main before new feature work.
+1. Verify the scoped [#32](https://github.com/Legend101Zz/X-trace/issues/32) export integration and its
+   persisted-catalog journey. OpenAPI keeps each colliding scope's projection under
+   `x-xtrace-alternate-operations` while counting only native operations. Preserve the shared export ancestry
+   in #36. If first attach fails again, capture its fixed phase label when available before choosing a repair.
 2. Continue [#69](https://github.com/Legend101Zz/X-trace/issues/69) and
    [#3](https://github.com/Legend101Zz/X-trace/issues/3): finish #32 export claims and policy digest, integrate
    #36's observed burst-correlation harness with honest ambiguity where individual correlation is unavailable, and
