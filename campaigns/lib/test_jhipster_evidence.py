@@ -35,6 +35,36 @@ def request(label, method, path, status):
 
 
 class JHipsterEvidence(unittest.TestCase):
+    def test_owned_host_launches_observe_bound_port_and_still_require_management_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = campaign_harness(pathlib.Path(tmp))
+            for name, prefix in (("baseline", ()), ("instrumented", ("xtrace", "run", "--"))):
+                with self.subTest(run=name), mock.patch.dict(xcamp.os.environ, {
+                    "XCAMP_APP_MODE": "host", "XCAMP_JAVA": "java", "TMPDIR": tmp,
+                    "XCAMP_LAUNCH_PREFIX": ""}):
+                    stack = harness.make_stack(name, prefix)
+                    with mock.patch.object(stack, "down"), mock.patch.object(stack, "_wait_db"), \
+                            mock.patch.object(xcamp, "docker"), \
+                            mock.patch.object(xcamp, "published_port", return_value=39452), \
+                            mock.patch.object(xcamp.subprocess, "Popen") as launch, \
+                            mock.patch.object(stack, "logs", return_value=(
+                                "org.springframework.boot.tomcat.TomcatWebServer : "
+                                "Tomcat started on port 39451 (http) with context path '/'")), \
+                            mock.patch.object(xcamp, "http_request", return_value={
+                                "status": 200, "body": b'{"status":"UP"}'}) as request:
+                        launch.return_value.poll.return_value = None
+                        stack.up()
+                    argv = launch.call_args.args[0]
+                    self.assertIn("--server.port=0", argv)
+                    self.assertIn("--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO", argv)
+                    self.assertEqual(argv[:len(prefix)], list(prefix))
+                    self.assertEqual(stack.host_port, 39451)
+                    self.assertEqual(request.call_args.args[:3],
+                                     ("http://127.0.0.1:39451", "GET", "/management/health"))
+                    self.assertTrue(stack.ready_ok(200, '{"status":"UP"}'))
+                    self.assertFalse(stack.ready_ok(503, '{"status":"UP"}'))
+                    self.assertFalse(stack.ready_ok(200, '{"status":"DOWN"}'))
+
     def test_expectations_match_all_tracked_request_counts(self):
         summary = json.loads((PROJECT / "baseline-summary.json").read_text())
         self.assertEqual(list(evidence.EXPECT), [row["id"] for row in summary["scenarios"]])
