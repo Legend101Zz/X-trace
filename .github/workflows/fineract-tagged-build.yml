@@ -1,0 +1,112 @@
+name: Fineract upstream build diagnosis
+on:
+  push:
+    branches: [codex/proof-fineract-tagged-bootjar-117]
+permissions:
+  contents: read
+jobs:
+  upstream:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: a692dae048b85cb1c1276ff9a92d95414cc52e84
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Check six named tag and build regressions and their full modules
+        run: |
+          set -euo pipefail
+          umask 077
+          export PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GITHUB_WORKSPACE/campaigns/lib"
+          mkdir -m 700 "$RUNNER_TEMP/tag-checks"
+          for group in named modules; do
+            if [[ $group == named ]]; then
+              names=(test_checkout_keeps_the_commit_pin_and_fetches_only_the_exact_annotated_tag test_checkout_refuses_tag_pin_inconsistent_with_the_declared_peeled_ref test_release_tag_verification_checks_object_kind_hash_and_peeled_commit test_bootjar_reports_process_failure_separately_from_zero_without_expected_jar test_bootjar_success_requires_a_new_nonempty_expected_artifact test_build_summary_rejects_unrecognized_values_or_inconsistent_exit)
+              set -- "${names[@]/#/test_fineract_installed.FineractInstalled.}"
+              expected=6
+            else
+              set -- test_fineract_installed test_fineract_privacy test_fineract_sink_coverage
+              expected=56
+            fi
+            rc=0
+            python3 -B -m tools.qa.unittest_run --result "$RUNNER_TEMP/tag-checks/$group.json" "$@" > "$RUNNER_TEMP/tag-checks/$group.log" 2>&1 || rc=$?
+            python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/tag-checks/$group.json"
+            python3 -B -c 'import json,sys; counts=json.load(open(sys.argv[1]))["counts"]; assert counts["testsRun"]==int(sys.argv[2]) and not any(v for k,v in counts.items() if k!="testsRun")' "$RUNNER_TEMP/tag-checks/$group.json" "$expected"
+            test "$rc" -eq 0
+          done
+      - name: Run the exact pinned upstream build and classify its private streams
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = a692dae048b85cb1c1276ff9a92d95414cc52e84
+          mkdir -m 700 "$RUNNER_TEMP/fineract-diagnosis"
+          python3 -B - <<'PY'
+          import json, os, pathlib, re, shlex, subprocess
+          config=json.loads(pathlib.Path('campaigns/java/fineract/campaign.json').read_bytes())
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'fineract-diagnosis'
+          import contextlib
+          from campaigns.java.fineract.harness import installed, privacy
+          project=root/'run'
+          for folder in (root/'driver', project, project/'home', project/'tmp', project/'campaign', project/'campaign/java', project/'campaign/java/fineract'):
+              folder.mkdir(mode=0o700)
+          privacy.mark_admitted(project)
+          runner=installed.InstalledCampaign(project, root/'unused-package', '0'*64, subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(), pathlib.Path(os.environ['JAVA_HOME'])/'bin/java')
+          source=runner.source
+          with (root/'clone.log').open('x') as out, contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+              if runner.checkout_upstream() or runner.source_verify(): raise SystemExit(1)
+          with (root/'build.log').open('x') as out, contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+              rc=runner.build_upstream()
+          size=(root/'build.log').stat().st_size
+          with (root/'build.log').open('rb') as stream:
+              stream.seek(max(0,size-524288))
+              tail=stream.read(524288).decode('utf-8','replace')
+          categories={
+              'gradle-plugin-not-found': r'Plugin \[id: [^\n]+ was not found',
+              'dependency-resolution': r'Could not resolve (all (?:files|dependencies)|[\w.-]+:[\w.-]+:)',
+              'artifact-missing': r'Could not find [\w.-]+:[\w.-]+:',
+              'http429': r'(?:status code 429|HTTP response code: 429|429 Too Many Requests)',
+              'http403': r'(?:status code 403|HTTP response code: 403|403 Forbidden)',
+              'http5xx': r'(?:status code 5[0-9]{2}|HTTP response code: 5[0-9]{2})',
+              'daemon-disappeared': r'Gradle build daemon disappeared unexpectedly',
+              'download-failure': r'Could not (?:GET|HEAD) [^\n]+|Downloading from [^\n]+ failed',
+              'toolchain-unavailable': r'Cannot find a Java installation|No locally installed toolchains match',
+              'missing-tag': r'No (?:matching )?tags? found|no tag exactly matches',
+              'git-object-missing': r'MissingObjectException|bad revision|bad object|unknown revision',
+              'compilation-error': r'Compilation failed|error: cannot find symbol',
+              'permission-denied': r'Permission denied|AccessDeniedException',
+              'out-of-memory': r'OutOfMemoryError|Java heap space',
+              'wrapper-network': r'Exception in thread .main. java\.net\.|UnknownHostException|SocketTimeoutException',
+              'shallow-without-version-tag': r'no.*tag.*shallow|shallow.*no.*tag',
+              'disk-full': r'No space left on device',
+              'build-script-evaluation': r'A problem occurred evaluating (?:root )?project',
+              'unavailable-task': r'Task [^\n]+ not found in (?:root )?project',
+          }
+          markers=[name for name,pattern in categories.items() if re.search(pattern,tail,re.I)]
+          result={'schema':1,'product':'a692dae048b85cb1c1276ff9a92d95414cc52e84','upstream':config['upstream']['sha'],'exitCode':rc,'markers':markers,'inspectedWholeOutput':size<=524288,'expectedJarPresent':(source/config['build']['artifact']).is_file(),'nonRelease':True}
+          result['tagIdentityVerified']=True
+          result['buildStatus']=runner.manifest['upstreamBuild']
+          result['rootBuildLine'] = None
+          for match in re.finditer(r"Build file '([^']+)' line: (\d{1,5})", tail):
+              if match.group(1)==str(source/'build.gradle'): result['rootBuildLine']=int(match.group(2)); break
+          jar=source/config['build']['artifact']
+          if rc==0 and jar.is_file():
+              import zipfile
+              with zipfile.ZipFile(jar) as archive:
+                  libs=set(archive.namelist())
+                  result['runtimeDependencies']={key:f'BOOT-INF/lib/{prefix}-{config["runtime"][key]}.jar' in libs for key,prefix in [('jersey','jersey-server'),('pgjdbc','postgresql'),('springBoot','spring-boot')]}
+          (root/'summary.json').write_text(json.dumps(result,sort_keys=True)+'\n')
+          print(json.dumps(result,sort_keys=True))
+          raise SystemExit(0 if rc==0 and result['expectedJarPresent'] and all(result['runtimeDependencies'].values()) else 1)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() }}
+        with:
+          name: fineract-tagged-build-diagnosis
+          path: ${{ runner.temp }}/fineract-diagnosis/summary.json
+          if-no-files-found: error
+          retention-days: 14
