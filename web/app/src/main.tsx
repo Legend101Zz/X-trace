@@ -43,6 +43,7 @@ export default function App() {
   const [selectedOperation, setSelectedOperation] = useState('');
   const [catalogMode, setCatalogMode] = useState<CatalogMode>('endpoints');
   const [activePane, setActivePane] = useState<Pane>('recordings');
+  const [projectEmpty, setProjectEmpty] = useState(false);
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [endpointCursor, setEndpointCursor] = useState<string | null>(null);
   const [selectedEndpointSnapshot, setSelectedEndpointSnapshot] = useState<Endpoint | null>(null);
@@ -97,6 +98,7 @@ export default function App() {
     const { generation, signal } = endpointLane.begin();
     setEndpointBusy(true);
     setEndpointError('');
+    setProjectEmpty(false);
     try {
       const query = cursor ? `?limit=100&cursor=${encodeURIComponent(cursor)}` : '?limit=100';
       const page = await api<components['schemas']['ObservedEndpointPage']>(`/api/v1/endpoints${query}`, signal);
@@ -106,6 +108,19 @@ export default function App() {
       setEndpoints(result.items);
       setEndpointCursor(result.nextCursor);
       setOlderEndpointsReleased(result.released > 0);
+      if (!append && page.items.length === 0 && page.nextCursor === null) {
+        // Empty endpoint results say nothing about recordings without a link.
+        // A single bounded metadata row is enough to distinguish a new project.
+        try {
+          const presence = await api<components['schemas']['RecordingList']>('/api/v1/recordings?limit=1', signal);
+          if (endpointLane.isCurrent(generation)
+              && presence.schemaVersion === 3 && Array.isArray(presence.recordings)
+              && presence.recordings.length === 0 && presence.nextAfter === null) setProjectEmpty(true);
+        } catch (error) {
+          if (endpointLane.isCurrent(generation)) markExpired(error);
+        }
+      }
+      if (!endpointLane.isCurrent(generation)) return;
       endpointHasLoaded.current = true;
       if (catalogModeRef.current === 'endpoints') setAnnouncement(`${page.items.length} observed endpoints loaded`);
     } catch (error) {
@@ -501,6 +516,8 @@ export default function App() {
     openRecordings={openRecordings} selectedRecording={selectedRecording} onSelectRecording={activateRecording} onCloseRecording={closeRecording}
     sourceEvent={event} detail={detail} endpoint={activeRecordingTab?.endpoint ?? null}>
     <CatalogPanel
+      projectEmpty={auth === 'ready' && projectEmpty}
+      onAnnounce={setAnnouncement}
       active={activePane === 'recordings'}
       catalogMode={catalogMode}
       endpointLane={{ items: endpoints, cursor: endpointCursor, busy: endpointBusy, error: endpointError, released: olderEndpointsReleased }}

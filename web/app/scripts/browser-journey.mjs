@@ -507,6 +507,17 @@ try {
     await saveScreenshot(`viewer-help-${width}.png`, 'help-glossary', width, 844);
     await helpClose.press('Escape');
     await expect(helpButton).toBeFocused();
+    await helpButton.press('Enter');
+    await help.getByRole('button', { name: 'Take the 3-step tour' }).press('Enter');
+    const guide = page.locator('.viewer-tour');
+    await expect(guide.getByRole('heading')).toHaveText('Find a recording');
+    await guide.getByRole('button', { name: 'Next', exact: true }).press('Enter');
+    await guide.getByRole('button', { name: 'Next', exact: true }).press('Enter');
+    await expect(guide.getByRole('heading')).toHaveText('Check what was recorded');
+    assert.equal(await page.locator('#events-panel .event[aria-current="true"] .event-seq').textContent(), selected,
+      'the tour preserves exact selection for the real recording');
+    await guide.getByRole('button', { name: 'Finish', exact: true }).press('Enter');
+    await expect(helpButton).toBeFocused();
     await settingsButton.press('Enter');
   }
 
