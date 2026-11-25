@@ -5,10 +5,11 @@ import { chromium, expect } from '@playwright/test';
 
 const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
-const { url } = JSON.parse(Buffer.concat(chunks).toString());
+const { url, widths = [320, 736, 1024, 1440], recordingId } = JSON.parse(Buffer.concat(chunks).toString());
+assert.ok(widths.length > 0 && widths.every((width) => [320, 736, 1024, 1440].includes(width)));
 const origin = new URL(url).origin;
 const screenshotRoot = process.env.XTRACE_BROWSER_SCREENSHOT_DIR;
-const screenshotDirectory = screenshotRoot && join(screenshotRoot, 'first-recording');
+const screenshotDirectory = screenshotRoot && join(screenshotRoot, recordingId ? 'spring-tour' : 'first-recording');
 if (screenshotDirectory) await mkdir(screenshotDirectory, { recursive: true, mode: 0o700 });
 const browser = await chromium.launch({ headless: true });
 let stage = 'bootstrap';
@@ -18,9 +19,38 @@ try {
   let external = 0;
   page.on('request', (request) => { if (new URL(request.url()).origin !== origin) external += 1; });
   await page.goto(url);
-  for (const width of [320, 736, 1024, 1440]) {
+  for (const width of widths) {
     stage = `verified empty project and tour at ${width}px`;
     await page.setViewportSize({ width, height: 844 });
+    if (recordingId) {
+      stage = `recorded Spring tour at ${width}px`;
+      const requests = page.getByRole('tab', { name: 'Requests', exact: true });
+      if (await requests.isVisible()) await requests.click();
+      const endpoint = page.locator('.endpoint-card').filter({ hasText: '/orders' });
+      if (await endpoint.getAttribute('aria-expanded') === 'false') await endpoint.click();
+      await page.locator('.recording-list .recording').filter({ hasText: recordingId }).click();
+      await expect(page.getByRole('region', { name: 'No recordings yet' })).toHaveCount(0);
+      const current = page.locator('#events-panel .event[aria-current="true"] .event-seq');
+      await expect(current).toBeVisible();
+      const sequence = await current.textContent();
+      const help = page.getByRole('button', { name: 'Help', exact: true });
+      await help.press('Enter');
+      await page.getByRole('dialog', { name: 'Help' }).getByRole('button', { name: 'Take the 3-step tour' }).press('Enter');
+      const guide = page.locator('.viewer-tour');
+      for (const title of ['Find a recording', 'Read Steps in order', 'Check what was recorded']) {
+        await expect(guide.getByRole('heading', { name: title })).toBeFocused();
+        if (screenshotDirectory) await page.screenshot({ path: join(screenshotDirectory, `tour-${width}-${title.split(' ')[0]}.png`) });
+        const next = guide.getByRole('button', { name: 'Next', exact: true });
+        if (await next.isVisible()) await next.press('Enter');
+      }
+      await guide.getByRole('button', { name: 'Finish', exact: true }).press('Enter');
+      await expect(help).toBeFocused();
+      await expect(current).toHaveText(sequence);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      const text = await page.locator('body').textContent();
+      assert.ok(!text.includes('INSTALLED_TOUR_PRIVATE_BODY') && !text.includes('INSTALLED_TOUR_PRIVATE_QUERY'));
+      continue;
+    }
     const empty = page.getByRole('region', { name: 'No recordings yet' });
     await expect(empty).toBeVisible();
     await expect(page.getByRole('tablist', { name: 'Open recordings' })).toHaveCount(0);
@@ -65,7 +95,7 @@ try {
   }
   assert.equal(external, 0);
   assert.deepEqual(await page.evaluate(() => [localStorage.length, sessionStorage.length]), [0, 0]);
-  console.log('first recording and Help tour passed at 320, 736, 1024 and 1440px');
+  console.log(recordingId ? 'recorded Spring Help tour passed' : 'first recording and Help tour passed');
 } catch {
   console.error(`First recording browser journey failed during ${stage}`);
   process.exitCode = 1;

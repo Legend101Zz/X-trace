@@ -1,0 +1,92 @@
+name: viewer-tour-installed-temporary
+on:
+  push:
+    branches: [codex/viewer-tour-108]
+permissions:
+  contents: read
+jobs:
+  linux-installed-tour:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Prepare private diagnostics
+        run: |
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/tour-private" "$RUNNER_TEMP/tour-scratch"
+      - name: Hosted viewer checks and embedded assets
+        id: web
+        working-directory: web/app
+        run: |
+          set -eu
+          npm ci
+          npm run typecheck
+          npm exec --no -- vitest run src/main.test.tsx src/features/shell/ViewerSettings.test.tsx
+          node scripts/check-contrast.mjs
+          npm run build
+          npm run embed
+          node scripts/embed-assets.mjs --check
+          if git diff --quiet -- ../../crates/xtrace-daemon/assets/ui; then
+            echo "archive_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "archive_ready=false" >> "$GITHUB_OUTPUT"
+            echo "Installed Help tour: NOT RUN until generated viewer assets are committed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: generated-tour-viewer
+          path: crates/xtrace-daemon/assets/ui/
+          if-no-files-found: error
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        if: steps.web.outputs.archive_ready == 'true'
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        if: steps.web.outputs.archive_ready == 'true'
+        with:
+          toolchain: stable
+      - name: Build one Linux archive and the Spring fixture
+        if: steps.web.outputs.archive_ready == 'true'
+        run: |
+          set -eu
+          umask 077
+          cd "$GITHUB_WORKSPACE"
+          (cd web/app && npm exec --no -- playwright install --with-deps chromium) > "$RUNNER_TEMP/tour-private/chromium.log" 2>&1
+          python3 packaging/build.py --out "$RUNNER_TEMP/tour-dist" --platform linux-x86_64 > "$RUNNER_TEMP/tour-private/archive.log" 2>&1
+          (cd adapters/java && ./gradlew --no-daemon --dependency-verification strict fixtureBootJar) > "$RUNNER_TEMP/tour-private/fixture.log" 2>&1
+      - name: Installed fresh project and real Spring tour at 320 and 1440
+        if: steps.web.outputs.archive_ready == 'true'
+        env:
+          XTRACE_BROWSER_SCREENSHOT_DIR: ${{ runner.temp }}/tour-private/frames
+        run: |
+          umask 077
+          mkdir -m 700 "$XTRACE_BROWSER_SCREENSHOT_DIR"
+          if python3 -B tools/qa/installed_help_tour.py               --dist "$RUNNER_TEMP/tour-dist/linux-x86_64"               --source-sha "$GITHUB_SHA"               --spring-fixture "$GITHUB_WORKSPACE/adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar"               --scratch "$RUNNER_TEMP/tour-scratch"               > "$RUNNER_TEMP/tour-private/receipt.json" 2> "$RUNNER_TEMP/tour-private/journey.log"; then
+            cat "$RUNNER_TEMP/tour-private/receipt.json" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Installed Help tour: FAIL; inspect encrypted diagnostics." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Encrypt private screenshots and diagnostics
+        if: always() && steps.web.outputs.archive_ready == 'true'
+        env:
+          EVIDENCE_CERT: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVOVENDQXAyZ0F3SUJBZ0lVZkxxMVlkSWI5OVZQa1lFSUJwVUw2RVpUL2RVd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0tqRW9NQ1lHQTFVRUF3d2ZXQzEwY21GalpTQndjbWwyWVhSbElIWnBaWGRsY2lCbGRtbGtaVzVqWlRBZQpGdzB5TmpFeE1qVXhOVEV6TWpaYUZ3MHlOakV5TURreE5URXpNalphTUNveEtEQW1CZ05WQkFNTUgxZ3RkSEpoClkyVWdjSEpwZG1GMFpTQjJhV1YzWlhJZ1pYWnBaR1Z1WTJVd2dnR2lNQTBHQ1NxR1NJYjNEUUVCQVFVQUE0SUIKandBd2dnR0tBb0lCZ1FDMkJ3Mi9QdURTZWFQeWNZby9HblhUNjhKMVpVWmhvM285U2dhQ3NjR0UvdXZrRXNyTQo0OUtvcVNKeExaSmdrbUcwODRvUEs1SXhKQVkzd29jcGRBL3dUVW5UYWZTWTc1N0JBZ0dFbGVjQTh1T2lpcHZyCm9XTFloUS9YVUxOaUNaVTUrRHB3OGs5cmxWQ3lNa1FNa2NJNWRkTE1JL0MyTDFzSnExSWx3Ulo3dzBmV3MzVXoKc1hwaUxjb2VJejdGalphV2tPUzdwMHVvREowMkQ0alFaR2p1WUl2a0xwL3c3b3JtdHFYOW5tazhmWDdOK0JXeQowTnpjYlFvV1B5QzlTalYzaUNNMkNDMCtxRzBINDB2Uy9zU2s3c0RhQVVDTFVrTHFCTHduY2tWNGJ4Sk1mdE9BClZ3VUpNUSt1aUhpUUsyNnVCcXovUDNOcFBqRGFZT3BCK1ppZlN2Y0V6TjFQWndLTlM5d2JzZm1WdjlCTjg2UkYKK1VYSzdHdURSUHpKdDkrckc5RHZneHZJWG4ydWxrNXhlYStuRGR5d3k1TGRZSFNMZ1NRekZWWXpCLzVXaXA5VQpSTmdDekRPU01FTXZ4SFBibXpaSzF4QWtlbjZHK1hpbG1MMW9XNmlTU01kOUpTNU1jbXZ3bWN6RmtLU293SWQvCnFydVdVV0VmNUUzck9Gc0NBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmMKVmxpK01COEdBMVVkSXdRWU1CYUFGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmNWbGkrTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dHQkFCa0ZsN3Znc05TN0tMVWp3bDFnSFlKL1BYMDEydnlpCi9VNExVM0g3eHZHZFZBSUpXejIvYjdZaHg0OFh6SWFyb0RoQ1lYNzY5ZStBODM1Si9pQ042cExmeTYyM3R1WU8KWUhVMEZUSFZqdUZ0OFVxRDVYdExpdGVmMHJuN0luam9HWmJvR3lLbXBrTWs3TkgydmFCcDY3SHA3UnV5anBTTQp6UmY3LzNPOFN3U1FxK1RxNENvaVh6OWgwdzBjV3AxRytqRGtBR2pOMXNUeU45amNrM0VnSkpia2trR2lENC9wCkw5eE5WbUFqZmhrRExqc2t0VmZaQ1hNcDVlbVZmWkJqZW9wUHpDS3YwN1NrOERTeWFNcnRFTFJhbU9JMXZUM08KSWkzNTFoaTVuNnpiamVCTUM4dmt4T0pCckxsc2FVUHV6V0M4OEpQQzRCUGk0SXVFanA3eHVFdUlLSTR3YTVuUApZVC81SDAzWUwrajJ2V3pUa2Z3UVUvS0wrMEx3NkIwNVByTC9ZRFY4dXcrU3crK1A4bG5TK2ZsaisxUi9iY0tTClg3NFVnY2g0c0tESXd2clBzemRUZXh4cVBrajlHYXpPbzk4RHRlTys5RUdvWDZKcU9ZWmVCU3VIUndoTGNqNXYKK0c5blVacDc1R1djYmlzYk1udUpIQkVOV3RQVzhFUTZQZz09Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+        run: |
+          set -eu
+          umask 077
+          printf '%s' "$EVIDENCE_CERT" | base64 -d > "$RUNNER_TEMP/tour-evidence.crt"
+          tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/tour-evidence.tar" tour-private
+          openssl cms -encrypt -binary -aes-256-cbc -in "$RUNNER_TEMP/tour-evidence.tar" -outform DER             -out "$RUNNER_TEMP/tour-evidence.enc" "$RUNNER_TEMP/tour-evidence.crt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && steps.web.outputs.archive_ready == 'true'
+        with:
+          name: encrypted-installed-tour-evidence
+          path: ${{ runner.temp }}/tour-evidence.enc
+          if-no-files-found: error
+          retention-days: 1
