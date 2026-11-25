@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: d3f8b7873d01ceb854b9f1556eda95f5b0839327
+          ref: 7fe67283d91dfdadd9b09c63d71c7dac94dec4ad
           persist-credentials: false
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
         with:
@@ -28,7 +28,7 @@ jobs:
           umask 077
           root="$RUNNER_TEMP/pg-proof"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/classes" "$root/lib"
-          test "$(git rev-parse HEAD)" = d3f8b7873d01ceb854b9f1556eda95f5b0839327
+          test "$(git rev-parse HEAD)" = 7fe67283d91dfdadd9b09c63d71c7dac94dec4ad
           if ! adapters/java/gradlew -p adapters/java --dependency-verification strict --no-daemon \
             "-Porg.gradle.java.installations.paths=$JAVA_HOME_17_X64" \
             :agent-bootstrap:test :agent-runtime:test agentDist fixtureBootJar >"$root/gradle.log" 2>&1; then
