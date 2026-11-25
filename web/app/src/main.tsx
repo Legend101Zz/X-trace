@@ -81,6 +81,7 @@ export default function App() {
   const linkedLane = useLane();
   const unmatchedLane = useLane();
   const detailLane = useLane();
+  const authLane = useLane();
 
   useEffect(() => { endpointsRef.current = endpoints; }, [endpoints]);
   useEffect(() => { linkedRef.current = linked; }, [linked]);
@@ -88,11 +89,22 @@ export default function App() {
 
   const markExpired = (error: unknown) => {
     if (!(error instanceof ApiError) || error.status !== 401) return;
+    authLane.invalidate();
     endpointLane.invalidate(); linkedLane.invalidate();
     unmatchedLane.invalidate(); detailLane.invalidate();
     setEndpointBusy(false); setLinkedBusy(false); setUnmatchedBusy(false); setDetailBusy(false);
     setAuth('expired');
   };
+
+  const applyEndpointPage = useCallback((page: components['schemas']['ObservedEndpointPage'], append: boolean) => {
+    const result = retainPage(append ? endpointsRef.current : [], page.items, MAX_RETAINED_ROWS, page.nextCursor);
+    endpointsRef.current = result.items;
+    setEndpoints(result.items);
+    setEndpointCursor(result.nextCursor);
+    setOlderEndpointsReleased(result.released > 0);
+    endpointHasLoaded.current = true;
+    if (catalogModeRef.current === 'endpoints') setAnnouncement(`${page.items.length} observed endpoints loaded`);
+  }, []);
 
   const loadEndpoints = useCallback(async (cursor: string | null = null, append = false) => {
     const { generation, signal } = endpointLane.begin();
@@ -102,13 +114,7 @@ export default function App() {
       const query = cursor ? `?limit=100&cursor=${encodeURIComponent(cursor)}` : '?limit=100';
       const page = await api<components['schemas']['ObservedEndpointPage']>(`/api/v1/endpoints${query}`, signal);
       if (!endpointLane.isCurrent(generation)) return;
-      const result = retainPage(append ? endpointsRef.current : [], page.items, MAX_RETAINED_ROWS, page.nextCursor);
-      endpointsRef.current = result.items;
-      setEndpoints(result.items);
-      setEndpointCursor(result.nextCursor);
-      setOlderEndpointsReleased(result.released > 0);
-      endpointHasLoaded.current = true;
-      if (catalogModeRef.current === 'endpoints') setAnnouncement(`${page.items.length} observed endpoints loaded`);
+      applyEndpointPage(page, append);
     } catch (error) {
       if (!endpointLane.isCurrent(generation)) return;
       markExpired(error);
@@ -118,7 +124,7 @@ export default function App() {
         setEndpointBusy(false);
       }
     }
-  }, []);
+  }, [applyEndpointPage]);
 
   const loadLinked = useCallback(async (operationId: string, cursor: string | null = null, append = false) => {
     if (!operationId || selectedOperationRef.current !== operationId) return;
@@ -272,13 +278,30 @@ export default function App() {
   useEffect(() => {
     if (authStarted.current) return;
     authStarted.current = true;
-    const fragment = new URLSearchParams(window.location.hash.slice(1));
+    const fragmentText = window.location.hash.slice(1);
+    const fragment = new URLSearchParams(fragmentText);
     const token = fragment.get('token');
     // Always discard the one-time fragment before rendering an error or sending a request.
     window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
     if (!token) {
-      setAuth('error');
-      setAuthError('The one-time viewer link is missing. Restart xtrace open --viewer.');
+      if (fragmentText) {
+        setAuth('error');
+        setAuthError('The one-time viewer link is missing. Restart xtrace open --viewer.');
+        return;
+      }
+      // Catalog navigation may supersede its own reads while this guarded session probe
+      // is pending. It must not cancel authentication or overwrite a newer catalog page.
+      const { generation, signal } = authLane.begin();
+      void api<components['schemas']['ObservedEndpointPage']>('/api/v1/endpoints?limit=100', signal).then((page) => {
+        if (!authLane.isCurrent(generation)) return;
+        if (!endpointHasLoaded.current) applyEndpointPage(page, false);
+        setAuth('ready');
+      }).catch((cause: unknown) => {
+        if (!authLane.isCurrent(generation)) return;
+        markExpired(cause);
+        setAuthError('The local viewer could not verify this session. Restart xtrace open --viewer.');
+        setAuth((current) => current === 'checking' ? 'error' : current);
+      });
       return;
     }
     void fetch('/api/v1/auth/exchange', {
@@ -295,7 +318,7 @@ export default function App() {
       setAuth('error');
       setAuthError(cause instanceof Error ? cause.message : 'Viewer authentication failed');
     });
-  }, [loadEndpoints]);
+  }, [applyEndpointPage, loadEndpoints]);
 
   const selectedEndpoint = selectedEndpointSnapshot;
   const activeRecordingTab = openRecordings.find(({ id }) => id === selectedRecording);
@@ -517,7 +540,7 @@ export default function App() {
     <CatalogPanel
       active={activePane === 'recordings'}
       catalogMode={catalogMode}
-      endpointLane={{ items: endpoints, cursor: endpointCursor, busy: endpointBusy, error: endpointError, released: olderEndpointsReleased }}
+      endpointLane={{ items: endpoints, cursor: endpointCursor, busy: endpointBusy || auth === 'checking', error: endpointError, released: olderEndpointsReleased }}
       linkedLane={{ items: linked, cursor: linkedCursor, busy: linkedBusy, error: linkedError, released: olderLinkedReleased }}
       unmatchedLane={{ items: unmatched, cursor: unmatchedCursor, busy: unmatchedBusy, error: unmatchedError, released: olderUnmatchedReleased }}
       arrivals={arrivals}

@@ -32,10 +32,12 @@ try {
   page.setDefaultNavigationTimeout(10000);
   let consoleErrorCount = 0;
   let unexpectedRequestCount = 0;
+  let bootstrapExchangeCount = 0;
   const bootstrapToken = new URL(startUrl).hash.slice('#token='.length);
   page.on('console', (message) => { if (message.type() === 'error') consoleErrorCount += 1; });
   page.on('pageerror', () => { consoleErrorCount += 1; });
   page.on('request', (request) => {
+    if (new URL(request.url()).pathname === '/api/v1/auth/exchange') bootstrapExchangeCount += 1;
     assert.ok(!request.url().includes(bootstrapToken), 'bootstrap token appeared in a request URL');
     if (new URL(request.url()).origin !== new URL(startUrl).origin) unexpectedRequestCount += 1;
     const headers = request.headers();
@@ -446,10 +448,12 @@ try {
       toolsPage.setDefaultTimeout(8000);
       toolsPage.setDefaultNavigationTimeout(10000);
       let toolsErrors = 0;
+      let toolsExchanges = 0;
       const activate = (control) => pointer === 'coarse' ? control.tap() : control.click();
       toolsPage.on('pageerror', () => { toolsErrors += 1; });
       toolsPage.on('console', (message) => { if (message.type() === 'error') toolsErrors += 1; });
       toolsPage.on('request', (request) => {
+        if (new URL(request.url()).pathname === '/api/v1/auth/exchange') toolsExchanges += 1;
         assert.equal(new URL(request.url()).origin, new URL(startUrl).origin, `${pointer} tools journey stays on the local origin`);
         assert.ok(!request.url().includes(bootstrapToken), 'bootstrap token appeared in a tools request URL');
         assert.ok(!request.headers().referer?.includes(bootstrapToken), 'bootstrap token appeared in a tools referrer');
@@ -460,20 +464,49 @@ try {
         await expect(toolsPage.locator('.event[aria-current="true"]')).toBeVisible();
       };
       await toolsPage.goto(page.url(), { waitUntil: 'domcontentloaded' });
+      await expect(toolsPage.getByText('Local viewer connected', { exact: true })).toBeVisible();
+      assert.equal(toolsExchanges, 0, 'the cloned session resumes without exchanging a bootstrap token');
       await openCapture();
       const verifyRecordingSelection = async ({ sequence }) => {
         const tabs = toolsPage.getByRole('tablist', { name: 'Open recordings' });
         const historical = tabs.getByRole('tab', { name: new RegExp(legacyV4Id) });
         if (await historical.count() === 0) {
-          await activate(toolsPage.getByRole('tab', { name: 'Requests', exact: true }));
+          const requestsTab = toolsPage.getByRole('tab', { name: 'Requests', exact: true });
+          if (await requestsTab.isVisible()) await activate(requestsTab);
+          else {
+            const requestsButton = toolsPage.locator('#header-requests');
+            if (await requestsButton.isVisible() && await requestsButton.getAttribute('aria-expanded') === 'false') await activate(requestsButton);
+          }
+          await expect(toolsPage.locator('#recordings-panel')).toBeVisible();
           await activate(toolsPage.getByRole('button', { name: 'Not linked to an endpoint', exact: true }));
           await activate(toolsPage.getByRole('button', { name: new RegExp(legacyV4Id) }));
         } else await activate(historical);
         await expect(toolsPage.getByText('No projected events', { exact: true })).toBeVisible();
         await activate(tabs.getByRole('tab', { name: new RegExp(recordingId) }));
         await expect(toolsPage.locator('.event[aria-current="true"] .event-seq')).toHaveText(sequence);
-        await activate(toolsPage.getByRole('tabpanel', { name: 'Steps' }).getByRole('button', { name: 'Refresh', exact: true }));
+        const steps = toolsPage.getByRole('tabpanel', { name: 'Steps' });
+        const refresh = steps.getByRole('button', { name: 'Refresh', exact: true });
+        let refreshRequest;
+        const [, refreshResponse] = await Promise.all([
+          toolsPage.waitForRequest((request) => {
+            if (request.method() !== 'GET' || new URL(request.url()).pathname !== `/api/v1/recordings/${encodeURIComponent(recordingId)}`) return false;
+            refreshRequest = request;
+            return true;
+          }),
+          toolsPage.waitForResponse((response) => response.request() === refreshRequest),
+          activate(refresh),
+        ]);
+        const refreshUrl = new URL(refreshRequest.url());
+        assert.ok(refreshUrl.searchParams.get('limit') === '200' && !refreshUrl.searchParams.has('cursor')
+          && [...refreshUrl.searchParams].length === 1, 'Refresh requests the selected first window with the exact limit and no cursor');
+        assert.ok(refreshResponse.status() === 200, 'the selected recording Refresh receives a successful guarded detail response');
+        const refreshedDetail = await refreshResponse.json();
+        assert.ok(refreshedDetail.recordingId === recordingId, 'the Refresh response belongs to the selected recording');
+        assert.ok(JSON.stringify(refreshedDetail.events.map((event) => event.sequence)) === JSON.stringify(expectedSequences),
+          'the successful Refresh response contains the expected observed first window');
         await expect(toolsPage.getByRole('region', { name: 'Loaded event window' }).getByText('Loading event window…', { exact: true })).not.toBeVisible();
+        await expect(refresh).toBeEnabled();
+        await expect(steps.getByRole('alert')).toHaveCount(0);
         await expect(toolsPage.locator('.event[aria-current="true"] .event-seq')).toHaveText(sequence);
       };
       await verifyLoadedReplayTools(toolsPage, { events: verifiedEvents, pointer, saveScreenshot, verifyRecordingSelection, jumpReport });
@@ -482,13 +515,34 @@ try {
       await expect(timingButton).toHaveAttribute('aria-pressed', 'true');
       assert.equal(await toolsPage.evaluate(() => JSON.parse(localStorage.getItem('xtrace.viewer.appearance')).timing), 'on');
       await toolsPage.reload({ waitUntil: 'domcontentloaded' });
+      await expect(toolsPage.getByText('Local viewer connected', { exact: true })).toBeVisible();
       await openCapture();
       await expect(timingButton).toHaveAttribute('aria-pressed', 'true');
       await expect(toolsPage.locator('.event[aria-current="true"] .event-time')).toHaveText('+0 ns');
+      assert.equal(toolsExchanges, 0, 'session reload preserves the original cookie without token re-exchange');
       assert.equal(toolsErrors, 0, `${pointer} tools journey has no console or page errors`);
     } finally {
       await toolsContext.close();
     }
+  }
+  const anonymousContext = await browser.newContext();
+  try {
+    const anonymousPage = await anonymousContext.newPage();
+    anonymousPage.setDefaultTimeout(8000);
+    anonymousPage.setDefaultNavigationTimeout(10000);
+    let anonymousExchanges = 0;
+    anonymousPage.on('request', (request) => {
+      assert.equal(new URL(request.url()).origin, new URL(startUrl).origin, 'the anonymous session check stays on the local origin');
+      if (new URL(request.url()).pathname === '/api/v1/auth/exchange') anonymousExchanges += 1;
+    });
+    await anonymousPage.goto(page.url(), { waitUntil: 'domcontentloaded' });
+    await expect(anonymousPage.getByText('Viewer session expired', { exact: true })).toBeVisible();
+    await expect(anonymousPage.getByText('Local viewer connected', { exact: true })).toHaveCount(0);
+    await expect(anonymousPage.locator('.endpoint-card')).toHaveCount(0);
+    assert.equal(anonymousExchanges, 0, 'a fragment-free anonymous page cannot create a session');
+    assert.deepEqual(await anonymousContext.cookies(), [], 'a rejected anonymous read issues no session cookie');
+  } finally {
+    await anonymousContext.close();
   }
   assert.deepEqual(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length })), { local: 0, session: 0 });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -688,6 +742,8 @@ try {
   await expect(page.getByRole('button', { name: 'Requests', exact: true })).toBeFocused();
   // Reloading the spent link exercises startup and persisted appearance without exchanging another token.
   await page.reload({ waitUntil: 'domcontentloaded' });
+  await expect(page.getByText('Local viewer connected', { exact: true })).toBeVisible();
+  assert.equal(bootstrapExchangeCount, 1, 'the original viewer exchanged its one-use bootstrap token exactly once');
   await settingsButton.press('Enter');
   await expect(theme).toHaveValue('hc');
   await closeSettings();

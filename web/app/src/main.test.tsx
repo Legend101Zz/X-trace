@@ -203,6 +203,127 @@ describe('endpoint-first recording viewer', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('resumes a fragment-free session only after its guarded endpoint read succeeds', async () => {
+    window.history.replaceState(null, '', '/viewer?keep=query');
+    let resolveEndpoints: ((result: Response) => void) | undefined;
+    vi.mocked(fetch).mockImplementation(() => new Promise((resolve) => { resolveEndpoints = resolve; }));
+    render(<App />);
+    expect(screen.getByText('Connecting to local viewer')).toBeInTheDocument();
+    expect(screen.queryByText('Local viewer connected')).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(1);
+    const [input, init] = vi.mocked(fetch).mock.calls[0];
+    expect(route(input)).toBe('/api/v1/endpoints?limit=100');
+    expect(init).toMatchObject({ credentials: 'same-origin', headers: { 'X-XTrace-Client': 'viewer-v1' } });
+    expect(init?.body).toBeUndefined();
+    if (!resolveEndpoints) throw new Error('Missing endpoint session check');
+    await act(async () => { resolveEndpoints?.(response(endpoints)); });
+    expect(await screen.findByText('Local viewer connected')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ })).toBeInTheDocument();
+    expect(window.location.search).toBe('?keep=query');
+    expect(window.location.hash).toBe('');
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(1);
+    expect(screen.queryByText('Viewer authentication failed')).not.toBeInTheDocument();
+  });
+
+  it('keeps startup authentication independent of catalog navigation and newer endpoint reads', async () => {
+    window.history.replaceState(null, '', '/viewer');
+    let resolveProbe: ((result: Response) => void) | undefined;
+    let probeSignal: AbortSignal | null | undefined;
+    let endpointReads = 0;
+    const newerEndpoints = { ...endpoints, items: [{ ...endpoints.items[0], routeTemplate: '/orders-new' }] };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (route(input).startsWith('/api/v1/endpoints?')) {
+        endpointReads += 1;
+        if (endpointReads === 1) {
+          probeSignal = init?.signal;
+          return new Promise((resolve) => { resolveProbe = resolve; });
+        }
+        return Promise.resolve(response(newerEndpoints));
+      }
+      return defaultFetch(input);
+    });
+    render(<App />);
+    expect(screen.getByText('Connecting to local viewer')).toBeInTheDocument();
+    const unmatchedButton = screen.getByRole('button', { name: 'Not linked to an endpoint' });
+    unmatchedButton.focus();
+    fireEvent.click(unmatchedButton);
+    await screen.findByRole('button', { name: new RegExp(recordingB) });
+    expect(screen.getByRole('heading', { name: 'Unmatched recordings' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Observed endpoints' }));
+    const endpoint = await screen.findByRole('button', { name: /POST \/orders-new Component: spring-fixture Binding: default observed/ });
+    fireEvent.click(endpoint);
+    const recording = await screen.findByRole('button', { name: new RegExp(recordingA) });
+    recording.focus();
+    expect(recording).toHaveFocus();
+    expect(screen.getByText('Connecting to local viewer')).toBeInTheDocument();
+    expect(probeSignal).toBeDefined();
+    expect(probeSignal?.aborted).toBe(false);
+    if (!resolveProbe) throw new Error('Missing independent session probe');
+    await act(async () => { resolveProbe?.(response(endpoints)); });
+    expect(await screen.findByText('Local viewer connected')).toBeInTheDocument();
+    expect(recording).toHaveFocus();
+    expect(screen.getByRole('heading', { name: 'Linked recordings' })).toBeInTheDocument();
+    expect(endpoint).toHaveTextContent('/orders-new');
+    expect(screen.queryByText('Viewer authentication failed')).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input) === '/api/v1/auth/exchange')).toBe(false);
+  });
+
+  it('does not revive an expired session when its older startup probe later succeeds', async () => {
+    window.history.replaceState(null, '', '/viewer');
+    let resolveProbe: ((result: Response) => void) | undefined;
+    let probeSignal: AbortSignal | null | undefined;
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (route(input).startsWith('/api/v1/endpoints?')) {
+        probeSignal = init?.signal;
+        return new Promise((resolve) => { resolveProbe = resolve; });
+      }
+      return Promise.resolve(response({ detail: 'UNTRUSTED_SESSION_CANARY' }, 401));
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
+    expect(await screen.findByText('Viewer session expired')).toBeInTheDocument();
+    expect(probeSignal?.aborted).toBe(true);
+    if (!resolveProbe) throw new Error('Missing superseded session probe');
+    await act(async () => { resolveProbe?.(response(endpoints)); });
+    expect(screen.getByText('Viewer session expired')).toBeInTheDocument();
+    expect(screen.queryByText('Local viewer connected')).not.toBeInTheDocument();
+    expect(screen.queryByText('UNTRUSTED_SESSION_CANARY')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /POST \/orders/ })).not.toBeInTheDocument();
+  });
+
+  it.each([401, 403, 503])('rejects a fragment-free session when its guarded read returns %i', async (status) => {
+    window.history.replaceState(null, '', '/viewer');
+    vi.mocked(fetch).mockResolvedValue(response({ detail: 'UNTRUSTED_SESSION_CANARY' }, status));
+    render(<App />);
+    const title = status === 401 ? 'Viewer session expired' : 'Viewer authentication failed';
+    expect(await screen.findByText(title)).toBeInTheDocument();
+    expect(screen.queryByText('Local viewer connected')).not.toBeInTheDocument();
+    expect(screen.queryByText('UNTRUSTED_SESSION_CANARY')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /POST \/orders/ })).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.map(([input]) => route(input))).toEqual(['/api/v1/endpoints?limit=100']);
+  });
+
+  it('does not expose a transport error or authenticate when session resumption cannot reach the daemon', async () => {
+    window.history.replaceState(null, '', '/viewer');
+    vi.mocked(fetch).mockRejectedValue(new Error('PRIVATE_TRANSPORT_CANARY'));
+    render(<App />);
+    expect(await screen.findByText('Viewer authentication failed')).toBeInTheDocument();
+    expect(screen.getByText('The local viewer could not verify this session. Restart xtrace open --viewer.')).toBeInTheDocument();
+    expect(screen.queryByText('Local viewer connected')).not.toBeInTheDocument();
+    expect(screen.queryByText('PRIVATE_TRANSPORT_CANARY')).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.map(([input]) => route(input))).toEqual(['/api/v1/endpoints?limit=100']);
+  });
+
+  it('never falls back to a cookie session after a supplied bootstrap token is rejected', async () => {
+    vi.mocked(fetch).mockResolvedValue(response({ detail: 'PRIVATE_TOKEN_CANARY' }, 401));
+    render(<App />);
+    expect(await screen.findByText('Viewer authentication failed')).toBeInTheDocument();
+    expect(window.location.hash).toBe('');
+    expect(screen.queryByText('Local viewer connected')).not.toBeInTheDocument();
+    expect(screen.queryByText('PRIVATE_TOKEN_CANARY')).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.map(([input]) => route(input))).toEqual(['/api/v1/auth/exchange']);
+  });
+
   it('keeps the newer recording detail when an older selection resolves late', async () => {
     let resolveFirst: ((response: Response) => void) | undefined;
     vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
