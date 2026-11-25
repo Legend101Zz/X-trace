@@ -2,9 +2,10 @@
 import { sha256Hex, canonicalJson } from "./canonical.mjs";
 
 export class Recorder {
-  constructor(baseUrl, normalizer) {
+  constructor(baseUrl, normalizer, transport = fetch) {
     this.baseUrl = baseUrl;
     this.norm = normalizer;
+    this.transport = transport;
     this.calls = [];
   }
 
@@ -24,7 +25,7 @@ export class Recorder {
     let res;
     let text = "";
     try {
-      res = await fetch(this.baseUrl + path, { method, headers: h, body: payload, signal: AbortSignal.timeout(timeoutMs) });
+      res = await this.transport(this.baseUrl + path, { method, headers: h, body: payload, signal: AbortSignal.timeout(timeoutMs) });
       text = await res.text();
     } catch (e) {
       const rec = { label, method, route: route || path, status: 0, error: e.name, durationMs: Math.round(performance.now() - t0) };
