@@ -1,0 +1,161 @@
+name: Installed servlet and PostgreSQL JDBC
+on:
+  push:
+    branches: [diagnostic/java-servlet-pgjdbc-stage]
+permissions:
+  contents: read
+jobs:
+  installed-java:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: subject
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: e7e080bdbe7fe4ad8faa8b81d6e51fe05aff8259
+          path: subject
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+          cache: gradle
+          cache-dependency-path: |
+            subject/adapters/java/build.gradle.kts
+            subject/adapters/java/settings.gradle.kts
+            subject/adapters/java/gradle.lockfile
+            subject/adapters/java/*/build.gradle.kts
+            subject/adapters/java/*/gradle.lockfile
+            subject/adapters/java/gradle/verification-metadata.xml
+            subject/adapters/java/gradle/wrapper/gradle-wrapper.properties
+      - name: Build and verify the reviewed unsigned archive
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/xjava"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/extract"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          test "$(git rev-parse HEAD^{tree})" = 7cc8e557240894f2e9a8cd6c65fe0e9c25b10c79
+          test "$(git rev-parse HEAD)" = e7e080bdbe7fe4ad8faa8b81d6e51fe05aff8259
+          if ! python3 -B packaging/build.py --out "$root/dist" --work "$root/package-work" --platform linux-x86_64 >"$root/build.log" 2>&1; then
+            if grep -Fq 'Could not resolve' "$root/build.log"; then
+              echo 'Package build dependency resolution failed.'
+            else
+              echo 'Exact-head package build failed.'
+            fi
+            exit 1
+          fi
+          dist="$root/dist/linux-x86_64"
+          sh packaging/install.sh verify-dist "$dist" >"$root/verify-dist.log" 2>&1
+          archives=("$dist"/xtrace-*-linux-x86_64.tar.gz)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          test -f "$archive"
+          python3 -B packaging/verify_package.py "$archive" --run-binary --repo . --out "$root/verify-package.json" >"$root/verify-package.log" 2>&1
+          tar -xzf "$archive" -C "$root/extract" >"$root/extract.log" 2>&1
+          entries=("$root"/extract/xtrace-*)
+          test "${#entries[@]}" -eq 1
+          prefix="$root/installed X-trace"
+          sh "${entries[0]}/install.sh" --prefix "$prefix" --data-home "$root/journey/data" >"$root/install.log" 2>&1
+          sh "$prefix/current/install.sh" verify --prefix "$prefix" >"$root/verify-install.log" 2>&1
+          digest=$(sha256sum "$archive" | cut -d' ' -f1)
+          echo "Verified unsigned Linux archive SHA-256: $digest" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Build the real Spring fixture and check Java probes
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/xjava"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          if ! adapters/java/gradlew -p adapters/java --dependency-verification strict --no-daemon \
+            "-Porg.gradle.java.installations.paths=$JAVA_HOME_17_X64" \
+            fixtureBootJar :agent-bootstrap:test :agent-runtime:test >"$root/fixture.log" 2>&1; then
+            if grep -Fq 'Could not resolve' "$root/fixture.log"; then
+              echo 'Java dependency resolution failed.'
+            else
+              echo 'Spring fixture build or focused Java tests failed.'
+            fi
+            exit 1
+          fi
+          python3 -B - "$GITHUB_STEP_SUMMARY" <<'PY'
+          from pathlib import Path
+          import sys
+          from xml.etree import ElementTree
+          with open(sys.argv[1], 'a') as summary:
+              for module in ('agent-bootstrap', 'agent-runtime'):
+                  results = Path(f'adapters/java/{module}/build/test-results/test').glob('TEST-*.xml')
+                  totals = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
+                  for path in results:
+                      counters = ElementTree.parse(path).getroot().attrib
+                      for key in totals:
+                          totals[key] += int(counters.get(key, 0))
+                  if totals['tests'] <= 0 or totals['failures'] or totals['errors'] or totals['skipped']:
+                      raise SystemExit('Test counters did not show a clean executed suite')
+                  line = f'{module}: {totals["tests"]} tests, zero failed or skipped.'
+                  print(line)
+                  print(line, file=summary)
+          PY
+      - name: Exercise real Spring requests through the verified installation
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/xjava"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          export XTRACE_TEST_JAVA_INSTALLED_PREFIX="$root/installed X-trace"
+          cargo fmt --all --check
+          git diff --check "$(git merge-base HEAD^1 HEAD^2)" HEAD
+          if cargo test --locked -p xtrace-cli --test java_redirect_source_journey -- --test-threads=1 \
+            >"$root/journey.log" 2>&1; then
+            rc=0
+          else
+            rc=$?
+          fi
+          grep -E '^test [a-z_0-9]+ \.\.\. (ok|FAILED)$|^test result: (ok|FAILED)\.' "$root/journey.log" \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+          if (( rc )); then
+            grep -E "^thread '[a-z_0-9]+' .*panicked at crates/[a-z_-]+/tests/[a-z_0-9]+\.rs:[0-9]+:[0-9]+:$" "$root/journey.log" || true
+            grep -Eo '^error\[E[0-9]+\]' "$root/journey.log" | sort -u || true
+            exit "$rc"
+          fi
+          grep -Eq '^test filter_refusal_with_servlet_and_completed_async_controls_keeps_one_route_less_recording \.\.\. ok$' "$root/journey.log"
+          grep -Eq '^test filter_send_error_remains_provisional_through_container_redispatch \.\.\. ok$' "$root/journey.log"
+      - name: Run actual PostgreSQL 18.3, pinned pgjdbc and instrumented Spring MVC
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/xjava"
+          mkdir -m 700 "$root/pg" "$root/classes" "$root/lib"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          fixture="$GITHUB_WORKSPACE/subject/adapters/java/agent-runtime/src/test/fixtures/pgjdbc"
+          driver="$root/postgresql.jar"
+          curl --silent --show-error --fail --location --max-time 60 \
+            -o "$driver" https://jdbc.postgresql.org/download/postgresql-42.7.13.jar >"$root/pg-fetch.log" 2>&1
+          cd "$root"
+          echo '6e0e4cc2d8cae902084f8a2b18728b073a6fd9d1f87c9d8bff8f298c18185b93  postgresql.jar' | sha256sum --check --status
+          cd "$root/lib"
+          jar -xf "$GITHUB_WORKSPACE/subject/adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar" BOOT-INF/lib >"$root/pg-jar.log" 2>&1
+          cp "$driver" BOOT-INF/lib/
+          if ! javac --release 17 -cp 'BOOT-INF/lib/*' -d "$root/classes" "$fixture/PgJdbcFixture.java" >"$root/fixture-build.log" 2>&1; then
+            echo 'PostgreSQL Spring fixture compilation failed.'
+            exit 1
+          fi
+          prefix="$root/installed X-trace"
+          if ! python3 -B "$fixture/probe.py" "$root/pg" "$prefix/bin/xtrace" \
+            "$prefix/current/share/xtrace/packs/java/agent/xtrace-java-agent.jar" \
+            "$root/classes:$root/lib/BOOT-INF/lib/*" >"$root/pg-journey.log" 2>&1; then
+            grep -E '^pgjdbc proof failed: [a-z0-9_ ,:]+$' "$root/pg-journey.log" || true
+            exit 1
+          fi
+          grep -Fx 'verified=3 recordings; JDBC starts=8; JDBC ends=8; failed=1; no raw canary observed' \
+            "$root/pg-journey.log" | tee -a "$GITHUB_STEP_SUMMARY"
