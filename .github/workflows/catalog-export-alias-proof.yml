@@ -1,0 +1,44 @@
+name: catalog-export-alias-proof
+on:
+  push:
+    branches: [codex/proof-selector-approvals-102]
+permissions:
+  contents: read
+jobs:
+  http:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PROBE_SOURCE: 01b5583916d1f7cab232557cd66f4d5151a58138
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Admit private test scratch
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          root="${RUNNER_TEMP:?}/xh"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/frag"
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+          echo "PROBE_ADMITTED=true" >> "$GITHUB_ENV"
+          printf '{"sourceSha":"%s","releaseAcceptance":false}\n' "$PROBE_SOURCE" > "$root/frag/source.json"
+      - name: Bind both selector kinds to their own approval
+        run: |
+          set -euo pipefail
+          python3 -B -m tools.qa.lane_run run --suite rust --step approval-http --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" --min-passed 1 --max-ignored 0 -- cargo test --locked -p xtrace-daemon --lib viewer::tests::export_contract_tests::observed_scope_echoes_original_selector_and_exposes_only_resolved_catalog_id -- --exact
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && env.PROBE_ADMITTED == 'true' }}
+        with:
+          name: catalog-export-alias-proof
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
+          if-no-files-found: error
+          retention-days: 14
