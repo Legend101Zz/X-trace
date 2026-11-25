@@ -110,6 +110,48 @@ fn openapi_duplicate_method_path_is_reported_not_merged() {
 }
 
 #[test]
+fn openapi_alternates_keep_their_standalone_projection_in_scope_order() {
+    use xtrace_export::{EffectiveState, ExampleOrigin};
+
+    let mut input = spring_orders();
+    let mut alternate_claim = claim("partner-list");
+    alternate_claim.params.push(param("region", "query", "string", true));
+    alternate_claim.responses.push(response("202", "Partner catalogue"));
+    alternate_claim.request_body_media_type = Some("application/json".into());
+    alternate_claim.examples.push(common::example(
+        "param:region",
+        "region",
+        ExampleOrigin::Claim,
+        "north",
+    ));
+    alternate_claim.confidence_basis_points = Some(7500);
+    let mut partner = op("partner", "GET", "/orders", vec![alternate_claim]);
+    partner.application_component = "partner".into();
+    partner.binding_key = "partner-list".into();
+    partner.effective_state = EffectiveState::Observed;
+    input.operations.push(partner);
+
+    let expected = doc(&input);
+    let native = &expected["paths"]["/orders"]["get"];
+    assert_eq!(native["operationId"], "getOrders");
+    assert_eq!(native["x-xtrace"]["operation_id"], "op-list");
+    assert_eq!(native["x-xtrace-observation"], "inferred");
+    let alternates = native["x-xtrace-alternate-operations"].as_array().unwrap();
+    assert_eq!(alternates.len(), 2);
+    for (alternate, id) in alternates.iter().zip(["op-zdup", "partner"]) {
+        assert_eq!(alternate["x-xtrace"]["operation_id"], id);
+        let mut standalone = input.clone();
+        standalone.operations.retain(|op| op.operation_id == id);
+        let mut expected_operation = doc(&standalone)["paths"]["/orders"]["get"].clone();
+        expected_operation.as_object_mut().unwrap().remove("operationId");
+        assert_eq!(alternate, &expected_operation);
+    }
+    assert_eq!(alternates[1]["x-xtrace-observation"], "observed");
+    input.operations.reverse();
+    assert_eq!(doc(&input), expected);
+}
+
+#[test]
 fn openapi_passes_structural_31_validator() {
     // NOTE: structural validator, not the official OpenAPI JSON Schema; see
     // validate.rs. The official-schema check needs a jsonschema dependency.
