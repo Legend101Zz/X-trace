@@ -39,6 +39,7 @@ class CampaignPublication(unittest.TestCase):
         publication.write(self.private / "privacy-canary-report.json",
                           {"clean": True, "scanned": [{"files": 5}], "hits": [], "uncovered": []})
         (self.private / "package.sha256").write_text("c" * 64 + "\n", encoding="ascii")
+        (self.private / "analyzer.sha256").write_text("e" * 64 + "\n", encoding="ascii")
         (self.private / "application.log").write_text(self.canaries["query-token"], encoding="ascii")
 
     def test_success_keeps_frozen_summary_and_exact_named_hashes(self):
@@ -56,7 +57,7 @@ class CampaignPublication(unittest.TestCase):
         self.assertEqual(publication.read(self.public / "publication.json"),
                          {"receiptGeneration": "succeeded", "finalPrivacyScan": "passed"})
         self.assertEqual(len(publication.read(self.summary)["steps"]), 3)
-        for name in ("summary.json", "package.sha256"):
+        for name in ("summary.json", "package.sha256", "analyzer.sha256"):
             target = self.public / name
             original = target.read_bytes()
             target.write_bytes(original + b"changed")

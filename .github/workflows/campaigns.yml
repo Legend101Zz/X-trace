@@ -249,6 +249,8 @@ jobs:
             test -x "$analyzer"
             "$prefix/bin/xtrace" --version
             sha256sum "${archives[0]}" | cut -d' ' -f1 > "$CAMP_OUT/package.sha256"
+            awk '$2 ~ /^share\/xtrace\/analyzers\/java\// { print; found = 1 } END { exit !found }' \
+              "$installed/share/xtrace/payload.sha256" | sha256sum | cut -d' ' -f1 > "$CAMP_OUT/analyzer.sha256"
             printf 'XCAMP_XTRACE=%s\nXCAMP_AGENT=%s\n' "$prefix/bin/xtrace" "$agent" >> "$GITHUB_ENV"
           } > "$RUNNER_TEMP/priv/candidate-install.log" 2>&1
           python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
@@ -296,24 +298,32 @@ jobs:
           echo "INSTR_DIR=${d}" >> "$GITHUB_ENV"
           python3 -B tools/qa/camp_instr_steps.py instrumented --file "$CAMP_OUT/summary.json" --project petclinic \
             --receipt "${d:-/nonexistent}/receipt.json"
-      - name: Build the real Spring MVC analyzer from the candidate sources
-        if: matrix.project == 'petclinic' && always()
-        run: |
-          (umask 077; : >"$RUNNER_TEMP/priv/console/analyzer-source.log")
-          exec >"$RUNNER_TEMP/priv/console/analyzer-source.log" 2>&1
-          (cd adapters/java && ./gradlew --no-daemon --dependency-verification strict :static-analyzer:installDist)
-          echo "XCAMP_ANALYZER=$GITHUB_WORKSPACE/adapters/java/static-analyzer/build/install/xtrace-java-static/bin/xtrace-java-static" >> "$GITHUB_ENV"
-          python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
-            --step analyzer-source-accommodation --status reported \
-            --note "real Spring MVC analyzer built from candidate sources pending installed analyzer qualification"
-      - name: Exports of the recorded project (scanned for canaries below)
+      - name: Scan and export through the installed Spring analyzer
+        id: installed_exports
         if: matrix.project == 'petclinic' && always()
         run: |
           (umask 077; : >"$RUNNER_TEMP/priv/console/exports.log")
           exec >"$RUNNER_TEMP/priv/console/exports.log" 2>&1
+          unset XTRACE_JAVA_ANALYZER
           export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
           python3 -B tools/qa/camp_exports.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
-            --analyzer "$XCAMP_ANALYZER" --out "$RUNNER_TEMP/xt/exports" --file "$CAMP_OUT/summary.json" --project petclinic
+            --out "$RUNNER_TEMP/xt/exports" --file "$CAMP_OUT/summary.json" --project petclinic --require-pass
+      - name: Source analyzer accommodation after an unsuccessful installed scan
+        if: matrix.project == 'petclinic' && always() && steps.unpack.outcome == 'success' && steps.installed_exports.outcome != 'success'
+        run: |
+          set -eu
+          (umask 077; : >"$RUNNER_TEMP/priv/console/analyzer-source.log")
+          exec >"$RUNNER_TEMP/priv/console/analyzer-source.log" 2>&1
+          if python3 -c 'import json,sys; sys.exit(not any(row["step"] == "export-catalog-scan" and row["status"] == "pass" for row in json.load(open(sys.argv[1]))["steps"]))' "$CAMP_OUT/summary.json"; then
+            exit 0
+          fi
+          (cd adapters/java && ./gradlew --no-daemon --dependency-verification strict :static-analyzer:installDist)
+          analyzer="$GITHUB_WORKSPACE/adapters/java/static-analyzer/build/install/xtrace-java-static/bin/xtrace-java-static"
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
+            --step analyzer-source-accommodation --status reported --note "installed scan remains failed; independent source analyzer run attempted"
+          python3 -B tools/qa/camp_exports.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
+            --analyzer "$analyzer" --out "$RUNNER_TEMP/xt/fallback-exports" --file "$CAMP_OUT/fallback-exports-summary.json" --project petclinic
       - name: Browser setup
         if: matrix.project == 'petclinic' && always()
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -450,6 +460,7 @@ jobs:
               --loc "install-log=$RUNNER_TEMP/priv/candidate-install.log" \
               --loc "baseline-artifacts=$CAMP_ROOT/java/petclinic/baseline-1" \
               --loc "baseline-artifacts=$CAMP_OUT/baseline-bodies" \
+              --loc "fallback-exports=$RUNNER_TEMP/xt/fallback-exports" \
               --loc "browser-dom=$RUNNER_TEMP/priv/browser/dom" \
               --loc "browser-assets=$RUNNER_TEMP/priv/browser" \
               --loc "tui-transcript=$RUNNER_TEMP/priv/tui" \

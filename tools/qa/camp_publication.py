@@ -93,7 +93,7 @@ def verify_references(root: pathlib.Path, receipt: dict) -> None:
         rel = entry["path"]
         if not isinstance(rel, str) or rel not in {
             "summary.json", "baseline-receipt.json", "instrumented-receipt.json",
-            "privacy-canary-report.json", "package.sha256",
+            "privacy-canary-report.json", "package.sha256", "analyzer.sha256",
         }:
             raise ValueError("unexpected evidence reference")
         if camp_receipt.ref(root, rel) != entry:
@@ -148,8 +148,16 @@ def publish(args: argparse.Namespace) -> bool:
                     raise ValueError("invalid archive digest")
                 (stage / "package.sha256").write_text(archive_digest + "\n", encoding="ascii")
 
+            analyzer = private / "analyzer.sha256"
+            analyzer_digest = None
+            if analyzer.is_file():
+                analyzer_digest = analyzer.read_text(encoding="ascii").strip()
+                if not ARCHIVE_DIGEST.fullmatch(analyzer_digest):
+                    raise ValueError("invalid installed analyzer inventory digest")
+                (stage / "analyzer.sha256").write_text(analyzer_digest + "\n", encoding="ascii")
             if args.project == "petclinic" and (
-                baseline is None or instrumented is None or not first_scan.is_file() or archive_digest is None
+                baseline is None or instrumented is None or not first_scan.is_file()
+                or archive_digest is None or analyzer_digest is None
             ):
                 raise ValueError("required campaign evidence is missing")
 
@@ -157,6 +165,9 @@ def publish(args: argparse.Namespace) -> bool:
                 stage, args.project, "CAMPAIGN-" + args.project.upper(), args.candidate, definition,
                 summary, instrumented, baseline, archive_digest, args.run_id,
             )
+            if analyzer_digest is not None:
+                receipt["build"]["installedAnalyzerInventorySha256"] = analyzer_digest
+                receipt["artifacts"].append(camp_receipt.ref(stage, "analyzer.sha256"))
             verify_references(stage, receipt)
             write(stage / RECEIPT, receipt)
             # This document is eligible for publication only if this exact tree passes its scan.
