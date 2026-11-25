@@ -22,7 +22,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
 from tools.qa import camp_publication, canary  # noqa: E402
+from campaigns.lib import boundary_diagnostics  # noqa: E402
 from campaigns.lib.private_diagnostic import root_admitted  # noqa: E402
+from campaigns.java.jhipster.harness import collect_sinks  # noqa: E402
 from campaigns.java.jhipster.harness.evidence import EXPECT  # noqa: E402
 
 PHASES = ("prerequisite", "package-verify", "candidate-install", "installed-verify", "checkout-upstream",
@@ -679,6 +681,54 @@ def diagnostic_retention(root, *, root_available=True):
     return output
 
 
+def boundary_manifest(doc):
+    notes = doc.get("notes") if valid_receipt(doc) else None
+    if not isinstance(notes, dict):
+        return None
+    manifest = boundary_diagnostics.projection(notes.get("boundaryDiagnostics"))
+    observed = notes.get("orderedBoundaries")
+    if (manifest is None or not isinstance(observed, list)
+            or len(observed) != len(manifest["phases"])):
+        return None
+    for phase, original in zip(manifest["phases"], observed):
+        if (not isinstance(original, dict) or original.get("kind") != phase["kind"]
+                or original.get("verified") is not (phase["status"] == "verified")):
+            return None
+    return manifest if doc.get("boundariesVerified") is (
+        bool(observed) and manifest["firstUnverifiedPhase"] is None) else None
+
+
+def cli_diagnostics(doc):
+    """Project the first CLI failure only from a consistent bounded collection manifest."""
+    if not isinstance(doc, dict) or doc.get("schema") != "xtrace-jhipster-cli-sinks/2":
+        return None
+    keys = ("listCommands", "detailCommands", "recordings", "completedDetails")
+    if any(count(doc.get(key)) is None for key in keys) or type(doc.get("complete")) is not bool:
+        return None
+    listing, details, listed, completed = (doc[key] for key in keys)
+    if (listing > collect_sinks.MAX_PAGES or details > collect_sinks.MAX_RECORDINGS * collect_sinks.MAX_PAGES
+            or completed > min(details, listed) or listed > collect_sinks.MAX_RECORDINGS + 100):
+        return None
+    failure = doc.get("firstFailure")
+    if doc["complete"]:
+        if failure is not None or not (listing and 0 < completed == listed <= collect_sinks.MAX_RECORDINGS):
+            return None
+    else:
+        if (not isinstance(failure, dict) or set(failure) != {"stage", "reason", "exitCode"}
+                or failure["stage"] not in ("list", "detail") or failure["reason"] not in collect_sinks.FAILURE_REASONS
+                or (failure["stage"] == "list" and (details or completed))
+                or (failure["stage"] == "detail" and not (listing and details and completed < listed))
+                or (failure["reason"] in ("no-recordings", "recording-limit", "duplicate-identity")
+                    and failure["stage"] != "list")
+                or (failure["reason"] == "incomplete-evidence" and failure["stage"] != "detail")):
+            return None
+        code = failure["exitCode"]
+        if (not (type(code) is int and -255 <= code <= 255 and code != 0)
+                if failure["reason"] == "nonzero-exit" else code is not None):
+            return None
+    return {**{key: doc[key] for key in keys}, "firstFailure": failure}
+
+
 def build_summary(root):
     try:
         info = root.lstat()
@@ -731,6 +781,8 @@ def build_summary(root):
                "artifactScope": "saved-api-json-only", "exportBundle": "not-exercised",
                "individualBurstCorrelation": "not-observed", "privacy": scan_sinks(root, values),
                "scannerScope": "raw-and-common-encodings-plus-supported-containers-depth-two"}
+    summary["boundaryDiagnostics"] = boundary_manifest(instrumented)
+    summary["cli"]["diagnostics"] = cli_diagnostics(cli)
     summary["canaryInjection"] = injection_summary(instrumented, values)
     summary["privateRoot"] = root_state
     summary["outerDriver"] = driver_status(root)

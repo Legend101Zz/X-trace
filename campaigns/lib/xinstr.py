@@ -22,6 +22,7 @@ from itertools import groupby
 from typing import Any, Callable
 from urllib.parse import quote
 
+import boundary_diagnostics
 import private_diagnostic
 
 # matched against the class part of a frame symbol such as `OwnerController.findOwner`
@@ -242,17 +243,25 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
     list_gap = ""
     problem = None
     live_timeout = False
+    read_failure = None
+
+    def failed(stage, reason):
+        nonlocal read_failure
+        if read_failure is None:
+            read_failure = {"stage": stage, "reason": reason}
     for pages in range(20):
         q = "/api/v1/recordings?limit=200" + (f"&after={quote(after, safe='')}" if after else "")
         try:
             st, doc = client.get(q)
         except (OSError, http.client.HTTPException) as exc:
             list_gap = "recordings list transport failure"
+            failed("list", "deadline" if isinstance(exc, TimeoutError) else "transport")
             live_timeout = isinstance(exc, TimeoutError) and client.deadline is not None
             break
         (out_dir / f"recordings-page-{pages}.json").write_text(json.dumps(doc, indent=1, sort_keys=True))
         if st != 200:
             list_gap = f"recordings list HTTP {st}"
+            failed("list", "http-status")
             problem = read_problem(st, doc)
             break
         rows = doc.get("recordings") if isinstance(doc, dict) else None
@@ -260,10 +269,12 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
                 or any(not isinstance(row, dict) or not isinstance(row.get("recordingId"), str)
                        or not re.fullmatch(r"[A-Za-z0-9_-]+", row["recordingId"]) for row in rows)):
             list_gap = "recordings list malformed page"
+            failed("list", "schema")
             break
         page_ids = {row["recordingId"] for row in rows}
         if len(page_ids) != len(rows) or listed_ids & page_ids:
             list_gap = "recordings list repeated recording IDs"
+            failed("list", "duplicate-identity")
             break
         listed_ids.update(page_ids)
         listing.extend(rows)
@@ -271,14 +282,17 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             after = _next_page(doc, "nextAfter", seen, bool(rows))
         except (KeyError, ValueError):
             list_gap = "recordings list malformed continuation"
+            failed("list", "cursor")
             break
         if len(listing) > max_recordings or (after is not None and len(listing) >= max_recordings):
             list_gap = "recordings list recording bound reached"
+            failed("list", "recording-limit")
             break
         if after is None:
             break
     else:
         list_gap = "recordings list pagination bound reached"
+        failed("list", "page-limit")
 
     listing = listing[:max_recordings]
     details: dict[str, dict] = {}
@@ -299,18 +313,21 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
                 st, doc = client.get(q)
             except (OSError, http.client.HTTPException) as exc:
                 detail_gap = "detail transport failure"
+                failed("detail", "deadline" if isinstance(exc, TimeoutError) else "transport")
                 live_timeout = isinstance(exc, TimeoutError) and client.deadline is not None
                 break
             if st != 200:
                 if first is None:
                     first = {"_http": st}
                 detail_gap = f"detail HTTP {st}"
+                failed("detail", "http-status")
                 break
             rows = doc.get("events") if isinstance(doc, dict) else None
             if (not isinstance(rows, list) or (cursor is not None and not rows)
                     or any(not isinstance(row, dict) for row in rows)
                     or doc.get("recordingId", rid) != rid):
                 detail_gap = "detail malformed page"
+                failed("detail", "schema")
                 break
             if first is None:
                 first = {k: v for k, v in doc.items() if k != "events"}
@@ -321,11 +338,13 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
                 cursor = _next_page(doc, "nextCursor", seen, bool(rows))
             except (KeyError, ValueError):
                 detail_gap = "detail malformed continuation"
+                failed("detail", "cursor")
                 break
             if cursor is None:
                 break
         else:
             detail_gap = "detail pagination bound reached"
+            failed("detail", "page-limit")
         d = dict(first or {})
         d["events"] = events
         if detail_gap is not None:
@@ -347,6 +366,8 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
                              if len(details) < len(listing) else "")
     reason = list_gap or detail_collection_gap or first_detail_gap
     result = {"ok": not reason, "reason": reason, "recordings": listing, "details": details}
+    if read_failure is not None:
+        result["readFailure"] = read_failure
     if list_gap:
         result["listReadGap"] = list_gap
     if detail_collection_gap:
@@ -611,17 +632,33 @@ def burst_accounting(details: dict[str, dict], sent: list[tuple[str | None, str,
 def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list, expectations: dict,
                         before: dict, deadline: float, *, require_complete: bool = False,
                         before_capacity: dict[str, int] | None = None,
-                        optional_roots: tuple[tuple[str, str, int], ...] = ()) -> dict[str, Any]:
+                        optional_roots: tuple[tuple[str, str, int], ...] = (), diagnose: bool = False) -> dict[str, Any]:
     """Poll observable read state within the caller's remaining scenario budget; no drain sleep."""
     boundary = burst_accounting({}, sent, expectations, before, before_capacity, optional_roots)
+    polls, observed, observed_poll, failure = 0, None, None, None
+
+    def annotate(status):
+        if diagnose:
+            # Project only after the original boundary decision. A diagnostic walk must not
+            # consume time inside the polling loop or change an on-time verification.
+            snapshot = (boundary_diagnostics.snapshot(observed[0], observed[1], before, observed[2])
+                        if observed is not None else None)
+            boundary["diagnostic"] = {"status": status, "polls": polls, "failure": failure,
+                                      "snapshot": snapshot, "snapshotPoll": observed_poll}
+
     client.deadline = deadline
     try:
         while time.monotonic() < deadline:
+            polls += 1
             api = collect_api(client, out_dir)
             # Keep observed counts for diagnosis even when the snapshot cannot verify the boundary.
             if api["ok"] or api["details"]:
                 boundary = burst_accounting(api["details"], sent, expectations, before, before_capacity, optional_roots)
+            if diagnose and (api["ok"] or api["details"] or api.get("recordings")):
+                observed = api["details"], api.get("recordings"), boundary
+                observed_poll = polls
             if not api["ok"]:
+                failure = api.get("readFailure", {"stage": "snapshot", "reason": "unavailable"})
                 boundary["readError"] = api["reason"]
                 if "problem" in api:
                     boundary["readProblem"] = api["problem"]
@@ -630,13 +667,16 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
                 if require_complete and (boundary["capacityDrops"] or boundary["partialRecordingIds"]):
                     boundary["verified"] = False
                     boundary["verifiedAt"] = None
+                annotate("verified" if boundary["verified"] else "strict-serial")
                 return boundary
     except OSError:
+        failure = {"stage": "snapshot", "reason": "io-error"}
         boundary["readError"] = "recording snapshot could not be read or saved"
     finally:
         client.deadline = None
     boundary["verified"] = False
     boundary["verifiedAt"] = None
+    annotate("read" if failure is not None else "deadline")
     return boundary
 
 
@@ -1091,10 +1131,14 @@ def capture_ordered_phases(stack: Any, scenarios: list, norm_extra: list, expect
             scoped = {result["id"]: expectations[result["id"]] for result in results}
             boundary = wait_burst_boundary(client, out_dir / f"phase-{index + 1}-api", sent, scoped, before, deadline,
                                            require_complete=not concurrent, before_capacity=counters,
-                                           optional_roots=tuple(pre_dispatch_roots))
+                                           optional_roots=tuple(pre_dispatch_roots), diagnose=True)
         else:
             boundary = burst_accounting({}, sent, {}, before, counters)
             boundary.update(verified=False, verifiedAt=None, readError="prior recording boundary unverified")
+            boundary["diagnostic"] = {"status": "initial-unverified" if index == 0 else "prior-unverified",
+                                      "polls": 0, "failure": None, "snapshot": None, "snapshotPoll": None}
+        if "diagnostic" in boundary:
+            boundary["diagnostic"].update(ordinal=index + 1, kind=kind)
         boundary["preDispatchRequests"] = len(pre_dispatch_roots)
         phases.append(OrderedPhase(kind, results, boundary))
         trusted = boundary["verified"]
@@ -1160,6 +1204,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     phases: list[OrderedPhase] = []
     probes: list[dict] = []
     ordered_request_attempts = 0
+    initial_diagnostic = {"status": "not-reached", "failure": None}
     try:
         t0 = time.perf_counter()
         if ordered_campaign is not None:
@@ -1176,13 +1221,19 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
                 live_client = None
                 initial_details = None
                 try:
+                    initial_diagnostic["status"] = "viewer-start"
                     live_viewer, ready = start_viewer(xtrace, project_dir, env, out_dir / "boundary-viewer.log")
                     live_client = ViewerClient(ready["origin"])
+                    initial_diagnostic["status"] = "viewer-auth"
                     live_client.exchange(bootstrap_token(ready["url"]))
+                    initial_diagnostic.update(status="read", failure={"stage": "snapshot", "reason": "io-error"})
                     initial = collect_api(live_client, out_dir / "boundary-before")
                     if initial["ok"]:
                         initial_details = initial["details"]
+                        initial_diagnostic.update(status="verified", failure=None)
                     else:
+                        initial_diagnostic["failure"] = initial.get(
+                            "readFailure", {"stage": "snapshot", "reason": "unavailable"})
                         notes["initialBoundaryFailure"] = initial["reason"]
                 except Exception as exc:
                     notes["initialBoundaryFailure"] = type(exc).__name__
@@ -1195,6 +1246,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
                 ordered_request_attempts = len(xcamp.SENT_LOG)
                 probes = ordered_campaign.inject_probes(stack.base, canaries)
             notes["orderedBoundaries"] = [{"kind": phase.kind, **phase.boundary} for phase in phases]
+            notes["boundaryDiagnostics"] = {"schemaVersion": 1, "initial": initial_diagnostic,
+                                            "phases": [phase.boundary.get("diagnostic") for phase in phases]}
         else:
             stack.up()
             boot_ms = round((time.perf_counter() - t0) * 1000)

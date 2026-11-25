@@ -529,6 +529,8 @@ class CollectSinks(unittest.TestCase):
         status = json.loads((self.root / "sinks/cli-status.json").read_text())
         self.assertEqual(status["commandExits"], [0, 0])
         self.assertTrue(status["artifactComplete"])
+        self.assertEqual(public.cli_diagnostics(status), {"listCommands": 1, "detailCommands": 1,
+                         "recordings": 1, "completedDetails": 1, "firstFailure": None})
         with zipfile.ZipFile(self.root / "sinks/recordings.zip") as archive:
             self.assertEqual(archive.namelist(), ["api-0000.json"])
 
@@ -541,6 +543,9 @@ class CollectSinks(unittest.TestCase):
         status = json.loads((self.root / "sinks/cli-status.json").read_text())
         self.assertFalse(status["complete"])
         self.assertEqual(status["commandExits"], [7])
+        self.assertEqual(public.cli_diagnostics(status)["firstFailure"],
+                         {"stage": "list", "reason": "nonzero-exit", "exitCode": 7})
+        self.assertNotIn("private transport diagnostic", json.dumps(public.cli_diagnostics(status)))
         self.assertEqual((self.root / "sinks/cli/list-00.stderr").read_bytes(), b"private transport diagnostic")
 
     def test_timeout_is_not_an_exit_zero_or_complete_read(self):
@@ -549,6 +554,46 @@ class CollectSinks(unittest.TestCase):
         status = json.loads((self.root / "sinks/cli-status.json").read_text())
         self.assertEqual(status["commandExits"], [None])
         self.assertFalse(status["complete"])
+        self.assertEqual(public.cli_diagnostics(status)["firstFailure"],
+                         {"stage": "list", "reason": "command-timeout", "exitCode": None})
+
+    def test_detail_schema_failure_after_listing_preserves_safe_counts_and_artifact(self):
+        def malformed(args, **kwargs):
+            if args[2] == "list":
+                return self.run_cli(args, **kwargs)
+            kwargs["stdout"].write(json.dumps(
+                {"recording_id": "rec-1", "events": "private-detail-bytes", "next_cursor": None}).encode())
+            return subprocess.CompletedProcess(args, 0)
+        with mock.patch.object(sinks.subprocess, "run", side_effect=malformed):
+            self.assertFalse(sinks.collect(self.root))
+        status = json.loads((self.root / "sinks/cli-status.json").read_text())
+        diagnostic = public.cli_diagnostics(status)
+        self.assertEqual(diagnostic, {"listCommands": 1, "detailCommands": 1, "recordings": 1,
+                         "completedDetails": 0, "firstFailure": {
+                             "stage": "detail", "reason": "invalid-schema", "exitCode": None}})
+        self.assertTrue(status["artifactComplete"])
+        self.assertNotIn("private-detail-bytes", json.dumps(diagnostic))
+        status["firstFailure"]["reason"] = "private CLI message"
+        self.assertIsNone(public.cli_diagnostics(status))
+        status["firstFailure"] = {"stage": "list", "reason": "invalid-schema", "exitCode": None}
+        self.assertIsNone(public.cli_diagnostics(status))
+
+    def test_detail_paging_reports_a_repeated_cursor_as_the_first_failure(self):
+        def cycle(args, **kwargs):
+            if args[2] == "list":
+                return self.run_cli(args, **kwargs)
+            kwargs["stdout"].write(json.dumps(
+                {"recording_id": "rec-1", "events": [{}], "next_cursor": "private-cursor"}).encode())
+            return subprocess.CompletedProcess(args, 0)
+        with mock.patch.object(sinks.subprocess, "run", side_effect=cycle) as run:
+            self.assertFalse(sinks.collect(self.root))
+        self.assertEqual(run.call_count, 3)
+        status = json.loads((self.root / "sinks/cli-status.json").read_text())
+        diagnostic = public.cli_diagnostics(status)
+        self.assertEqual(diagnostic["detailCommands"], 2)
+        self.assertEqual(diagnostic["firstFailure"],
+                         {"stage": "detail", "reason": "invalid-cursor", "exitCode": None})
+        self.assertNotIn("private-cursor", json.dumps(diagnostic))
 
     def test_pagination_cycle_cannot_pass(self):
         def cycle(args, **kwargs):

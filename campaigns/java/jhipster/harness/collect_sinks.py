@@ -18,6 +18,18 @@ MAX_RECORDINGS = 100
 MAX_PAGES = 40
 MAX_OUTPUT = 16 << 20
 TOTAL_SECONDS = 180
+FAILURE_REASONS = (
+    "deadline", "command-timeout", "nonzero-exit", "output-limit", "io-error",
+    "invalid-json", "invalid-schema", "invalid-identity", "duplicate-identity",
+    "missing-cursor", "invalid-cursor", "pagination-limit", "recording-limit",
+    "no-recordings", "incomplete-evidence",
+)
+
+
+class CollectionFailure(Exception):
+    def __init__(self, reason, exit_code=None):
+        self.reason = reason
+        self.exit_code = exit_code
 
 
 def limit_output():
@@ -31,8 +43,9 @@ def collect(root: Path) -> bool:
         raise ValueError("collection root is not owner-only")
     output = root / "sinks" / "cli"
     output.mkdir(parents=True, mode=0o700)
-    status = {"schema": "xtrace-jhipster-cli-sinks/1", "complete": False,
-              "listCommands": 0, "detailCommands": 0, "recordings": 0, "commandExits": []}
+    status = {"schema": "xtrace-jhipster-cli-sinks/2", "complete": False,
+              "listCommands": 0, "detailCommands": 0, "recordings": 0,
+              "completedDetails": 0, "commandExits": [], "firstFailure": None}
     env = {**os.environ, "XTRACE_DATA_HOME": str(root / "data"), "TMPDIR": str(root / "tmp")}
     binary = root / "installed X-trace" / "bin" / "xtrace"
     project = root / "campaign" / "java" / "jhipster" / "src"
@@ -41,7 +54,7 @@ def collect(root: Path) -> bool:
     def command(args, label):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ValueError("collection time bound reached")
+            raise CollectionFailure("deadline")
         stdout, stderr = output / (label + ".stdout"), output / (label + ".stderr")
         # File redirection keeps raw output private even on failure or timeout.
         with stdout.open("xb") as out, stderr.open("xb") as err:
@@ -52,14 +65,20 @@ def collect(root: Path) -> bool:
                 status["commandExits"].append(result.returncode)
             except subprocess.TimeoutExpired:
                 status["commandExits"].append(None)
-                raise ValueError("CLI command timeout") from None
-        if result.returncode or stdout.stat().st_size > MAX_OUTPUT or stderr.stat().st_size > MAX_OUTPUT:
-            raise ValueError("CLI command failed or exceeded read bound")
-        doc = json.loads(stdout.read_bytes())
+                raise CollectionFailure("command-timeout") from None
+        if result.returncode:
+            raise CollectionFailure("nonzero-exit", result.returncode)
+        if stdout.stat().st_size > MAX_OUTPUT or stderr.stat().st_size > MAX_OUTPUT:
+            raise CollectionFailure("output-limit")
+        try:
+            doc = json.loads(stdout.read_bytes())
+        except (ValueError, RecursionError):
+            raise CollectionFailure("invalid-json") from None
         if not isinstance(doc, dict):
-            raise ValueError("CLI response is not an object")
+            raise CollectionFailure("invalid-schema")
         return doc
 
+    stage = "list"
     try:
         ids, after, seen = [], None, set()
         for page in range(MAX_PAGES):
@@ -68,45 +87,58 @@ def collect(root: Path) -> bool:
             doc = command(args, f"list-{page:02d}")
             rows = doc.get("recordings")
             if not isinstance(rows, list):
-                raise ValueError("CLI list is malformed")
+                raise CollectionFailure("invalid-schema")
             for row in rows:
                 rid = row.get("recording_id") if isinstance(row, dict) else None
-                if not isinstance(rid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", rid) or rid in ids:
-                    raise ValueError("CLI recording identity is invalid or repeated")
+                if not isinstance(rid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", rid):
+                    raise CollectionFailure("invalid-identity")
+                if rid in ids:
+                    raise CollectionFailure("duplicate-identity")
                 ids.append(rid)
             status["recordings"] = len(ids)
-            if len(ids) > MAX_RECORDINGS or "next_after" not in doc:
-                raise ValueError("CLI listing bound or contract gap")
+            if len(ids) > MAX_RECORDINGS:
+                raise CollectionFailure("recording-limit")
+            if "next_after" not in doc:
+                raise CollectionFailure("missing-cursor")
             after = doc["next_after"]
             if after is None:
                 break
             if not isinstance(after, str) or not after or after in seen or not rows:
-                raise ValueError("CLI list continuation is invalid")
+                raise CollectionFailure("invalid-cursor")
             seen.add(after)
         else:
-            raise ValueError("CLI list pagination bound reached")
+            raise CollectionFailure("pagination-limit")
         if not ids:
-            raise ValueError("CLI listed no recordings")
+            raise CollectionFailure("no-recordings")
+        stage = "detail"
         for index, rid in enumerate(ids):
             cursor, seen = None, set()
             for page in range(MAX_PAGES):
                 args = ["show", rid, "--limit", "1000"] + (["--cursor", cursor] if cursor else [])
                 status["detailCommands"] += 1
                 doc = command(args, f"detail-{index:03d}-{page:02d}")
-                if (doc.get("recording_id") != rid or not isinstance(doc.get("events"), list)
-                        or "next_cursor" not in doc or doc.get("incomplete_evidence")):
-                    raise ValueError("CLI detail contract or completeness gap")
+                if doc.get("recording_id") != rid:
+                    raise CollectionFailure("invalid-identity")
+                if not isinstance(doc.get("events"), list):
+                    raise CollectionFailure("invalid-schema")
+                if "next_cursor" not in doc:
+                    raise CollectionFailure("missing-cursor")
+                if doc.get("incomplete_evidence"):
+                    raise CollectionFailure("incomplete-evidence")
                 cursor = doc["next_cursor"]
                 if cursor is None:
+                    status["completedDetails"] += 1
                     break
                 if not isinstance(cursor, str) or not cursor or cursor in seen or not doc["events"]:
-                    raise ValueError("CLI detail continuation is invalid")
+                    raise CollectionFailure("invalid-cursor")
                 seen.add(cursor)
             else:
-                raise ValueError("CLI detail pagination bound reached")
+                raise CollectionFailure("pagination-limit")
         status["complete"] = True
+    except CollectionFailure as error:
+        status["firstFailure"] = {"stage": stage, "reason": error.reason, "exitCode": error.exit_code}
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
-        pass
+        status["firstFailure"] = {"stage": stage, "reason": "io-error", "exitCode": None}
     artifact = root / "sinks" / "recordings.zip"
     status["artifactComplete"] = False
     try:

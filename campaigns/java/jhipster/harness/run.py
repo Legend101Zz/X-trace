@@ -460,7 +460,8 @@ def instrumented():
         norm_extra=[], expectations=evidence.EXPECT, xtrace=xtrace, project_dir=SRC, data_home=data_home,
         adaptations=CAMP["configAdaptations"], canaries=canaries, baseline_receipt=None, extra_canary_paths=[],
         baseline_fingerprints=baseline_fingerprints,
-        harness_files=[HERE, pathlib.Path(evidence.__file__), pathlib.Path(xinstr.__file__), pathlib.Path(xcamp.__file__)],
+        harness_files=[HERE, pathlib.Path(evidence.__file__), pathlib.Path(xinstr.__file__), pathlib.Path(xcamp.__file__),
+                       pathlib.Path(xinstr.boundary_diagnostics.__file__)],
         ordered_campaign=xinstr.OrderedCampaign(evidence.PRE_DISPATCH, evidence.inject_probes, evidence.judge))
     print(json.dumps({"result": receipt["result"], "workloadsPassed": receipt["workloadsPassed"],
                       "sameRunnerBaselineMatched": receipt["baselineMatched"],
