@@ -16,7 +16,7 @@ use std::{path::PathBuf, sync::OnceLock};
 use rusqlite::{Connection, params, types::Value};
 use uuid::Uuid;
 use xtrace_private_storage::AdmittedPrivateRoot;
-use xtrace_store::{OpenOptions, SqliteStore};
+use xtrace_store::Migrations;
 
 const V9_SQL: &str = include_str!("../src/lane_sql/catalog_v9.sql");
 
@@ -63,9 +63,17 @@ fn catalog_cases() -> &'static CatalogCases {
 fn fresh_database(parent: &AdmittedPrivateRoot) -> (AdmittedPrivateRoot, Connection) {
     let dir = parent.create_private_child("db").expect("private database directory");
     let path = dir.path().join("xtrace.sqlite3");
-    drop(SqliteStore::open(&path, OpenOptions::default()).expect("store opens and migrates"));
-    let connection = Connection::open(&path).expect("raw connection");
+    let mut connection = Connection::open(&path).expect("raw connection");
     connection.pragma_update(None, "foreign_keys", true).expect("foreign keys on");
+    // The orphan SQL verifies a historical rebuild and must start from v10,
+    // before the registered migration adds new nullable evidence columns.
+    for migration in Migrations::catalog().into_iter().take_while(|record| record.version <= 10) {
+        let tx = connection.transaction().expect("migration transaction");
+        for sql in migration.statements {
+            tx.execute_batch(sql).expect("historical schema");
+        }
+        tx.commit().expect("commit historical schema");
+    }
     (dir, connection)
 }
 

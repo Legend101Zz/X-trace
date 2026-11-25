@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './main';
 import { retainPage } from './retained-page';
@@ -47,7 +47,7 @@ function defaultFetch(input: RequestInfo | URL) {
   if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response(endpoints));
   if (path.includes('/recordings?unmatched=true')) return Promise.resolve(response(unmatched));
   if (path.includes('/api/v1/endpoints/') && path.includes('/recordings')) return Promise.resolve(response(linked));
-  if (path.startsWith('/api/v1/recordings/')) return Promise.resolve(response(detail(path.split('/')[4])));
+  if (path.startsWith('/api/v1/recordings/')) return Promise.resolve(response(detail(path.split('?')[0].split('/')[4])));
   throw new Error(`Unexpected request ${path}`);
 }
 
@@ -63,18 +63,23 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     expect(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ })).toBeInTheDocument();
     expect(screen.getByText('Operator-selected policy')).toBeInTheDocument();
-    expect(screen.getByText('spring-orders-v1 does not attest which adapter or application produced the event.')).toBeInTheDocument();
+    expect(screen.getByText(/The policy does not attest which adapter or application produced the event/)).toBeInTheDocument();
+    expect(screen.getByText('Representative policy: spring-orders-v1')).toBeInTheDocument();
     expect(window.location.hash).toBe('');
     expect(window.location.search).toBe('?keep=query');
 
     const calls = vi.mocked(fetch).mock.calls.map(([input]) => route(input as RequestInfo | URL));
     expect(calls.some((url) => url.startsWith('/api/v1/recordings?'))).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
-    expect(await screen.findByRole('button', { name: new RegExp(recordingA) })).toBeInTheDocument();
+    const linkedRow = await screen.findByRole('button', { name: new RegExp(recordingA) });
+    expect(linkedRow).toBeInTheDocument();
+    expect(linkedRow).toHaveTextContent('Recording policy: spring-orders-v1');
+    expect(linkedRow.querySelector('time')).toHaveAttribute('datetime', linked.items[0].openedAt);
+    expect(document.querySelectorAll('.recording-date-heading')).toHaveLength(1);
     expect(screen.queryByText(recordingB)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingA) }));
-    expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
     fireEvent.keyDown(window, { key: 'ArrowDown', altKey: true });
     expect(window.location.hash).toBe('');
     for (const [input, init] of vi.mocked(fetch).mock.calls) {
@@ -88,14 +93,61 @@ describe('endpoint-first recording viewer', () => {
   it('keeps unmatched separate and displays a legacy null reason without inventing one', async () => {
     render(<App />);
     await screen.findByText('Operator-selected policy');
-    fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
-    expect(await screen.findByRole('button', { name: new RegExp(recordingB) })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
+    const unmatchedRow = await screen.findByRole('button', { name: new RegExp(recordingB) });
+    expect(unmatchedRow).toBeInTheDocument();
+    expect(unmatchedRow).toHaveTextContent('The observation policy did not approve the route.');
+    expect(unmatchedRow).not.toHaveTextContent('route_unapproved');
+    expect(unmatchedRow.querySelector('time')).toHaveAttribute('datetime', unmatched.items[0].openedAt);
+    expect(document.querySelectorAll('.recording-date-heading')).toHaveLength(2);
     const legacyRow = screen.getByRole('button', { name: new RegExp(legacyV4) });
     expect(legacyRow).toHaveTextContent('No historical reason recorded');
+    expect(legacyRow).toHaveTextContent('Recording policy: Unavailable');
     expect(legacyRow).not.toHaveTextContent('route_unapproved');
     fireEvent.click(legacyRow);
-    expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call')).toBeInTheDocument();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL).includes(`/${legacyV4}?limit=200`))).toBe(true);
+  });
+
+  it('discloses the representative policy separately from each recording and hides raw unrecognized evidence', async () => {
+    const cases = [
+      ['catalog_revision_unavailable', 'The catalog revision was unavailable.'],
+      ['route_template_unavailable_or_ineligible', 'A route template eligible for catalog linking was unavailable.'],
+      ['no_catalog_match', 'No eligible operation matched the recorded catalog context.'],
+      ['PRIVATE-UNRECOGNIZED-REASON', 'The recorded reason is unavailable in this viewer.'],
+    ];
+    const reasonItems = cases.map(([unmatchedReason], index) => ({
+      ...unmatched.items[0], recordingId: `reason-fixture-${index}`, unmatchedReason,
+      observationPolicy: index === 3 ? 'PRIVATE-UNRECOGNIZED-POLICY' : 'runtime-route-v1',
+    }));
+    vi.mocked(fetch).mockImplementation((input) => {
+      const path = route(input);
+      if (path.includes('/recordings?unmatched=true')) return Promise.resolve(response({ items: reasonItems, nextCursor: null }));
+      if (path.includes('/api/v1/endpoints/') && path.includes('/recordings')) {
+        return Promise.resolve(response({ ...linked, items: [{ ...linked.items[0], observationPolicy: 'runtime-route-v1' }] }));
+      }
+      return defaultFetch(input);
+    });
+
+    render(<App />);
+    const endpoint = await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ });
+    expect(endpoint).toHaveTextContent('Representative policy: spring-orders-v1');
+    fireEvent.click(endpoint);
+    const recording = await screen.findByRole('button', { name: new RegExp(recordingA) });
+    expect(recording).toHaveTextContent('Recording policy: runtime-route-v1');
+    expect(recording).not.toHaveTextContent('spring-orders-v1');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
+    for (const [index, [code, label]] of cases.entries()) {
+      const row = await screen.findByRole('button', { name: new RegExp(reasonItems[index].recordingId) });
+      expect(row).toHaveTextContent(label);
+      expect(row).not.toHaveTextContent(code);
+      expect(row).toHaveTextContent(index === 3 ? 'Recording policy: Unavailable' : 'Recording policy: runtime-route-v1');
+      expect(row).not.toHaveTextContent('PRIVATE-UNRECOGNIZED-POLICY');
+    }
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search loaded requests' }), { target: { value: 'catalog revision' } });
+    expect(screen.getByRole('button', { name: /reason-fixture-0/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /reason-fixture-1/ })).not.toBeInTheDocument();
   });
 
   it('ignores an obsolete linked 401 and clears that lane after returning to endpoints', async () => {
@@ -128,12 +180,12 @@ describe('endpoint-first recording viewer', () => {
       if (path === '/api/v1/auth/exchange') return Promise.resolve(response({ authenticated: true }));
       if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response(endpoints));
       if (path.includes('/recordings?unmatched=true')) return new Promise((resolve) => { resolveUnmatched = resolve; });
-      if (path.startsWith('/api/v1/recordings/')) return Promise.resolve(response(detail(path.split('/')[4], 'stale-unmatched-selection')));
+      if (path.startsWith('/api/v1/recordings/')) return Promise.resolve(response(detail(path.split('?')[0].split('/')[4], 'stale-unmatched-selection')));
       throw new Error(`Unexpected request ${path}`);
     });
     render(<App />);
     await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ });
-    fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
     await waitFor(() => expect(resolveUnmatched).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: 'Observed endpoints' }));
     await act(async () => { resolveUnmatched?.(response(body, status)); });
@@ -161,7 +213,7 @@ describe('endpoint-first recording viewer', () => {
     await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ });
     fireEvent.click(screen.getAllByRole('button', { name: 'Refresh' })[0]);
     await waitFor(() => expect(endpointRequests).toBe(2));
-    fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
     expect(await screen.findByRole('button', { name: new RegExp(recordingB) })).toBeInTheDocument();
     await act(async () => { resolveOld?.(response({ detail: 'stale endpoint error' }, 422)); });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
@@ -180,7 +232,7 @@ describe('endpoint-first recording viewer', () => {
     });
     render(<App />);
     await screen.findByText('Operator-selected policy');
-    fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
     await screen.findByRole('button', { name: new RegExp(recordingB) });
     fireEvent.click(screen.getByRole('button', { name: 'Load next page' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Request failed with status 422.');
@@ -212,11 +264,49 @@ describe('endpoint-first recording viewer', () => {
     fireEvent.click(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
     await waitFor(() => expect(resolveFirst).toBeDefined());
+    expect(screen.queryByLabelText('Recording summary')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
-    expect(await screen.findByText('newer-recording-detail')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('newer-recording-detail')).toBeInTheDocument();
     await act(async () => { resolveFirst?.(response(detail(recordingA, 'stale-recording-detail'))); });
     expect(screen.getByRole('heading', { name: recordingB })).toBeInTheDocument();
     expect(screen.queryByText('stale-recording-detail')).not.toBeInTheDocument();
+  });
+
+
+  it('checks for arrivals while replaying if the Requests sidebar is visible', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    const now = vi.spyOn(window, 'setInterval');
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
+    await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call');
+
+    const search = screen.getByRole('searchbox', { name: 'Search loaded requests' });
+    const layout = vi.spyOn(search, 'getClientRects').mockReturnValue({ length: 0 } as DOMRectList);
+    const callback = now.mock.calls.filter(([, delay]) => delay === 15_000).at(-1)?.[0];
+    if (typeof callback !== 'function') throw new Error('Missing Requests timer');
+    const linkedCalls = () => vi.mocked(fetch).mock.calls.filter(([input]) => route(input).includes(`/endpoints/${operationA}/recordings`));
+    try {
+      await act(async () => { callback(); });
+      expect(linkedCalls()).toHaveLength(1);
+
+      layout.mockReturnValue({ length: 1 } as DOMRectList);
+      await act(async () => { callback(); });
+      expect(linkedCalls()).toHaveLength(2);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
+      await screen.findByRole('button', { name: new RegExp(recordingB) });
+      const stale = now.mock.calls.filter(([, delay]) => delay === 15_000).at(-1)?.[0];
+      if (typeof stale !== 'function') throw new Error('Missing unlinked Requests timer');
+      fireEvent.click(screen.getByRole('button', { name: 'Observed endpoints' }));
+      await act(async () => { stale(); });
+      const unmatchedCalls = vi.mocked(fetch).mock.calls.filter(([input]) => route(input).includes('/recordings?unmatched=true'));
+      expect(unmatchedCalls).toHaveLength(1);
+    } finally {
+      layout.mockRestore();
+      now.mockRestore();
+      visibility.mockRestore();
+    }
   });
 
   it('expires the current viewer session after an authenticated endpoint request returns 401', async () => {
@@ -226,7 +316,7 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     expect(await screen.findByText('Viewer session expired')).toBeInTheDocument();
     expect(screen.queryByText('sensitive server wording')).not.toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: 'recordings' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Requests' })).toBeInTheDocument();
   });
 
   it('keeps event stepping, truncation, unavailable evidence, and recording-scoped cursors', async () => {
@@ -239,7 +329,7 @@ describe('endpoint-first recording viewer', () => {
       if (path === '/api/v1/auth/exchange') return Promise.resolve(response({ authenticated: true }));
       if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response(endpoints));
       if (path.includes(`/endpoints/${operationA}/recordings`)) return Promise.resolve(response({ ...linked, items: [linked.items[0], { ...linked.items[0], recordingId: recordingB }] }));
-      if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200&cursor=`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: null, events: [{ sequence: '3', frameId: null, navigation: navigationUnavailable, monotonicNs: '30', kind: 'method', symbol: 'fixture.Service.call', sourceBinding: 'unspecified', fieldTruncations: [] }] }));
+      if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200&cursor=`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: null, events: [{ sequence: '300', frameId: null, navigation: navigationUnavailable, monotonicNs: '30', kind: 'method', symbol: 'fixture.Service.call', sourceBinding: 'unspecified', fieldTruncations: [] }] }));
       if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: 'recording-a-next', events: firstEvents }));
       if (path.startsWith(`/api/v1/recordings/${recordingB}?limit=200`)) return Promise.resolve(response(detail(recordingB, 'recording-b-only')));
       throw new Error(`Unexpected request ${path}`);
@@ -247,24 +337,37 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
-    await screen.findByText('fixture.Controller.handle');
+    await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Controller.handle');
     fireEvent.keyDown(window, { key: 'ArrowDown', altKey: true });
-    expect(await screen.findByText('recording_event_kind:gap')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('Events were not recorded here')).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('Event 2 selected');
-    fireEvent.click(screen.getByRole('button', { name: /recording_event_kind:gap/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Events were not recorded here/ }));
+    expect(screen.getByText('recording_event_kind:gap')).toBeInTheDocument();
     expect(screen.getByText('symbol truncated · 300 bytes')).toBeInTheDocument();
     expect(screen.getByText('Source location is unavailable for this event')).toBeInTheDocument();
-    expect(screen.getByText(/No value bindings were recorded for this event/)).toBeInTheDocument();
     expect(screen.getByText('Per-event duration is not recorded')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: 'events' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Load next window' }));
-    expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /^Values/ }));
+    expect(screen.getByText(/No value bindings were recorded for this event/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Load later' }));
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /fixture\.Service\.call/ }));
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL) === `/api/v1/recordings/${recordingA}?limit=200&cursor=recording-a-next`)).toBe(true);
-    fireEvent.click(screen.getByRole('tab', { name: 'recordings' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Requests' }));
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
-    expect(await screen.findByText('recording-b-only')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('recording-b-only')).toBeInTheDocument();
     expect(screen.queryByText('fixture.Service.call')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Load next window' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Load later' })).not.toBeInTheDocument();
+
+    const tabs = screen.getByRole('tablist', { name: 'Open recordings' });
+    fireEvent.keyDown(within(tabs).getByRole('tab', { name: new RegExp(recordingB) }), { key: 'ArrowLeft' });
+    const restored = await screen.findByRole('button', { name: /fixture\.Service\.call/ });
+    expect(restored).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByLabelText('Recording summary')).toHaveTextContent('Event sequence 300');
+    expect(screen.queryByText('fixture.Controller.handle')).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.filter(([input]) =>
+      route(input as RequestInfo | URL) === `/api/v1/recordings/${recordingA}?limit=200&cursor=recording-a-next`,
+    )).toHaveLength(2);
   });
 
   it('shows only matched bounded source returned for a compile-attested frame', async () => {

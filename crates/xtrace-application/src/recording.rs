@@ -179,10 +179,41 @@ pub struct EndpointObservationInput {
     pub application_component: Option<String>,
     /// Optional paired run-scoped binding key.
     pub binding_key: Option<String>,
+    /// Run-selected immutable revision and framework for the general policy.
+    pub runtime_catalog: Option<RuntimeCatalogSelection>,
     /// Adapter supplied method, not trusted until classified.
     pub method: String,
     /// Adapter supplied matched route template, not trusted until classified.
     pub route_template: String,
+}
+
+/// Admitted launch dialect. Other adapters cannot opt into the route matcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeCatalogDialect {
+    /// The matched Spring MVC mapping template.
+    SpringMvc,
+    /// The matched Express route and declared mounts.
+    Express,
+}
+
+impl RuntimeCatalogDialect {
+    /// The corresponding static route normalizer.
+    pub const fn framework(self) -> xtrace_domain::endpoint_normalization::RouteFramework {
+        use xtrace_domain::endpoint_normalization::RouteFramework;
+        match self {
+            Self::SpringMvc => RouteFramework::SpringMvc,
+            Self::Express => RouteFramework::Express,
+        }
+    }
+}
+
+/// Local operator scope for runtime catalog linking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeCatalogSelection {
+    /// An absent revision leaves the recording unmatched.
+    pub revision_id: Option<xtrace_domain::CatalogRevisionId>,
+    /// Dialect determined by the supported launcher.
+    pub dialect: RuntimeCatalogDialect,
 }
 
 /// Idempotency disposition returned by a recording-anchor port.

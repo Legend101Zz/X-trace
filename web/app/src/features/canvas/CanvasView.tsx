@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import { projectFrameGraph, treeRows } from '../../replay/graph';
 import type { GraphFrame } from '../../replay/graph';
 import type { NavAction } from '../../replay/navigation';
 import type { ReplayEvent } from '../../types';
+import { revealWithin } from '../common/reveal-within';
+import './canvas.css';
 
 const NODE_W = 168;
 const NODE_H = 28;
@@ -49,20 +51,18 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
   const width = Math.max(1, Math.ceil(Math.max(0, ...drawn.map((node) => node.column)) + 1)) * (NODE_W + COL_GAP);
   const height = Math.max(1, Math.max(0, ...drawn.map((node) => node.layer)) + 1) * (NODE_H + ROW_GAP);
   const kindOf = (node: { kind: string }) => (node.kind.toLowerCase() === 'gap' || node.kind.toLowerCase().endsWith(':gap') ? 'gap' : 'frame');
-  useEffect(() => {
-    // Keep the selection visible in the scroll region without moving focus.
-    const element = treeRef.current?.querySelector('[aria-selected="true"]');
-    (element as (Element & { scrollIntoView?: (options?: object) => void }) | null)?.scrollIntoView?.({ block: 'nearest' });
-    const svgNode = scrollRef.current?.querySelector('[data-selected="true"]');
-    (svgNode as (Element & { scrollIntoView?: (options?: object) => void }) | null)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
-  }, [selectedFrameId]);
-  // Move focus only when the roving focus key changes while focus is already inside the tree;
-  // toggling an Expand button re-renders without changing the key and must not steal focus.
+  useLayoutEffect(() => {
+    revealWithin(treeRef.current, treeRef.current?.querySelector('[aria-selected="true"]') ?? null, 'both');
+    revealWithin(scrollRef.current, scrollRef.current?.querySelector('[data-selected="true"]') ?? null, 'both');
+  }, [selectedFrameId, focusKey]);
+  // Move focus only from a tree row. An Expand button keeps focus even when expansion
+  // changes the selected member's row key.
   const lastFocusKey = useRef<string | null>(null);
   useEffect(() => {
-    if (lastFocusKey.current !== focusKey && selectedRow && document.activeElement?.closest('.canvas-tree')) {
+    const focused = document.activeElement;
+    if (lastFocusKey.current !== focusKey && selectedRow && focused?.getAttribute('role') === 'treeitem' && treeRef.current?.contains(focused)) {
       const target = Array.from(treeRef.current?.querySelectorAll<HTMLElement>('[role="treeitem"]') ?? []).find((item) => item.dataset.key === focusKey);
-      target?.focus();
+      target?.focus({ preventScroll: true });
     }
     lastFocusKey.current = focusKey;
   }, [focusKey, selectedRow]);
@@ -81,7 +81,8 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
     return next;
   });
   const onKeyDown = (keyboard: KeyboardEvent) => {
-    if ((keyboard.target as HTMLElement).tagName === 'BUTTON') return;
+    // Alt+ArrowUp/Down belong to the viewer-wide event stepping handler.
+    if (keyboard.altKey || (keyboard.target as HTMLElement).tagName === 'BUTTON') return;
     const actions: Record<string, () => void> = {
       ArrowDown: () => move(1), ArrowUp: () => move(-1),
       Home: () => rows[0] && onSelectFrame(rows[0].frameId),
@@ -98,10 +99,12 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
 
   if (graph.nodes.length === 0) return <div className="empty"><strong>No frames to draw</strong><p>This window has no events with a frame id.</p></div>;
   return <div className="canvas-view">
-    {!anyParent ? <div className="evidence-state">Parent links were not observed for these frames; they are drawn as one level, not as a call tree.</div> : null}
-    {undrawn > 0 ? <div className="evidence-state">{undrawn} events have no frame id and are not drawn.</div> : null}
-    {graph.dropped > 0 ? <div className="evidence-state">{graph.dropped} events are not drawn or listed: duplicate frame ids or a parent cycle in the recorded data.</div> : null}
-    {drawn.length < graph.nodes.length ? <div className="evidence-state">Drawing the shallowest {drawn.length} of {graph.nodes.length} nodes; the tree below lists all of them.</div> : null}
+    {!anyParent || undrawn > 0 || graph.dropped > 0 || drawn.length < graph.nodes.length ? <div className="canvas-notes" role="region" aria-label="Frame graph evidence" tabIndex={0}>
+      {!anyParent ? <div className="evidence-state">Parent links were not observed for these frames; they are drawn as one level, not as a call tree.</div> : null}
+      {undrawn > 0 ? <div className="evidence-state">{undrawn} events have no frame id and are not drawn.</div> : null}
+      {graph.dropped > 0 ? <div className="evidence-state">{graph.dropped} events are not drawn or listed: duplicate frame ids or a parent cycle in the recorded data.</div> : null}
+      {drawn.length < graph.nodes.length ? <div className="evidence-state">Drawing the shallowest {drawn.length} of {graph.nodes.length} nodes; the tree below lists all of them.</div> : null}
+    </div> : null}
     <div ref={scrollRef} className="canvas-scroll" role="region" aria-label="Frame graph drawing" tabIndex={0}>
       <svg className="canvas-svg" width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden="true" focusable="false">
         {graph.edges.map((edge) => {

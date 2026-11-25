@@ -843,6 +843,185 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
 }
 
 #[test]
+fn focused_spring_viewer_highlights_a_recorded_line_and_local() {
+    run_focused_spring_viewer_journey(false);
+}
+
+#[test]
+fn focused_spring_viewer_loads_earlier_and_later_recorded_events() {
+    run_focused_spring_viewer_journey(true);
+}
+
+fn run_focused_spring_viewer_journey(window_journey: bool) {
+    let root = temp_root();
+    let repo = root.path().join("focused repository");
+    let data_home = root.path().join("focused data");
+    fs::create_dir_all(&repo).expect("focused repository");
+    let init = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize focused project");
+    assert!(init.status.success(), "focused project initialization failed");
+    copy_fixture_sources(&repo);
+    let project: Value = serde_json::from_slice(&init.stdout).expect("focused project JSON");
+    let project_root = data_home.join("projects").join(project["project_id"].as_str().unwrap());
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let agent =
+        workspace.join("adapters/java/agent-bootstrap/build/agent-dist/xtrace-java-agent.jar");
+    let fixture =
+        workspace.join("adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["run", "--project-dir"])
+        .arg(&repo)
+        .arg("--java-agent")
+        .arg(agent)
+        .args([
+            "--capture-depth",
+            "focused",
+            "--app-package",
+            "dev.xtrace.fixture",
+            "--source-root",
+            "adapters/java/spring-fixture/src/main/java",
+            "--observed-endpoint-policy",
+            "spring-orders-v1",
+            "--application-component",
+            "spring-fixture",
+            "--binding-key",
+            "default",
+        ])
+        .args(["--", "java", "-jar"])
+        .arg(fixture)
+        .arg("--server.port=0")
+        .arg("--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO")
+        .env("XTRACE_DATA_HOME", &data_home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start focused xtrace run");
+    let stdout = child.stdout.take().expect("focused stdout");
+    let readiness_stderr = ReadinessStderr::default();
+    let stderr = readiness_stderr.observe(child.stderr.take().expect("focused stderr"));
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+    let mut process = RunProcess {
+        child,
+        stdout: Some(thread::spawn(move || drain_fixture_stdout(stdout, lines_tx))),
+        stderr: Some(thread::spawn(move || drain(stderr))),
+    };
+    let port = spring_readiness::wait_for_fixture(
+        &lines_rx,
+        Instant::now() + Duration::from_secs(45),
+        &mut process.child,
+        &readiness_stderr,
+    );
+    let response = post_order_body(
+        port,
+        br#"{"description":"focused fixture","bodyCanary":"BODY_CANARY_1D4","errorCanary":""}"#,
+    );
+    assert!(response.starts_with(b"HTTP/1.1 201"), "focused fixture POST failed");
+    wait_for_terminal_recordings(&project_root, 1);
+    if window_journey {
+        let response = post_order_body(
+            port,
+            br#"{"description":"replay-window fixture","bodyCanary":"BODY_CANARY_1D4","errorCanary":""}"#,
+        );
+        assert!(response.starts_with(b"HTTP/1.1 201"), "paging fixture POST failed");
+        wait_for_terminal_recordings(&project_root, 2);
+    }
+
+    let pid = rustix::process::Pid::from_raw(process.child.id() as i32).expect("focused CLI PID");
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("stop focused run");
+    process.child.wait().expect("focused run shutdown");
+    let stdout =
+        process.stdout.take().expect("focused stdout reader").join().expect("join focused stdout");
+    let stderr =
+        process.stderr.take().expect("focused stderr reader").join().expect("join focused stderr");
+    assert_canaries_absent(&stdout);
+    assert_canaries_absent(&stderr);
+
+    let (script, receipt, id_key, ids) = if window_journey {
+        let endpoints = endpoint_list_page(&repo, &data_home, None, None);
+        assert!(endpoints.status.success(), "paging fixture endpoint list failed");
+        assert_canaries_absent(&endpoints.stdout);
+        let endpoints: Value =
+            serde_json::from_slice(&endpoints.stdout).expect("fixture endpoints");
+        let operation_id =
+            endpoints["items"][0]["operationId"].as_str().expect("fixture operation");
+        let linked = endpoint_recordings_page(&repo, &data_home, operation_id, 2, None);
+        assert!(linked.status.success(), "paging fixture recording list failed");
+        assert_canaries_absent(&linked.stdout);
+        let linked: Value = serde_json::from_slice(&linked.stdout).expect("fixture recordings");
+        let items = linked["items"].as_array().expect("fixture recording items");
+        assert_eq!(items.len(), 2, "both real Spring requests produced linked recordings");
+        (
+            "real-replay-window-journey.mjs",
+            "real Spring replay windows proof passed",
+            "recordingIds",
+            Value::Array(items.iter().map(|item| item["recordingId"].clone()).collect()),
+        )
+    } else {
+        let list = recording_list_page(&repo, &data_home, None);
+        assert!(list.status.success(), "focused recording list failed");
+        let list: Value =
+            serde_json::from_slice(&list.stdout).expect("focused recording list JSON");
+        let recording_id =
+            list["recordings"][0]["recording_id"].as_str().expect("focused recording ID");
+        (
+            "focused-code-journey.mjs",
+            "focused Code and Values proof passed",
+            "recordingId",
+            serde_json::json!(recording_id),
+        )
+    };
+    let (mut readiness, mut viewer) = launch_viewer(&repo, &data_home);
+    readiness[id_key] = ids;
+    let mut browser = Command::new("node")
+        .arg(workspace.join("web/app/scripts").join(script))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start focused browser journey");
+    browser
+        .stdin
+        .take()
+        .expect("focused browser stdin")
+        .write_all(serde_json::to_string(&readiness).unwrap().as_bytes())
+        .expect("send focused viewer context privately");
+    let result = browser.wait_with_output().expect("wait for focused browser");
+    assert_canaries_absent(&result.stdout);
+    assert_canaries_absent(&result.stderr);
+    assert!(
+        result.status.success(),
+        "focused browser failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains(receipt));
+    println!("{}", String::from_utf8_lossy(&result.stdout).trim());
+    stop_viewer(&mut viewer);
+}
+
+fn wait_for_terminal_recordings(project_root: &Path, expected: u32) {
+    let database = Connection::open(project_root.join("metadata.sqlite3")).expect("focused SQLite");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let finished: u32 = database
+            .query_row(
+                "SELECT COUNT(*) FROM recordings WHERE status IN ('complete', 'partial')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("focused recording status");
+        if finished >= expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "focused recording did not reach a terminal state");
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
 fn attach_keeps_existing_spring_target_alive_and_persists_real_request() {
     let root = temp_root();
     let repo = root.path().join("attach repository");
@@ -1250,9 +1429,13 @@ fn copy_fixture_sources(repo: &Path) {
 }
 
 fn post_order(port: u16) -> Vec<u8> {
-    use std::net::TcpStream;
+    post_order_body(
+        port,
+        br#"{"description":"BODY_CANARY_1D4","bodyCanary":"safe","errorCanary":""}"#,
+    )
+}
 
-    let body = br#"{"description":"BODY_CANARY_1D4","bodyCanary":"safe","errorCanary":""}"#;
+fn post_order_body(port: u16, body: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect Spring fixture");
     stream.set_read_timeout(Some(Duration::from_secs(10))).expect("read timeout");
     write!(stream, "POST /orders?trace=PATH_QUERY_CANARY_1E2 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer AUTH_CANARY_1D4\r\nCookie: session=COOKIE_CANARY_1D4\r\nContent-Length: {}\r\n\r\n", body.len()).expect("write request");
@@ -1550,6 +1733,7 @@ fn add_endpoint_cli_fixture_recordings(
         application_component: Some("spring-fixture".to_owned()),
         binding_key: Some("default".to_owned()),
         method: "POST".to_owned(),
+        runtime_catalog: None,
         route_template: "/orders".to_owned(),
     };
     let linked_ids = [

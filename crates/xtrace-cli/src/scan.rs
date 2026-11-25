@@ -14,7 +14,7 @@
 //! persist, and exits 10. Every revision made here is `dev_unsigned`. Static path hypotheses
 //! (call graphs) are not produced at all.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -25,8 +25,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
 use xtrace_domain::catalog_discovery::ValidatedEndpointClaim;
+use xtrace_domain::endpoint_normalization::{MAX_ROUTE_BYTES, normalize_link_template};
 use xtrace_domain::static_claims::{
-    ANALYZER_INCOMPLETE_REASONS, AnalyzerLine, StaticClaimContext, StaticClaimError,
+    ANALYZER_INCOMPLETE_REASONS, AnalyzerLine, RouteBasis, StaticClaimContext, StaticClaimError,
     framework_syntax,
 };
 use xtrace_domain::{ContentHash, ProjectId, SourceRevisionId};
@@ -53,8 +54,8 @@ pub struct ScanArgs {
     /// Framework family: spring-mvc, spring-webflux, express, fastify or nest.
     #[arg(long, value_name = "FAMILY")]
     pub framework: String,
-    /// Analyzer executable. The environment override takes precedence over the
-    /// packaged Spring analyzer. Node requires an explicit executable or environment override.
+    /// Analyzer executable. Otherwise use the framework's environment override or
+    /// the analyzer in the installed versioned payload.
     #[arg(long, value_name = "PATH")]
     pub analyzer: Option<PathBuf>,
     /// Application component recorded in every operation identity.
@@ -134,6 +135,8 @@ pub struct ScanResult {
     pub limitation_histogram: BTreeMap<String, usize>,
     /// Operations, ordered by route then method.
     pub operations: Vec<ScannedOperation>,
+    #[serde(skip)]
+    eligible_claims: HashSet<ContentHash>,
 }
 
 /// Failure to process a transcript at all (no usable header).
@@ -208,6 +211,7 @@ pub fn process_transcript_claims(
     let mut operations: BTreeMap<(String, String), ScannedOperation> = BTreeMap::new();
     let mut claim_count = 0;
     let mut kept_claims: Vec<ValidatedEndpointClaim> = Vec::new();
+    let mut eligible_claims = HashSet::new();
     for line in parsed {
         let Ok(parsed_line) = serde_json::from_str::<AnalyzerLine>(line) else {
             reasons.insert("transcript_invalid");
@@ -293,6 +297,32 @@ pub fn process_transcript_claims(
                                 entry.handlers.push(handler.to_owned());
                             }
                         }
+                        // Capture only a positive decision on the validated claim. Its digest
+                        // binds the marker to the exact declaration without retaining raw parts.
+                        if claim.route_basis != RouteBasis::Computed
+                            && validated.limitation_codes().is_empty()
+                            && let Some(digest) = validated.digest()
+                        {
+                            let mut template = String::new();
+                            for part in &claim.route_parts {
+                                if part.is_empty() || (part == "/" && template.is_empty()) {
+                                    continue;
+                                }
+                                template.push('/');
+                                template.push_str(part.strip_prefix('/').unwrap_or(part));
+                                if template.len() > MAX_ROUTE_BYTES {
+                                    break;
+                                }
+                            }
+                            if template.is_empty() {
+                                template.push('/');
+                            }
+                            if normalize_link_template(route_syntax, &template)
+                                .is_some_and(|route| route == validated.operation().route_template)
+                            {
+                                eligible_claims.insert(digest);
+                            }
+                        }
                         kept_claims.push(validated);
                     }
                     Err(_) => {
@@ -343,6 +373,7 @@ pub fn process_transcript_claims(
         files_scanned,
         limitation_histogram: histogram,
         operations,
+        eligible_claims,
     };
     Ok((result, kept_claims))
 }
@@ -439,13 +470,14 @@ async fn run_analyzer(
 
 /// Resolve the real CLI path so invoking it through the public installer symlink
 /// still selects the analyzer from the same version directory.
-fn installed_spring_analyzer(executable: &Path) -> Option<PathBuf> {
+fn installed_analyzer(executable: &Path, spring: bool) -> Option<PathBuf> {
     let executable = executable.canonicalize().ok()?;
     let bin = executable.parent()?;
     if bin.file_name()? != "bin" {
         return None;
     }
-    let analyzer = bin.parent()?.join("share/xtrace/analyzers/java/bin/xtrace-java-static");
+    let entry = if spring { "java/bin/xtrace-java-static" } else { "node/dist/main.js" };
+    let analyzer = bin.parent()?.join("share/xtrace/analyzers").join(entry);
     let resolved = analyzer.canonicalize().ok()?;
     (resolved == analyzer && resolved.is_file()).then_some(resolved)
 }
@@ -492,9 +524,7 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
         .analyzer
         .clone()
         .or_else(|| std::env::var_os(variable).map(PathBuf::from))
-        .or_else(|| {
-            if spring { installed_spring_analyzer(&std::env::current_exe().ok()?) } else { None }
-        })
+        .or_else(|| installed_analyzer(&std::env::current_exe().ok()?, spring))
         .ok_or_else(|| invalid(format!("no analyzer: pass --analyzer or set {variable}")))?;
 
     let (lines, problem) = run_analyzer(
@@ -551,6 +581,7 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
                 files_scanned: 0,
                 limitation_histogram: BTreeMap::new(),
                 operations: Vec::new(),
+                eligible_claims: HashSet::new(),
             },
             Vec::new(),
         ),
@@ -978,8 +1009,14 @@ mod persist {
             completion,
             limitation_codes: codes,
         };
+        let eligible = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.claims)
+            .filter_map(ValidatedEndpointClaim::digest)
+            .filter(|digest| result.eligible_claims.contains(digest))
+            .collect();
         service
-            .finish_run(context, &finish)
+            .finish_local_scan(context, &finish, &eligible)
             .map_err(|error| format!("the catalog run could not finish: {error}"))?;
 
         let history = SqliteCatalogHistoryStore::new(target.store.clone());

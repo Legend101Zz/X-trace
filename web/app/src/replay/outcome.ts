@@ -30,7 +30,7 @@ const COMPLETION_HEADLINE: Record<OutcomeBannerModel['tone'], string> = {
   unavailable: 'Completion unavailable for this recording.',
 };
 
-function nsToLabel(ns: string): string {
+export function nsToLabel(ns: string): string {
   if (!/^\d+$/.test(ns)) return 'unavailable';
   const value = BigInt(ns);
   if (value < 1_000_000n) return `${value} ns`;

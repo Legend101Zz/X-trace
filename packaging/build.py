@@ -36,7 +36,8 @@ PLATFORMS = {
     "linux-aarch64-dev": ("aarch64-unknown-linux-gnu", "Linux", "aarch64"),
 }
 JAVA_ANALYZER = "share/xtrace/analyzers/java/bin/xtrace-java-static"
-EXECUTABLES = {"bin/xtrace", "install.sh", "uninstall.sh", JAVA_ANALYZER}
+NODE_ANALYZER = "share/xtrace/analyzers/node/dist/main.js"
+EXECUTABLES = {"bin/xtrace", "install.sh", "uninstall.sh", JAVA_ANALYZER, NODE_ANALYZER}
 
 
 def run(cmd, cwd=None, env=None, capture=False):
@@ -131,8 +132,12 @@ def sha_rows(root: Path, exclude=()):
     return rows
 
 
-def node_pack(src: Path, env: dict, stage_pack: Path):
-    node = src / "adapters" / "node"
+def skip_node_dev_file(rel: Path) -> bool:
+    return rel.parts[0] == "test" or rel.name.endswith(
+        (".d.ts", ".d.cts", ".d.mts", ".map", ".tsbuildinfo"))
+
+
+def node_payload(node: Path, env: dict, stage_pack: Path, stage_analyzer: Path):
     run(["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], cwd=node, env=env)
     run(["npm", "run", "build:protocol"], cwd=node, env=env)
     run(["npm", "run", "build:core"], cwd=node, env=env)
@@ -140,12 +145,12 @@ def node_pack(src: Path, env: dict, stage_pack: Path):
     if not (dist / "register.cjs").is_file() or not (dist / "register.mjs").is_file():
         sys.exit("node adapter dist is missing register.cjs/register.mjs")
 
-    def skip(rel):
-        parts = rel.parts
-        return (parts[0] == "test" or rel.name.endswith((".d.ts", ".d.cts", ".d.mts", ".map", ".tsbuildinfo"))
-                or rel.as_posix() == "manifest.sha256")
-
-    copy_tree(dist, stage_pack / "dist", skip)
+    installed_dist = stage_pack / "dist"
+    copy_tree(dist, installed_dist,
+              lambda rel: skip_node_dev_file(rel) or rel == Path("manifest.sha256"))
+    # The launcher validates exact dist membership, which differs from the development build.
+    (installed_dist / "manifest.sha256").write_text(
+        "\n".join(sha_rows(installed_dist)) + "\n", encoding="utf-8")
     # ADR 0004 unbundled layout: licenses/THIRD_PARTY.txt lists every bundled dependency.
     lic = ["Third-party packages bundled in the Node adapter pack", ""]
     for pj in sorted((stage_pack / "dist" / "node_modules").rglob("package.json")):
@@ -158,6 +163,25 @@ def node_pack(src: Path, env: dict, stage_pack: Path):
     (stage_pack / "licenses" / "THIRD_PARTY.txt").write_text("\n".join(lic) + "\n", encoding="utf-8")
     (stage_pack / "pack.manifest").write_text("\n".join(sha_rows(stage_pack, {"pack.manifest"})) + "\n",
                                               encoding="utf-8")
+
+    # The CLI scanner is a host tool outside the runtime pack. npm ci verified the alias tarball
+    # against the lockfile; copy the resolved runtime package and its original license evidence.
+    run(["npm", "run", "build:analyzer"], cwd=node, env=env)
+    analyzer = node / "packages" / "analyzer"
+    parser = node / "node_modules" / "typescript-parser"
+    lock = json.loads((node / "package-lock.json").read_text(encoding="utf-8"))
+    locked = lock["packages"]["node_modules/typescript-parser"]
+    metadata = json.loads((parser / "package.json").read_text(encoding="utf-8"))
+    if any(metadata.get(field) != locked[field] for field in ("name", "version", "license")):
+        sys.exit("Node analyzer parser does not match the lockfile")
+    if any(not (parser / file).is_file() for file in ("LICENSE.txt", "ThirdPartyNoticeText.txt")):
+        sys.exit("Node analyzer parser license or notices are missing")
+    entry = analyzer / "dist" / "main.js"
+    if not entry.is_file() or not entry.read_bytes().startswith(b"#!/usr/bin/env node\n"):
+        sys.exit("Node analyzer executable entry is missing")
+    shutil.copyfile(analyzer / "package.json", _mk(stage_analyzer / "package.json"))
+    copy_tree(analyzer / "dist", stage_analyzer / "dist", skip_node_dev_file)
+    copy_tree(parser, stage_analyzer / "node_modules" / "typescript-parser")
 
 
 def deterministic_tar_gz(stage: Path, top: str, out: Path, epoch: int):
@@ -256,8 +280,10 @@ def main(argv=None):
         sys.exit("Spring static analyzer distribution is missing its runtime libraries")
     shutil.copyfile(analyzer / "bin" / "xtrace-java-static", _mk(stage / JAVA_ANALYZER))
     copy_tree(analyzer / "lib", (stage / JAVA_ANALYZER).parent.parent / "lib")
-    # 4. Node pack
-    node_pack(src, env, stage / "share" / "xtrace" / "packs" / "node")
+    # 4. Node pack and standalone scanner
+    share = stage / "share" / "xtrace"
+    node_payload(src / "adapters" / "node", env, share / "packs" / "node",
+                 share / "analyzers" / "node")
     # 5. schemas
     copy_tree(src / "schema" / "proto", stage / "share" / "xtrace" / "schema" / "proto")
     shutil.copyfile(src / "schema" / "xtp-client" / "openapi.yaml", _mk(stage / "share/xtrace/schema/xtp-client/openapi.yaml"))
@@ -279,7 +305,6 @@ def main(argv=None):
                           "review": sum("review" in p["flags"] for p in pub)}}
     lic_text = json.dumps(lic_doc, indent=2, sort_keys=True) + "\n"
     notices = licenses.render_notices(items)
-    share = stage / "share" / "xtrace"
     (share / "sbom.cdx.json").write_text(sbom_text, encoding="utf-8")
     (share / "licenses.json").write_text(lic_text, encoding="utf-8")
     (share / "THIRD_PARTY_LICENSES").write_text(notices, encoding="utf-8")

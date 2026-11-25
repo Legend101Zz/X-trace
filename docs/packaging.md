@@ -29,15 +29,11 @@ are compiled into the store crate, so no separate migration files ship.
 
 ## Static analyzers and `xtrace scan`
 
-The release payload does not bundle the static analyzers. `xtrace scan` runs an analyzer as a separate subprocess and
-finds it only from the `--analyzer PATH` flag or, when the flag is absent, the environment variable
-`XTRACE_NODE_ANALYZER` (express, fastify, nest) or `XTRACE_JAVA_ANALYZER` (spring-mvc, spring-webflux). There is no
-default lookup: with neither set the command exits with a usage error naming the variable. The Node analyzer is built
-from `adapters/node` (`npm ci && npm run build`; entry `packages/analyzer/dist/main.js`, run with `node`, so point
-`--analyzer` at a small executable wrapper). The Java analyzer is `adapters/java/static-analyzer`. It is part of the
-Java Gradle build (`adapters/java/settings.gradle.kts`) and has unit tests (`SpringMvcAnalyzerTest`), but it is
-not bundled in the release payload, and no test yet runs `xtrace scan` against the built Java analyzer. CI proves the Node path end to end with `crates/xtrace-cli/tests/scan_real_node_analyzer.rs`,
-which scans the `express-basic` fixture with the built analyzer and reads the catalog back.
+`xtrace scan` runs an analyzer as a separate subprocess. The installed CLI finds the Spring and Node analyzers
+inside the same versioned payload. Use `--analyzer PATH`, `XTRACE_JAVA_ANALYZER`, or `XTRACE_NODE_ANALYZER`
+to select an analyzer explicitly. Express, Fastify, and Nest scans use Node 22 or newer and the
+packaged TypeScript parser. The Node runtime adapter has its own exact manifest over the installed
+`share/xtrace/packs/node/dist` files. Pass that directory to `xtrace run --node-adapter`.
 
 ## Install, upgrade, uninstall
 
@@ -53,11 +49,8 @@ copies the data home to `<prefix>/backups/<utc>-pre-<version>/` before the new v
 previous version for rollback, refuses downgrades without `--allow-downgrade`, and refuses a prefix inside the data
 home. Uninstall removes program files only and prints where data and backups are. The product itself runs store
 migrations at first use; the installer cannot migrate (and does not stop a running daemon: stop it first).
-The package includes the Spring static analyzer and its Java runtime libraries outside the agent pack.
-With Java 17 available, an initialized project can run
+With Java 17 available, an initialized project can run using the installed Spring analyzer and its Java libraries.
 `xtrace scan --project-dir "$project_dir" --source "$project_dir/src/main/java" --framework spring-mvc`.
-The installed CLI finds the analyzer alongside its own versioned payload. `--analyzer` and
-`XTRACE_JAVA_ANALYZER` still take precedence.
 
 `packaging/test/install_test.sh dist/<platform>` exercises fresh install, upgrade, tamper/downgrade refusal and uninstall, and
 the lifecycle on the installed binary (`init`, `record`, `stop`, and `restart` after the upgrade).

@@ -63,6 +63,14 @@ REQUIRED = [
     ("java_analyzer_parser_jar", _any("share/xtrace/analyzers/java/lib/javaparser-core-", ".jar")),
     ("node_pack_manifest", _has("share/xtrace/packs/node/pack.manifest")),
     ("node_pack_dist", _any("share/xtrace/packs/node/dist/", ".cjs")),
+    ("node_pack_dist_manifest", _has("share/xtrace/packs/node/dist/manifest.sha256")),
+    ("node_analyzer_launcher", _has("share/xtrace/analyzers/node/dist/main.js")),
+    ("node_analyzer_main", _has("share/xtrace/analyzers/node/dist/analyzer.js")),
+    ("node_analyzer_metadata", _has("share/xtrace/analyzers/node/package.json")),
+    ("node_analyzer_parser", _has("share/xtrace/analyzers/node/node_modules/typescript-parser/lib/typescript.js")),
+    ("node_analyzer_parser_metadata", _has("share/xtrace/analyzers/node/node_modules/typescript-parser/package.json")),
+    ("node_analyzer_parser_license", _has("share/xtrace/analyzers/node/node_modules/typescript-parser/LICENSE.txt")),
+    ("node_analyzer_parser_notices", _has("share/xtrace/analyzers/node/node_modules/typescript-parser/ThirdPartyNoticeText.txt")),
     ("schema_proto", _any("share/xtrace/schema/proto/", ".proto")),
     ("schema_openapi", _has("share/xtrace/schema/xtp-client/openapi.yaml")),
     ("sbom", _has("share/xtrace/sbom.cdx.json")),
@@ -169,6 +177,9 @@ def check_manifest(root, manifest, expected_version, rep):
     rep.add("required_components", not missing, "missing: " + ", ".join(missing) if missing else "all present")
     analyzer = root / "share/xtrace/analyzers/java/bin/xtrace-java-static"
     rep.add("java_analyzer_executable", analyzer.is_file() and not analyzer.is_symlink()
+            and (analyzer.stat().st_mode & 0o777) == 0o755)
+    analyzer = root / "share/xtrace/analyzers/node/dist/main.js"
+    rep.add("node_analyzer_executable", analyzer.is_file() and not analyzer.is_symlink()
             and (analyzer.stat().st_mode & 0o777) == 0o755)
 
     bad = []

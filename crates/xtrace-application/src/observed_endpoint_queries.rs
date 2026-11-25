@@ -500,8 +500,14 @@ fn encode_endpoint_cursor(
     last: ObservedEndpointKey,
     correlation_id: CorrelationId,
 ) -> Result<String, AppError> {
+    let legacy = is_fixture_endpoint(
+        &last.method,
+        &last.route_template,
+        &last.application_component,
+        &last.binding,
+    );
     let cursor = EndpointCursor {
-        version: 1,
+        version: if legacy { 1 } else { 2 },
         kind: QueryKind::Endpoints,
         project_id: project_id.to_string(),
         filter: "observed".to_owned(),
@@ -517,9 +523,11 @@ fn encode_endpoint_cursor(
     encode_json(&cursor).map_err(|()| cursor_error(correlation_id))
 }
 fn decode_endpoint_cursor(token: &str) -> Result<DecodedEndpointCursor, ()> {
+    use xtrace_domain::endpoint_normalization::{
+        RouteFramework, is_runtime_link_scope_id, normalize_link_template,
+    };
     let value: EndpointCursor = decode_json(token)?;
-    if value.version != 1
-        || value.kind != QueryKind::Endpoints
+    if value.kind != QueryKind::Endpoints
         || value.filter != "observed"
         || value.sort != "method_route_component_binding_operation_id_asc"
     {
@@ -532,11 +540,28 @@ fn decode_endpoint_cursor(token: &str) -> Result<DecodedEndpointCursor, ()> {
     {
         return Err(());
     }
-    if value.last.method != "POST"
-        || value.last.route_template != "/orders"
-        || value.last.application_component != "spring-fixture"
-        || value.last.binding != "default"
-    {
+    let key = &value.last;
+    let legacy = is_fixture_endpoint(
+        &key.method,
+        &key.route_template,
+        &key.application_component,
+        &key.binding,
+    );
+    let valid = match value.version {
+        1 => legacy,
+        2 => {
+            !legacy
+                && xtrace_domain::HttpMethod::parse(&key.method)
+                    .is_some_and(|method| method.as_str() == key.method)
+                && is_runtime_link_scope_id(&key.application_component)
+                && is_runtime_link_scope_id(&key.binding)
+                && normalize_link_template(RouteFramework::SpringMvc, &key.route_template)
+                    .as_deref()
+                    == Some(key.route_template.as_str())
+        }
+        _ => false,
+    };
+    if !valid {
         return Err(());
     }
     Ok(DecodedEndpointCursor {
@@ -549,6 +574,10 @@ fn decode_endpoint_cursor(token: &str) -> Result<DecodedEndpointCursor, ()> {
             operation_id,
         },
     })
+}
+
+fn is_fixture_endpoint(method: &str, route: &str, component: &str, binding: &str) -> bool {
+    (method, route, component, binding) == ("POST", "/orders", "spring-fixture", "default")
 }
 struct DecodedEndpointCursor {
     project_id: ProjectId,

@@ -118,6 +118,11 @@ impl Migrations {
                 label: "v0010_session_health",
                 statements: &[SESSION_HEALTH_SCHEMA],
             },
+            MigrationRecord {
+                version: 11,
+                label: "v0011_catalog_runtime_links",
+                statements: &[include_str!("lane_sql/catalog_v11_proposal.sql")],
+            },
         ]
     }
 
@@ -1035,6 +1040,199 @@ mod tests {
     }
 
     #[test]
+    fn proposed_catalog_link_upgrade_keeps_existing_rows_and_migration_prefix() {
+        let conn = new_memory();
+        let catalog = Migrations::catalog();
+        let prefix = &catalog[..10];
+        let correlation = CorrelationId::new();
+        apply_catalog(&conn, "test", correlation, prefix).expect("initialize v10");
+        verify_applied_checksum(&conn, &catalog, 10, correlation).expect("exact v10 prefix");
+        let project = id(1);
+        let operation = revision_member_id(2);
+        let legacy_v4 = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 3];
+        let linked_v7 = revision_member_id(4);
+        let unmatched_v7 = revision_member_id(6);
+        insert_project(&conn, &project).expect("project");
+        for recording in [legacy_v4, linked_v7, unmatched_v7] {
+            insert_recording(&conn, &recording, &project, &revision_member_id(5), "complete")
+                .expect("recording");
+        }
+        conn.execute(
+            "INSERT INTO operations VALUES (?1, ?2, 'http', 'POST', '/orders', 'spring-fixture', 'default', 1, zeroblob(32), 'then')",
+            params![operation, project],
+        ).expect("fixture operation");
+        conn.execute(
+            "INSERT INTO recording_endpoint_observations VALUES (?1, ?2, 'linked', 'spring-orders-v1', ?3, 'spring-fixture', 'default', 'POST', '/orders', NULL)",
+            params![linked_v7, project, operation],
+        ).expect("fixture sidecar");
+        conn.execute(
+            "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, reason_code)
+             VALUES (?1, ?2, 'unmatched', 'observation_policy_missing')",
+            params![unmatched_v7, project],
+        ).expect("historical unmatched sidecar");
+        let checksum_before = applied_checksum(&conn);
+        let mut wrong_prefix = catalog.clone();
+        wrong_prefix[9].label = "tampered";
+        let error = apply_catalog(&conn, "test", correlation, &wrong_prefix)
+            .expect_err("reject a changed prefix before the rebuild");
+        assert_eq!(error.kind(), StoreErrorKind::SchemaIncompatible);
+        assert_eq!(applied_checksum(&conn), checksum_before);
+        assert!(!table_exists(&conn, "catalog_runtime_link_routes"));
+
+        for _ in 0..2 {
+            assert_eq!(apply_pending(&conn, "test", correlation).expect("v11"), 11);
+        }
+        assert_eq!(schema_version(&conn), 11);
+        let stored: (Vec<u8>, Vec<u8>, Vec<u8>, String) = conn
+            .query_row(
+                "SELECT e.recording_id, o.operation_id, o.endpoint_fingerprint, o.created_at
+             FROM recording_endpoint_observations e JOIN operations o USING(operation_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("preserved fixture link");
+        assert_eq!(stored, (linked_v7.to_vec(), operation.to_vec(), vec![0; 32], "then".into()));
+        let unchanged: bool = conn.query_row(
+            "SELECT observation_policy_id IS NULL AND operation_id IS NULL AND application_component IS NULL
+               AND binding_key IS NULL AND method IS NULL AND route_template IS NULL
+               AND catalog_revision_id IS NULL AND operation_fingerprint IS NULL
+               AND disposition = 'unmatched' AND reason_code = 'observation_policy_missing'
+             FROM recording_endpoint_observations WHERE recording_id = ?1",
+            [unmatched_v7], |row| row.get(0),
+        ).expect("preserved unmatched nulls");
+        assert!(unchanged);
+        let absent: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM recordings WHERE recording_id = ?1
+             AND recording_id NOT IN (SELECT recording_id FROM recording_endpoint_observations)",
+                [legacy_v4],
+                |row| row.get(0),
+            )
+            .expect("untouched legacy ID");
+        assert_eq!(absent, 1);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    fn revision_member_id(suffix: u8) -> [u8; 16] {
+        [0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, suffix]
+    }
+
+    #[test]
+    fn proposed_catalog_link_shapes_require_eligible_project_revision_member() {
+        let conn = new_memory();
+        apply_pending(&conn, "test", CorrelationId::new()).expect("v11");
+        let (project, other_project) = (id(1), id(2));
+        let (operation, version, revision, selection, run, session, recording, unmatched) = (
+            revision_member_id(3),
+            revision_member_id(4),
+            revision_member_id(5),
+            revision_member_id(6),
+            revision_member_id(7),
+            revision_member_id(8),
+            revision_member_id(9),
+            revision_member_id(10),
+        );
+        insert_project(&conn, &project).expect("project");
+        conn.execute(
+            "INSERT INTO projects (project_id, canonical_repo_hash, display_name, created_at, last_opened_at,
+             config_schema_version, effective_config_hash)
+             VALUES (?1, 'other-repo', 'other', 'then', 'then', 1, 'config')",
+            [other_project],
+        )
+        .expect("second project");
+        insert_recording(&conn, &recording, &project, &session, "complete").expect("recording");
+        insert_recording(&conn, &unmatched, &project, &session, "complete")
+            .expect("unmatched recording");
+        conn.execute(
+            "INSERT INTO catalog_owner_selections (owner_selection_id, project_id, selection_epoch, current_for_scope, verified_pack_digest, scope_digest, scope_json) VALUES (?1, ?2, 1, 1, zeroblob(32), zeroblob(32), '{}')",
+            params![selection, project],
+        ).expect("catalog ownership");
+        conn.execute(
+            "INSERT INTO catalog_discovery_runs (run_id, project_id, runtime_session_id, protocol_minor, verified_pack_digest, owner_selection_id, selection_epoch, run_hint, request_bytes, request_digest, scope_digest, scope_json, status, final_digest) VALUES (?1, ?2, ?3, 1, zeroblob(32), ?4, 1, 'run', x'01', zeroblob(32), zeroblob(32), '{}', 'complete', zeroblob(32))",
+            params![run, project, session, selection],
+        ).expect("catalog run");
+        conn.execute(
+            "INSERT INTO catalog_revisions (revision_id, project_id, owner_selection_id, run_id, scope_digest, ordinal, content_digest, final_digest, operation_count, created_at) VALUES (?1, ?2, ?3, ?4, zeroblob(32), 1, zeroblob(32), zeroblob(32), 1, 'then')",
+            params![revision, project, selection, run],
+        ).expect("catalog revision");
+        conn.execute(
+            "INSERT INTO catalog_operations VALUES (?1, ?2, 1, zeroblob(32), 'http', 'owners', 'default', 'GET', '/owners/{id}', 'then')",
+            params![operation, project],
+        ).expect("catalog operation");
+        conn.execute(
+            "INSERT INTO catalog_operation_versions VALUES (?1, ?2, ?3, zeroblob(32), 'inferred', 'then')",
+            params![version, project, operation],
+        ).expect("operation version");
+        conn.execute(
+            "INSERT INTO catalog_revision_entries VALUES (?1, ?2, ?3, ?4, 'added', 'unverified')",
+            params![project, revision, operation, version],
+        )
+        .expect("catalog membership");
+        conn.execute(
+            "INSERT INTO operations VALUES (?1, ?2, 'http', 'GET', '/owners/{id}', 'owners', 'default', 1, zeroblob(32), 'then')",
+            params![operation, project],
+        ).expect("canonical alias");
+        let mark = |scope: [u8; 16]| {
+            conn.execute(
+                "INSERT INTO catalog_runtime_link_routes VALUES (?1, ?2, ?3)",
+                params![scope, revision, operation],
+            )
+        };
+        let link = |route: &str,
+                    policy: Option<&str>,
+                    selected: Option<[u8; 16]>,
+                    witness: [u8; 32]| {
+            conn.execute(
+            "INSERT INTO recording_endpoint_observations VALUES (?1, ?2, 'linked', ?3, ?4, 'owners', 'default', 'GET', ?5, NULL, ?6, ?7)",
+            params![recording, project, policy, operation, route, selected, witness],
+        )
+        };
+        let policy = Some("runtime-route-v1");
+        let route = "/owners/{id}";
+        assert!(mark(other_project).is_err(), "eligibility must match revision project");
+        assert!(
+            link(route, policy, Some(revision), [0; 32]).is_err(),
+            "membership alone does not establish eligibility"
+        );
+        mark(project).expect("scanned eligible membership");
+        assert!(link(route, None, Some(revision), [0; 32]).is_err());
+        assert!(link(route, policy, None, [0; 32]).is_err());
+        assert!(link("/owners/guessed", policy, Some(revision), [0; 32]).is_err());
+        conn.execute("UPDATE operations SET route_template = '/owners/guessed'", [])
+            .expect("construct a mismatched alias tuple");
+        assert!(
+            link("/owners/guessed", policy, Some(revision), [0; 32]).is_err(),
+            "the matched alias tuple must also match the catalog tuple"
+        );
+        conn.execute(
+            "UPDATE operations SET route_template = '/owners/{id}', endpoint_fingerprint = ?1",
+            [[1_u8; 32]],
+        )
+        .expect("construct a mismatched alias fingerprint");
+        assert!(link(route, policy, Some(revision), [1; 32]).is_err());
+        assert!(link(route, policy, Some(revision), [0; 32]).is_err());
+        conn.execute("UPDATE operations SET endpoint_fingerprint = zeroblob(32)", [])
+            .expect("restore the catalog fingerprint");
+        link(route, policy, Some(revision), [0; 32]).expect("exact eligible link");
+
+        let unmatched_row = |reason: Option<&str>, selected: Option<[u8; 16]>| {
+            conn.execute(
+                "INSERT INTO recording_endpoint_observations VALUES (?1, ?2, 'unmatched',
+             'runtime-route-v1', NULL, 'owners', 'default', NULL, NULL, ?3, ?4, NULL)",
+                params![unmatched, project, reason, selected],
+            )
+        };
+        assert!(unmatched_row(None, Some(revision)).is_err());
+        assert!(unmatched_row(Some("method_unsupported"), None).is_err());
+        unmatched_row(Some("method_unsupported"), Some(revision)).expect("scoped unmatched");
+    }
+
+    #[test]
     fn v6_adds_retry_and_deadline_tables_without_adopting_v5_history_and_rolls_back_atomically() {
         let conn = new_memory();
         let v5 = Migrations::catalog()[..5].to_vec();
@@ -1343,7 +1541,7 @@ mod tests {
             apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v9"),
             Migrations::latest_version()
         );
-        assert_eq!(Migrations::latest_version(), 10);
+        assert_eq!(Migrations::latest_version(), 11);
         assert_ne!(applied_checksum(&conn), v8_checksum, "checksum changes with v9");
         let legacy: i64 = conn
             .query_row(

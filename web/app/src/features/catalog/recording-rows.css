@@ -1,0 +1,16 @@
+.recording-list .recording-date-heading {
+  margin: 12px 9px 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.recording-list .recording-date-heading:first-child {
+  margin-top: 4px;
+}
+
+.recording-list .recording-sub {
+  overflow-wrap: anywhere;
+}
+.recording-policy { display: block; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
