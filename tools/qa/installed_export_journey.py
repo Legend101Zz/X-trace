@@ -363,13 +363,19 @@ def run(args, private, report):
     operation = endpoints[0]["operationId"]
     catalog = runner.cli(binary, project, ["catalog", "list", "--json"])
     # Transport is HTTP-only in the domain and is absent from both CLI projections.
-    # Observed and catalog identities have distinct UUID namespaces. Match their exposed scope,
-    # independently of the viewer's eventual resolution, rather than inventing an ID link.
+    # Match exposed identity facts independently of viewer resolution first. This finite
+    # registered Spring /orders case reuses the persisted operation UUID; do not generalize
+    # that supported alias into equality of every observed and catalog selector.
+    require(catalog["revision"]["revisionId"] == scan["catalogRevisionId"], "scanned-revision-selection")
+    require((endpoints[0]["applicationComponent"], endpoints[0]["binding"], endpoints[0]["observationPolicy"]) ==
+            ("spring-fixture", "default", "spring-orders-v1"), "supported-observed-scope")
     matching = [item for item in catalog["operations"] if
                 (item["applicationComponent"], item["bindingKey"], item["method"], item["routeTemplate"]) ==
                 (endpoints[0]["applicationComponent"], endpoints[0]["binding"], endpoints[0]["method"], endpoints[0]["routeTemplate"])]
     require(len(matching) == 1, "genuine-scan-scope")
     catalog_operation = matching[0]["operationId"]
+    report["supportedOrdersUuidAlias"] = catalog_operation == operation
+    require(report["supportedOrdersUuidAlias"], "supported-orders-uuid-alias")
     linked = runner.cli(binary, project, ["endpoint", "recordings", operation])["items"]
     require(len(linked) == 1 and linked[0]["status"] == "complete", "genuine-recording")
     recording = linked[0]["recordingId"]
@@ -434,7 +440,7 @@ def main(argv=None):
     private = Path(args.private_dir)
     owned = False
     report = {"schemaVersion": 1, "kind": "installed-spring-export-journey", "releaseEvidence": False, "status": "fail",
-              "packageVerified": False, "sameProjectCatalogLinked": False, "genuineRequests": 0, "viewports": 0, "downloads": 0,
+              "packageVerified": False, "sameProjectCatalogLinked": False, "supportedOrdersUuidAlias": None, "genuineRequests": 0, "viewports": 0, "downloads": 0,
               "logicalFilesCompared": 0, "privacySurfaces": 0,
               "privacyLimits": ["four-injected-canary-kinds-only", "listed-files-and-decoded-recording-only", "common-encodings-only", "compressed-scan-depth-two", "decompression-caps-may-truncate", "screenshots-not-ocr-scanned", "browser-dom-snapshots-at-named-phases-only"],
               "viewportHeight": 900, "scopeTransport": "http-only-domain-enum-not-exposed-in-cli",
