@@ -2021,11 +2021,14 @@ mod tests {
             ),
             Err(CatalogExportReadError::OperationNotFound)
         );
-        for (component, binding, route) in [
+        for (index, (component, binding, route)) in [
             ("other-component", "default", "/orders"),
             ("spring-fixture", "other-binding", "/orders"),
             ("spring-fixture", "default", "/orders/{id}"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut separate = owner.clone();
             separate.owner_selection_id = *uuid::Uuid::now_v7().as_bytes();
             separate.scope.application_component = component.to_owned();
@@ -2043,7 +2046,8 @@ mod tests {
             let separate_revision = publish_fixture_catalog(
                 &shared,
                 &separate,
-                "unmatched-revision",
+                // Retry hints belong to the producer session, not the owner selection or scope.
+                &format!("unmatched-revision-{index}"),
                 &[test_identity_claim(identity, "declared-orders")],
             );
             assert_eq!(
