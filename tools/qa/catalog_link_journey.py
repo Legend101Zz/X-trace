@@ -71,7 +71,23 @@ class Journey:
                 and result["confirmed"] == int(confirmed)
                 and result["unobserved"] == int(not confirmed), "reconciled_recording_count")
 
-    def check_installed_restart(self, revision, endpoint, catalog_id, recording_ids):
+    def readback(self, catalog_id):
+        linked = self.call("endpoint_recordings", "endpoint", "recordings", catalog_id)["items"]
+        unmatched = self.call("unmatched", "recording", "list", "--unmatched")["items"]
+        rows = self.call("recording_inventory", "recording", "list")["recordings"]
+        ids = {row["recordingId"] for row in linked + unmatched}
+        require(len(ids) == len(linked) + len(unmatched) == len(rows)
+                and ids == {row["recording_id"] for row in rows}, "persisted_recording_identity")
+        details = {}
+        for recording_id in sorted(ids):
+            detail = self.call("recording_readback", "recording", "show", recording_id)
+            require(detail["recording_id"] == recording_id and detail["completion"] == "complete"
+                    and detail["outcome"]["kind"] == "responded"
+                    and detail["next_cursor"] is None and detail["events"], "complete_recording_detail")
+            details[recording_id] = detail
+        return linked, unmatched, details
+
+    def check_installed_restart(self, revision, endpoint, catalog_id, snapshot):
         before = None
         try:
             before = self.call("record_installed", "record")
@@ -81,15 +97,14 @@ class Journey:
                     and after["stopped"]["runtime_session_id"] == before["runtime_session_id"]
                     and started != before["runtime_session_id"], "real_restart_session_changed")
             self.check_reconciliation(revision, endpoint, confirmed=True)
-            linked = self.call("links_after_daemon_restart", "endpoint", "recordings", catalog_id)["items"]
-            require({row["recordingId"] for row in linked} == recording_ids,
-                    "restart_preserved_linked_recordings")
+            require(self.readback(catalog_id) == snapshot, "restart_preserved_exact_readback")
         finally:
             # This isolated project has no unrelated daemon. Reconcile even
             # when the start launched a daemon but its command timed out.
             stopped = self.call("stop_installed", "stop", allow_not_running=before is None)
             require(stopped is None or stopped["kind"] == "stopped", "daemon_stopped_after_restart")
         self.check_reconciliation(revision, endpoint, confirmed=True)
+        require(self.readback(catalog_id) == snapshot, "reopen_preserved_exact_readback")
 
     def check_static_refusals(self, scan, app, matched, scope, endpoint, catalog_id):
         conflict_source = self.project / "conflicts"
@@ -320,11 +335,11 @@ process.once('SIGTERM', () => server.close());
                 and (rows[0]["method"], rows[0]["routeTemplate"]) == endpoint
                 and rows[0]["applicationComponent"] == scope and rows[0]["binding"] == "default"
                 and rows[0]["observationPolicy"] == "runtime-route-v1", "stable_endpoint")
-        linked = self.call("endpoint_recordings", "endpoint", "recordings", catalog_id)["items"]
+        snapshot = self.readback(catalog_id)
+        linked, unmatched, _ = snapshot
         require(len(linked) == len(matched) and all(row["operationId"] == catalog_id
                     and row["observationPolicy"] == "runtime-route-v1"
                     and row["unmatchedReason"] is None for row in linked), "exact_linked_rows")
-        unmatched = self.call("unmatched", "recording", "list", "--unmatched")["items"]
         reasons = ["no_catalog_match", "catalog_revision_unavailable", "observation_policy_missing"]
         if self.framework == "express":
             reasons.extend(["no_catalog_match", "route_template_unavailable_or_ineligible"])
@@ -332,16 +347,8 @@ process.once('SIGTERM', () => server.close());
             reasons.append("no_catalog_match")
         require(sorted(row["unmatchedReason"] for row in unmatched) == sorted(reasons)
                 and all(row["operationId"] is None for row in unmatched), "unmatched_reasons")
-        ids = {row["recordingId"] for row in linked + unmatched}
-        all_rows = self.call("recordings_after_restart", "recording", "list")["recordings"]
-        require(ids == {row["recording_id"] for row in all_rows}, "persisted_recording_identity")
-        for row in linked:
-            detail = self.call("recording_readback", "recording", "show", row["recordingId"])
-            require(detail["recording_id"] == row["recordingId"]
-                    and detail["completion"] == "complete" and detail["outcome"]["kind"] == "responded",
-                    "linked_recording_detail")
         if self.installed_prefix is not None:
-            self.check_installed_restart(revision, endpoint, catalog_id, {row["recordingId"] for row in linked})
+            self.check_installed_restart(revision, endpoint, catalog_id, snapshot)
         print(f"{self.framework}: one stable operation, {len(linked)} linked, {len(unmatched)} unmatched")
 
 
