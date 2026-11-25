@@ -1,0 +1,40 @@
+name: Catalog link migration proposal proof
+on:
+  push:
+    branches: [diagnostic/catalog-runtime-link-112]
+permissions:
+  contents: read
+jobs:
+  migration-proposal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 65e34bb0a3d007ee0da107df4e3acfa22ebd1029
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Verify the migration proposal and original SQL checks
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = 65e34bb0a3d007ee0da107df4e3acfa22ebd1029
+          root="$RUNNER_TEMP/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/fragments"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          cargo fmt --all --check
+          cargo clippy --locked -p xtrace-store --tests -- -D warnings
+          python3 -B -m tools.qa.lane_run run --suite rust --step catalog-v11 --min-passed 2 \
+            --max-ignored 0 --out "$root/fragments" -- \
+            cargo test --locked -p xtrace-store --lib proposed_catalog_link
+          python3 -B -m tools.qa.lane_run run --suite rust --step catalog-v9 --min-passed 6 \
+            --max-ignored 0 --out "$root/fragments" -- \
+            cargo test --locked -p xtrace-store --test catalog_link_tests
+          grep -Fxq 'test migrations::tests::proposed_catalog_link_upgrade_keeps_existing_rows_and_migration_prefix ... ok' \
+            "$RUNNER_TEMP/xl/rust---catalog-v11.log"
+          grep -Fxq 'test migrations::tests::proposed_catalog_link_shapes_require_eligible_project_revision_member ... ok' \
+            "$RUNNER_TEMP/xl/rust---catalog-v11.log"
+          echo "Verified both named v11 draft cases and all six original v9 SQL cases." >> "$GITHUB_STEP_SUMMARY"
