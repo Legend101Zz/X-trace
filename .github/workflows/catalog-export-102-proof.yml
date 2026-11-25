@@ -1,0 +1,64 @@
+name: catalog-export-102-proof
+
+on:
+  push:
+    branches: [codex/export-catalog-102-proof]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PROBE_SOURCE: 20055d07502d4b0996fd6b262b541772e3ebb985
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Verify exact source and admit private scratch
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          root="${RUNNER_TEMP:?}/xf"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/frag"
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+          printf '{"sourceSha":"%s","fullFloor":false,"releaseAcceptance":false}\n' \
+            "$PROBE_SOURCE" > "$root/frag/probe-source.json"
+      - name: Format and lint the shared exporter and CLI journey
+        run: |
+          set -euo pipefail
+          umask 077
+          cargo fmt --all --check > "$XTRACE_CI_PRIVATE_ROOT/fmt.log" 2>&1
+          cargo clippy --locked --all-features -p xtrace-export --all-targets -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/export-clippy.log" 2>&1
+          cargo clippy --locked --all-features -p xtrace-cli --test export_journey -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/cli-clippy.log" 2>&1
+      - name: Validate export projection and goldens
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step export-core \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 59 --max-ignored 0 -- \
+            cargo test --locked --all-features -p xtrace-export
+      - name: Validate persisted catalog export through the CLI
+        if: ${{ !cancelled() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step export-journey \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 19 --max-ignored 0 -- \
+            cargo test --locked --all-features -p xtrace-cli --test export_journey
+      - name: Upload sanitized test receipts
+        if: ${{ always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: catalog-export-102-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
+          if-no-files-found: error
+          retention-days: 14
