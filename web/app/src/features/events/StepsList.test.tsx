@@ -100,3 +100,58 @@ it('holds the exact visible row offset when unknown variable-height rows are pre
     geometry.mockRestore();
   }
 });
+
+it('browses past the mounted range with plain arrows when the selection is unavailable', () => {
+  const events = Array.from({ length: 100 }, (_, index) => ({
+    sequence: String(index + 1), kind: 'recording_event_kind:frame_enter',
+    frameId: 'shared-frame', monotonicNs: '1', symbol: 'Synthetic.method',
+  })) as unknown as ReplayEvent[];
+  const onMove = vi.fn();
+  render(<section id="events-panel">
+    <StepsList events={events} selected={undefined} onMove={onMove} onPick={() => undefined} />
+  </section>);
+  const list = screen.getByRole('list', { name: 'Loaded replay steps' });
+  const boundary = within(list).getAllByRole('listitem').at(-1)!;
+  const position = Number(boundary.getAttribute('aria-posinset'));
+  expect(position).toBeLessThan(events.length);
+  const successor = () => list.querySelector<HTMLElement>(`[aria-posinset="${position + 1}"] .event`);
+  expect(successor()).toBeNull();
+  const browse = within(boundary).getByRole('button');
+  act(() => browse.focus());
+  fireEvent.keyDown(browse, { key: 'ArrowDown' });
+  expect(successor()).toHaveFocus();
+  expect(list.querySelector('.event[aria-current="true"]')).toBeNull();
+  expect(onMove).not.toHaveBeenCalled();
+});
+
+it('starts each loaded-row browse group from the visible position after a manual scroll', () => {
+  const events = Array.from({ length: 55 }, (_, index) => ({
+    sequence: String(index + 1), kind: 'recording_event_kind:frame_enter',
+    frameId: 'shared-frame', monotonicNs: '1', symbol: 'Synthetic.method',
+  })) as unknown as ReplayEvent[];
+  const { container } = render(<section id="events-panel">
+    <StepsList events={events} selected={events[0]} onMove={() => undefined} onPick={() => undefined} />
+  </section>);
+  const pane = container.querySelector<HTMLElement>('#events-panel')!;
+  const list = screen.getByRole('list', { name: 'Loaded replay steps' });
+  Object.defineProperty(pane, 'clientHeight', { value: 180 });
+  const geometry = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+    if (this === pane) return new DOMRect(0, 0, 320, 180);
+    const position = Number(this.getAttribute('aria-posinset') ?? 1);
+    return new DOMRect(0, (position - 1) * 60 - pane.scrollTop, 320, this === list ? 3_300 : 60);
+  });
+  const step = (sequence: string) => list.querySelector<HTMLElement>(`[data-step-sequence="${sequence}"] .event`);
+  try {
+    const later = screen.getByRole('button', { name: 'Later loaded rows' });
+    fireEvent.click(later);
+    expect(step('10')).toHaveFocus();
+    pane.scrollTop = 30 * 60;
+    fireEvent.scroll(pane);
+    expect(screen.getByText('Loaded position 31 of 55')).toBeInTheDocument();
+    fireEvent.click(later);
+    expect(step('40')).toHaveFocus();
+    expect(step('1')).toHaveAttribute('aria-current', 'true');
+  } finally {
+    geometry.mockRestore();
+  }
+});
