@@ -63,7 +63,8 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     expect(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ })).toBeInTheDocument();
     expect(screen.getByText('Operator-selected policy')).toBeInTheDocument();
-    expect(screen.getByText('spring-orders-v1 does not attest which adapter or application produced the event.')).toBeInTheDocument();
+    expect(screen.getByText(/The policy does not attest which adapter or application produced the event/)).toBeInTheDocument();
+    expect(screen.getByText('Representative policy: spring-orders-v1')).toBeInTheDocument();
     expect(window.location.hash).toBe('');
     expect(window.location.search).toBe('?keep=query');
 
@@ -72,6 +73,7 @@ describe('endpoint-first recording viewer', () => {
     fireEvent.click(screen.getByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
     const linkedRow = await screen.findByRole('button', { name: new RegExp(recordingA) });
     expect(linkedRow).toBeInTheDocument();
+    expect(linkedRow).toHaveTextContent('Recording policy: spring-orders-v1');
     expect(linkedRow.querySelector('time')).toHaveAttribute('datetime', linked.items[0].openedAt);
     expect(document.querySelectorAll('.recording-date-heading')).toHaveLength(1);
     expect(screen.queryByText(recordingB)).not.toBeInTheDocument();
@@ -94,14 +96,58 @@ describe('endpoint-first recording viewer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
     const unmatchedRow = await screen.findByRole('button', { name: new RegExp(recordingB) });
     expect(unmatchedRow).toBeInTheDocument();
+    expect(unmatchedRow).toHaveTextContent('The observation policy did not approve the route.');
+    expect(unmatchedRow).not.toHaveTextContent('route_unapproved');
     expect(unmatchedRow.querySelector('time')).toHaveAttribute('datetime', unmatched.items[0].openedAt);
     expect(document.querySelectorAll('.recording-date-heading')).toHaveLength(2);
     const legacyRow = screen.getByRole('button', { name: new RegExp(legacyV4) });
     expect(legacyRow).toHaveTextContent('No historical reason recorded');
+    expect(legacyRow).toHaveTextContent('Recording policy: Unavailable');
     expect(legacyRow).not.toHaveTextContent('route_unapproved');
     fireEvent.click(legacyRow);
     expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call')).toBeInTheDocument();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL).includes(`/${legacyV4}?limit=200`))).toBe(true);
+  });
+
+  it('discloses the representative policy separately from each recording and hides raw unrecognized evidence', async () => {
+    const cases = [
+      ['catalog_revision_unavailable', 'The catalog revision was unavailable.'],
+      ['route_template_unavailable_or_ineligible', 'A route template eligible for catalog linking was unavailable.'],
+      ['no_catalog_match', 'No eligible operation matched the recorded catalog context.'],
+      ['PRIVATE-UNRECOGNIZED-REASON', 'The recorded reason is unavailable in this viewer.'],
+    ];
+    const reasonItems = cases.map(([unmatchedReason], index) => ({
+      ...unmatched.items[0], recordingId: `reason-fixture-${index}`, unmatchedReason,
+      observationPolicy: index === 3 ? 'PRIVATE-UNRECOGNIZED-POLICY' : 'runtime-route-v1',
+    }));
+    vi.mocked(fetch).mockImplementation((input) => {
+      const path = route(input);
+      if (path.includes('/recordings?unmatched=true')) return Promise.resolve(response({ items: reasonItems, nextCursor: null }));
+      if (path.includes('/api/v1/endpoints/') && path.includes('/recordings')) {
+        return Promise.resolve(response({ ...linked, items: [{ ...linked.items[0], observationPolicy: 'runtime-route-v1' }] }));
+      }
+      return defaultFetch(input);
+    });
+
+    render(<App />);
+    const endpoint = await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ });
+    expect(endpoint).toHaveTextContent('Representative policy: spring-orders-v1');
+    fireEvent.click(endpoint);
+    const recording = await screen.findByRole('button', { name: new RegExp(recordingA) });
+    expect(recording).toHaveTextContent('Recording policy: runtime-route-v1');
+    expect(recording).not.toHaveTextContent('spring-orders-v1');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
+    for (const [index, [code, label]] of cases.entries()) {
+      const row = await screen.findByRole('button', { name: new RegExp(reasonItems[index].recordingId) });
+      expect(row).toHaveTextContent(label);
+      expect(row).not.toHaveTextContent(code);
+      expect(row).toHaveTextContent(index === 3 ? 'Recording policy: Unavailable' : 'Recording policy: runtime-route-v1');
+      expect(row).not.toHaveTextContent('PRIVATE-UNRECOGNIZED-POLICY');
+    }
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search loaded requests' }), { target: { value: 'catalog revision' } });
+    expect(screen.getByRole('button', { name: /reason-fixture-0/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /reason-fixture-1/ })).not.toBeInTheDocument();
   });
 
   it('ignores an obsolete linked 401 and clears that lane after returning to endpoints', async () => {

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { CatalogMode, Endpoint, Recording } from '../../types';
 import { ErrorState } from '../common/ErrorState';
 import { RecordingRows } from './RecordingRows';
+import { observationPolicyLabel, unmatchedReasonLabel } from './observation-disclosure';
 
 /** One paged catalog lane as the panel sees it. */
 export interface CatalogLaneView<T> {
@@ -48,7 +49,8 @@ export function CatalogPanel(props: CatalogPanelProps) {
   const matches = (...fields: (string | null | undefined)[]) =>
     fields.join(' ').toLocaleLowerCase().includes(query);
   const matchingRecordings = (items: Recording[]) => items.filter((recording) =>
-    matches(recording.recordingId, recording.openedAt, recording.status, recording.unmatchedReason));
+    matches(recording.recordingId, recording.openedAt, recording.status, observationPolicyLabel(recording.observationPolicy),
+      recording.operationId === null || recording.unmatchedReason ? unmatchedReasonLabel(recording.unmatchedReason) : null));
   const visibleLinked = selectedEndpoint && matches(selectedEndpoint.method, selectedEndpoint.routeTemplate, selectedEndpoint.applicationComponent, selectedEndpoint.binding)
     ? linked : matchingRecordings(linked);
   const visibleUnmatched = matchingRecordings(unmatched);
@@ -57,11 +59,13 @@ export function CatalogPanel(props: CatalogPanelProps) {
   const tree = <ul className="request-tree">
     {branches.map((endpoint) => {
       const expanded = catalogMode === 'linked' && selectedEndpoint?.operationId === endpoint.operationId;
+      const representativePolicy = observationPolicyLabel(endpoint.observationPolicy);
       return <li key={endpoint.operationId}>
         <button className="recording endpoint-card" aria-expanded={expanded}
           onClick={() => expanded ? onBack() : onOpenEndpoint(endpoint)}>
           <span className="endpoint-method">{endpoint.method}</span>
-          <span><span className="recording-title">{endpoint.routeTemplate}</span><span className="recording-sub">Component: {endpoint.applicationComponent}<br />Binding: {endpoint.binding}</span><span className="recording-status">observed</span></span>
+          <span><span className="recording-title">{endpoint.routeTemplate}</span><span className="recording-sub">Component: {endpoint.applicationComponent}<br />Binding: {endpoint.binding}</span><span className="recording-status">observed</span>
+            <span className="recording-policy">Representative policy: {representativePolicy ?? 'Unavailable'}</span></span>
         </button>
         {expanded ? <div className="request-branch">
           {linkedBusy && linked.length === 0 ? <div className="loading">Reading linked recordings…</div> : null}
@@ -74,6 +78,11 @@ export function CatalogPanel(props: CatalogPanelProps) {
       </li>;
     })}
   </ul>;
+  const policyNote = <div className="policy-note">
+    <strong>Operator-selected policy</strong>
+    <span>Endpoint summaries show a representative policy. Each recording shows its own recorded policy when available.
+      The policy does not attest which adapter or application produced the event.</span>
+  </div>;
   return <section className="pane" role="tabpanel" id="recordings-panel" aria-labelledby="recordings-tab" data-active={active} aria-label="Recordings">
         <div className="pane-head"><div><div className="eyebrow">Requests</div><h1>{catalogMode === 'endpoints' ? 'Endpoints' : catalogMode === 'linked' ? 'Linked recordings' : 'Unmatched recordings'}</h1></div>
           <button className="button" onClick={onRefresh} disabled={endpointBusy || linkedBusy || unmatchedBusy}>Refresh</button></div>
@@ -83,7 +92,7 @@ export function CatalogPanel(props: CatalogPanelProps) {
         {catalogMode === 'linked' ? <div className="catalog-back"><div className="catalog-actions"><button className="button" onClick={onBack}>← Observed endpoints</button><button className="button" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button></div><span>{selectedEndpoint?.method} {selectedEndpoint?.routeTemplate}</span><small>Component: {selectedEndpoint?.applicationComponent} · Binding: {selectedEndpoint?.binding}</small></div> : null}
         {catalogMode === 'endpoints' ? <>
           <div className="catalog-switch"><button className="button" aria-current="page">Observed endpoints</button><button className="button" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button></div>
-          <div className="policy-note"><strong>Operator-selected policy</strong><span>{endpoints[0]?.observationPolicy ?? 'spring-orders-v1'} does not attest which adapter or application produced the event.</span></div>
+          {policyNote}
           {endpointBusy && endpoints.length === 0 ? <div className="loading">Reading observed endpoints…</div> : null}
           {endpointError ? <ErrorState message={endpointError} onRetry={onRetryEndpoints} /> : null}
           {!endpointBusy && !endpointError && endpoints.length === 0 ? <div className="empty"><strong>No observed endpoints</strong><p>A persisted capture must include the exact operator-selected policy and approved route.</p></div> : null}
@@ -92,7 +101,7 @@ export function CatalogPanel(props: CatalogPanelProps) {
           {endpointCursor ? <div className="page-controls"><span className="top-meta">More endpoints</span><button className="button" onClick={onNextEndpoints} disabled={endpointBusy}>Load next page</button></div> : null}
         </> : null}
         {catalogMode === 'linked' ? <>
-          <div className="policy-note"><strong>Operator-selected policy</strong><span>{selectedEndpoint?.observationPolicy ?? 'spring-orders-v1'} does not attest which adapter or application produced the event.</span></div>
+          {policyNote}
           {tree}
         </> : null}
         {catalogMode === 'unmatched' ? <>

@@ -13,3 +13,4 @@
 .recording-list .recording-sub {
   overflow-wrap: anywhere;
 }
+.recording-policy { display: block; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }

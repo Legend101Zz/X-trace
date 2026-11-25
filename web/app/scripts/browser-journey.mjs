@@ -46,7 +46,8 @@ try {
   }
   await page.getByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }).waitFor();
   await page.getByText('Operator-selected policy').waitFor();
-  await page.getByText('spring-orders-v1 does not attest which adapter or application produced the event.').waitFor();
+  await page.getByText(/The policy does not attest which adapter or application produced the event/).waitFor();
+  await expect(page.locator('.endpoint-card').first()).toContainText('Representative policy: spring-orders-v1');
   assert.equal(await page.locator('.endpoint-card').count(), 1, 'the finite fixture policy shows its persisted endpoint');
   const screenshotDirectory = process.env.XTRACE_BROWSER_SCREENSHOT_DIR;
   const screenshotViews = [];
@@ -80,6 +81,7 @@ try {
   await expect(endpointCard).toHaveAttribute('aria-expanded', 'true');
   await requestSearch.fill('');
   const linkedRows = page.locator('.recording-list .recording');
+  await expect(linkedRows.filter({ hasText: recordingId })).toContainText('Recording policy: spring-orders-v1');
   await linkedRows.first().waitFor();
   const linkedIds = await linkedRows.locator('.recording-title').allTextContents();
   assert.deepEqual([...linkedIds].sort(), [...expectedLinkedIds].sort(), 'browser linked list matches the bounded endpoint query projection');
