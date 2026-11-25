@@ -11,7 +11,7 @@ const browser = await chromium.launch({ headless: true });
 try {
   const page = await browser.newPage({ colorScheme: 'dark' });
   const screenshotDirectory = process.env.XTRACE_FOCUSED_SCREENSHOT_DIR;
-  if (screenshotDirectory) await mkdir(screenshotDirectory, { recursive: true });
+  if (screenshotDirectory) await mkdir(screenshotDirectory, { recursive: true, mode: 0o700 });
   page.setDefaultTimeout(8000);
   const origin = new URL(url).origin;
   let externalRequests = 0;
@@ -62,7 +62,7 @@ try {
     assert.ok(await step.evaluate((row) => {
       const { left, right, top, bottom } = row.getBoundingClientRect();
       const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
-      return hit && row.contains(hit);
+      return hit != null && row.contains(hit);
     }), `the real event receives pointer input with Why expanded at ${width}px`);
     const copyWidth = await measureTextColumn();
     assert.ok(copyWidth >= 80, `focused Steps preserve a readable text column at ${width}px`);
