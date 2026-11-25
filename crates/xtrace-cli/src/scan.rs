@@ -54,8 +54,8 @@ pub struct ScanArgs {
     /// Framework family: spring-mvc, spring-webflux, express, fastify or nest.
     #[arg(long, value_name = "FAMILY")]
     pub framework: String,
-    /// Analyzer executable. Defaults to `XTRACE_JAVA_ANALYZER` (Spring) or
-    /// `XTRACE_NODE_ANALYZER` (Node).
+    /// Analyzer executable. The environment override takes precedence over the
+    /// packaged Spring analyzer. Node requires an explicit executable or environment override.
     #[arg(long, value_name = "PATH")]
     pub analyzer: Option<PathBuf>,
     /// Application component recorded in every operation identity.
@@ -468,6 +468,19 @@ async fn run_analyzer(
     Ok((lines, problem))
 }
 
+/// Resolve the real CLI path so invoking it through the public installer symlink
+/// still selects the analyzer from the same version directory.
+fn installed_spring_analyzer(executable: &Path) -> Option<PathBuf> {
+    let executable = executable.canonicalize().ok()?;
+    let bin = executable.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    let analyzer = bin.parent()?.join("share/xtrace/analyzers/java/bin/xtrace-java-static");
+    let resolved = analyzer.canonicalize().ok()?;
+    (resolved == analyzer && resolved.is_file()).then_some(resolved)
+}
+
 /// Signals the process group led by the analyzer we started (KILL; it is a scanner, not a service).
 #[cfg(unix)]
 fn stop_group(pid: Option<u32>) {
@@ -504,19 +517,16 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
     framework_syntax(&args.framework).map_err(|_| {
         invalid("framework must be spring-mvc, spring-webflux, express, fastify or nest")
     })?;
-    let analyzer = match &args.analyzer {
-        Some(path) => path.clone(),
-        None => {
-            let variable = if args.framework.starts_with("spring") {
-                "XTRACE_JAVA_ANALYZER"
-            } else {
-                "XTRACE_NODE_ANALYZER"
-            };
-            std::env::var_os(variable)
-                .map(PathBuf::from)
-                .ok_or_else(|| invalid(format!("no analyzer: pass --analyzer or set {variable}")))?
-        }
-    };
+    let spring = args.framework.starts_with("spring");
+    let variable = if spring { "XTRACE_JAVA_ANALYZER" } else { "XTRACE_NODE_ANALYZER" };
+    let analyzer = args
+        .analyzer
+        .clone()
+        .or_else(|| std::env::var_os(variable).map(PathBuf::from))
+        .or_else(|| {
+            if spring { installed_spring_analyzer(&std::env::current_exe().ok()?) } else { None }
+        })
+        .ok_or_else(|| invalid(format!("no analyzer: pass --analyzer or set {variable}")))?;
 
     let (lines, problem) = run_analyzer(
         &analyzer,
