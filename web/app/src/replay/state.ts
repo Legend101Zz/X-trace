@@ -29,7 +29,7 @@ export interface ReplayState {
 
 export type ReplayAction =
   | { type: 'select-operation'; operationId: string }
-  | { type: 'select-recording'; recordingId: string }
+  | { type: 'select-recording'; recordingId: string; restore?: Pick<ReplayState, 'frameId' | 'sequence'> }
   | { type: 'initialize-selection'; recordingId: string; frameId: string | null; sequence: string }
   | { type: 'select-frame'; frameId: string | null; sequence: string | null }
   | { type: 'set-mode'; mode: ReplayMode }
@@ -63,7 +63,7 @@ export function replayReducer(state: ReplayState, action: ReplayAction): ReplayS
       return { ...clearSelection(state), operationId: action.operationId, recordingId: '' };
     case 'select-recording':
       if (action.recordingId === state.recordingId) return state;
-      return { ...clearSelection(state), recordingId: action.recordingId };
+      return { ...clearSelection(state), recordingId: action.recordingId, ...action.restore };
     case 'initialize-selection':
       if (state.recordingId !== action.recordingId || state.sequence !== null) return state;
       return { ...state, frameId: action.frameId, sequence: action.sequence };
