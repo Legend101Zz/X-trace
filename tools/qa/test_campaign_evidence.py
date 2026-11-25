@@ -24,9 +24,23 @@ class WorkflowEvidence(unittest.TestCase):
 
     def test_exports_use_real_analyzer_and_required_privacy_coverage(self):
         text = (ROOT / ".github/workflows/campaigns.yml").read_text()
-        self.assertIn(":static-analyzer:installDist", text)
-        self.assertIn('--analyzer "$XCAMP_ANALYZER"', text)
-        self.assertIn("analyzer is not shipped", text)
+        build = (ROOT / "packaging/build.py").read_text()
+        self.assertIn('":static-analyzer:installDist"', build)
+        install_start = text.index("      - name: Install and verify the candidate in a fresh prefix")
+        install_end = text.index("      - name: Private canaries", install_start)
+        install = text[install_start:install_end]
+        self.assertIn('verify-dist "$RUNNER_TEMP/pkg"', install)
+        self.assertIn('--prefix "$prefix" --data-home', install)
+        self.assertIn('verify --prefix "$prefix"', install)
+        self.assertIn('test -x "$analyzer"', install)
+        self.assertIn('"$prefix/bin/xtrace" "$agent" >> "$GITHUB_ENV"', install)
+        export_start = text.index("      - name: Scan and export through the installed Spring analyzer")
+        exports = text[export_start:text.index("      - name: Browser setup", export_start)]
+        self.assertIn("unset XTRACE_JAVA_ANALYZER", exports)
+        self.assertIn('camp_exports.py --xtrace "$XCAMP_XTRACE"', exports)
+        self.assertIn("--require-pass", exports)
+        self.assertNotIn("--analyzer", exports)
+        self.assertNotIn(":static-analyzer:installDist", text)
         self.assertIn("--require exports:3", text)
         self.assertIn('--loc "exports=$RUNNER_TEMP/xt/exports"', text)
         self.assertIn("--require bundle-files:6", text)
