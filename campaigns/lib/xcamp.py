@@ -31,6 +31,7 @@ PLATFORM = os.environ.get("XCAMP_PLATFORM", "linux/arm64")  # CI x86_64 runners 
 POSTGRES_IMAGE = "postgres:18.3"
 POSTGRES_DIGEST = "sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+JAVA_OPTIONS_ENV = ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")
 
 
 # ---------------------------------------------------------------- hashing ----
@@ -320,6 +321,8 @@ class Stack:
     extra_db_init: list[str] = field(default_factory=list)
     ready_timeout: float = 420.0
     app_mem: str = "2g"
+    db_image: str = POSTGRES_IMAGE
+    launch_prefix: tuple[str, ...] = ()
     run_id: str = ""
     host_port: int = 0
 
@@ -355,7 +358,7 @@ class Stack:
                    *publish,
                    "-e", f"POSTGRES_USER={self.db_user}", "-e", f"POSTGRES_PASSWORD={self.db_password}",
                    "-e", f"POSTGRES_DB={self.db_name}", "--tmpfs", "/var/lib/postgresql:rw,size=1g",
-                   POSTGRES_IMAGE, "-c", "fsync=off", "-c", "max_connections=200", "-c", "timezone=UTC",
+                   self.db_image, "-c", "fsync=off", "-c", "max_connections=200", "-c", "timezone=UTC",
                    "-c", "log_timezone=UTC")
             if self.mode == "host":
                 self.db_host_port = published_port(self.db, 5432)
@@ -370,10 +373,10 @@ class Stack:
             java = os.environ.get("XCAMP_JAVA")
             if not java:
                 raise RuntimeError("XCAMP_APP_MODE=host requires XCAMP_JAVA (path to the JDK `java` binary)")
-            prefix = shlex.split(os.environ.get("XCAMP_LAUNCH_PREFIX", ""))
+            prefix = self.launch_prefix or shlex.split(os.environ.get("XCAMP_LAUNCH_PREFIX", ""))
             self._logfile = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / f"{PREFIX}{self.project}-{self.run_id}.log"
             child_env = {**os.environ, **env, "TZ": "UTC"}
-            for k in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
+            for k in JAVA_OPTIONS_ENV:
                 child_env.pop(k, None)
             with open(self._logfile, "wb") as fh:
                 self._proc = subprocess.Popen(

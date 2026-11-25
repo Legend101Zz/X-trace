@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""JHipster sample app campaign harness (PREPARATION, uninstrumented baseline). See petclinic/harness/run.py for usage."""
+"""Pinned JHipster backend workload, baseline and installed instrumented run."""
 import concurrent.futures
+import json
+import os
 import pathlib
 import re
+import stat
+import subprocess
 import sys
-import json
+import tarfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
 import xcamp  # noqa: E402
+import xinstr  # noqa: E402
+import evidence  # noqa: E402
 
 CAMP, PROJ, SRC = xcamp.load_campaign(__file__)
 HERE = pathlib.Path(__file__).resolve()
 JAR = SRC / CAMP["build"]["artifact"]
 IMAGE = CAMP["runtime"]["buildImage"]
+POSTGRES_IMAGE = CAMP["runtime"]["databaseImage"]
+POSTGRES_DIGEST = POSTGRES_IMAGE.split("@", 1)[1]
 # Synthetic, campaign-only signing secret (64 bytes, base64) - never an upstream or real secret.
 JWT_SECRET = "eHRyYWNlLWNhbXBhaWduLXN5bnRoZXRpYy1qd3Qtc2VjcmV0LW5vdC1mb3ItcHJvZHVjdGlvbi11c2UtMDEyMzQ1Njc4OWFiY2RlZg=="
 
@@ -28,15 +36,16 @@ def build() -> int:
     return rc
 
 
-def make_stack(run_id: str) -> xcamp.Stack:
+def make_stack(run_id: str, launch_prefix: tuple[str, ...] = ()) -> xcamp.Stack:
     return xcamp.Stack(
         project="jhipster", jdk_image=IMAGE, jar=JAR, run_id=run_id, app_port=8080,
-        app_args=["--spring.profiles.active=prod", "--server.port={APPPORT}"],
+        app_args=["--spring.profiles.active=prod", "--server.port={APPPORT}", "--server.address={BINDADDR}"],
         env={"SPRING_DATASOURCE_URL": "jdbc:postgresql://{DBHOST}:{DBPORT}/jhipsterSampleApplication",
              "SPRING_DATASOURCE_USERNAME": "jhipsterSampleApplication", "SPRING_DATASOURCE_PASSWORD": "campaign-synthetic",
              "JHIPSTER_SECURITY_AUTHENTICATION_JWT_BASE64_SECRET": JWT_SECRET},
         java_opts=["-Xmx1g"], db_name="jhipsterSampleApplication", db_user="jhipsterSampleApplication",
-        db_password="campaign-synthetic", ready_path="/management/health", ready_timeout=360,
+        db_password="campaign-synthetic", db_image=POSTGRES_IMAGE, launch_prefix=launch_prefix,
+        ready_path="/management/health", ready_timeout=360,
         ready_ok=lambda st, body: st == 200 and '"UP"' in body)
 
 
@@ -208,13 +217,252 @@ SCENARIOS = [
 ]
 
 
+def source_pin():
+    pin = {**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR),
+           "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
+           "postgresImageDigest": POSTGRES_DIGEST, "jdkImage": IMAGE}
+    if os.environ.get("XCAMP_APP_MODE") == "host":
+        pin["hostJava"] = host_java_identity()
+        pin["hostRunBindingSha256"] = hosted_run_binding()
+    return pin
+
+
+def host_java_identity():
+    """Observe the configured host executable and runtime with the stack's option policy."""
+    java = pathlib.Path(os.environ["XCAMP_JAVA"])
+    if not java.is_absolute():
+        raise ValueError("XCAMP_JAVA must identify the host JDK executable by absolute path")
+    java = java.resolve(strict=True)
+    env = {k: v for k, v in os.environ.items() if k not in xcamp.JAVA_OPTIONS_ENV}
+    result = subprocess.run([str(java), "-XshowSettings:properties", "-version"], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+    names = {"java.specification.version", "java.runtime.version", "java.vm.name", "java.vendor", "os.name", "os.arch"}
+    properties = {}
+    for line in result.stdout.splitlines():
+        key, _, val = line.strip().partition(" = ")
+        if key in names and 0 < len(val) <= 120 and val.isprintable():
+            properties[key] = val
+    if (result.returncode != 0 or properties.keys() != names
+            or properties["java.specification.version"] != str(CAMP["runtime"]["jdk"])):
+        raise ValueError("JHipster host runtime did not report the pinned Java major")
+    return {"properties": properties, "executableSha256": xcamp.sha256_file(java),
+            "jdkReleaseSha256": xcamp.sha256_file(java.parents[1] / "release")}
+
+
+def hosted_run_binding():
+    """Bind the job IDs to the Linux boot where baseline and instrumented workloads run."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return None
+    fields = ("GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB")
+    identity = {k: os.environ.get(k) for k in fields}
+    boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    if not all(identity.values()) or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_id):
+        raise ValueError("GitHub job and Linux boot identity unavailable")
+    return xcamp.sha256_json({**identity, "bootId": boot_id})
+
+
 def baseline(out):
-    return xcamp.run_baseline(project="jhipster", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR),
-                              "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
-                              "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
+    if os.environ.get("XCAMP_LAUNCH_PREFIX"):
+        raise ValueError("JHipster baseline requires an uninstrumented JVM")
+    STATE.clear()
+    return xcamp.run_baseline(project="jhipster", pin=source_pin(),
                               make_stack=make_stack, scenarios=SCENARIOS, out_dir=out, norm_extra=[],
                               adaptations=CAMP["configAdaptations"], harness_files=[HERE])
 
 
+def private_dir(path):
+    path = path.resolve(strict=True)
+    info = path.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("campaign directory must be owned by the runner and private")
+    return path
+
+
+def private_json_path(path):
+    path = path.resolve(strict=True)
+    private_dir(path.parent)
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("campaign input must be an owner-only file")
+    return path
+
+
+def package_inventory(current, manifest):
+    files = {}
+    for row in manifest["files"]:
+        rel = row["path"]
+        path = pathlib.PurePosixPath(rel)
+        digest, size = row["sha256"], row["size"]
+        if (path.is_absolute() or not path.parts or ".." in path.parts or path.as_posix() != rel
+                or rel in files or not xcamp.HEX64.fullmatch(digest) or type(size) is not int or size < 0
+                or not re.fullmatch(r"[^\x00-\x1f\x7f\\]+", rel)):
+            raise ValueError("invalid campaign package manifest inventory")
+        files[rel] = (digest, size)
+    installed = {}
+    for directory, dirs, names in os.walk(current, followlinks=False):
+        folder = pathlib.Path(directory)
+        if any((folder / d).is_symlink() for d in dirs):
+            raise ValueError("symbolic directory in installed package")
+        for name in names:
+            path = folder / name
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("non-regular entry in installed package")
+            installed[path.relative_to(current).as_posix()] = info.st_size
+    expected_sizes = {rel: size for rel, (_, size) in files.items()}
+    return files, installed, expected_sizes
+
+
+def installed_package(prefix, archive, package_sha, source_sha):
+    """Bind the hosted job's verified archive and installed payload to their actual bytes."""
+    if not xcamp.HEX64.fullmatch(package_sha) or xcamp.sha256_file(archive) != package_sha:
+        raise ValueError("campaign package archive digest mismatch")
+    rel_manifest = "share/xtrace/PACKAGE-MANIFEST.json"
+    rel_inventory = "share/xtrace/payload.sha256"
+    metadata = {}
+    tops = set()
+    with tarfile.open(archive, mode="r|gz") as tar:
+        for member in tar:
+            top, _, rel = member.name.partition("/")
+            if rel not in (rel_manifest, rel_inventory):
+                continue
+            if rel in metadata or not member.isfile() or member.size > 1024 * 1024:
+                raise ValueError("campaign package archive metadata is ambiguous or invalid")
+            tops.add(top)
+            with tar.extractfile(member) as stream:
+                metadata[rel] = stream.read()
+    if len(tops) != 1 or set(metadata) != {rel_manifest, rel_inventory}:
+        raise ValueError("campaign package archive metadata unavailable")
+    current = (prefix / "current").resolve(strict=True)
+    root = (prefix / "versions").resolve(strict=True)
+    if current.parent != root or root.parent != prefix:
+        raise ValueError("installed version is outside the verified prefix")
+    manifest = json.loads(metadata[rel_manifest])
+    if (manifest.get("schema") != "xtrace-package-manifest/1" or manifest.get("platform") != "linux-x86_64"
+            or tops != {f"xtrace-{manifest.get('version')}-linux-x86_64"}
+            or not re.fullmatch(r"[0-9a-f]{40}", source_sha) or manifest.get("sourceCommit") != source_sha):
+        raise ValueError("installed package source revision or platform mismatch")
+    xtrace = prefix / "bin/xtrace"
+    agent = current / "share/xtrace/packs/java/agent/xtrace-java-agent.jar"
+    analyzer = current / "share/xtrace/analyzers/java/bin/xtrace-java-static"
+    if xtrace.resolve(strict=True) != current / "bin/xtrace" or not all(os.access(p, os.X_OK) for p in (xtrace, analyzer)):
+        raise ValueError("installed campaign CLI or analyzer unavailable")
+    files, installed, expected_sizes = package_inventory(current, manifest)
+    expected_sizes[rel_manifest] = len(metadata[rel_manifest])
+    if installed != expected_sizes or any((current / rel).read_bytes() != data for rel, data in metadata.items()):
+        raise ValueError("installed package paths or metadata differ from the archive manifest")
+    inventory_sha = xcamp.sha256_bytes(metadata[rel_inventory])
+    expected_rows = {rel: digest for rel, (digest, _) in files.items() if rel != rel_inventory}
+    payload_rows = {}
+    for line in metadata[rel_inventory].decode().splitlines():
+        row = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if row is None or row[2] in payload_rows:
+            raise ValueError("invalid campaign package checksum inventory")
+        payload_rows[row[2]] = row[1]
+    if payload_rows != expected_rows or files[rel_inventory][0] != inventory_sha:
+        raise ValueError("installer checksum inventory does not cover the archive manifest")
+    installer = current / "install.sh"
+    if xcamp.sha256_file(installer) != expected_rows["install.sh"]:
+        raise ValueError("installed verifier differs from the archive manifest")
+    verification = subprocess.run(["sh", str(installer), "verify", "--prefix", str(prefix)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    if verification.returncode != 0:
+        raise ValueError("installer did not verify the complete package payload")
+    return str(xtrace), str(agent), {
+        "archiveSha256": package_sha, "sourceCommit": source_sha,
+        "payloadInventorySha256": inventory_sha, "payloadFilesVerified": len(payload_rows),
+        "cliSha256": expected_rows["bin/xtrace"],
+        "agentSha256": expected_rows[agent.relative_to(current).as_posix()],
+        "analyzerLauncherSha256": expected_rows[analyzer.relative_to(current).as_posix()],
+    }
+
+
+def checked_baseline(path, pin):
+    """Require the passing baseline from this job, Linux boot, JVM and built JAR."""
+    raw = path.read_bytes()
+    baseline_doc = json.loads(raw)
+    tracked = json.loads((HERE.parents[1] / "baseline-summary.json").read_text())
+    baseline_pin = baseline_doc.get("pin", {})
+    tracked_pin = tracked.get("pin", {})
+    expected_ids = [scenario.id for scenario in SCENARIOS]
+    rows = baseline_doc.get("scenarios", [])
+    ref = tracked.get("scenarios", [])
+    observed_java = pin["hostJava"]["properties"]
+    if (not pin.get("hostRunBindingSha256") or observed_java["os.name"] != "Linux" or observed_java["os.arch"] != "amd64"
+            or baseline_doc.get("result") != "passed_baseline_only" or baseline_doc.get("instrumented") is not False
+            or baseline_doc.get("project") != "jhipster" or baseline_doc.get("appMode") != "host"
+            or any(baseline_pin.get(k) != pin[k] for k in (
+                "sha", "git", "jarSha256", "postgresImageDigest", "hostJava", "hostRunBindingSha256"))
+            or any(tracked_pin.get(k) != pin[k] for k in ("sha", "postgresImageDigest"))
+            or [row.get("id") for row in rows] != expected_ids or [row.get("id") for row in ref] != expected_ids
+            or any(row.get("passed") is not True or not row.get("checks")
+                   or len(row.get("requests", [])) != expected["requests"] or len(row["checks"]) != expected["checks"]
+                   or any(check.get("passed") is not True for check in row["checks"])
+                   or not xcamp.HEX64.fullmatch(row.get("semanticEffectFingerprint", "")) for row, expected in zip(rows, ref))):
+        raise ValueError("baseline must be complete and passing with this job, boot, JVM, JAR, source and database")
+    fingerprints = {row["id"]: row["semanticEffectFingerprint"] for row in rows}
+    tracked_matches = {row["id"]: fingerprints[row["id"]] == row["semanticEffectFingerprint"] for row in ref}
+    return fingerprints, tracked_matches, xcamp.sha256_bytes(raw)
+
+
+def instrumented():
+    required = ("XCAMP_INSTALL_PREFIX", "XCAMP_PACKAGE_ARCHIVE", "XCAMP_PACKAGE_SHA256", "XCAMP_PRODUCT_SHA",
+                "XCAMP_JAVA", "XCAMP_DATA_HOME", "XCAMP_BASELINE_RECEIPT", "XCAMP_CANARY_FILE", "TMPDIR")
+    missing = [name for name in required if not os.environ.get(name)]
+    if (missing or os.environ.get("XCAMP_APP_MODE") != "host" or xcamp.PLATFORM != "linux/amd64"
+            or os.environ.get("XCAMP_LAUNCH_PREFIX")):
+        print("instrumented requires host mode with XCAMP_PLATFORM=linux/amd64 and no inherited launch prefix",
+              file=sys.stderr)
+        if missing:
+            print("Missing environment: " + ", ".join(missing), file=sys.stderr)
+        return 2
+    try:
+        private_root = private_dir(pathlib.Path(os.environ["XTRACE_CAMPAIGN_ROOT"]))
+        project_root = private_dir(PROJ)
+        if not project_root.is_relative_to(private_root) or SRC.resolve(strict=True).parent != project_root:
+            raise ValueError("JHipster checkout and receipts must remain under the private campaign root")
+        private_dir(pathlib.Path(os.environ["TMPDIR"]))
+        data_home = private_dir(pathlib.Path(os.environ["XCAMP_DATA_HOME"]))
+        baseline_path = private_json_path(pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]))
+        canary_path = private_json_path(pathlib.Path(os.environ["XCAMP_CANARY_FILE"]))
+        canaries = json.loads(canary_path.read_text())
+        canary_keys = ("authorization-header", "cookie-header", "query-token", "json-body-password", "env-var")
+        if (not isinstance(canaries, dict) or any(not isinstance(canaries.get(k), str) or not canaries[k]
+                                                  for k in canary_keys)
+                or len({canaries[k] for k in canary_keys}) != len(canary_keys)):
+            raise ValueError("campaign canary file lacks distinct values for the exercised surfaces")
+        prefix = pathlib.Path(os.environ["XCAMP_INSTALL_PREFIX"]).resolve(strict=True)
+        xtrace, agent, package = installed_package(prefix, pathlib.Path(os.environ["XCAMP_PACKAGE_ARCHIVE"]),
+                                                    os.environ["XCAMP_PACKAGE_SHA256"], os.environ["XCAMP_PRODUCT_SHA"])
+        pin = source_pin()
+        baseline_fingerprints, tracked_matches, baseline_digest = checked_baseline(baseline_path, pin)
+    except (OSError, subprocess.SubprocessError, tarfile.TarError, TypeError, ValueError, KeyError, RuntimeError) as exc:
+        # File and process errors may embed runner-local paths or sensitive input.
+        print(f"JHipster instrumented preparation failed ({type(exc).__name__})", file=sys.stderr)
+        return 2
+    launch = (xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent, "--app-package", evidence.APP_PACKAGE,
+              "--source-root", evidence.SOURCE_ROOT, "--capture-depth", "standard", "--")
+    STATE.clear()
+    n = 1
+    while (PROJ / f"instrumented-{n}").exists():
+        n += 1
+    receipt = xinstr.run_instrumented(
+        project="jhipster", pin={**pin, "installedPackage": package, "trackedBaselineMatches": tracked_matches,
+                                 "runBoundBaselineReceiptSha256": baseline_digest},
+        make_stack=lambda run_id: make_stack(run_id, launch), scenarios=SCENARIOS, out_dir=project_root / f"instrumented-{n}",
+        norm_extra=[], expectations=evidence.EXPECT, xtrace=xtrace, project_dir=SRC, data_home=data_home,
+        adaptations=CAMP["configAdaptations"], canaries=canaries, baseline_receipt=None, extra_canary_paths=[],
+        baseline_fingerprints=baseline_fingerprints,
+        harness_files=[HERE, pathlib.Path(evidence.__file__), pathlib.Path(xinstr.__file__), pathlib.Path(xcamp.__file__)],
+        ordered_campaign=xinstr.OrderedCampaign(evidence.PRE_DISPATCH, evidence.inject_probes, evidence.judge))
+    print(json.dumps({"result": receipt["result"], "workloadsPassed": receipt["workloadsPassed"],
+                      "sameRunnerBaselineMatched": receipt["baselineMatched"],
+                      "trackedBaselineMatched": all(tracked_matches.values()), "problemClasses": receipt["problemClasses"]}))
+    return 0 if receipt["result"] == "recorded" and all(tracked_matches.values()) else 1
+
+
 if __name__ == "__main__":
+    os.umask(0o077)
+    if sys.argv[1:] == ["instrumented"]:
+        sys.exit(instrumented())
     sys.exit(xcamp.main_cli("jhipster", build, baseline, PROJ))

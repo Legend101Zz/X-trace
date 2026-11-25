@@ -35,9 +35,9 @@
   "auth": {"scheme": "JWT bearer via POST /api/authenticate", "syntheticAccounts": "upstream-seeded admin and user (documented JHipster defaults); passwords redacted from recorded request bodies"},
   "scenarios": [
     {"id": "anonymous-and-invalid-login-denied", "kind": "auth", "seams": ["Spring Security filter chain 401", "AuthenticateController.authorize (invalid credentials)"]},
-    {"id": "admin-and-user-authentication", "kind": "auth", "seams": ["AuthenticateController.authorize", "AccountResource.getAccount", "UserResource.getAllUsers (403 for ROLE_USER)", "JDBC select jhi_user/jhi_user_authority"]},
+    {"id": "admin-and-user-authentication", "kind": "auth", "seams": ["AuthenticateController.authorize", "AccountResource.getAccount", "UserResource.getAllUsers (admin 200)", "Spring Security rejects ROLE_USER before MVC dispatch (403)", "JDBC select jhi_user/jhi_user_authority"]},
     {"id": "account-create-read-roundtrip", "kind": "db-write-read", "seams": ["BankAccountResource.createBankAccount", "BankAccountResource.getBankAccount", "JDBC insert bank_account"]},
-    {"id": "account-validation-errors", "kind": "validation", "seams": ["BankAccountResource.createBankAccount (BadRequestAlertException idexists / @Valid errors / HttpMessageNotReadable)"]},
+    {"id": "account-validation-errors", "kind": "validation", "seams": ["BankAccountResource.createBankAccount rejects preset id", "Spring MVC argument resolution rejects missing name and the malformed body before controller entry"]},
     {"id": "account-update-and-missing", "kind": "db-write-read", "seams": ["BankAccountResource.updateBankAccount", "JDBC update bank_account", "error path for unknown id"]},
     {"id": "operation-with-relations", "kind": "business", "seams": ["LabelResource.createLabel", "OperationResource.createOperation", "OperationResource.getOperation", "JDBC insert operation + rel_operation__label"]},
     {"id": "concurrent-isolation", "kind": "concurrency", "seams": ["12 parallel BankAccountResource create+get", "12 parallel authenticate+getAccount as admin/user; recordings must not cross-associate principals"]},
