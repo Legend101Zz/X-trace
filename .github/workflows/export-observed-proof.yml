@@ -1,0 +1,63 @@
+name: catalog-export-observed-proof
+on:
+  push:
+    branches: [codex/export-observed-102-proof]
+permissions:
+  contents: read
+jobs:
+  http:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PROBE_SOURCE: 3a878d144720a7afdccb0b05ceac9c75b68bad43
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Admit private test scratch
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          root="${RUNNER_TEMP:?}/xh"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/frag"
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+          echo "PROBE_ADMITTED=true" >> "$GITHUB_ENV"
+          printf '{"sourceSha":"%s","releaseAcceptance":false}\n' "$PROBE_SOURCE" > "$root/frag/source.json"
+      - name: Rust formatting and affected lint
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check > "$XTRACE_CI_PRIVATE_ROOT/fmt.log" 2>&1
+          cargo clippy --locked --all-features --all-targets -p xtrace-daemon -p xtrace-store -p xtrace-application -p xtrace-export -p xtrace-cli -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/clippy.log" 2>&1
+      - name: Project, tuple, revision and read snapshot
+        if: ${{ !cancelled() && env.PROBE_ADMITTED == 'true' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step observed-store \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 3 --max-ignored 0 -- cargo test --locked -p xtrace-store --lib viewer_export_observed
+      - name: Renderer approval and exact scoped CLI artifact bytes
+        if: ${{ !cancelled() && env.PROBE_ADMITTED == 'true' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step observed-render \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 1 --max-ignored 0 -- cargo test --locked -p xtrace-export --test catalog_export observed_scope
+      - name: Authenticated preview, scoped save and rejected selector spellings
+        if: ${{ !cancelled() && env.PROBE_ADMITTED == 'true' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step observed-http \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 1 --max-ignored 0 -- cargo test --locked -p xtrace-daemon --lib observed_scope
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && env.PROBE_ADMITTED == 'true' }}
+        with:
+          name: catalog-export-observed-proof
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
+          if-no-files-found: error
+          retention-days: 14
