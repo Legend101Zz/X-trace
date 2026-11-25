@@ -1,0 +1,59 @@
+.viewer-dialog:has(.export-sheet) {
+  inset: 0;
+  width: min(57.5rem, calc(100% - 2rem));
+  height: fit-content;
+  margin: auto;
+  max-height: calc(100dvh - 2rem);
+  border: 1px solid var(--line-strong);
+  border-top: 3px solid var(--amber);
+  border-radius: var(--radius);
+}
+.viewer-dialog:has(.export-sheet)::backdrop { background: var(--scrim); }
+.viewer-dialog:has(.export-sheet) .viewer-dialog-body { padding: 0; }
+.export-sheet { font-size: .875rem; line-height: 1.45; overflow-wrap: anywhere; }
+.export-sheet nav, .export-sheet > section { padding: .6rem 1rem; }
+.export-sheet .export-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; padding: 0; margin: 0; list-style: none; }
+.export-progress li { display: flex; gap: .35rem; align-items: center; color: var(--muted); }
+.export-progress li span { display: grid; place-items: center; width: 1.4rem; height: 1.4rem; border: 1px solid var(--line-strong); border-radius: 50%; }
+.export-progress li[aria-current] { color: var(--text); font-weight: 600; }
+.export-progress li[aria-current] span, .export-sheet .export-primary {
+  color: var(--on-accent); background: var(--amber); border-color: var(--amber);
+}
+.export-sheet :is(button, select) {
+  min-height: 44px; min-width: 44px; padding: .4rem .75rem;
+  color: var(--text); background: var(--panel-raised); border: 1px solid var(--line-strong); border-radius: var(--radius);
+  font: inherit; cursor: pointer;
+}
+.export-sheet :is(button, select):focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.export-sheet [aria-pressed='true'] { border-color: var(--amber); box-shadow: inset 0 0 0 1px var(--amber); }
+.export-sheet [aria-pressed='true']::before { content: ''; display: inline-block; width: .45em; height: .75em; margin-right: .6em; border: solid var(--amber); border-width: 0 2px 2px 0; transform: rotate(45deg); }
+.export-sheet button:disabled { color: var(--muted); cursor: default; }
+.export-sheet h3 { font-size: .95rem; margin: .6rem 0 .4rem; }
+.export-formats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
+.export-formats button { text-align: start; }
+.export-formats button span { display: block; margin-top: .25rem; color: var(--muted); }
+.export-sheet .export-encoding { display: inline-flex; align-items: center; gap: .5rem; margin: .5rem 0; }
+.export-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
+.export-footer { padding: .7rem 1rem; justify-content: end; border-top: 1px solid var(--line); }
+.export-footer span { margin-inline-end: auto; color: var(--muted); }
+.export-feedback:not(:empty) { padding: .5rem 1rem; }
+.export-preview { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
+.export-preview > *, .export-files li, .export-command { min-width: 0; }
+.export-sheet code { display: block; font: .75rem/1.6 var(--mono); overflow-wrap: anywhere; }
+.export-files { list-style: none; margin: 0; padding: 0; }
+.export-files li { display: grid; gap: .2rem; padding: .5rem 0; border-top: 1px solid var(--line); }
+.export-files span { color: var(--muted); }
+.export-command { margin-top: .7rem; border-top: 1px solid var(--line); }
+.export-command code { margin: .4rem 0; padding: .5rem; background: var(--surface); }
+@media (max-width: 40rem) {
+  .viewer-dialog:has(.export-sheet) { width: 100%; max-height: 100dvh; }
+  .export-preview, .export-formats { grid-template-columns: minmax(0, 1fr); }
+}
+
+.request-branch > .export-trigger, #recordings-panel > .export-trigger { margin: .25rem .65rem; }
+.export-trigger, .recording-more summary { min-height: 44px; min-width: 44px; }
+.recording-more { flex-shrink: 0; margin-inline-start: auto; }
+.recording-more summary { display: grid; place-items: center; cursor: pointer; list-style: none; }
+.recording-more summary::-webkit-details-marker { display: none; }
+.recording-more summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+.recording-more-options { position: absolute; z-index: 4; inset-inline-end: .5rem; top: 100%; padding: .3rem; background: var(--panel-raised); border: 1px solid var(--line-strong); border-radius: var(--radius); }

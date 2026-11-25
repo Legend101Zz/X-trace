@@ -1,3 +1,4 @@
+import { ExportAction } from '../export/ExportAction';
 import { useState } from 'react';
 import type { CatalogMode, Endpoint, Recording } from '../../types';
 import { ErrorState } from '../common/ErrorState';
@@ -64,6 +65,7 @@ export function CatalogPanel(props: CatalogPanelProps) {
           <span><span className="recording-title">{endpoint.routeTemplate}</span><span className="recording-sub">Component: {endpoint.applicationComponent}<br />Binding: {endpoint.binding}</span><span className="recording-status">observed</span></span>
         </button>
         {expanded ? <div className="request-branch">
+          <ExportAction endpoint={endpoint} label="Export this endpoint…" />
           {linkedBusy && linked.length === 0 ? <div className="loading">Reading linked recordings…</div> : null}
           {linkedError ? <ErrorState message={linkedError} onRetry={onRetryLinked} /> : null}
           {!linkedBusy && !linkedError && linked.length === 0 ? <div className="empty"><strong>No linked recordings</strong><p>This endpoint has no persisted linked recording in the current page.</p></div> : null}
@@ -77,6 +79,7 @@ export function CatalogPanel(props: CatalogPanelProps) {
   return <section className="pane" role="tabpanel" id="recordings-panel" aria-labelledby="recordings-tab" data-active={active} aria-label="Recordings">
         <div className="pane-head"><div><div className="eyebrow">Requests</div><h1>{catalogMode === 'endpoints' ? 'Endpoints' : catalogMode === 'linked' ? 'Linked recordings' : 'Unmatched recordings'}</h1></div>
           <button className="button" onClick={onRefresh} disabled={endpointBusy || linkedBusy || unmatchedBusy}>Refresh</button></div>
+        {catalogMode === 'endpoints' ? <ExportAction endpoint={null} label="Export endpoints…" /> : null}
         <label className="request-search" id="request-search-label" htmlFor="request-search">Search loaded requests</label>
         <input type="search" id="request-search" className="request-search-input" aria-labelledby="request-search-label"
           value={search} onChange={(event) => setSearch(event.currentTarget.value)} />
