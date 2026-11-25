@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 env:
-  PROBE_SOURCE: 617cab4d31a343c91b8e025e64135128975999b6
+  PROBE_SOURCE: 522b2a95607ba7cefb8cefbafe167e377274e7ee
   CARGO_TERM_COLOR: never
 jobs:
   meta:
