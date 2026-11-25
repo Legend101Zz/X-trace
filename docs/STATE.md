@@ -77,8 +77,9 @@ direct commands, 12 per scratch layout, with 97 tests each; [run 45457094207](ht
 passed 12 after the original Gradle/CLI precursors with cold caches. Neither reproduced the failure; its cause
 remains open. The separately reviewed store candidate `1bb2ae3abc4b865d8823ff33f2e07180fb05bbfa` passed its
 named focused [run 45455858650](https://github.com/Legend101Zz/X-trace/actions/runs/45455858650), preserving the
-workloads, and still needs integration into the next coherent head. These focused runs do not establish a full
-CI pass. See #69 handoff comments
+workloads. PR #75 now includes that fixture change and fixed test-only Java labels for the cache admission
+phase when available. Production admission and the concurrent worker workload are unchanged. The focused runs
+do not establish a full CI pass on the combined change. See #69 handoff comments
 [7139591259](https://github.com/Legend101Zz/X-trace/issues/69#issuecomment-7139591259) and
 [7140221334](https://github.com/Legend101Zz/X-trace/issues/69#issuecomment-7140221334).
 
@@ -89,10 +90,9 @@ before Rust. Do not infer that main is green or that every historical intermitte
 
 ## Next work
 
-1. Resolve the current red main based on evidence. Batch the reviewed store candidate with an evidence-supported
-   Java follow-up in the next coherent head. Preserve every gate, assertion and budget; an
-   unreached gate is not a pass. Verify the exact reviewed head and post-merge main under ADR 0012 before new
-   feature work.
+1. Resolve the current red main based on evidence. Verify the combined PR #75 head with three full Linux
+   `ci-ok` passes. If first attach fails again, capture the fixed phase label when available before choosing a
+   repair. Preserve every gate, assertion and budget. Verify post-merge main before new feature work.
 2. Continue [#69](https://github.com/Legend101Zz/X-trace/issues/69) and
    [#3](https://github.com/Legend101Zz/X-trace/issues/3): finish #32 export claims and policy digest, integrate
    #36's observed burst-correlation harness with honest ambiguity where individual correlation is unavailable, and
