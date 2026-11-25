@@ -69,13 +69,17 @@ try {
     const shownLocal = active.locator('.value-binding').filter({ hasText: 'descriptionPresent' });
     assert.ok(await shownLocal.locator('.value-preview').textContent() === local.value.preview,
       `selected real local preview matches the read API inline at ${width}px`);
+    await page.getByRole('tablist', { name: 'Inspector evidence' }).getByRole('tab', { name: /^Values/ }).click();
     assert.ok((await page.getByRole('region', { name: 'Values', exact: true }).textContent()).includes('descriptionPresent'),
       `selected real local is in Values at ${width}px`);
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
       `focused source and values fit at ${width}px`);
     const rendered = await page.locator('body').textContent();
     assert.ok(canaries.every((canary) => !rendered.includes(canary)), 'private limits hold in the focused rendered UI');
-    if (screenshotDirectory) await page.screenshot({ path: join(screenshotDirectory, `focused-code-${width}.png`), fullPage: true });
+    if (screenshotDirectory) {
+      await page.screenshot({ path: join(screenshotDirectory, `focused-code-${width}.png`), fullPage: true });
+      await page.screenshot({ path: join(screenshotDirectory, `focused-code-${width}-viewport.png`) });
+    }
   }
   assert.equal(externalRequests, 0, 'focused viewer made a request outside loopback');
   assert.equal(browserErrors, 0, 'focused browser reported an error');

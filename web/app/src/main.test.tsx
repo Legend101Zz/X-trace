@@ -299,8 +299,9 @@ describe('endpoint-first recording viewer', () => {
     expect(screen.getByText('recording_event_kind:gap')).toBeInTheDocument();
     expect(screen.getByText('symbol truncated · 300 bytes')).toBeInTheDocument();
     expect(screen.getByText('Source location is unavailable for this event')).toBeInTheDocument();
-    expect(screen.getByText(/No value bindings were recorded for this event/)).toBeInTheDocument();
     expect(screen.getByText('Per-event duration is not recorded')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /^Values/ }));
+    expect(screen.getByText(/No value bindings were recorded for this event/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: 'events' }));
     fireEvent.click(screen.getByRole('button', { name: 'Load next window' }));
     expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();

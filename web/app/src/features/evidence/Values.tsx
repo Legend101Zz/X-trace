@@ -1,5 +1,6 @@
 import type { Binding } from '../../replay/value-evidence';
 import { valueEvidence } from '../../replay/value-evidence';
+import { WhyDisclosure } from './WhyDisclosure';
 import './values.css';
 
 export function BindingList({ bindings, inline = false }: { bindings: readonly Binding[]; inline?: boolean }) {
@@ -13,11 +14,7 @@ export function BindingList({ bindings, inline = false }: { bindings: readonly B
         </div>
         {!inline ? <p className="value-metadata">{binding.role || 'Role unavailable'} · {binding.nameOrigin || 'Name origin unavailable'}</p> : null}
         {typeof item.preview === 'string' ? <code className="value-preview">{item.preview === '' ? 'Empty preview' : item.preview}</code> : null}
-        {item.wording ? <details className="value-why">
-          <summary>Why?</summary>
-          <p>{item.wording}</p>
-          {item.reason ? <p>{item.reason}</p> : null}
-        </details> : null}
+        {item.wording ? <WhyDisclosure lines={[item.wording, ...(item.reason ? [item.reason] : [])]} /> : null}
       </li>;
     })}
   </ul>;

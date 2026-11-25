@@ -1,0 +1,5 @@
+.inspector-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 12px; }
+.inspector-tabs .button[aria-selected='true'] { color: var(--amber); background: var(--select); border-color: var(--amber); }
+.missing-list { list-style: none; margin: 4px 0 12px; padding: 0; }
+.missing-entry { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 11px; overflow-wrap: anywhere; }
+.missing-entry > p { margin: 4px 0; }

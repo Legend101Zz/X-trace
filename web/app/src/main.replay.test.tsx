@@ -24,7 +24,10 @@ const events = [
 ];
 
 const detail = {
-  recordingId: recordingA, status: 'complete', completion: 'complete', adapterSummary: null, durationNs: '20', dropCountsByPriority: {}, segmentCount: '1', incompleteEvidence: [], nextCursor: null,
+  recordingId: recordingA, status: 'complete', completion: 'complete',
+  adapterSummary: null as null | { Redacted: { rule_id: string; shape_hint: unknown } },
+  capacity: null as null | { eventCap: number; eventCount: number; capacityDroppedEvents: string; dropsByPriority: Record<string, string> },
+  durationNs: '20', dropCountsByPriority: {}, segmentCount: '1', incompleteEvidence: [] as string[], nextCursor: null,
   sessionContext,
   unavailable: { source: 'unavailable', values: 'unavailable', completion: 'unavailable' },
   outcome: { kind: 'exception', httpStatus: 500, exception: { exceptionType: 'java.lang.IllegalStateException', message: 'boom' }, thrownFromEventId: null },
@@ -381,6 +384,7 @@ describe('replay wiring in the app', () => {
     expect(active?.querySelector('.source-inline')).not.toHaveTextContent('before it ran');
     expect(within(code()).getByText('Source excerpt is bounded')).toBeInTheDocument();
 
+    fireEvent.click(within(inspector()).getByRole('tab', { name: /^Values/ }));
     const values = within(inspector()).getByRole('region', { name: 'Values', hidden: true });
     expect([...values.querySelectorAll('[data-value-state]')].map((row) => row.getAttribute('data-value-state')))
       .toEqual(['captured', 'truncated', 'redacted', 'unavailable', 'dropped']);
@@ -393,5 +397,46 @@ describe('replay wiring in the app', () => {
     expect(rows()).toHaveLength(0);
     expect(within(code()).getByText('Recorded line cursor L8. No matching source row is available.')).toBeInTheDocument();
     expect(inspector()).not.toHaveTextContent('PRIVATE-SOURCE');
+  });
+  it('groups loaded reports and focuses the recorded frame-less gap without inventing step targets', async () => {
+    const sentinel = { ...events[1], frameId: null, kind: 'recording_event_kind:gap',
+      gap: { count: '9007199254740993', reason: 'line_budget' } };
+    const event = { ...events[0], interaction: { method: 'GET', path: 'PRIVATE-WITHHELD-PATH' } };
+    responseDetail = { ...detail, events: [event, sentinel],
+      incompleteEvidence: ['gap_event_sequence:2', 'gap_event_sequence:12', 'future_persisted_code'] };
+    await openRecording();
+    fireEvent.click(screen.getByRole('tab', { name: 'evidence' }));
+    const details = within(inspector()).getByRole('tab', { name: 'Details', hidden: true });
+    const missing = within(inspector()).getByRole('tab', { name: /^Missing/, hidden: true });
+    expect(within(inspector()).getByText('Event capacity facts unavailable')).toBeInTheDocument();
+    expect(inspector()).not.toHaveTextContent('PRIVATE-WITHHELD-PATH');
+
+    details.focus();
+    fireEvent.keyDown(details, { key: 'ArrowLeft' });
+    expect(missing).toHaveFocus();
+    expect(missing).toHaveAttribute('aria-selected', 'true');
+    const loaded = within(inspector()).getByRole('region', { name: 'Loaded window missing evidence', hidden: true });
+    const reports = within(inspector()).getByRole('region', { name: 'Recording reports', hidden: true });
+    expect(loaded).toHaveTextContent('9007199254740993 suppressed events');
+    expect(loaded).toHaveTextContent('Line events were not recorded: the line budget was exhausted.');
+    expect(reports).not.toHaveTextContent('gap_event_sequence:2');
+    expect(reports).toHaveTextContent('gap_event_sequence:12');
+    expect(reports).toHaveTextContent('future_persisted_code');
+    expect(within(reports).queryByRole('button', { name: /Go to event/ })).not.toBeInTheDocument();
+
+    fireEvent.click(within(loaded).getByRole('button', { name: 'Go to event 2' }));
+    const gapRow = screen.getByRole('button', { name: /9007199254740993 events were not recorded here/ });
+    expect(gapRow).toHaveAttribute('aria-current', 'true');
+    await waitFor(() => expect(gapRow).toHaveFocus());
+  });
+  it('shows observed zero capacity separately from a withheld adapter summary', async () => {
+    responseDetail = { ...detail, capacity: { eventCap: 16, eventCount: 4, capacityDroppedEvents: '0', dropsByPriority: {} },
+      adapterSummary: { Redacted: { rule_id: 'PRIVATE-RULE', shape_hint: { preview: 'PRIVATE-SUMMARY' } } } };
+    await openRecording();
+    const recording = within(inspector()).getByRole('region', { name: 'Recording details', hidden: true });
+    expect(recording).toHaveTextContent('Capacity drops · 0');
+    expect(recording).not.toHaveTextContent('Event capacity facts unavailable');
+    expect(recording).toHaveTextContent('Value withheld by a redaction rule.');
+    expect(recording).not.toHaveTextContent(/PRIVATE-RULE|PRIVATE-SUMMARY/);
   });
 });

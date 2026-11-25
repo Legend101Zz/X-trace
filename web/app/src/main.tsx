@@ -9,6 +9,7 @@ import { EventsPanel } from './features/events/EventsPanel';
 import { EvidencePanel } from './features/evidence/EvidencePanel';
 import { retainPage } from './retained-page';
 import { initialReplayState, replayReducer } from './replay/state';
+import type { MissingTarget } from './replay/missing';
 import { navigationControls } from './replay/navigation';
 import type { NavAction, NavFrameNavigation } from './replay/navigation';
 import { useLane } from './state/lane';
@@ -405,6 +406,24 @@ export default function App() {
     setAnnouncement(`Event ${item.sequence} selected`);
   };
 
+  const goToMissing = ({ recordingId, sequence, frameId }: MissingTarget) => {
+    if (selectedRecordingRef.current !== recordingId || detail?.recordingId !== recordingId) return;
+    const target = detail.events.find((item) => item.sequence === sequence && (item.frameId ?? null) === frameId);
+    if (!target) {
+      setAnnouncement('Selected event is not in the loaded window.');
+      return;
+    }
+    selectEvent(recordingId, target);
+    dispatchReplay({ type: 'set-mode', mode: 'linear' });
+    setActivePane('events');
+    setAnnouncement(`Event ${sequence} selected`);
+    requestAnimationFrame(() => {
+      if (selectedRecordingRef.current !== recordingId) return;
+      const current = document.querySelector<HTMLElement>('.event[aria-current="true"]');
+      if (current?.querySelector('.event-seq')?.textContent === sequence) current.focus();
+    });
+  };
+
   const navigateToFrame = useCallback((action: string, frameId: string) => {
     const target = detail?.events.find((item) => item.frameId === frameId);
     if (!target) {
@@ -501,7 +520,7 @@ export default function App() {
       nextReason={nextReason}
       frameControls={frameControls}
     />
-    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectionUnavailable={selectionUnavailable} onBackToEvent={() => {
+    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectionUnavailable={selectionUnavailable} onGoToMissing={goToMissing} onBackToEvent={() => {
       setActivePane('events');
       requestAnimationFrame(() => {
         const row = document.querySelector<HTMLElement>('.event[aria-current="true"], .canvas-tree [aria-selected="true"]');
