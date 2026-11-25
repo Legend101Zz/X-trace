@@ -585,7 +585,8 @@ mod tests {
     }
 
     #[test]
-    fn omission_summary_counts_complete_groups_without_exposing_input_text() {
+    fn omission_summary_counts_complete_groups_without_exposing_input_text()
+    -> Result<(), ViewerExportError> {
         let raw = Omission {
             what: "curl:param:query:client_secret".to_owned(),
             reason: "credential_not_embedded".to_owned(),
@@ -593,7 +594,7 @@ mod tests {
         };
         let future =
             Omission { reason: "unrecognized fixture-private-text".to_owned(), ..raw.clone() };
-        let summary = summarize_omissions(&[raw.clone(), future], ExportFormat::Bundle).unwrap();
+        let summary = summarize_omissions(&[raw.clone(), future], ExportFormat::Bundle)?;
         assert_eq!(
             summary,
             [
@@ -615,5 +616,6 @@ mod tests {
             summarize_omissions(&vec![raw; MAX_OMISSIONS + 1], ExportFormat::Bundle),
             Err(ViewerExportError::LimitExceeded(ViewerExportLimit::Omissions)),
         );
+        Ok(())
     }
 }
