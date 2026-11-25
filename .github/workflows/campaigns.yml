@@ -206,20 +206,43 @@ jobs:
             --step baseline-fingerprints-vs-pinned --status not-implemented \
             --note "no x86_64 pin to compare with and no repeat run; baseline above is one own-check run"
       # ---- instrumented stages (petclinic has the harness; other projects record not-implemented below)
-      - name: Unpack the candidate package
+      - name: Install and verify the candidate in a fresh prefix
         id: unpack
         if: matrix.project == 'petclinic' && always()
         run: |
-          set -u
-          mkdir -p "$RUNNER_TEMP/xpkg"
-          tar -xzf "$RUNNER_TEMP"/pkg/xtrace-*-linux-x86_64.tar.gz -C "$RUNNER_TEMP/xpkg"
-          top=$(ls -d "$RUNNER_TEMP"/xpkg/xtrace-* | head -n1)
-          echo "XCAMP_XTRACE=$top/bin/xtrace" >> "$GITHUB_ENV"
-          echo "XCAMP_AGENT=$top/share/xtrace/packs/java/agent/xtrace-java-agent.jar" >> "$GITHUB_ENV"
-          sha256sum "$RUNNER_TEMP"/pkg/xtrace-*-linux-x86_64.tar.gz | cut -d' ' -f1 > "$CAMP_OUT/package.sha256"
-          test -x "$top/bin/xtrace"
-          test -f "$top/share/xtrace/packs/java/agent/xtrace-java-agent.jar"
-          "$top/bin/xtrace" --version
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/xpkg"
+          prefix="$root/installed X-trace"
+          mkdir -p "$root/unpacked" "$RUNNER_TEMP/priv"
+          {
+            sh packaging/install.sh verify-dist "$RUNNER_TEMP/pkg"
+            archives=("$RUNNER_TEMP"/pkg/xtrace-*-linux-x86_64.tar.gz)
+            test "${#archives[@]}" -eq 1
+            test -f "${archives[0]}"
+            tar -xzf "${archives[0]}" -C "$root/unpacked"
+            tops=("$root"/unpacked/xtrace-*)
+            test "${#tops[@]}" -eq 1
+            test ! -e "$prefix"
+            sh "${tops[0]}/install.sh" --prefix "$prefix" --data-home "$RUNNER_TEMP/xt/data"
+            sh "$prefix/current/install.sh" verify --prefix "$prefix"
+            installed=$(cd "$prefix/current" && pwd -P)
+            agent="$installed/share/xtrace/packs/java/agent/xtrace-java-agent.jar"
+            analyzer="$installed/share/xtrace/analyzers/java/bin/xtrace-java-static"
+            test -x "$prefix/bin/xtrace"
+            test -f "$agent"
+            test -x "$analyzer"
+            "$prefix/bin/xtrace" --version
+            sha256sum "${archives[0]}" | cut -d' ' -f1 > "$CAMP_OUT/package.sha256"
+            printf 'XCAMP_XTRACE=%s\nXCAMP_AGENT=%s\n' "$prefix/bin/xtrace" "$agent" >> "$GITHUB_ENV"
+          } > "$RUNNER_TEMP/priv/candidate-install.log" 2>&1
+          python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
+            --step candidate-install --status pass --note "fresh prefix and installed payload verified"
+      - name: Record candidate install failure
+        if: matrix.project == 'petclinic' && always() && steps.unpack.outcome != 'success'
+        run: |
+          python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
+            --step candidate-install --status fail --note "candidate installation or verification failed"
       - name: Private canaries and scanner self-check
         if: matrix.project == 'petclinic' && always()
         run: |
@@ -263,7 +286,7 @@ jobs:
           echo "XCAMP_ANALYZER=$GITHUB_WORKSPACE/adapters/java/static-analyzer/build/install/xtrace-java-static/bin/xtrace-java-static" >> "$GITHUB_ENV"
           python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
             --step analyzer-source-accommodation --status reported \
-            --note "real Spring MVC analyzer built from candidate sources; analyzer is not shipped in the candidate package"
+            --note "real Spring MVC analyzer built from candidate sources pending installed analyzer qualification"
       - name: Exports of the recorded project (scanned for canaries below)
         if: matrix.project == 'petclinic' && always()
         run: |
