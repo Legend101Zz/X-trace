@@ -1,4 +1,4 @@
-name: Medusa installed development proof
+name: Medusa installed development proof successor
 on:
   push:
     branches: [codex/proof-medusa-installed-120]
@@ -12,8 +12,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      MEDUSA_PRODUCT_SHA: 5b8cf035f51834491484ea662ebadfd34f2b76f2
-      MEDUSA_PRODUCT_TREE: 9518035b35bdfb029e3b75af3ed2eccc8057bd81
+      MEDUSA_PRODUCT_SHA: 89596b9cc51b1fa283b55842f5ffd83b53895ccd
+      MEDUSA_PRODUCT_TREE: dae23c4eb3d5aaa87542c1cfd1f1962ab3ec2bd9
       CARGO_TERM_COLOR: never
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -52,6 +52,160 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          cat >"$MEDUSA_ROOT/outer/package-checkpoints.py" <<'MEDUSA_PACKAGE_CHECKPOINTS'
+          """Add finite package checkpoints to the pinned installed Medusa helper in memory."""
+
+          import ast
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from contextlib import contextmanager
+          from pathlib import Path
+
+          INSTALLED_SHA = "fcc453f29238c6fa0e0e92adc7fa0da76ac82fe3a310956547eedf7db8efc5ca"
+          PRODUCT_TREE = "dae23c4eb3d5aaa87542c1cfd1f1962ab3ec2bd9"
+
+          # Ordered, exhaustive line ranges for the body of Proof.install's package stage.
+          # Exact source bytes are checked before compiling, and each original statement
+          # is covered exactly once. The names are finite and never taken from runtime data.
+          OPERATIONS = (
+              ("hash-archive", 331, 331),
+              ("verify-dist", 332, 332),
+              ("verify-package-binary-schema-tui", 333, 334),
+              ("load-archive-verifier", 335, 337),
+              ("extract-archive", 338, 340),
+              ("check-package-identity", 341, 343),
+              ("check-fresh-prefix-and-archive-digest", 344, 344),
+              ("install-fresh-prefix", 345, 346),
+              ("verify-installed-prefix", 347, 348),
+              ("check-installed-cli-target", 349, 349),
+              ("compare-package-manifests", 350, 350),
+              ("compare-cli-bytes", 351, 351),
+              ("compare-node-runtime-manifests", 352, 353),
+              ("hash-installed-cli-and-node-manifest", 354, 354),
+              ("installed-cli-version", 355, 355),
+          )
+
+
+          def instrument(source, filename):
+              if hashlib.sha256(source).hexdigest() != INSTALLED_SHA:
+                  raise ValueError("installed helper digest mismatch")
+              parsed = ast.parse(source, filename=filename)
+              (proof,) = [node for node in parsed.body if isinstance(node, ast.ClassDef) and node.name == "Proof"]
+              (install,) = [node for node in proof.body if isinstance(node, ast.FunctionDef) and node.name == "install"]
+              (package,) = [node for node in install.body if isinstance(node, ast.With) and node.lineno == 330]
+              remaining = package.body.copy()
+              wrapped = []
+              for label, start, end in OPERATIONS:
+                  body = []
+                  while remaining and remaining[0].lineno <= end:
+                      body.append(remaining.pop(0))
+                  if not body or body[0].lineno != start or body[-1].end_lineno != end:
+                      raise ValueError("package checkpoint range mismatch")
+                  guard = ast.Call(func=ast.Name(id="_medusa_package_checkpoint", ctx=ast.Load()),
+                                   args=[ast.Constant(value=label)], keywords=[])
+                  wrapper = ast.With(items=[ast.withitem(context_expr=guard, optional_vars=None)], body=body)
+                  wrapped.append(ast.copy_location(wrapper, body[0]))
+              if remaining:
+                  raise ValueError("unaccounted package statements")
+              package.body = wrapped
+              return compile(ast.fix_missing_locations(parsed), filename, "exec")
+
+
+          def failure(exc):
+              if isinstance(exc, subprocess.CalledProcessError):
+                  code = exc.returncode
+                  if type(code) is int and 1 <= code <= 255:
+                      return "exit-nonzero", code
+                  if type(code) is int and -127 <= code <= -1:
+                      return "terminated", -code
+                  return "command-failed", None
+              if isinstance(exc, subprocess.TimeoutExpired):
+                  return "deadline", None
+              if isinstance(exc, OSError):
+                  return "filesystem-or-spawn", None
+              if isinstance(exc, KeyboardInterrupt):
+                  return "interrupted", None
+              if isinstance(exc, SystemExit):
+                  return "verifier-exited", None
+              return "check-or-internal-error", None
+
+
+          def main():
+              if len(sys.argv) != 5 or sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true":
+                  raise ValueError("expected the hosted proof invocation")
+              script = Path(sys.argv[1]).resolve(strict=True)
+              repo = script.parents[4]
+              if repo != Path.cwd() or script != repo / "campaigns/node/medusa/harness/installed.py":
+                  raise ValueError("unexpected installed helper path")
+              product_sha = os.environ["MEDUSA_PRODUCT_SHA"]
+              wrapper_sha = os.environ["GITHUB_SHA"]
+              run_id = os.environ["GITHUB_RUN_ID"]
+              attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+              if (not all(re.fullmatch("[a-f0-9]{40}", value) for value in (product_sha, wrapper_sha))
+                      or os.environ["MEDUSA_PRODUCT_TREE"] != PRODUCT_TREE
+                      or not re.fullmatch("[1-9][0-9]{0,19}", run_id)
+                      or not re.fullmatch("[1-9][0-9]{0,5}", attempt)):
+                  raise ValueError("invalid package checkpoint identity")
+              code = instrument(script.read_bytes(), str(script))
+              sys.path[:1] = [str(script.parent), str(repo)]
+              from tools.release.private_roots import admit_directory, atomic_write_private
+
+              root = Path(os.environ["MEDUSA_ROOT"])
+              admit_directory(root / "safe")
+              if Path(sys.argv[2]) != root / "proof":
+                  raise ValueError("unexpected proof root")
+              receipt = {
+                  "schemaVersion": 1,
+                  "kind": "medusa-package-checkpoints",
+                  "sourceSha": product_sha,
+                  "sourceTree": PRODUCT_TREE,
+                  "wrapperSha": wrapper_sha,
+                  "runId": run_id,
+                  "attempt": attempt,
+                  "installedHelperSha256": INSTALLED_SHA,
+                  "firstFailure": None,
+                  "steps": [{"name": label, "status": "unreached"} for label, _, _ in OPERATIONS],
+              }
+              next_step = 0
+
+              def save():
+                  atomic_write_private(root / "safe/package.json", (json.dumps(receipt, sort_keys=True) + "\n").encode())
+
+              @contextmanager
+              def checkpoint(label):
+                  nonlocal next_step
+                  if next_step >= len(receipt["steps"]) or receipt["steps"][next_step]["name"] != label:
+                      raise ValueError("unexpected package checkpoint order")
+                  step = receipt["steps"][next_step]
+                  step["status"] = "running"
+                  save()
+                  try:
+                      yield
+                  except BaseException as exc:
+                      reason, code = failure(exc)
+                      step["status"] = "failed"
+                      receipt["firstFailure"] = {"name": label, "reason": reason, "code": code}
+                      save()
+                      raise
+                  else:
+                      step["status"] = "passed"
+                      next_step += 1
+                      save()
+
+              save()
+              sys.argv = sys.argv[1:]
+              exec(code, {"__name__": "__main__", "__file__": str(script), "_medusa_package_checkpoint": checkpoint})
+
+
+          if __name__ == "__main__":
+              main()
+          MEDUSA_PACKAGE_CHECKPOINTS
+          helper_sum=$(sha256sum "$MEDUSA_ROOT/outer/package-checkpoints.py")
+          test "${helper_sum%% *}" = "784903a35280cd66bc3038f4a0b48140ffad5a8e407980d0fb5359b60cdec01d"
           rc=0
           python3 -B - <<'PYTHON' >"$MEDUSA_ROOT/outer/controller.stdout" 2>"$MEDUSA_ROOT/outer/controller.stderr" || rc=$?
           import json, os, pathlib, re, subprocess, sys
@@ -66,12 +220,14 @@ jobs:
           from installed_process import contain_children, verify_children_gone
           contain_children()
           stages = ('named-tests', 'named-counts', 'local-transport-tests', 'local-transport-counts',
+                    'staged-copy-tests', 'staged-copy-counts', 'package-verifier-tests', 'package-verifier-counts',
                     'package-build', 'clone-starter', 'database-image', 'installed-journey', 'runner-cleanup')
           docker = ['docker', '--host', 'unix:///var/run/docker.sock']
           receipt = {'schemaVersion': 1, 'kind': 'medusa-proof-120-host',
                      'sourceSha': os.environ['MEDUSA_PRODUCT_SHA'], 'sourceTree': os.environ['MEDUSA_PRODUCT_TREE'],
                      'status': 'failed', 'stages': dict.fromkeys(stages, 'unreached'),
-                     'namedTests': None, 'localTransportTests': None}
+                     'namedTests': None, 'localTransportTests': None,
+                     'stagedCopyTests': None, 'packageVerifierTests': None}
           def save():
               atomic_write_private(root / 'safe/host.json', (json.dumps(receipt, sort_keys=True)+'\n').encode())
           def command(stage, args, timeout):
@@ -95,6 +251,23 @@ jobs:
                   finally:
                       verify_children_gone()
               receipt['stages'][stage] = 'passed'
+              save()
+          def package_tests(label, pattern, field, expected):
+              result_path = root/'outer'/(label+'.json')
+              command(label+'-tests', ['python3', '-B', '-m', 'tools.qa.unittest_run', '--result',
+                      str(result_path), 'discover', '-s', 'packaging/test', '-p', pattern], 30)
+              count_stage = label+'-counts'
+              receipt['stages'][count_stage] = 'failed'
+              save()
+              assert result_path.stat().st_size <= 16384
+              result = read_result(result_path)
+              summarize(result)
+              counts = result['counts']
+              assert all(value <= 64 for value in counts.values())
+              receipt[field] = counts
+              save()
+              assert counts['testsRun'] == expected and all(value == 0 for key, value in counts.items() if key != 'testsRun')
+              receipt['stages'][count_stage] = 'passed'
               save()
           def verify_owned_databases_absent():
               receipt['stages']['runner-cleanup'] = 'failed'
@@ -157,6 +330,8 @@ jobs:
           assert node_counts == {'tests': 5, 'pass': 5, 'fail': 0, 'cancelled': 0, 'skipped': 0, 'todo': 0}
           receipt['stages']['local-transport-counts'] = 'passed'
           save()
+          package_tests('staged-copy', 'test_node_pack.py', 'stagedCopyTests', 1)
+          package_tests('package-verifier', 'test_verify_package.py', 'packageVerifierTests', 12)
           command('package-build', ['python3', '-B', 'packaging/build.py', '--out', str(proof/'dist'),
                                      '--work', str(root/'build'), '--platform', 'linux-x86_64'], 3600)
           archives = list((proof/'dist/linux-x86_64').glob('xtrace-*-linux-x86_64.tar.gz'))
@@ -167,7 +342,8 @@ jobs:
           command('database-image', docker + ['pull', '--platform', 'linux/amd64',
                   'postgres@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db'], 240)
           try:
-              command('installed-journey', ['python3', '-B', harness+'/installed.py', str(proof), str(archives[0]),
+              command('installed-journey', ['python3', '-B', str(root/'outer/package-checkpoints.py'),
+                                            harness+'/installed.py', str(proof), str(archives[0]),
                                             str(proof/'starter')], 3300)
           finally:
               verify_owned_databases_absent()
@@ -179,9 +355,10 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() && steps.root.outputs.admitted == 'true' }}
         with:
-          name: medusa-installed-120-counts
+          name: medusa-installed-120-successor-counts
           path: |
             ${{ env.MEDUSA_ROOT }}/safe/host.json
+            ${{ env.MEDUSA_ROOT }}/safe/package.json
             ${{ env.MEDUSA_ROOT }}/proof/safe/report.json
           if-no-files-found: error
           retention-days: 7
