@@ -480,7 +480,7 @@ final class FixtureInstrumentation {
     // driver-internal retry. Both JDBC batch entry points use internalExecuteBatch.
     var execute = named("execute")
         .and(takesArguments(3))
-        .and(takesArgument(0, named("org.postgresql.util.CachedQuery")))
+        .and(takesArgument(0, named("org.postgresql.core.CachedQuery")))
         .and(takesArgument(1, named("org.postgresql.core.ParameterList")))
         .and(takesArgument(2, int.class))
         .and(returns(void.class));
