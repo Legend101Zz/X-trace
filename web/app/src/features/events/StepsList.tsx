@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react';
 import { displaySymbol } from '../../replay/display-symbol';
 import { stepSentence } from '../../replay/step-sentence';
 import type { ReplayEvent } from '../../types';
+import { revealWithin } from '../common/reveal-within';
 import './steps.css';
 
 export function StepsList({ events, selected, onPick, onMove }: {
@@ -15,7 +16,12 @@ export function StepsList({ events, selected, onPick, onMove }: {
   const selectedRow = useRef<HTMLButtonElement>(null);
 
   useLayoutEffect(() => {
-    if (rail.current?.contains(document.activeElement)) selectedRow.current?.focus();
+    const scrollport = rail.current;
+    const row = selectedRow.current;
+    if (!scrollport || !row) return;
+    // A mode switch remounts this rail. Reveal its selection without scrolling any ancestor.
+    revealWithin(scrollport, row, 'vertical');
+    if (scrollport.contains(document.activeElement)) row.focus({ preventScroll: true });
   }, [selected?.sequence]);
 
   return <div className="event-rail" ref={rail} aria-label="Loaded replay steps">
