@@ -81,7 +81,8 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
     return next;
   });
   const onKeyDown = (keyboard: KeyboardEvent) => {
-    if ((keyboard.target as HTMLElement).tagName === 'BUTTON') return;
+    // Alt+ArrowUp/Down belong to the viewer-wide event stepping handler.
+    if (keyboard.altKey || (keyboard.target as HTMLElement).tagName === 'BUTTON') return;
     const actions: Record<string, () => void> = {
       ArrowDown: () => move(1), ArrowUp: () => move(-1),
       Home: () => rows[0] && onSelectFrame(rows[0].frameId),

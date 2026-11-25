@@ -246,6 +246,19 @@ describe('replay wiring in the app', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
     expect(screen.queryByRole('treeitem', { selected: true })).not.toBeInTheDocument();
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    const initialTreeItem = screen.getAllByRole('treeitem')[0];
+    initialTreeItem.focus();
+    expect(initialTreeItem).toHaveFocus();
+    fireEvent.keyDown(initialTreeItem, { altKey: true, key: 'ArrowDown' });
+    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    expect(screen.queryByRole('treeitem', { selected: true })).not.toBeInTheDocument();
+    expect(initialTreeItem).toHaveFocus();
+    fireEvent.keyDown(initialTreeItem, { altKey: true, key: 'ArrowUp' });
+    expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
+    const selectedTreeItem = screen.getByRole('treeitem', { selected: true });
+    expect(selectedTreeItem).toHaveFocus();
+    fireEvent.keyDown(selectedTreeItem, { altKey: true, key: 'ArrowDown' });
+    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Linear' }));
     expect(screen.getByRole('button', { name: /Request boundary/ })).toHaveAttribute('aria-current', 'true');
 
