@@ -54,6 +54,15 @@ jobs:
             --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
             --min-passed 19 --max-ignored 0 -- \
             cargo test --locked --all-features -p xtrace-cli --test export_journey
+      - name: Verify each newly added catalog fixture executed
+        run: |
+          set -euo pipefail
+          grep -Fxq "test linked_observations_require_positive_count_and_full_scope_identity ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Fxq "test live_observation_update_changes_rendered_bytes_without_changing_revision ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Fxq "test selection_uses_stable_ids_and_reports_first_missing_before_rendering ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Fxq "test all_formats_are_independent_of_catalog_and_observation_read_order ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Fxq "test missing_claims_and_policy_remain_explicit_without_copying_summary_values ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          echo "Five named catalog regression cases passed." >> "$GITHUB_STEP_SUMMARY"
       - name: Upload sanitized test receipts
         if: ${{ always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
