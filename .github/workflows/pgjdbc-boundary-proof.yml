@@ -19,6 +19,15 @@ jobs:
           java-version: |
             17
             21
+          cache: gradle
+          cache-dependency-path: |
+            adapters/java/build.gradle.kts
+            adapters/java/settings.gradle.kts
+            adapters/java/gradle.lockfile
+            adapters/java/*/build.gradle.kts
+            adapters/java/*/gradle.lockfile
+            adapters/java/gradle/verification-metadata.xml
+            adapters/java/gradle/wrapper/gradle-wrapper.properties
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
           toolchain: stable
@@ -39,6 +48,24 @@ jobs:
             else
               echo 'Java compilation or fixture packaging failed.'
             fi
+            python3 -B - "$root/gradle.log" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+          with Path(sys.argv[1]).open("rb") as stream:
+              data = stream.read(1048577)
+          if len(data) <= 1048576:
+              for label, pattern in {
+                  "maven-central": rb"https://repo\.maven\.apache\.org/",
+                  "gradle-plugin-portal": rb"https://plugins\.gradle\.org/",
+                  "http-5xx": rb"Received status code 5[0-9][0-9]\b",
+                  "connection-timeout": rb"timed out|TimeoutException",
+                  "dependency-verification": rb"Dependency verification failed",
+                  "compile-test-java": rb"> Task :[a-z-]+:compileTestJava FAILED",
+              }.items():
+                  if re.search(pattern, data):
+                      print("Gradle failure signal:", label)
+          PY
             exit 1
           fi
           python3 -B - "$GITHUB_STEP_SUMMARY" <<'PY'
