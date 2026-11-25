@@ -5,6 +5,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates curl tar gzip libstdc++6 libatomic1 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=pinned_node /usr/local/ /usr/local/
-RUN corepack enable
+# The build uses pnpm. The upstream Yarn shim points outside the copied prefix.
+RUN corepack enable pnpm
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 DO_NOT_TRACK=1
 WORKDIR /work
