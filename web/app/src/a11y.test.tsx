@@ -75,8 +75,8 @@ async function openRecording() {
   render(<App />);
   fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
-  await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('Controller.create');
-  fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
+  await within(screen.getAllByRole('tabpanel', { name: 'Steps' }).find((panel) => panel.id === 'events-panel')!).findByText('Controller.create');
+  fireEvent.click(within(screen.getByRole('tablist', { name: 'Viewer panes' })).getByRole('tab', { name: 'Steps' }));
 }
 
 describe('accessibility rules over the rendered viewer', () => {
@@ -100,8 +100,34 @@ describe('accessibility rules over the rendered viewer', () => {
 
   it('has no structural violations in the Canvas view', async () => {
     await openRecording();
-    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
+    fireEvent.click(within(screen.getByRole('tablist', { name: 'Replay view' })).getByRole('tab', { name: 'Map' }));
     expect(screen.getByRole('tree')).toBeInTheDocument();
+    expect(audit()).toEqual([]);
+  });
+
+  it('associates each replay view tab with its actual panel without changing the outer pane', async () => {
+    await openRecording();
+    const outer = document.getElementById('events-panel')!;
+    expect(outer).toHaveAccessibleName('Steps');
+    const views = within(outer).getByRole('tablist', { name: 'Replay view' });
+    const steps = within(views).getByRole('tab', { name: 'Steps' });
+    const map = within(views).getByRole('tab', { name: 'Map' });
+    const stepsPanel = document.getElementById(steps.getAttribute('aria-controls')!)!;
+    const mapPanel = document.getElementById(map.getAttribute('aria-controls')!)!;
+    expect(stepsPanel).toHaveAttribute('role', 'tabpanel');
+    expect(stepsPanel).toHaveAttribute('aria-labelledby', steps.id);
+    expect(stepsPanel).toHaveAccessibleName('Steps');
+    expect(stepsPanel).toBeVisible();
+    expect(within(stepsPanel).getByText('Controller.create')).toBeInTheDocument();
+    expect(mapPanel).toHaveAttribute('role', 'tabpanel');
+    expect(mapPanel).toHaveAttribute('aria-labelledby', map.id);
+    expect(mapPanel).not.toBeVisible();
+    fireEvent.click(map);
+    expect(mapPanel).toHaveAccessibleName('Map');
+    expect(mapPanel).toBeVisible();
+    expect(within(mapPanel).getByRole('tree')).toBeInTheDocument();
+    expect(stepsPanel).not.toBeVisible();
+    expect(outer).toHaveAccessibleName('Steps');
     expect(audit()).toEqual([]);
   });
 
@@ -116,7 +142,7 @@ describe('accessibility rules over the rendered viewer', () => {
   it('keyboard-only: Tab visits the active tab, then controls in DOM order, with one tree stop', async () => {
     const user = userEvent.setup();
     await openRecording();
-    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
+    fireEvent.click(within(screen.getByRole('tablist', { name: 'Replay view' })).getByRole('tab', { name: 'Map' }));
     (document.activeElement as HTMLElement | null)?.blur();
     const order: string[] = [];
     for (let step = 0; step < 60; step += 1) {
@@ -128,12 +154,12 @@ describe('accessibility rules over the rendered viewer', () => {
     }
     // The header request shortcut precedes the one active viewer-pane tab.
     expect(order[0]).toBe('button:Requests');
-    expect(order.filter((entry) => ['tab:Requests', 'tab:Steps', 'tab:Inspector'].includes(entry))).toEqual(['tab:Steps']);
+    expect(order.filter((entry) => ['tab:Requests', 'tab:Steps', 'tab:Inspector', 'tab:Map'].includes(entry))).toEqual(['tab:Steps', 'tab:Map']);
     expect(order.filter((entry) => entry.startsWith('treeitem:'))).toHaveLength(1);
     // Expand buttons inside the tree are reachable by pointer, not by Tab (roving tabindex).
     expect(order.some((entry) => entry.startsWith('button:Expand') || entry.startsWith('button:Collapse'))).toBe(false);
     // The tree stop comes after the Linear/Canvas switch.
-    const canvasIndex = order.indexOf('button:Map');
+    const canvasIndex = order.indexOf('tab:Map');
     const treeIndex = order.findIndex((entry) => entry.startsWith('treeitem:'));
     expect(canvasIndex).toBeGreaterThan(-1);
     expect(treeIndex).toBeGreaterThan(canvasIndex);

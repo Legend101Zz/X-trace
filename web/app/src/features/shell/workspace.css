@@ -28,7 +28,8 @@
    later event rows reachable without spilling across the Inspector divider. */
 .steps-and-code > .pane { container: replay-steps / inline-size; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; }
 .steps-and-code > .pane > *, .steps-content > * { flex-shrink: 0; }
-.steps-and-code .steps-content > .event-rail { overflow: visible; }
+.steps-and-code .replay-view-panel > .event-rail { overflow: visible; }
+.replay-view-panel { min-width: 0; }
 
 @media (min-width: 861px) {
   .workspace.viewer-workspace { grid-template-columns: minmax(0, var(--requests-size)) 8px minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); grid-template-rows: minmax(0, 1fr) auto; }

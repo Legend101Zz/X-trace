@@ -91,9 +91,9 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     await touchTargets(panel({ filter: 'Filter steps', goto: 'Go to step', jump: 'Jump to' }[name]));
   };
   const showSteps = async () => {
-    const tab = page.getByRole('tab', { name: 'Steps', exact: true });
+    const tab = page.getByRole('tablist', { name: 'Viewer panes' }).getByRole('tab', { name: 'Steps', exact: true });
     if (await tab.isVisible()) await activate(tab);
-    await activate(page.getByRole('button', { name: 'Steps', exact: true }));
+    await activate(page.getByRole('tablist', { name: 'Replay view' }).getByRole('tab', { name: 'Steps', exact: true }));
     await expect(selected).toBeVisible();
   };
   const goto = async (sequence) => {
@@ -162,9 +162,9 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
         await expect(selected.locator('.event-seq')).toHaveText(sequence);
         await expect(page.locator('.replay-filter-note')).toContainText(`showing ${expected.length} of ${events.length} loaded steps`);
       }
-      await activate(page.getByRole('button', { name: 'Map', exact: true }));
+      await activate(page.getByRole('tablist', { name: 'Replay view' }).getByRole('tab', { name: 'Map', exact: true }));
       await expect(page.getByRole('region', { name: 'Recording summary' })).toContainText(`Event sequence ${sequence}`);
-      await activate(page.getByRole('button', { name: 'Steps', exact: true }));
+      await activate(page.getByRole('tablist', { name: 'Replay view' }).getByRole('tab', { name: 'Steps', exact: true }));
       await expect(selected.locator('.event-seq')).toHaveText(sequence);
       await touchTargets(page.locator('.replay-filter-note'));
       await activate(page.getByRole('button', { name: 'Show all steps', exact: true }));

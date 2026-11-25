@@ -56,7 +56,7 @@ try {
   for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1440, 900]]) {
     stage = `synthetic scroll at ${width}px`;
     await page.setViewportSize({ width, height });
-    const stepsTab = page.getByRole('tab', { name: 'Steps', exact: true });
+    const stepsTab = page.getByRole('tablist', { name: 'Viewer panes' }).getByRole('tab', { name: 'Steps', exact: true });
     if (await stepsTab.isVisible()) await stepsTab.click();
     const scrollStart = performance.now();
     const peakMountedRows = await verifyMountedWindow(page, expected);

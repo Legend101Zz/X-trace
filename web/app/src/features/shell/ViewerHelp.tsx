@@ -52,6 +52,8 @@ export function ViewerHelp() {
         <dt><kbd>Alt + Shift + ↓ / ↑</kbd></dt><dd>Next or previous call when its navigation target is loaded.</dd>
         <dt><kbd>Alt + I / O / U</kbd></dt><dd>Step in, over, or out when a target is available.</dd>
         <dt><kbd>Alt + M</kbd></dt><dd>Switch between Steps and Map.</dd>
+        <dt><kbd>Alt + P</kbd></dt><dd>Replay or pause the selected recording. Esc also pauses outside text fields and dialogs.</dd>
+        <dt><kbd>Alt + , / .</kbd></dt><dd>Slower or faster replay: 0.5×, 1×, 2× or 4×. Recorded timestamps stay unchanged.</dd>
         <dt><kbd>← / →</kbd> on viewer, recording, or Inspector tabs</dt><dd>Change the active tab.</dd>
         <dt><kbd>↑ / ↓</kbd> in Steps</dt><dd>Move between loaded events or browse adjacent loaded rows.</dd>
         <dt><kbd>Home / End</kbd> on a divider</dt><dd>Use the smallest or largest panel size. Enter collapses or restores it.</dd>

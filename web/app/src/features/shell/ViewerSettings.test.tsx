@@ -27,14 +27,17 @@ it('validates stored choices independently and restores valid updates after remo
   expect(screen.getByLabelText('Recording times')).toHaveValue('utc');
   expect(screen.getByLabelText('Inline values in code')).toHaveValue('off');
   expect(screen.getByLabelText('Show timing')).toHaveValue('off');
+  expect(screen.getByLabelText('Default speed')).toHaveValue('1');
   expect(screen.getByLabelText('Animations')).toHaveValue('system');
   fireEvent.change(screen.getByLabelText('Code font size'), { target: { value: '16' } });
   fireEvent.change(screen.getByLabelText('Show timing'), { target: { value: 'on' } });
+  fireEvent.change(screen.getByLabelText('Default speed'), { target: { value: '2' } });
   mounted.unmount();
   render(<SettingsHarness />);
   expect(screen.getByLabelText('Code font size')).toHaveValue('16');
   expect(screen.getByLabelText('Recording times')).toHaveValue('utc');
   expect(screen.getByLabelText('Show timing')).toHaveValue('on');
+  expect(screen.getByLabelText('Default speed')).toHaveValue('2');
 });
 
 it('keeps appearance usable for the session when storage reads and writes are blocked', () => {
@@ -51,4 +54,14 @@ it('keeps appearance usable for the session when storage reads and writes are bl
   render(<SettingsHarness />);
   expect(screen.getByLabelText('Inline values in code')).toHaveValue('on');
   expect(screen.getByLabelText('Animations')).toHaveValue('system');
+});
+
+it('rejects an invalid default speed and keeps an explicit session speed when storage is blocked', () => {
+  localStorage.setItem(key, JSON.stringify({ defaultSpeed: '600', timing: 'on' }));
+  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('storage blocked'); });
+  render(<SettingsHarness />);
+  expect(screen.getByLabelText('Default speed')).toHaveValue('1');
+  expect(screen.getByLabelText('Show timing')).toHaveValue('on');
+  fireEvent.change(screen.getByLabelText('Default speed'), { target: { value: '0.5' } });
+  expect(screen.getByLabelText('Default speed')).toHaveValue('0.5');
 });

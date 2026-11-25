@@ -1,0 +1,14 @@
+.replay-playback { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; }
+.replay-playback-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.replay-playback .button, .replay-speed-panel .button { min-width: 44px; min-height: 44px; }
+.replay-playback .replay-start, .replay-playback .replay-start:hover { color: var(--on-accent); background: var(--amber); border-color: var(--amber); }
+.replay-playback .replay-start[aria-disabled='true'], .replay-playback .replay-start[aria-disabled='true']:hover { color: var(--muted); background: var(--panel); border-color: var(--line-strong); }
+.replay-playback-status { flex: 1 1 18rem; min-width: 0; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.replay-speed-panel { position: fixed; z-index: 30; width: min(360px, calc(100vw - 16px)); max-height: calc(100dvh - 16px); overflow-y: auto; padding: 12px; background: var(--panel-raised); border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.replay-speed-panel h3 { margin: 0 0 8px; font-size: 14px; }
+.replay-speed-panel p { margin: 8px 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.replay-speed-options { display: flex; flex-wrap: wrap; gap: 6px; }
+@media (max-width: 599px) {
+  .replay-playback { gap: 2px 8px; }
+  .replay-playback-status { flex-basis: 100%; font-size: 10px; }
+}

@@ -11,7 +11,8 @@ import { RecordingContext } from './features/shell/RecordingContext';
 import { ViewerDialog } from './features/shell/ViewerDialog';
 import { ViewerHelp } from './features/shell/ViewerHelp';
 import { ViewerSettings } from './features/shell/ViewerSettings';
-import { useAppearancePreferences, ViewerPreferencesContext, ViewerPreferencesUpdateContext } from './features/shell/viewer-preferences';
+import { ViewerPreferencesContext, ViewerPreferencesUpdateContext } from './features/shell/viewer-preferences';
+import type { useAppearancePreferences } from './features/shell/viewer-preferences';
 import './features/shell/viewer-dialog.css';
 
 const INSPECTOR_DOCK_KEY = 'xtrace.viewer.inspector-dock';
@@ -40,14 +41,16 @@ export interface AppShellProps {
   sourceEvent: ReplayEvent | undefined;
   detail: Detail | null;
   endpoint: Endpoint | null;
+  appearance: ReturnType<typeof useAppearancePreferences>;
+  playbackControls: ReactNode;
+  onPausePlayback: () => void;
   children: [ReactNode, ReactNode, ReactNode];
 }
 
 /** Page chrome: header, pane tabs, live region and authentication overlays. */
-export function AppShell({ activePane, onPane, announcement, auth, authError, openRecordings, selectedRecording, onSelectRecording, onCloseRecording, sourceEvent, detail, endpoint, children }: AppShellProps) {
+export function AppShell({ activePane, onPane, announcement, auth, authError, openRecordings, selectedRecording, onSelectRecording, onCloseRecording, sourceEvent, detail, endpoint, appearance, playbackControls, onPausePlayback, children }: AppShellProps) {
   const [dock, setDock] = useState(readInspectorDock);
   const theme = useThemePreference();
-  const appearance = useAppearancePreferences();
   const [modal, setModal] = useState<{ title: 'Settings' | 'Help'; opener: HTMLElement } | null>(null);
   function changeDock(next: InspectorDock) {
     setDock(next);
@@ -107,13 +110,13 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
       {PANES.map((pane) => <button key={pane} role="tab" id={`${pane}-tab`} aria-controls={`${pane}-panel`} tabIndex={activePane === pane ? 0 : -1} className="pane-tab" aria-selected={activePane === pane} onClick={() => onPane(pane)}>{PANE_LABELS[pane]}</button>)}
     </nav>
     <RecordingTabs recordings={openRecordings} selected={selectedRecording} onSelect={onSelectRecording} onClose={onCloseRecording} />
-    {detail ? <RecordingContext key={detail.recordingId} detail={detail} endpoint={endpoint} event={sourceEvent} /> : null}
+    {detail ? <RecordingContext key={detail.recordingId} detail={detail} endpoint={endpoint} event={sourceEvent} playback={playbackControls} /> : null}
     <ResizableWorkspace requests={children[0]} steps={children[1]} inspector={children[2]} sourceEvent={sourceEvent} activePane={activePane} dock={dock} />
     <footer className="viewer-preferences">
       <span>{auth === 'ready' ? 'Local viewer connected' : auth === 'checking' ? 'Connecting to local viewer' : 'Local viewer unavailable'}</span>
       <div className="viewer-dialog-actions">
         {(['Settings', 'Help'] as const).map((title) => <button type="button" className="button" key={title}
-          aria-haspopup="dialog" onClick={(event) => setModal({ title, opener: event.currentTarget })}>{title}</button>)}
+          aria-haspopup="dialog" onClick={(event) => { onPausePlayback(); setModal({ title, opener: event.currentTarget }); }}>{title}</button>)}
       </div>
     </footer>
     <div className="sr-only" role="status" aria-live="polite">{announcement}</div>

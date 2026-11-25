@@ -237,8 +237,8 @@ async function selectionDiagnostic(page, mode, event, recordingId) {
       // SVG exposes selection only, with no frame-key attribute. Do not infer identity from it.
       svgFrameIdentityComparable: false,
       stepsButtonCount: stepsButtons.length, mapButtonCount: mapButtons.length,
-      stepsPressedCount: stepsButtons.filter((node) => node.getAttribute('aria-pressed') === 'true').length,
-      mapPressedCount: mapButtons.filter((node) => node.getAttribute('aria-pressed') === 'true').length,
+      stepsPressedCount: stepsButtons.filter((node) => node.getAttribute('aria-selected') === 'true').length,
+      mapPressedCount: mapButtons.filter((node) => node.getAttribute('aria-selected') === 'true').length,
       surfaces: {
         stepsButton: geometry(stepsButtons[0]), mapButton: geometry(mapButtons[0]),
         selectedStep: geometry(steps[0]), selectedTree: geometry(tree[0]), expectedTree: geometry(matchingTree[0]),
@@ -334,20 +334,20 @@ async function measureSample(index, options, manifest, chromium) {
     let lastSequence = BigInt(detail.events.at(-1).sequence);
     setStage('initial_steps', 'dom_snapshot');
     result.dom.push(await domSample(page, 'initial_steps', apiState(), options['cdp-heap']));
-    const mode = page.getByRole('group', { name: 'Replay view', exact: true });
+    const mode = page.getByRole('tablist', { name: 'Replay view', exact: true });
     const navigation = page.getByRole('group', { name: 'Replay navigation', exact: true });
     const switchMode = async (target, phase) => {
       setStage(phase, 'mode_click');
       expectedMode = target;
       expectedSelection = selected;
-      const button = mode.getByRole('button', { name: target === 'map' ? 'Map' : 'Steps', exact: true });
+      const button = mode.getByRole('tab', { name: target === 'map' ? 'Map' : 'Steps', exact: true });
       const transition = { phase, requestedMap: target === 'map', clickCompleted: false,
         pressedObserved: null, selectionMatched: false };
       result.modeTransitions.push(transition);
       await button.click();
       transition.clickCompleted = true;
       result.substage = 'mode_pressed';
-      transition.pressedObserved = await button.getAttribute('aria-pressed') === 'true';
+      transition.pressedObserved = await button.getAttribute('aria-selected') === 'true';
       check(transition.pressedObserved);
       result.substage = 'selection_wait';
       await waitSelection(page, target, selected, manifest.recording_id);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { components } from './api.generated';
 import { api, ApiError, failureMessage } from './api';
 import { AppShell } from './app-shell';
@@ -12,7 +12,11 @@ import { EvidencePanel } from './features/evidence/EvidencePanel';
 import { retainPage } from './retained-page';
 import { replayPage, retainReplayWindow } from './replay/window';
 import type { ReplayPage, WindowDirection } from './replay/window';
-import { initialReplayState, replayReducer } from './replay/state';
+import { initialReplayState, PLAYBACK_SPEEDS, replayReducer } from './replay/state';
+import type { PlaybackSpeed } from './replay/state';
+import { usePlayback } from './replay/use-playback';
+import { ReplayControls } from './features/shell/ReplayControls';
+import { useAppearancePreferences } from './features/shell/viewer-preferences';
 import { filteredSteps } from './replay/loaded-tools';
 import type { MissingTarget } from './replay/missing';
 import { navigationControls } from './replay/navigation';
@@ -30,6 +34,7 @@ interface TabSelection {
 
 /** Read-only local browser for bounded observed endpoints and persisted recordings. */
 export default function App() {
+  const appearance = useAppearancePreferences();
   const [auth, setAuth] = useState<AuthState>('checking');
   const [authError, setAuthError] = useState('');
   const [replay, dispatchReplay] = useReducer(replayReducer, initialReplayState);
@@ -190,6 +195,7 @@ export default function App() {
 
   const loadDetail = useCallback(async (recordingId: string, cursor: string | null = null, direction: WindowDirection = 'replace') => {
     if (!recordingId || selectedRecordingRef.current !== recordingId) return;
+    dispatchReplay({ type: 'pause' });
     const { generation, signal } = detailLane.begin();
     setDetailBusy(true);
     setDetailError('');
@@ -235,6 +241,7 @@ export default function App() {
       restore: restore ? { frameId: restore.frameId, sequence: restore.sequence } : undefined });
     setActivePane(recordingId ? 'events' : 'recordings');
     if (changed) {
+      dispatchReplay({ type: 'set-speed', speed: Number(appearance.preferences.defaultSpeed) as PlaybackSpeed });
       detailLane.invalidate();
       eventPageCursors.current.clear();
       replayPages.current = [];
@@ -357,6 +364,38 @@ export default function App() {
       cursor: eventPageCursors.current.get(item.sequence) ?? null });
     dispatchReplay({ type: 'select-frame', frameId, sequence: item.sequence });
   }, []);
+
+  const playback = usePlayback({ replay, detail, busy: detailBusy, ready: auth === 'ready', dispatch: dispatchReplay,
+    prepareAdvance: (item) => {
+      const recordingId = selectedRecording;
+      const selection = { frameId: item.frameId ?? null, sequence: item.sequence,
+        cursor: eventPageCursors.current.get(item.sequence) ?? null };
+      return () => {
+        // A closed tab must not be recreated by a previously queued advance.
+        if (selectedRecordingRef.current === recordingId || tabSelections.current.has(recordingId)) {
+          tabSelections.current.set(recordingId, selection);
+        }
+      };
+    }, announce: setAnnouncement });
+  const changeSpeed = useCallback((speed: PlaybackSpeed) => {
+    dispatchReplay({ type: 'set-speed', speed });
+    setAnnouncement(`Replay speed ${speed}×.`);
+  }, []);
+
+  const [modeFocus, setModeFocus] = useState<{ mode: 'linear' | 'canvas'; owner: Element | null; recordingId: string } | null>(null);
+  const changeReplayMode = useCallback((mode: 'linear' | 'canvas', focusSelection: boolean) => {
+    dispatchReplay({ type: 'set-mode', mode });
+    setModeFocus(focusSelection ? { mode, owner: document.activeElement, recordingId: selectedRecording } : null);
+    if (focusSelection) setActivePane('events');
+  }, [selectedRecording]);
+  useLayoutEffect(() => {
+    if (!modeFocus) return;
+    setModeFocus(null);
+    if (replay.mode !== modeFocus.mode || selectedRecordingRef.current !== modeFocus.recordingId
+      || (document.activeElement !== modeFocus.owner && document.activeElement !== document.body)) return;
+    const selected = document.querySelector<HTMLElement>(modeFocus.mode === 'linear' ? '.event[aria-current="true"]' : '.canvas-tree [aria-selected="true"]');
+    if (selected) focusStepControl(selected);
+  }, [modeFocus, replay.mode]);
 
   const moveEvent = useCallback((delta: -1 | 1) => {
     const reason = delta < 0 ? backReason : nextReason;
@@ -506,6 +545,9 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (keyboard: KeyboardEvent) => {
+      if (keyboard.defaultPrevented) return;
+      if (keyboard.target instanceof Element && keyboard.target.closest('input, select, textarea, [contenteditable]:not([contenteditable="false"]), [role="dialog"]')) return;
+      if (keyboard.key === 'Escape' && replay.playback.status === 'playing') { keyboard.preventDefault(); playback.pause(); return; }
       if (!keyboard.altKey || keyboard.ctrlKey || keyboard.metaKey) return;
       if (keyboard.target instanceof HTMLElement && keyboard.target.closest('input, select, textarea, [contenteditable="true"]')) return;
       const key = keyboard.code || keyboard.key;
@@ -516,26 +558,35 @@ export default function App() {
         return;
       }
       switch (key) {
+        case 'KeyP': case 'p':
+          if (keyboard.shiftKey) return;
+          keyboard.preventDefault(); playback.toggle(); break;
+        case 'Comma': case ',': case 'Period': case '.': {
+          if (keyboard.shiftKey) return;
+          keyboard.preventDefault();
+          const delta = key === 'Comma' || key === ',' ? -1 : 1;
+          changeSpeed(PLAYBACK_SPEEDS[Math.max(0, Math.min(PLAYBACK_SPEEDS.length - 1, PLAYBACK_SPEEDS.indexOf(replay.playback.speed) + delta))]);
+          break;
+        }
         case 'KeyI': case 'i': keyboard.preventDefault(); navigateKey('into'); break;
         case 'KeyO': case 'o': keyboard.preventDefault(); navigateKey('over'); break;
         case 'KeyU': case 'u': keyboard.preventDefault(); navigateKey('out'); break;
         case 'KeyM': case 'm':
           if (!eventCount) return;
           keyboard.preventDefault();
-          dispatchReplay({ type: 'set-mode', mode: replay.mode === 'linear' ? 'canvas' : 'linear' });
-          setActivePane('events');
-          requestAnimationFrame(() => {
-            document.querySelector<HTMLElement>('.event[tabindex="0"], .canvas-tree [role="treeitem"][tabindex="0"]')?.focus();
-          });
+          changeReplayMode(replay.mode === 'linear' ? 'canvas' : 'linear', true);
           break;
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [eventCount, moveEvent, navigateKey, replay.mode]);
+  }, [changeReplayMode, changeSpeed, eventCount, moveEvent, navigateKey, playback.pause, playback.toggle, replay.mode, replay.playback.speed, replay.playback.status]);
 
   return <AppShell activePane={activePane} onPane={setActivePane} announcement={announcement} auth={auth} authError={authError}
     openRecordings={openRecordings} selectedRecording={selectedRecording} onSelectRecording={activateRecording} onCloseRecording={closeRecording}
+    appearance={appearance} onPausePlayback={playback.pause}
+    playbackControls={<ReplayControls playback={replay.playback} reason={playback.reason} pacing={playback.pacing}
+      onToggle={playback.toggle} onPause={playback.pause} onSpeed={changeSpeed} />}
     sourceEvent={event} detail={detail} endpoint={activeRecordingTab?.endpoint ?? null}>
     <CatalogPanel
       active={activePane === 'recordings'}
@@ -582,7 +633,7 @@ export default function App() {
       onAnnounce={setAnnouncement}
       onFocusedRowReleased={() => setAnnouncement('The focused event was released from the loaded window.')}
       mode={replay.mode}
-      onMode={(mode) => dispatchReplay({ type: 'set-mode', mode })}
+      onMode={changeReplayMode}
       onSelectFrame={selectFrame}
       onNavigateKey={navigateKey}
       onMove={moveEvent}

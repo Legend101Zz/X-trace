@@ -2,6 +2,7 @@
 
 export type ReplayMode = 'linear' | 'canvas';
 export type PlaybackSpeed = 0.5 | 1 | 2 | 4;
+export const PLAYBACK_SPEEDS: readonly PlaybackSpeed[] = [0.5, 1, 2, 4];
 
 export interface ReplayFilter {
   /** Event kinds to show; empty means no filter (everything). */
@@ -13,6 +14,12 @@ export interface Playback {
   speed: PlaybackSpeed;
   /** Plain-language reason playback last stopped on its own; null when the person paused or never played. */
   stopReason: string | null;
+  /** Invalidates scheduled work even when a manual action selects the same event again. */
+  epoch: number;
+  /** Identity of the last accepted scheduled advance, used to confirm its side effects. */
+  acceptedAdvance?: object;
+  /** Identity of the last accepted automatic stop. */
+  acceptedStop?: object;
 }
 
 export interface ReplayState {
@@ -32,15 +39,16 @@ export type ReplayAction =
   | { type: 'select-recording'; recordingId: string; restore?: Pick<ReplayState, 'frameId' | 'sequence'> }
   | { type: 'initialize-selection'; recordingId: string; frameId: string | null; sequence: string }
   | { type: 'select-frame'; frameId: string | null; sequence: string | null }
+  | { type: 'playback-advance'; recordingId: string; fromFrameId: string | null; fromSequence: string; epoch: number; frameId: string | null; sequence: string; advanceId?: object }
   | { type: 'set-mode'; mode: ReplayMode }
   | { type: 'set-filter'; kinds: readonly string[] }
   | { type: 'play' }
   | { type: 'pause' }
   | { type: 'set-speed'; speed: PlaybackSpeed }
-  | { type: 'playback-stopped'; reason: string }
+  | { type: 'playback-stopped'; reason: string; epoch?: number; stopId?: object }
   | { type: 'reset' };
 
-const PAUSED: Playback = { status: 'paused', speed: 1, stopReason: null };
+const PAUSED: Playback = { status: 'paused', speed: 1, stopReason: null, epoch: 0 };
 
 export const initialReplayState: ReplayState = {
   operationId: '',
@@ -53,7 +61,11 @@ export const initialReplayState: ReplayState = {
 };
 
 function clearSelection(state: ReplayState): ReplayState {
-  return { ...state, frameId: null, sequence: null, playback: { ...state.playback, status: 'paused', stopReason: null } };
+  return { ...state, frameId: null, sequence: null, playback: pause(state.playback) };
+}
+
+function pause(playback: Playback): Playback {
+  return { ...playback, status: 'paused', stopReason: null, epoch: playback.epoch + 1 };
 }
 
 export function replayReducer(state: ReplayState, action: ReplayAction): ReplayState {
@@ -69,25 +81,35 @@ export function replayReducer(state: ReplayState, action: ReplayAction): ReplayS
       return { ...state, frameId: action.frameId, sequence: action.sequence };
     case 'select-frame':
       // A manual selection ends playback: the person took the wheel.
-      return { ...state, frameId: action.frameId, sequence: action.sequence, playback: { ...state.playback, status: 'paused', stopReason: null } };
+      return { ...state, frameId: action.frameId, sequence: action.sequence,
+        playback: { ...pause(state.playback), acceptedAdvance: undefined } };
+    case 'playback-advance':
+      if (state.playback.status !== 'playing' || state.playback.epoch !== action.epoch || state.recordingId !== action.recordingId
+        || state.sequence !== action.fromSequence || state.frameId !== action.fromFrameId) return state;
+      return { ...state, frameId: action.frameId, sequence: action.sequence, playback: { ...state.playback, epoch: state.playback.epoch + 1,
+        ...(action.advanceId ? { acceptedAdvance: action.advanceId } : {}) } };
     case 'set-mode':
-      // Mode is a view; it never moves the selection.
-      return action.mode === state.mode ? state : { ...state, mode: action.mode };
+      // Reproject the same playback state, but retire work scheduled for the old view.
+      return action.mode === state.mode ? state
+        : { ...state, mode: action.mode, playback: { ...state.playback, epoch: state.playback.epoch + 1 } };
     case 'set-filter': {
       const kinds = [...new Set(action.kinds)].sort();
       const same = kinds.length === state.filter.kinds.length && kinds.every((kind, index) => kind === state.filter.kinds[index]);
-      return same ? state : { ...state, filter: { kinds } };
+      return same ? state : { ...state, filter: { kinds }, playback: pause(state.playback) };
     }
     case 'play':
-      // Nothing to play without a recording and a selected frame.
-      if (!state.recordingId || state.frameId === null) return state;
-      return { ...state, playback: { ...state.playback, status: 'playing', stopReason: null } };
+      // A recorded event can be frame-less; sequence, not a fabricated frame, is its identity.
+      if (!state.recordingId || state.sequence === null) return state;
+      return { ...state, playback: { ...state.playback, status: 'playing', stopReason: null, epoch: state.playback.epoch + 1 } };
     case 'pause':
-      return state.playback.status === 'paused' ? state : { ...state, playback: { ...state.playback, status: 'paused', stopReason: null } };
+      return { ...state, playback: pause(state.playback) };
     case 'set-speed':
-      return { ...state, playback: { ...state.playback, speed: action.speed } };
+      return !PLAYBACK_SPEEDS.includes(action.speed) || action.speed === state.playback.speed ? state
+        : { ...state, playback: { ...state.playback, speed: action.speed, epoch: state.playback.epoch + 1 } };
     case 'playback-stopped':
-      return { ...state, playback: { ...state.playback, status: 'paused', stopReason: action.reason } };
+      if (action.epoch !== undefined && action.epoch !== state.playback.epoch) return state;
+      return { ...state, playback: { ...pause(state.playback), stopReason: action.reason,
+        ...(action.stopId ? { acceptedStop: action.stopId } : {}) } };
     case 'reset':
       return initialReplayState;
   }

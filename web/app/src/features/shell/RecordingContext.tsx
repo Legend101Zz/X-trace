@@ -1,11 +1,13 @@
 import { outcomeBanner } from '../../replay/outcome';
 import { stepSentence } from '../../replay/step-sentence';
 import type { Detail, Endpoint, ReplayEvent } from '../../types';
+import type { ReactNode } from 'react';
 
-export function RecordingContext({ detail, endpoint, event }: {
+export function RecordingContext({ detail, endpoint, event, playback }: {
   detail: Detail;
   endpoint: Endpoint | null;
   event: ReplayEvent | undefined;
+  playback?: ReactNode;
 }) {
   const outcome = outcomeBanner(detail);
   const status = { complete: 'Complete', partial: 'Partial', invalid: 'Invalid', unavailable: 'Completion unavailable' }[outcome.tone];
@@ -33,6 +35,7 @@ export function RecordingContext({ detail, endpoint, event }: {
         </div>
       </details>
     </div>
+    {playback}
     {event ? <p className="replay-context-event">
       <span className="mono">Event sequence {event.sequence}</span><span>{stepSentence(event).text}</span>
     </p> : null}

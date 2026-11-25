@@ -46,7 +46,7 @@ try {
 
   for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1440, 900]]) {
     await page.setViewportSize({ width, height });
-    const steps = page.getByRole('tab', { name: 'Steps' });
+    const steps = page.getByRole('tablist', { name: 'Viewer panes' }).getByRole('tab', { name: 'Steps' });
     if (await steps.isVisible()) await steps.click();
     const step = page.locator('#events-panel .event').nth(index);
     const measureTextColumn = () => step.locator('.event-copy').evaluate((copy) => copy.getBoundingClientRect().width);

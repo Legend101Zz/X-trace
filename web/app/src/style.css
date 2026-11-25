@@ -119,7 +119,7 @@ h2 { font-size: 12px; font-weight: 600; }
 .recording-sub { margin-top: 6px; color: var(--muted); font-size: 10px; }
 .recording-status { display: block; margin-top: 7px; color: var(--quiet); font: 9px var(--mono); text-transform: uppercase; }
 .catalog-switch, .catalog-back { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
-.catalog-switch .button[aria-current='page'], .mode-switch .button[aria-pressed='true'] { border-color: var(--amber); color: var(--amber); }
+.catalog-switch .button[aria-current='page'], .mode-switch .button[aria-selected='true'] { border-color: var(--amber); color: var(--amber); }
 .catalog-back { justify-content: space-between; color: var(--muted); font: 9px var(--mono); }
 .catalog-actions { display: flex; flex: 1 1 100%; align-items: center; justify-content: space-between; gap: 6px; }
 .catalog-back > span, .catalog-back > small { flex: 1 1 100%; overflow-wrap: anywhere; }

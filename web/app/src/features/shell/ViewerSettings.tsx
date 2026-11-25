@@ -31,6 +31,16 @@ export function ViewerSettings({ appearance, theme, dock, onDock }: {
       <p>Compact shortens rows on a desktop with a fine pointer. Touch targets stay at least 44 px.</p>
     </section>
     <section><h3>Replay</h3>
+      <label>Default speed
+        <select className="theme-select" value={preferences.defaultSpeed}
+          onChange={(event) => {
+            const next = (['0.5', '1', '2', '4'] as const).find((speed) => speed === event.currentTarget.value);
+            if (next) update('defaultSpeed', next);
+          }}>
+          {['0.5', '1', '2', '4'].map((speed) => <option key={speed} value={speed}>{speed}×</option>)}
+        </select>
+      </label>
+      <p>Used when opening or switching a recording. The recording bar changes the current replay speed.</p>
       <label>Show timing
         <select className="theme-select" value={preferences.timing}
           onChange={(event) => update('timing', event.currentTarget.value === 'on' ? 'on' : 'off')}>
