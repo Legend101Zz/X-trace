@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      PROBE_SOURCE: 20055d07502d4b0996fd6b262b541772e3ebb985
+      PROBE_SOURCE: 8048159458ae9d93b664ce96e2269bd7a3a6470c
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -40,12 +40,13 @@ jobs:
           umask 077
           cargo fmt --all --check > "$XTRACE_CI_PRIVATE_ROOT/fmt.log" 2>&1
           cargo clippy --locked --all-features -p xtrace-export --all-targets -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/export-clippy.log" 2>&1
+          cargo clippy --locked --all-features -p xtrace-store --lib -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/store-clippy.log" 2>&1
           cargo clippy --locked --all-features -p xtrace-cli --test export_journey -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/cli-clippy.log" 2>&1
       - name: Validate export projection and goldens
         run: |
           python3 -B -m tools.qa.lane_run run --suite rust --step export-core \
             --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
-            --min-passed 59 --max-ignored 0 -- \
+            --min-passed 68 --max-ignored 0 -- \
             cargo test --locked --all-features -p xtrace-export
       - name: Validate persisted catalog export through the CLI
         if: ${{ !cancelled() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
@@ -54,15 +55,32 @@ jobs:
             --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
             --min-passed 19 --max-ignored 0 -- \
             cargo test --locked --all-features -p xtrace-cli --test export_journey
-      - name: Verify each newly added catalog fixture executed
+      - name: Exercise bounded store selection and snapshot conditions
+        if: ${{ !cancelled() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step store-snapshot \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 7 --max-ignored 0 -- \
+            cargo test --locked -p xtrace-store --lib viewer_export_
+      - name: Verify newly added viewer export and store regressions by name
         run: |
           set -euo pipefail
-          grep -Fxq "test linked_observations_require_positive_count_and_full_scope_identity ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Fxq "test live_observation_update_changes_rendered_bytes_without_changing_revision ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Fxq "test selection_uses_stable_ids_and_reports_first_missing_before_rendering ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Fxq "test all_formats_are_independent_of_catalog_and_observation_read_order ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Fxq "test missing_claims_and_policy_remain_explicit_without_copying_summary_values ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          echo "Five named catalog regression cases passed." >> "$GITHUB_STEP_SUMMARY"
+          grep -Eq "^test (.*::)?viewer_preview_and_approved_save_preserve_exact_cli_artifacts_for_each_scope_and_format \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?viewer_save_refuses_changed_observations_on_the_same_revision \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?endpoint_preview_binds_full_revision_identity_even_for_an_unselected_operation \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?viewer_save_binds_visible_metadata_even_when_logical_files_are_unchanged \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?viewer_save_binds_revision_policy_scope_options_and_approval_digest \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?viewer_preview_reports_colliding_scope_count_and_safe_omission \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?viewer_refuses_invalid_requests_incomplete_catalogs_and_sanitizer_paths_safely \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?manifest_refuses_output_overflow_and_unexpected_paths_or_modes \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?omission_summary_counts_complete_groups_without_exposing_input_text \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
+          grep -Eq "^test (.*::)?viewer_export_resolves_revision_and_stable_membership_with_project_isolation \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
+          grep -Eq "^test (.*::)?viewer_export_latest_follows_publication_after_reopen_and_clock_rollback \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
+          grep -Eq "^test (.*::)?viewer_export_observations_require_exact_linked_identity_and_can_change_on_same_revision \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
+          grep -Eq "^test (.*::)?viewer_export_admits_aggregate_claim_bytes_before_materializing_selected_claims \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
+          grep -Eq "^test (.*::)?viewer_export_refuses_inconsistent_publication_and_claims \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
+          grep -Eq "^test (.*::)?viewer_export_cancellation_leaves_the_connection_usable \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
+          grep -Eq "^test (.*::)?viewer_export_snapshot_does_not_observe_a_concurrent_link_committed_after_revision_read \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
       - name: Upload sanitized test receipts
         if: ${{ always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

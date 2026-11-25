@@ -31,6 +31,7 @@ pub mod projection;
 pub mod request;
 pub mod sanitize;
 pub mod validate;
+pub mod viewer;
 
 pub use request::{
     CatalogSummaryInput, ClaimInput, EffectiveState, ExampleInput, ExampleOrigin, ExportError,

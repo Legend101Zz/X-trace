@@ -5,7 +5,7 @@
 - Refs: #102, #7, #32 and #80.
 - Related: ADR 0010 (CLI exports), ADR 0012 (shared-contract and privacy review), and the approved viewer brief on #7.
 
-## Context and implemented extraction
+## Context and implemented exporter seams
 
 The approved viewer chooses OpenAPI 3.1, Postman Collection 2.1, cURL recipes or a developer bundle, scopes the
 export to this endpoint or all eligible operations, previews what is included and left out, then saves. Postman
@@ -28,9 +28,22 @@ with a positive recording count. It does not use route-only reconciliation or in
 Unknown revision entries remain unknown. Selection uses stable operation IDs; the first missing requested ID is
 an error before rendering. Existing claim gaps, unavailable policy digest and sanitizer refusals stay explicit.
 
-Catalog revision and runtime observations are separate reads today. A new linked observation can change export
-bytes without changing the revision or the catalog-identity digest. Neither the extraction nor a revision ID
-alone establishes an atomic snapshot or binds a future download to the preview.
+The CLI reads the revision and linked observations separately. A new linked observation can change export bytes
+without changing the revision or the catalog-identity digest. The viewer exporter accepts an already-read
+snapshot with full-revision identities and selected operation views. The full identity set supplies the same
+catalog digest and application name the CLI uses. Claims and exact linked operation membership apply only to
+the selected views. For the same resolved revision and linked evidence, both paths use the same projection
+semantics and renderer. The CLI keeps its existing default revision selection. The viewer store reads one
+snapshot, and the pure exporter relies on the caller for project admission.
+
+Viewer Latest means the last committed catalog publication for the admitted project, across scopes. The store
+seeks the highest ordinal in each scope through the existing index and selects the last inserted scope head.
+SQLite assigns the hidden rowid when the append-only publisher inserts each revision in a serialized write transaction.
+That internal ordering survives normal reopen and WAL checkpoint. Revision UUID and wall time remain independent
+of publication order. SQLite rowids remain internal to the store. Current supported workflows do not rebuild
+catalog revision rows. Any future catalog retention, compaction or migration that rewrites rows must preserve
+publication order or establish an explicit sequence before using it for Latest. External database rewrites,
+including `VACUUM`, are outside this guarantee.
 
 ## Proposed authenticated read contract
 
@@ -44,33 +57,43 @@ These choices require review before routes or generated clients are added:
    that revision. The visible scope label names the revision; "all" does not promise every recording or the latest
    revision of every catalog scope. An unmatched recording or runtime-only endpoint without revision membership
    has an explicit unavailable reason. Do not substitute a similarly named route.
-3. Preview returns the resolved revision, selection, selected versus emitted counts, format, controlled relative
-   filenames, byte counts, file digests, aggregate content digest, and omissions. OpenAPI native method/path
-   counts can differ from selected counts because colliding scopes use alternate-operation metadata. A future
-   operation inventory or bounded file-text preview needs its own documented response budget; CLI metadata alone
-   must not be labelled as showing file contents. No host output path is returned.
+3. Preview exposes format, options, resolved revision and selection, selected and emitted operation counts, and
+   the byte count, logical mode and exact-byte digest of each file. OpenAPI counts native method/path slots, which
+   may be fewer than the selected operations when alternate scopes are attached to a native slot. Fixed artifact
+   paths and recipe paths containing only an ordinal, a standard HTTP method and the fixed `root` slug are shown
+   as actual relative paths. Other recipe names embed catalog route text, even when their characters and shape
+   pass filename checks. Preview returns an explicit filename-withheld state and the recipe ordinal for these
+   entries. The raw path is available only in the existing saved artifacts and is included in the aggregate
+   digest. Omission entries are grouped by fixed subject and reason and applicable format, with every entry counted. Extra
+   reason text, operation IDs on omission entries, parameter and example names, and sanitizer paths stay out of
+   preview. Unknown reasons use a fixed `other` group. A future operation inventory or file-text preview needs its
+   own response budget. The preview contains metadata and no file contents or host output path.
 4. Describe typed missing-catalog/revision/operation, stale-preview, invalid-selection, sanitizer-refusal,
    resource-limit and busy failures. Return fixed safe messages and a request correlation ID. Do not echo raw
    operation input, sanitizer offender paths, claims, credential-shaped keys or underlying SQL errors. The CLI's
    existing error and exit-code contract remains separate and unchanged.
 
-## Proposed binding from preview to save
+## Preview-to-save binding
 
-Prefer recomputation plus digest comparison over retaining export payloads or adding a persistent export store.
-The browser retains only preview metadata. An explicit Save action supplies the same format/options/selection,
-actual preview revision and expected aggregate digest. The daemon recomputes through the shared seam, checks the
-digest before sending artifact bytes and returns an explicit stale-preview result on mismatch. The UI offers
-Refresh preview; it never silently downloads a replacement. If the request selected latest, a changed latest
-revision also requires refresh; an explicitly selected historical revision remains explicit.
+The pure viewer exporter recomputes the artifact at Save. The browser retains preview metadata and the approval
+value. An explicit Save supplies the same format, options, selection and revision-selection policy, along with
+the resolved preview revision and a versioned approval digest. The caller rereads the admitted project, resolving
+latest again or reading the same explicitly requested historical revision. It also reads linked observations
+again. A valid new snapshot is compared with the approved revision and digest before releasing the exact file
+collection from that render. When the approved projection changes, the UI offers Refresh preview.
 
-The aggregate exporter digest covers sorted, length-prefixed file paths, logical modes and exact bytes. Comparing
-only a revision, operation count or catalog hash is insufficient. Tests must change both catalog and linked-runtime
-state between preview and save and verify refusal or an unchanged exact payload, including changes during the
-separate reads. This proposal binds the eventual bytes to the preview; it does not claim those reads were atomic.
+The approval digest includes resolved revision and ordinal, requested revision policy, scope and selected ID if
+present, format/options, selected and emitted counts, the safe file inventory, total bytes and the grouped
+omissions. It also includes the existing exporter content digest over sorted, length-prefixed actual file paths,
+logical modes and exact bytes. Two projections can have identical files but distinct safe omissions or other
+approval metadata. A latest revision change also requires refresh even if the observed files match. For a
+historical choice, a newer available revision leaves the explicit historical choice intact. The digest does not
+authenticate the project or session, authorize a request, or prove which bytes a browser displayed. The HTTP
+adapter owns admission, request validation, safe responses and delivery.
 
-Recomputation avoids long-lived payload retention and cleanup policy but costs a second render and can legitimately
-require refresh during capture. Caching exact rendered bytes would avoid that race but would require explicit
-per-session memory, expiry, ownership and shutdown rules. A durable snapshot store is outside this slice.
+Recomputation costs a second render and can require refresh during capture. Retaining exact rendered bytes
+would require per-session memory, expiry, ownership and shutdown rules. No payload is retained between the two
+calls by the exporter seam.
 
 ## Proposed download representation and bounds
 
@@ -86,25 +109,30 @@ The response remains no-store with existing security headers. The browser saves 
 Save action. Neither preview nor save publishes, uploads, executes a recipe or writes an arbitrary host path.
 Postman credential setup and online delivery remain terminal-only and separate from local collection export.
 
-Candidate bounds, **proposed for review and measurement**, are the existing 1 KiB JSON request ceiling for a single
-endpoint/all request, at most 4,096 selected operations, at most 4,101 files, 8 MiB of aggregate admitted catalog
-export input and 16 MiB of rendered payload. The largest file count includes one recipe per operation plus the
-cURL index and bundle metadata/other formats. Input admission must apply before unbounded materialization, not
-only after rendering. Exceeding a bound is a named refusal, never silent truncation or a complete-looking prefix.
-Keep the existing two-worker query lane, busy response and 15-second request lifetime; do not raise deadlines to
-make an export pass. Exact aggregate input/output accounting and cancellation must be specified before the HTTP
-implementation. Existing per-operation claim limits alone do not bound whole-export memory.
+The viewer exporter refuses supplied snapshots above 4,096 revision members, including endpoint-scoped reads,
+and refuses rendered results above 4,101 logical files, 16 MiB aggregate logical file bytes or 32,768 raw omission
+entries. Latest refuses projects above 4,096 catalog scopes after a bounded index walk. An explicit historical
+revision uses a point lookup and remains available under the other export limits. The file limit covers one
+recipe per operation plus the cURL index and bundle metadata/other formats.
+The raw omission limit applies before grouping, so the safe preview contains only a fixed vocabulary of subject,
+reason and format combinations. These checks reject the whole projection. The byte and omission checks run after
+rendering and do not bound the renderer's peak allocation. Input admission must apply at the catalog read.
+Measure the full read and render path before accepting these budgets for HTTP. The existing 1 KiB JSON request
+ceiling, two-worker query lane, busy response and 15-second request lifetime remain the proposed transport
+constraints. Exact response-encoding bounds and cancellation behavior need HTTP review.
 
 ## Verification and open review points
 
-The shared-seam tests are authored read-model fixtures, not packaged or framework evidence. Existing export CLI
-journeys must remain unchanged and verify all format bytes, selection errors, privacy and preview/write behavior.
+The shared-seam tests compare actual renderer files for both scopes and every format against the CLI preparation
+path. Authored snapshots exercise changed linked observations on one revision, metadata-only changes, refusal
+on malformed selections or resource limits, and safe preview disclosure. Existing export CLI journeys cover its
+format bytes, selection errors, privacy and preview/write behavior. Packaged framework verification is separate.
 The HTTP slice needs authenticated project-isolation, invalid-input, limits, sanitizer and stale-preview tests.
 The modal needs choose/preview/save, focus trapping, Escape, focus return, visible omissions and unavailable reasons,
 keyboard/coarse-pointer use and narrow layouts. Final acceptance needs a real framework catalog through the
 embedded packaged viewer, actual downloaded byte/digest checks at both scopes and the installed archive journey.
 
-Still proposed: final HTTP names/methods and DTOs; preview inventory/text detail; exact latest/historical behavior;
-archive encoding/media/naming policy; resource accounting and measured limits. Adding OpenAPI/client fields is
+Open questions include final HTTP names/methods and DTOs, any file-text preview, archive encoding/media/naming
+policy, transport resource accounting and measured limits. Adding OpenAPI/client fields is
 an additive shared-contract change and needs the reviews required by ADR 0012. No proposal here grants Postman
 access, replaces owner acceptance evidence or authorizes publication.

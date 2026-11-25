@@ -4,11 +4,15 @@
 
 use serde_json::Value;
 use xtrace_application::catalog_discovery::history::{
-    ObservedOperation, OperationView, RevisionClaim, RevisionEntry,
+    CatalogExportOperationIdentity, CatalogExportRevision, CatalogExportScope,
+    CatalogExportSnapshot, ObservedOperation, OperationView, RevisionClaim, RevisionEntry,
 };
 use xtrace_application::{CatalogChangeKind, CatalogSourceAvailability};
-use xtrace_domain::ContentHash;
+use xtrace_domain::{ContentHash, OperationId};
 use xtrace_export::catalog::{self, CatalogExportError};
+use xtrace_export::viewer::{
+    self, PreviewFilename, ViewerExportError, ViewerExportLimit, ViewerExportRequest,
+};
 use xtrace_export::{EffectiveState, ExportFormat, ExportRequest};
 
 const FORMATS: [ExportFormat; 4] =
@@ -183,4 +187,310 @@ fn missing_claims_and_policy_remain_explicit_without_copying_summary_values() {
     assert!(operation.get("requestBody").is_none());
     assert_eq!(operation["x-xtrace"]["claims_projection"], "unavailable");
     assert_eq!(document["info"]["x-xtrace"].get("policy_digest"), Some(&Value::Null));
+}
+
+fn snapshot(
+    views: &[OperationView],
+    scope: CatalogExportScope,
+    linked: &[OperationId],
+) -> CatalogExportSnapshot {
+    CatalogExportSnapshot {
+        revision: revision(u32::try_from(views.len()).unwrap()),
+        catalog_identities: views
+            .iter()
+            .map(|view| CatalogExportOperationIdentity {
+                application_component: view.application_component.clone(),
+                binding_key: view.binding_key.clone(),
+                method: view.method.clone(),
+                route_template: view.route_template.clone(),
+                operation_version_id: view.operation_version_id.clone(),
+            })
+            .collect(),
+        operations: views
+            .iter()
+            .filter(|view| match scope {
+                CatalogExportScope::All => true,
+                CatalogExportScope::Operation(id) => view.operation_id == id,
+            })
+            .cloned()
+            .collect(),
+        linked_operation_ids: linked.iter().copied().collect(),
+    }
+}
+
+fn viewer_request(format: ExportFormat, scope: CatalogExportScope) -> ViewerExportRequest {
+    ViewerExportRequest { revision: CatalogExportRevision::Latest, scope, format, yaml: false }
+}
+
+#[test]
+fn viewer_preview_and_approved_save_preserve_exact_cli_artifacts_for_each_scope_and_format() {
+    let root = operation(3, "/");
+    let mut orders = operation(4, "/fixturePrivateSegment/{id}");
+    orders.application_component = "second-component".to_owned();
+    let observations = [observed(&orders)];
+    let orders_id = orders.operation_id;
+    let views = [root, orders];
+    for scope in [CatalogExportScope::All, CatalogExportScope::Operation(orders_id)] {
+        let snapshot = snapshot(&views, scope, &[orders_id]);
+        let cli_input = catalog::prepare(&snapshot.revision, &views, &observations);
+        for (format, yaml) in
+            FORMATS.map(|format| (format, false)).into_iter().chain([(ExportFormat::OpenApi, true)])
+        {
+            let request = ViewerExportRequest { yaml, ..viewer_request(format, scope) };
+            let cli_request = ExportRequest {
+                format,
+                operation_ids: match scope {
+                    CatalogExportScope::All => None,
+                    CatalogExportScope::Operation(id) => Some(vec![id.to_string()]),
+                },
+                yaml,
+            };
+            let cli = catalog::render(&cli_input, &cli_request).unwrap();
+            let preview = viewer::preview(&snapshot, request).unwrap();
+            assert_eq!(preview.revision_id, snapshot.revision.revision_id);
+            assert_eq!(preview.request, request);
+            assert_eq!(preview.selected_operations, snapshot.operations.len());
+            assert_eq!(preview.emitted_operations, cli.operation_count);
+            assert_eq!(
+                preview.total_bytes,
+                cli.files.iter().map(|file| file.bytes.len()).sum::<usize>()
+            );
+            assert_eq!(preview.content_hash.to_hex().as_str(), cli.content_hash);
+            assert_eq!(
+                preview.omissions.iter().map(|item| item.count).sum::<usize>(),
+                cli.omissions.len()
+            );
+            assert!(preview.omissions.iter().any(|item| item.format.is_none()
+                && item.kind == "policy_digest"
+                && item.reason == "not_available_in_catalog_view"));
+            assert_eq!(preview.files.len(), cli.files.len());
+            for (metadata, file) in preview.files.iter().zip(&cli.files) {
+                assert_eq!(metadata.bytes, file.bytes.len());
+                assert_eq!(metadata.mode, file.mode);
+                assert_eq!(metadata.hash, blake3::hash(&file.bytes));
+                match &metadata.name {
+                    PreviewFilename::Available(path) => {
+                        assert_eq!(path, &file.path);
+                        assert!(!path.contains("fixtureprivatesegment"));
+                    }
+                    PreviewFilename::WithheldRecipe { ordinal } => {
+                        assert_eq!(
+                            *ordinal,
+                            match scope {
+                                CatalogExportScope::All => 2,
+                                CatalogExportScope::Operation(_) => 1,
+                            }
+                        );
+                        assert!(file.path.contains("fixtureprivatesegment"));
+                    }
+                }
+            }
+            if matches!(format, ExportFormat::Curl | ExportFormat::Bundle) {
+                assert_eq!(
+                    preview
+                        .files
+                        .iter()
+                        .filter(|file| matches!(file.name, PreviewFilename::WithheldRecipe { .. }))
+                        .count(),
+                    1
+                );
+                if scope == CatalogExportScope::All {
+                    let root_path = if format == ExportFormat::Curl {
+                        "001-get-root.sh"
+                    } else {
+                        "curl/001-get-root.sh"
+                    };
+                    assert!(
+                        preview
+                            .files
+                            .iter()
+                            .any(|file| file.name
+                                == PreviewFilename::Available(root_path.to_owned()))
+                    );
+                }
+            }
+            assert!(!format!("{preview:?}").to_ascii_lowercase().contains("fixtureprivatesegment"));
+            let approved = viewer::save(&snapshot, request, preview.approval()).unwrap();
+            assert_eq!(approved.into_files(), cli.files);
+        }
+    }
+}
+
+#[test]
+fn viewer_save_refuses_changed_observations_on_the_same_revision() {
+    let op = operation(3, "/orders/{id}");
+    let scope = CatalogExportScope::Operation(op.operation_id);
+    let before = snapshot(std::slice::from_ref(&op), scope, &[]);
+    let after = snapshot(std::slice::from_ref(&op), scope, &[op.operation_id]);
+    assert_eq!(before.revision, after.revision);
+    assert_eq!(before.catalog_identities, after.catalog_identities);
+    for format in FORMATS {
+        let request = viewer_request(format, scope);
+        let first = viewer::preview(&before, request).unwrap();
+        let refreshed = viewer::preview(&after, request).unwrap();
+        assert_ne!(first.content_hash, refreshed.content_hash);
+        assert!(matches!(
+            viewer::save(&after, request, first.approval()),
+            Err(ViewerExportError::StalePreview)
+        ));
+        assert!(viewer::save(&after, request, refreshed.approval()).is_ok());
+    }
+}
+
+#[test]
+fn endpoint_preview_binds_full_revision_identity_even_for_an_unselected_operation() {
+    let selected = operation(3, "/orders");
+    let other = operation(4, "/other");
+    let scope = CatalogExportScope::Operation(selected.operation_id);
+    let before = snapshot(&[selected, other], scope, &[]);
+    let mut after = before.clone();
+    after.catalog_identities[1].route_template = "/different".to_owned();
+    assert_eq!(before.operations, after.operations);
+    let request = viewer_request(ExportFormat::OpenApi, scope);
+    let first = viewer::preview(&before, request).unwrap();
+    let refreshed = viewer::preview(&after, request).unwrap();
+    assert_ne!(first.content_hash, refreshed.content_hash);
+    assert!(matches!(
+        viewer::save(&after, request, first.approval()),
+        Err(ViewerExportError::StalePreview)
+    ));
+}
+
+#[test]
+fn viewer_save_binds_visible_metadata_even_when_logical_files_are_unchanged() {
+    let before = snapshot(&[operation(3, "/orders")], CatalogExportScope::All, &[]);
+    let mut after = before.clone();
+    after.revision.ordinal += 1;
+    let request = viewer_request(ExportFormat::Curl, CatalogExportScope::All);
+    let first = viewer::preview(&before, request).unwrap();
+    let refreshed = viewer::preview(&after, request).unwrap();
+    assert_eq!(first.content_hash, refreshed.content_hash);
+    assert_eq!(first.files, refreshed.files);
+    assert_ne!(first.revision_ordinal, refreshed.revision_ordinal);
+    assert!(matches!(
+        viewer::save(&after, request, first.approval()),
+        Err(ViewerExportError::StalePreview)
+    ));
+
+    let mut wrong_omissions = first.clone();
+    wrong_omissions.omissions[0].count += 1;
+    assert_ne!(wrong_omissions.approval(), first.approval());
+    assert!(matches!(
+        viewer::save(&before, request, wrong_omissions.approval()),
+        Err(ViewerExportError::StalePreview)
+    ));
+}
+
+#[test]
+fn viewer_save_binds_revision_policy_scope_options_and_approval_digest() {
+    let op = operation(3, "/orders");
+    let scope = CatalogExportScope::Operation(op.operation_id);
+    let first = snapshot(std::slice::from_ref(&op), CatalogExportScope::All, &[]);
+    let mut new_latest = first.clone();
+    new_latest.revision.revision_id = "018f0000-0000-7000-8000-000000000099".parse().unwrap();
+    let latest = viewer_request(ExportFormat::OpenApi, CatalogExportScope::All);
+    let historical = ViewerExportRequest {
+        revision: CatalogExportRevision::Historical(first.revision.revision_id),
+        ..latest
+    };
+    let approval = viewer::preview(&first, latest).unwrap().approval();
+    let historical_approval = viewer::preview(&first, historical).unwrap().approval();
+    assert!(matches!(
+        viewer::save(&new_latest, latest, approval),
+        Err(ViewerExportError::StalePreview)
+    ));
+    assert!(matches!(
+        viewer::save(&new_latest, historical, historical_approval),
+        Err(ViewerExportError::RevisionUnavailable)
+    ));
+    assert!(viewer::save(&first, historical, historical_approval).is_ok());
+    let endpoint = ViewerExportRequest { scope, ..latest };
+    assert_eq!(
+        viewer::preview(&first, endpoint).unwrap().content_hash,
+        viewer::preview(&first, latest).unwrap().content_hash
+    );
+    for changed in [
+        historical,
+        endpoint,
+        ViewerExportRequest { yaml: true, ..latest },
+        viewer_request(ExportFormat::Postman, CatalogExportScope::All),
+    ] {
+        assert!(matches!(
+            viewer::save(&first, changed, approval),
+            Err(ViewerExportError::StalePreview)
+        ));
+    }
+    let modified = viewer::ViewerExportApproval {
+        digest: blake3::hash(b"fixture wrong approval"),
+        ..approval
+    };
+    assert!(matches!(viewer::save(&first, latest, modified), Err(ViewerExportError::StalePreview)));
+}
+
+#[test]
+fn viewer_preview_reports_colliding_scope_count_and_safe_omission() {
+    let first = operation(3, "/orders/{id}");
+    let mut second = operation(4, "/orders/{id}");
+    second.binding_key = "other-binding".to_owned();
+    let input = snapshot(&[first.clone(), second], CatalogExportScope::All, &[]);
+    let preview =
+        viewer::preview(&input, viewer_request(ExportFormat::OpenApi, CatalogExportScope::All))
+            .unwrap();
+    assert_eq!((preview.selected_operations, preview.emitted_operations), (2, 1));
+    assert!(preview.omissions.iter().any(|item| item.format == Some("openapi")
+        && item.reason == "duplicate_method_path"
+        && item.count == 1));
+    assert!(!format!("{:?}", preview.omissions).contains(&first.operation_id.to_string()));
+}
+
+#[test]
+fn viewer_refuses_invalid_requests_incomplete_catalogs_and_sanitizer_paths_safely() {
+    let op = operation(3, "/orders");
+    let input = snapshot(std::slice::from_ref(&op), CatalogExportScope::All, &[]);
+    let request = viewer_request(ExportFormat::OpenApi, CatalogExportScope::All);
+    assert_eq!(
+        viewer::preview(
+            &input,
+            ViewerExportRequest { format: ExportFormat::Curl, yaml: true, ..request }
+        ),
+        Err(ViewerExportError::InvalidOptions),
+    );
+    let missing = viewer_request(
+        ExportFormat::OpenApi,
+        CatalogExportScope::Operation(operation(4, "/other").operation_id),
+    );
+    assert_eq!(viewer::preview(&input, missing), Err(ViewerExportError::OperationUnavailable));
+    let mut incomplete = input.clone();
+    incomplete.catalog_identities.clear();
+    assert_eq!(viewer::preview(&incomplete, request), Err(ViewerExportError::IncompleteCatalog));
+    let mut duplicate = input.clone();
+    duplicate.revision.operation_count += 1;
+    duplicate.catalog_identities.push(input.catalog_identities[0].clone());
+    duplicate.operations.push(op);
+    assert_eq!(viewer::preview(&duplicate, request), Err(ViewerExportError::IncompleteCatalog));
+    let mut oversized = input.clone();
+    oversized.catalog_identities.resize(4_097, input.catalog_identities[0].clone());
+    assert_eq!(
+        viewer::preview(&oversized, request),
+        Err(ViewerExportError::LimitExceeded(ViewerExportLimit::Operations))
+    );
+
+    let canary = "xtrace-canary-fixture-route";
+    let unsafe_view = operation(7, &format!("/{canary}"));
+    let unsafe_snapshot =
+        snapshot(std::slice::from_ref(&unsafe_view), CatalogExportScope::All, &[]);
+    let raw = catalog::render(
+        &catalog::prepare(&unsafe_snapshot.revision, &[unsafe_view], &[]),
+        &ExportRequest::new(ExportFormat::OpenApi),
+    )
+    .unwrap_err();
+    assert!(format!("{raw:?}").contains(canary));
+    let safe = viewer::preview(&unsafe_snapshot, request).unwrap_err();
+    assert_eq!(safe, ViewerExportError::SanitizerRefused);
+    assert!(!format!("{safe:?} {safe}").contains(canary));
+    let prior_approval = viewer::preview(&input, request).unwrap().approval();
+    assert!(matches!(
+        viewer::save(&unsafe_snapshot, request, prior_approval),
+        Err(ViewerExportError::SanitizerRefused)
+    ));
 }

@@ -25,6 +25,8 @@ use crate::catalog_discovery_store::{MAX_STORED_CLAIM_JSON_BYTES, rebuild_revisi
 use crate::connection::SqliteStore;
 use crate::error::StoreError;
 
+mod export_snapshot;
+
 /// Read view over the catalog tables.
 #[derive(Clone, Debug)]
 pub struct SqliteCatalogHistoryStore {
@@ -119,6 +121,109 @@ struct RevisionOperation {
     change_kind: CatalogChangeKind,
     source_availability: CatalogSourceAvailability,
     identity: EndpointIdentity,
+}
+
+type RevisionOperationRow =
+    (Vec<u8>, Vec<u8>, String, String, String, String, String, String, String, Option<Vec<u8>>);
+
+fn revision_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RevisionOperationRow> {
+    Ok((
+        row.get::<_, Vec<u8>>(0)?,
+        row.get::<_, Vec<u8>>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, String>(5)?,
+        row.get::<_, String>(6)?,
+        row.get::<_, String>(7)?,
+        row.get::<_, String>(8)?,
+        row.get::<_, Option<Vec<u8>>>(9)?,
+    ))
+}
+
+fn revision_operation(
+    project_id: ProjectId,
+    row: RevisionOperationRow,
+) -> Result<RevisionOperation, PortError> {
+    let change_kind = match row.2.as_str() {
+        "added" => CatalogChangeKind::Added,
+        "unchanged" => CatalogChangeKind::Unchanged,
+        "changed" => CatalogChangeKind::Changed,
+        "removed" => CatalogChangeKind::Removed,
+        "unknown" => CatalogChangeKind::Unknown,
+        _ => return Err(corrupt()),
+    };
+    let source_availability = match row.3.as_str() {
+        "unverified" => CatalogSourceAvailability::Unverified,
+        "unavailable" => CatalogSourceAvailability::Unavailable,
+        _ => return Err(corrupt()),
+    };
+    let method =
+        HttpMethod::parse(&row.6).filter(|method| method.as_str() == row.6).ok_or_else(corrupt)?;
+    if row.8 != Transport::Http.as_str() {
+        return Err(corrupt());
+    }
+    Ok(RevisionOperation {
+        id: id(&row.0)?,
+        version: uuid::Uuid::from_slice(&row.1).map_err(|_| corrupt())?,
+        version_digest: row.9.as_deref().map(hash).transpose()?,
+        change_kind,
+        source_availability,
+        identity: EndpointIdentity {
+            project_id,
+            application_component: row.4,
+            binding_key: row.5,
+            method,
+            route_template: row.7,
+            transport: Transport::Http,
+        },
+    })
+}
+
+fn operation_view(
+    op: RevisionOperation,
+    mut linked: Vec<([u8; 32], RevisionClaim)>,
+) -> Result<OperationView, PortError> {
+    // The history summary uses the first available location in claim digest order.
+    linked.sort_unstable_by_key(|(digest, claim)| (*digest, claim.claim_id));
+    let claims_available = match op.change_kind {
+        CatalogChangeKind::Added | CatalogChangeKind::Changed | CatalogChangeKind::Unchanged => {
+            verify_published_claims(&op, &linked)?;
+            true
+        }
+        CatalogChangeKind::Unknown
+            if op.source_availability == CatalogSourceAvailability::Unavailable =>
+        {
+            // An omitted parent entry retains its version without its claim links.
+            if !linked.is_empty() {
+                return Err(corrupt());
+            }
+            false
+        }
+        _ => true,
+    };
+    let claims: Vec<_> = linked.into_iter().map(|(_, claim)| claim).collect();
+    let summary = ClaimSummary::from_claims(&claims);
+    Ok(OperationView {
+        operation_id: op.id,
+        operation_version_id: op.version.to_string(),
+        application_component: op.identity.application_component,
+        binding_key: op.identity.binding_key,
+        method: op.identity.method.as_str().to_owned(),
+        route_template: op.identity.route_template,
+        change_kind: op.change_kind,
+        source_availability: op.source_availability,
+        provenance: summary.provenance.into_iter().collect(),
+        confidence_basis_points: summary.confidence,
+        limitation_codes: summary.limitations.into_iter().collect(),
+        handler_conflict: summary.handlers.len() > 1,
+        handlers: summary.handlers.into_iter().collect(),
+        claim_count: claims.len(),
+        source_path: summary.source.as_ref().map(|(path, _)| path.clone()),
+        source_line: summary.source.map(|(_, line)| line),
+        claims_available,
+        claims,
+    })
 }
 
 impl CatalogHistoryPort for SqliteCatalogHistoryStore {
@@ -218,20 +323,7 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
                     bytes(&revision_id),
                     i64::try_from(MAX_REVISION_OPERATIONS + 1).map_err(|_| corrupt())?
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, Option<Vec<u8>>>(9)?,
-                    ))
-                },
+                revision_operation_from_row,
             )
             .map_err(map_sql)?
             .collect::<Result<Vec<_>, _>>()
@@ -239,90 +331,16 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
         if rows.len() > MAX_REVISION_OPERATIONS {
             return Err(corrupt());
         }
-        let mut operations = Vec::with_capacity(rows.len());
-        for row in rows {
-            let change_kind = match row.2.as_str() {
-                "added" => CatalogChangeKind::Added,
-                "unchanged" => CatalogChangeKind::Unchanged,
-                "changed" => CatalogChangeKind::Changed,
-                "removed" => CatalogChangeKind::Removed,
-                "unknown" => CatalogChangeKind::Unknown,
-                _ => return Err(corrupt()),
-            };
-            let source_availability = match row.3.as_str() {
-                "unverified" => CatalogSourceAvailability::Unverified,
-                "unavailable" => CatalogSourceAvailability::Unavailable,
-                _ => return Err(corrupt()),
-            };
-            let method = HttpMethod::parse(&row.6)
-                .filter(|method| method.as_str() == row.6)
-                .ok_or_else(corrupt)?;
-            if row.8 != Transport::Http.as_str() {
-                return Err(corrupt());
-            }
-            operations.push(RevisionOperation {
-                id: id(&row.0)?,
-                version: uuid::Uuid::from_slice(&row.1).map_err(|_| corrupt())?,
-                version_digest: row.9.as_deref().map(hash).transpose()?,
-                change_kind,
-                source_availability,
-                identity: EndpointIdentity {
-                    project_id,
-                    application_component: row.4,
-                    binding_key: row.5,
-                    method,
-                    route_template: row.7,
-                    transport: Transport::Http,
-                },
-            });
-        }
+        let operations: Vec<_> = rows
+            .into_iter()
+            .map(|row| revision_operation(project_id, row))
+            .collect::<Result<_, _>>()?;
         let identities = operations.iter().map(|op| (op.id, &op.identity)).collect();
         let mut claims = load_claims(&connection, project_id, revision_id, &identities)?;
         let mut views = Vec::with_capacity(operations.len());
         for op in operations {
-            let mut linked = claims.remove(&op.id).unwrap_or_default().claims;
-            // The history summary uses the first available location in claim digest order.
-            linked.sort_unstable_by_key(|(digest, claim)| (*digest, claim.claim_id));
-            let claims_available = match op.change_kind {
-                CatalogChangeKind::Added
-                | CatalogChangeKind::Changed
-                | CatalogChangeKind::Unchanged => {
-                    verify_published_claims(&op, &linked)?;
-                    true
-                }
-                CatalogChangeKind::Unknown
-                    if op.source_availability == CatalogSourceAvailability::Unavailable =>
-                {
-                    // An omitted parent entry retains its version without its claim links.
-                    if !linked.is_empty() {
-                        return Err(corrupt());
-                    }
-                    false
-                }
-                _ => true,
-            };
-            let claims: Vec<_> = linked.into_iter().map(|(_, claim)| claim).collect();
-            let summary = ClaimSummary::from_claims(&claims);
-            views.push(OperationView {
-                operation_id: op.id,
-                operation_version_id: op.version.to_string(),
-                application_component: op.identity.application_component,
-                binding_key: op.identity.binding_key,
-                method: op.identity.method.as_str().to_owned(),
-                route_template: op.identity.route_template,
-                change_kind: op.change_kind,
-                source_availability: op.source_availability,
-                provenance: summary.provenance.into_iter().collect(),
-                confidence_basis_points: summary.confidence,
-                limitation_codes: summary.limitations.into_iter().collect(),
-                handler_conflict: summary.handlers.len() > 1,
-                handlers: summary.handlers.into_iter().collect(),
-                claim_count: claims.len(),
-                source_path: summary.source.as_ref().map(|(path, _)| path.clone()),
-                source_line: summary.source.map(|(_, line)| line),
-                claims_available,
-                claims,
-            });
+            let linked = claims.remove(&op.id).unwrap_or_default().claims;
+            views.push(operation_view(op, linked)?);
         }
         Ok(views)
     }
@@ -492,24 +510,39 @@ fn load_claims(
         }
         let json = row.get_ref(4).map_err(map_sql)?.as_str().map_err(|_| corrupt())?;
         let digest = row.get_ref(2).map_err(map_sql)?.as_blob().map_err(|_| corrupt())?;
-        let claim =
-            rebuild_revision_claim(digest, canonical, json, identity).map_err(|_| corrupt())?;
-        let serde_json::Value::String(provenance) =
-            serde_json::to_value(claim.provenance()).map_err(|_| corrupt())?
-        else {
-            return Err(corrupt());
-        };
-        operation.claims.push((
-            digest.try_into().map_err(|_| corrupt())?,
-            RevisionClaim {
-                claim_id: id(&row.get::<_, Vec<u8>>(1).map_err(map_sql)?)?,
-                provenance,
-                handler_symbol: claim.handler_symbol().map(str::to_owned),
-                confidence_basis_points: claim.confidence_basis_points(),
-                limitation_codes: claim.limitation_codes().to_vec(),
-                source_evidence: claim.source_evidence().to_vec(),
-            },
-        ));
+        operation.claims.push(project_claim(
+            id(&row.get::<_, Vec<u8>>(1).map_err(map_sql)?)?,
+            digest,
+            canonical,
+            json,
+            identity,
+        )?);
     }
     Ok(by_operation)
+}
+
+fn project_claim(
+    claim_id: xtrace_domain::ClaimId,
+    digest: &[u8],
+    canonical: &[u8],
+    json: &str,
+    identity: &EndpointIdentity,
+) -> Result<([u8; 32], RevisionClaim), PortError> {
+    let claim = rebuild_revision_claim(digest, canonical, json, identity).map_err(|_| corrupt())?;
+    let serde_json::Value::String(provenance) =
+        serde_json::to_value(claim.provenance()).map_err(|_| corrupt())?
+    else {
+        return Err(corrupt());
+    };
+    Ok((
+        digest.try_into().map_err(|_| corrupt())?,
+        RevisionClaim {
+            claim_id,
+            provenance,
+            handler_symbol: claim.handler_symbol().map(str::to_owned),
+            confidence_basis_points: claim.confidence_basis_points(),
+            limitation_codes: claim.limitation_codes().to_vec(),
+            source_evidence: claim.source_evidence().to_vec(),
+        },
+    ))
 }
