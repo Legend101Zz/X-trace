@@ -22,6 +22,8 @@ from itertools import groupby
 from typing import Any, Callable
 from urllib.parse import quote
 
+import private_diagnostic
+
 # matched against the class part of a frame symbol such as `OwnerController.findOwner`
 LAYER_PATTERNS = {
     "controller": re.compile(r"Controller|Resource$"),
@@ -161,7 +163,7 @@ def list_recording_ids(xtrace: str, project_dir: pathlib.Path, env: dict[str, st
         args = [xtrace, "recording", "list", "--project-dir", str(project_dir), "--limit", "200"]
         if after:
             args += ["--after", after]
-        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
+        result = private_diagnostic.run_captured(args, env=env, text=True, timeout=60, label="recording-list")
         if result.returncode != 0:
             raise RuntimeError(f"recording list before launch exited {result.returncode}")
         doc = json.loads(result.stdout)
@@ -1125,8 +1127,11 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "attribution": "serial scenarios run in pinned order; burst starts only after every serial request has a complete recording",
         "correlationGap": REQUEST_CORRELATION_GAP,
     }}
-    init = subprocess.run([xtrace, "init", "--project-dir", str(project_dir), "--display-name", "campaign"],
-                          env=env, capture_output=True, text=True, timeout=120)
+    init_args = [xtrace, "init", "--project-dir", str(project_dir), "--display-name", "campaign"]
+    if project == "jhipster" and ordered_campaign is not None:
+        init = private_diagnostic.run_captured(init_args, env=env, text=True, timeout=120, label="init")
+    else:
+        init = subprocess.run(init_args, env=env, capture_output=True, text=True, timeout=120)
     notes["init"] = {"exitCode": init.returncode}
     if init.returncode != 0:
         raise RuntimeError(f"xtrace init failed with exit {init.returncode}")
@@ -1247,7 +1252,11 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     notes["launcherExitCode"] = getattr(stack, "launcher_exit", None)
 
     # product lifecycle commands that exist in the CLI surface: exit code 9 means "not implemented yet"
-    stop = subprocess.run([xtrace, "stop", "--project-dir", str(project_dir)], env=env, capture_output=True, text=True, timeout=60)
+    stop_args = [xtrace, "stop", "--project-dir", str(project_dir)]
+    if project == "jhipster" and ordered_campaign is not None:
+        stop = private_diagnostic.run_captured(stop_args, env=env, text=True, timeout=60, label="stop")
+    else:
+        stop = subprocess.run(stop_args, env=env, capture_output=True, text=True, timeout=60)
     notes["stopCommand"] = {"exitCode": stop.returncode, "notImplemented": stop.returncode == 9}
 
     api: dict[str, Any] = {"ok": False, "reason": "viewer not started", "recordings": [], "details": {}}

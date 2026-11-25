@@ -9,12 +9,14 @@ import stat
 import subprocess
 import sys
 import tarfile
+import traceback
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
 import xcamp  # noqa: E402
 import xinstr  # noqa: E402
 import evidence  # noqa: E402
+import private_diagnostic  # noqa: E402
 
 CAMP, PROJ, SRC = xcamp.load_campaign(__file__)
 HERE = pathlib.Path(__file__).resolve()
@@ -234,11 +236,11 @@ def host_java_identity():
         raise ValueError("XCAMP_JAVA must identify the host JDK executable by absolute path")
     java = java.resolve(strict=True)
     env = {k: v for k, v in os.environ.items() if k not in xcamp.JAVA_OPTIONS_ENV}
-    result = subprocess.run([str(java), "-XshowSettings:properties", "-version"], env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+    result = private_diagnostic.run_captured([str(java), "-XshowSettings:properties", "-version"], env=env,
+                                             text=True, timeout=30, label="host-java")
     names = {"java.specification.version", "java.runtime.version", "java.vm.name", "java.vendor", "os.name", "os.arch"}
     properties = {}
-    for line in result.stdout.splitlines():
+    for line in ((result.stdout or "") + (result.stderr or "")).splitlines():
         key, _, val = line.strip().partition(" = ")
         if key in names and 0 < len(val) <= 120 and val.isprintable():
             properties[key] = val
@@ -364,8 +366,9 @@ def installed_package(prefix, archive, package_sha, source_sha):
     installer = current / "install.sh"
     if xcamp.sha256_file(installer) != expected_rows["install.sh"]:
         raise ValueError("installed verifier differs from the archive manifest")
-    verification = subprocess.run(["sh", str(installer), "verify", "--prefix", str(prefix)],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    verification = private_diagnostic.run_captured(["sh", str(installer), "verify", "--prefix", str(prefix)],
+                                                   env=dict(os.environ), text=False, timeout=120,
+                                                   label="installed-payload-verify")
     if verification.returncode != 0:
         raise ValueError("installer did not verify the complete package payload")
     return str(xtrace), str(agent), {
@@ -438,6 +441,7 @@ def instrumented():
         baseline_fingerprints, tracked_matches, baseline_digest = checked_baseline(baseline_path, pin)
     except (OSError, subprocess.SubprocessError, tarfile.TarError, TypeError, ValueError, KeyError, RuntimeError) as exc:
         # File and process errors may embed runner-local paths or sensitive input.
+        private_preparation_traceback()
         print(f"JHipster instrumented preparation failed ({type(exc).__name__})", file=sys.stderr)
         return 2
     launch = (xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent, "--app-package", evidence.APP_PACKAGE,
@@ -459,6 +463,18 @@ def instrumented():
                       "sameRunnerBaselineMatched": receipt["baselineMatched"],
                       "trackedBaselineMatched": all(tracked_matches.values()), "problemClasses": receipt["problemClasses"]}))
     return 0 if receipt["result"] == "recorded" and all(tracked_matches.values()) else 1
+
+
+def private_preparation_traceback():
+    """Retain setup diagnosis only in an explicitly opted-in owner-only file sink."""
+    if os.environ.get("XCAMP_PRIVATE_PREPARATION_TRACEBACK") != "1":
+        return
+    try:
+        info = os.fstat(sys.stderr.fileno())
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077:
+            traceback.print_exc(file=sys.stderr)
+    except (OSError, ValueError):
+        pass
 
 
 if __name__ == "__main__":
