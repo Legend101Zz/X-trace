@@ -235,7 +235,7 @@ pub struct RecordingStoreError {
     correlation_id: CorrelationId,
     source: Option<&'static str>,
     #[cfg(all(test, unix, debug_assertions))]
-    pub(crate) admission_facts: Option<object_diagnostic::Observation>,
+    pub(crate) diagnostic_facts: Option<object_diagnostic::Observation>,
 }
 
 impl RecordingStoreError {
@@ -252,7 +252,7 @@ impl RecordingStoreError {
             correlation_id,
             source: None,
             #[cfg(all(test, unix, debug_assertions))]
-            admission_facts: None,
+            diagnostic_facts: None,
         }
     }
 
@@ -6029,7 +6029,7 @@ fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> Recordin
     let mut mapped = RecordingStoreError::new(kind, code, message, correlation_id);
     #[cfg(all(test, unix, debug_assertions))]
     {
-        mapped.admission_facts = error.admission_facts;
+        mapped.diagnostic_facts = error.admission_facts;
     }
     if let Some(source) = source {
         mapped = mapped.with_source(source);

@@ -440,7 +440,7 @@ fn map_recording_error(error: RecordingStoreError) -> PortError {
     #[cfg(all(test, unix, debug_assertions))]
     crate::recording_store::object_diagnostic::returned_error(
         error.correlation_id(),
-        error.admission_facts,
+        error.diagnostic_facts,
     );
     let kind = match error.kind() {
         RecordingStoreErrorKind::Validation | RecordingStoreErrorKind::Permission => {
@@ -2175,15 +2175,15 @@ mod tests {
     }
 
     #[cfg(all(unix, debug_assertions))]
-    #[allow(clippy::panic, reason = "failed test reports only bounded admission facts")]
-    fn fail_singleton_admission(diagnostic: String) {
-        panic!("acknowledgement admission {diagnostic}");
+    #[allow(clippy::panic, reason = "failed test reports only bounded acknowledgement facts")]
+    fn fail_singleton_acknowledgement(label: &'static str, diagnostic: String) {
+        panic!("acknowledgement {label} {diagnostic}");
     }
 
     #[cfg(all(unix, debug_assertions))]
     #[test]
     fn journal_sync_errors_prevent_acknowledgement_and_report_original_io_facts() {
-        use crate::recording_store::object_diagnostic::Scope;
+        use crate::recording_store::object_diagnostic::{Scope, observe_acknowledgement};
         use crate::recording_store::recording_journal::{SyncFailure, SyncKind};
         use rustix::io::Errno;
 
@@ -2204,12 +2204,19 @@ mod tests {
 
             // The first append also encounters an absent checkpoint on the cold read path.
             let observation = Scope::enter();
+            let mut correlated = None;
             let failure = {
                 let _sync_failure = SyncFailure::enter(sync, errno);
-                capture.record_events(RecordEvents {
-                    recording_id,
-                    events: vec![event(2, "unacknowledged-event")],
-                })
+                observe_acknowledgement(
+                    1,
+                    || {
+                        capture.record_events(RecordEvents {
+                            recording_id,
+                            events: vec![event(2, "unacknowledged-event")],
+                        })
+                    },
+                    |label, facts| correlated = Some((label, facts)),
+                )
             }
             .expect_err("failed sync prevents acknowledgement");
             assert_eq!(failure.kind(), PortErrorKind::Transport);
@@ -2224,6 +2231,7 @@ mod tests {
                     errno.raw_os_error()
                 )
             );
+            assert_eq!(correlated, Some(("object io", observation.report(1))));
             drop(observation);
             assert_eq!(
                 store
@@ -2389,7 +2397,7 @@ mod tests {
             let receipt = crate::recording_store::object_diagnostic::observe_acknowledgement(
                 index as u64 + 1,
                 record,
-                fail_singleton_admission,
+                fail_singleton_acknowledgement,
             );
             #[cfg(not(all(unix, debug_assertions)))]
             let receipt = record();
