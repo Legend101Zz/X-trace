@@ -45,14 +45,41 @@ class PlanTests(unittest.TestCase):
 
     def test_tui_absent_never_pass(self):
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(status(["crates/xtrace-tui/x.rs"], repo=pathlib.Path(d))["tui"], "absent")
-            (pathlib.Path(d) / "crates/xtrace-tui").mkdir(parents=True)
-            self.assertEqual(status(["crates/xtrace-tui/x.rs"], repo=pathlib.Path(d))["tui"], "selected")
+            repo = pathlib.Path(d)
+            self.assertEqual(status(["crates/xtrace-tui/x.rs"], repo=repo)["tui"], "absent")
+            requested = ls.plan([], "tui", repo)["tui"]
+            self.assertEqual(requested["status"], "absent")
+            self.assertTrue(requested["forced"])
+            all_suites = ls.plan([], "all", repo)
+            self.assertEqual(all_suites["tui"]["status"], "absent")
+            self.assertNotIn("forced", all_suites["tui"])
+            (repo / "crates/xtrace-tui").mkdir(parents=True)
+            self.assertEqual(status(["crates/xtrace-tui/x.rs"], repo=repo)["tui"], "selected")
 
     def test_dispatch_force(self):
         self.assertEqual(status([], "java")["java"], "selected")
         self.assertEqual(status([], "java")["node"], "skipped-by-filter")
         self.assertEqual(status([], "all")["node"], "selected")
+
+    def test_dispatch_selects_only_the_requested_suite(self):
+        files = ["crates/xtrace-domain/src/lib.rs", "adapters/java/build.gradle.kts", "web/app/src/a.ts"]
+        with tempfile.TemporaryDirectory() as d:
+            repo = pathlib.Path(d)
+            (repo / ls.TUI_DIR).mkdir(parents=True)
+            automatic = status(files, "", repo)
+            self.assertEqual({name for name, state in automatic.items() if state == "selected"},
+                             {"meta", "rust", "java", "web"})
+            self.assertEqual(status(files, "all", repo), dict.fromkeys(ls.SUITES, "selected"))
+            for changed in (files, [*files, ".github/workflows/lane.yml"], None):
+                for suite in ("meta", "rust"):
+                    with self.subTest(changed=changed, suite=suite):
+                        expected = dict.fromkeys(ls.SUITES, "skipped-by-filter")
+                        expected[suite] = "selected"
+                        self.assertEqual(status(changed, suite, repo), expected)
+
+    def test_dispatch_rejects_invalid_suite(self):
+        with self.assertRaisesRegex(ValueError, "invalid suite 'typo'"):
+            status(["adapters/java/build.gradle.kts"], "typo")
 
     def test_adapter_paths(self):
         self.assertEqual(status(["adapters/node/package.json"])["node"], "selected")

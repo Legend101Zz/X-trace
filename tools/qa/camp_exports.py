@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scan the Spring MVC catalog, then export and judge all developer formats, including the bundle.
 
-  camp_exports.py --xtrace BIN --project-dir DIR --analyzer BIN --out DIR --file SUMMARY --project P
+  camp_exports.py --xtrace BIN --project-dir DIR [--analyzer BIN] --out DIR --file SUMMARY --project P
 
 Exit code 9 (the CLI's NotImplemented) for a format is not-implemented; any other non-zero exit, or an exit 0 that wrote
 nothing, is a failure. The output directory is later scanned for privacy canaries (location class `exports`).
@@ -115,14 +115,16 @@ def judge_bundle(dest: pathlib.Path, catalog: dict, counts: dict[str, int]) -> t
         return "fail", "bundle contents, inventory, catalog revision or operation counts could not be verified"
 
 
-def run_exports(xtrace: str, project_dir: str, analyzer: str, out: pathlib.Path) -> list[tuple[str, str, str]]:
+def run_exports(xtrace: str, project_dir: str, analyzer: str | None, out: pathlib.Path) -> list[tuple[str, str, str]]:
     """Scan before exporting. Never count pre-existing output as evidence from this invocation."""
     out.mkdir(parents=True, exist_ok=True)
     try:
-        scan = subprocess.run([xtrace, "scan", "--project-dir", project_dir,
-                               "--source", str(pathlib.Path(project_dir) / "src/main/java"),
-                               "--framework", "spring-mvc", "--analyzer", analyzer, "--json"],
-                              capture_output=True, text=True, timeout=320)
+        argv = [xtrace, "scan", "--project-dir", project_dir,
+                "--source", str(pathlib.Path(project_dir) / "src/main/java"),
+                "--framework", "spring-mvc", "--json"]
+        if analyzer is not None:
+            argv.extend(["--analyzer", analyzer])
+        scan = subprocess.run(argv, capture_output=True, text=True, timeout=320)
         try:
             doc = json.loads(scan.stdout)
         except ValueError:
@@ -174,13 +176,16 @@ def run_exports(xtrace: str, project_dir: str, analyzer: str, out: pathlib.Path)
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    for n in ("xtrace", "project-dir", "analyzer", "out", "file", "project"):
+    for n in ("xtrace", "project-dir", "out", "file", "project"):
         ap.add_argument(f"--{n}", required=True)
+    ap.add_argument("--analyzer", help="override the packaged Spring analyzer for a reported accommodation")
+    ap.add_argument("--require-pass", action="store_true", help="exit nonzero if any export check failed")
     a = ap.parse_args()
-    for name, status, note in run_exports(a.xtrace, a.project_dir, a.analyzer, pathlib.Path(a.out)):
+    steps = run_exports(a.xtrace, a.project_dir, a.analyzer, pathlib.Path(a.out))
+    for name, status, note in steps:
         cs.record(pathlib.Path(a.file), a.project, name, status, note)
         print(f"campaign step {name}: {status} ({note})")
-    return 0
+    return int(a.require_pass and any(status != "pass" for _, status, _ in steps))
 
 
 if __name__ == "__main__":

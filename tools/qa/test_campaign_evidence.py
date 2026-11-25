@@ -24,15 +24,50 @@ class WorkflowEvidence(unittest.TestCase):
 
     def test_exports_use_real_analyzer_and_required_privacy_coverage(self):
         text = (ROOT / ".github/workflows/campaigns.yml").read_text()
-        self.assertIn(":static-analyzer:installDist", text)
-        self.assertIn('--analyzer "$XCAMP_ANALYZER"', text)
-        self.assertIn("analyzer is not shipped", text)
+        build = (ROOT / "packaging/build.py").read_text()
+        self.assertIn('":static-analyzer:installDist"', build)
+        install_start = text.index("      - name: Install and verify the candidate in a fresh prefix")
+        install_end = text.index("      - name: Private canaries", install_start)
+        install = text[install_start:install_end]
+        self.assertIn('verify-dist "$RUNNER_TEMP/pkg"', install)
+        self.assertIn('--prefix "$prefix" --data-home', install)
+        self.assertIn('verify --prefix "$prefix"', install)
+        self.assertIn('test -x "$analyzer"', install)
+        self.assertIn('"$prefix/bin/xtrace" "$agent" >> "$GITHUB_ENV"', install)
+        export_start = text.index("      - name: Scan and export through the installed Spring analyzer")
+        exports = text[export_start:text.index("      - name: Browser setup", export_start)]
+        self.assertIn("unset XTRACE_JAVA_ANALYZER", exports)
+        self.assertIn('camp_exports.py --xtrace "$XCAMP_XTRACE"', exports)
+        self.assertIn("--require-pass", exports)
+        self.assertNotIn("--analyzer", exports)
+        self.assertNotIn(":static-analyzer:installDist", text)
         self.assertIn("--require exports:3", text)
         self.assertIn('--loc "exports=$RUNNER_TEMP/xt/exports"', text)
         self.assertIn("--require bundle-files:6", text)
         self.assertIn('--loc "bundle-files=$RUNNER_TEMP/xt/exports/export-bundle"', text)
         self.assertNotIn("xtrace export exits 9", text)
         self.assertNotIn("while it exits 9", text)
+
+    def test_installed_browser_and_judge_share_provenance_and_fail_closed_in_private(self):
+        text = (ROOT / ".github/workflows/campaigns.yml").read_text()
+        start = text.index("      - name: Browser journeys,")
+        browser = text[start:text.index("      - name: TUI PTY transcript", start)]
+        runner = browser.index('node tools/qa/browser_journeys.mjs --xtrace "$XCAMP_XTRACE"')
+        judge = browser.index("python3 -B tools/qa/camp_instr_steps.py browser")
+        self.assertLess(browser.index('exec >"$RUNNER_TEMP/priv/console/browser.log" 2>&1'), runner)
+        self.assertIn("umask 077", browser[:runner])
+        self.assertIn("widths=320,736,1024,1280,1440", browser[:runner])
+        self.assertIn('source_sha="$(git rev-parse HEAD)"', browser[:runner])
+        self.assertIn('cat "$CAMP_OUT/package.sha256"', browser[:runner])
+        provenance = '--source-sha "$source_sha" --package-sha256 "$package_sha"'
+        self.assertIn('--out "$RUNNER_TEMP/priv/browser" --widths "$widths"', browser[runner:judge])
+        self.assertIn(provenance + " || browser_rc=$?", browser[runner:judge])
+        self.assertIn('--journeys "$RUNNER_TEMP/priv/browser/journeys.json" --widths "$widths"', browser[judge:])
+        self.assertIn(provenance + " || judge_rc=$?", browser[judge:])
+        self.assertIn('[ "$browser_rc" -ne 0 ] || [ "$judge_rc" -ne 0 ]; then status=fail', browser[judge:])
+        self.assertIn('--step browser-execution --status "$status"', browser[judge:])
+        self.assertIn('then exit "$browser_rc"; fi\n          exit "$judge_rc"', browser[judge:])
+        self.assertIn('--loc "private-console=$RUNNER_TEMP/priv/console"', text)
 
     def test_focused_artifacts_and_repeated_runs_are_scanned_independently(self):
         text = (ROOT / ".github/workflows/campaigns.yml").read_text()
