@@ -37,11 +37,12 @@ def record(path: pathlib.Path, project: str, step: str, status: str, note: str =
     _save(path, doc)
 
 
-def gate(path: pathlib.Path) -> int:
+def gate(path: pathlib.Path, *, statuses_only: bool = False) -> int:
     doc = _load(path, "")
     bad = [s for s in doc["steps"] if s["status"] in ("fail", "not-implemented")]
-    for s in doc["steps"]:
-        print(f"campaign step {s['step']}: {s['status']}" + (f" ({s['note']})" if s["note"] else ""))
+    if not statuses_only:
+        for s in doc["steps"]:
+            print(f"campaign step {s['step']}: {s['status']}" + (f" ({s['note']})" if s["note"] else ""))
     if not doc["steps"]:
         print("campaign gate: no steps recorded")
         return 1
@@ -61,6 +62,8 @@ def main() -> int:
         if name == "record":
             p.add_argument("--status", required=True)
             p.add_argument("--note", default="")
+        if name == "gate":
+            p.add_argument("--statuses-only", action="store_true")
         if name == "exec":
             p.add_argument("--cwd", default="")
             p.add_argument("command", nargs=argparse.REMAINDER)
@@ -70,7 +73,7 @@ def main() -> int:
         record(path, args.project, args.step, args.status, args.note)
         return 0
     if args.cmd == "gate":
-        return gate(path)
+        return gate(path, statuses_only=args.statuses_only)
     cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
     rc = subprocess.run(cmd, cwd=args.cwd or None, check=False).returncode
     record(path, args.project, args.step, "pass" if rc == 0 else "fail", f"exit {rc}")
