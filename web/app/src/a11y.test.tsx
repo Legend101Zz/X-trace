@@ -100,7 +100,7 @@ describe('accessibility rules over the rendered viewer', () => {
 
   it('has no structural violations in the Canvas view', async () => {
     await openRecording();
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     expect(screen.getByRole('tree')).toBeInTheDocument();
     expect(audit()).toEqual([]);
   });
@@ -116,7 +116,7 @@ describe('accessibility rules over the rendered viewer', () => {
   it('keyboard-only: Tab visits the active tab, then controls in DOM order, with one tree stop', async () => {
     const user = userEvent.setup();
     await openRecording();
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     (document.activeElement as HTMLElement | null)?.blur();
     const order: string[] = [];
     for (let step = 0; step < 60; step += 1) {
@@ -132,7 +132,7 @@ describe('accessibility rules over the rendered viewer', () => {
     // Expand buttons inside the tree are reachable by pointer, not by Tab (roving tabindex).
     expect(order.some((entry) => entry.startsWith('button:Expand') || entry.startsWith('button:Collapse'))).toBe(false);
     // The tree stop comes after the Linear/Canvas switch.
-    const canvasIndex = order.indexOf('button:Canvas');
+    const canvasIndex = order.indexOf('button:Map');
     const treeIndex = order.findIndex((entry) => entry.startsWith('treeitem:'));
     expect(canvasIndex).toBeGreaterThan(-1);
     expect(treeIndex).toBeGreaterThan(canvasIndex);

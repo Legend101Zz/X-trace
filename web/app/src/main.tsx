@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { components } from './api.generated';
 import { api, ApiError, failureMessage } from './api';
 import { AppShell } from './app-shell';
@@ -9,7 +9,8 @@ import { EventsPanel } from './features/events/EventsPanel';
 import { EvidencePanel } from './features/evidence/EvidencePanel';
 import { retainPage } from './retained-page';
 import { initialReplayState, replayReducer } from './replay/state';
-import type { NavAction } from './replay/navigation';
+import { navigationControls } from './replay/navigation';
+import type { NavAction, NavFrameNavigation } from './replay/navigation';
 import { useLane } from './state/lane';
 import { MAX_RETAINED_EVENTS, MAX_RETAINED_ROWS } from './types';
 import type { AuthState, CatalogMode, Detail, Endpoint, Pane, Recording, ReplayEvent } from './types';
@@ -308,6 +309,17 @@ export default function App() {
     ? 'Selected event is not in the loaded window.'
     : null;
 
+  const loadedFrameIds = useMemo(() => new Set((detail?.events ?? []).flatMap((item) => item.frameId ? [item.frameId] : [])), [detail]);
+  const frameControls = useMemo(
+    () => navigationControls(event?.navigation as NavFrameNavigation | undefined, loadedFrameIds),
+    [event, loadedFrameIds],
+  );
+  const missingSelection = selectionUnavailable ?? 'Select an event first.';
+  const backReason = selectedEvent < 0 ? missingSelection : selectedEvent === 0 ? 'No earlier event in the loaded window.' : null;
+  const nextReason = selectedEvent < 0 ? missingSelection : selectedEvent === eventCount - 1
+    ? detail?.nextCursor ? 'Load the next window to reach more events.' : 'No later event in the loaded window.'
+    : null;
+
   const selectEvent = useCallback((recordingId: string, item: ReplayEvent) => {
     const frameId = item.frameId ?? null;
     tabSelections.current.set(recordingId, { frameId, sequence: item.sequence,
@@ -315,23 +327,18 @@ export default function App() {
     dispatchReplay({ type: 'select-frame', frameId, sequence: item.sequence });
   }, []);
 
-  const moveEvent = useCallback((delta: number) => {
-    if (!detail || selectedEvent < 0) return;
+  const moveEvent = useCallback((delta: -1 | 1) => {
+    const reason = delta < 0 ? backReason : nextReason;
+    if (reason) {
+      setAnnouncement(reason);
+      return;
+    }
+    if (!detail) return;
     const next = detail.events[selectedEvent + delta];
     if (!next) return;
     selectEvent(detail.recordingId, next);
     setAnnouncement(`Event ${next.sequence} selected`);
-  }, [detail, selectEvent, selectedEvent]);
-
-  useEffect(() => {
-    const onKeyDown = (keyboard: KeyboardEvent) => {
-      if (!keyboard.altKey || (keyboard.key !== 'ArrowDown' && keyboard.key !== 'ArrowUp')) return;
-      keyboard.preventDefault();
-      moveEvent(keyboard.key === 'ArrowDown' ? 1 : -1);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [moveEvent]);
+  }, [backReason, detail, nextReason, selectEvent, selectedEvent]);
 
   useEffect(() => {
     if (auth !== 'ready' || catalogMode === 'endpoints') return;
@@ -398,7 +405,7 @@ export default function App() {
     setAnnouncement(`Event ${item.sequence} selected`);
   };
 
-  const navigateToFrame = (action: string, frameId: string) => {
+  const navigateToFrame = useCallback((action: string, frameId: string) => {
     const target = detail?.events.find((item) => item.frameId === frameId);
     if (!target) {
       setAnnouncement(`${action}: the target frame is outside the loaded window. Load more events to reach it; paging backward is not available yet.`);
@@ -406,17 +413,47 @@ export default function App() {
     }
     selectEvent(selectedRecording, target);
     setAnnouncement(`Selected event ${target.sequence}`);
-  };
+  }, [detail, selectEvent, selectedRecording]);
 
   const selectFrame = (frameId: string) => {
     // A Map node represents a frame and can stand for more than one recorded event.
     if (event?.frameId !== frameId) navigateToFrame('select', frameId);
   };
-  const navigateKey = (action: NavAction) => {
-    const result = (event?.navigation as Partial<Record<NavAction, { state: string; frameId?: string }>> | undefined)?.[action];
-    if (result?.state === 'target' && result.frameId) navigateToFrame(action, result.frameId);
-    else setAnnouncement(`${action}: ${result?.state === 'boundary' ? 'boundary, no further frame in this direction' : 'unavailable for this frame'}`);
-  };
+  const navigateKey = useCallback((action: NavAction) => {
+    const target = frameControls.find((control) => control.action === action);
+    if (target?.targetFrameId && target.enabled) navigateToFrame(action, target.targetFrameId);
+    else if (target?.reason) setAnnouncement(target.reason);
+  }, [frameControls, navigateToFrame]);
+
+  useEffect(() => {
+    const onKeyDown = (keyboard: KeyboardEvent) => {
+      if (!keyboard.altKey || keyboard.ctrlKey || keyboard.metaKey) return;
+      if (keyboard.target instanceof HTMLElement && keyboard.target.closest('input, select, textarea, [contenteditable="true"]')) return;
+      const key = keyboard.code || keyboard.key;
+      if (key === 'ArrowDown' || key === 'ArrowUp') {
+        keyboard.preventDefault();
+        if (keyboard.shiftKey) navigateKey(key === 'ArrowDown' ? 'next' : 'previous');
+        else moveEvent(key === 'ArrowDown' ? 1 : -1);
+        return;
+      }
+      switch (key) {
+        case 'KeyI': case 'i': keyboard.preventDefault(); navigateKey('into'); break;
+        case 'KeyO': case 'o': keyboard.preventDefault(); navigateKey('over'); break;
+        case 'KeyU': case 'u': keyboard.preventDefault(); navigateKey('out'); break;
+        case 'KeyM': case 'm':
+          if (!eventCount) return;
+          keyboard.preventDefault();
+          dispatchReplay({ type: 'set-mode', mode: replay.mode === 'linear' ? 'canvas' : 'linear' });
+          setActivePane('events');
+          requestAnimationFrame(() => {
+            document.querySelector<HTMLElement>('.event[tabindex="0"], .canvas-tree [role="treeitem"][tabindex="0"]')?.focus();
+          });
+          break;
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [eventCount, moveEvent, navigateKey, replay.mode]);
 
   return <AppShell activePane={activePane} onPane={setActivePane} announcement={announcement} auth={auth} authError={authError}
     openRecordings={openRecordings} selectedRecording={selectedRecording} onSelectRecording={activateRecording} onCloseRecording={closeRecording}
@@ -459,8 +496,12 @@ export default function App() {
       onMode={(mode) => dispatchReplay({ type: 'set-mode', mode })}
       onSelectFrame={selectFrame}
       onNavigateKey={navigateKey}
+      onMove={moveEvent}
+      backReason={backReason}
+      nextReason={nextReason}
+      frameControls={frameControls}
     />
-    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectionUnavailable={selectionUnavailable} selectedEvent={selectedEvent} eventCount={eventCount} onMoveEvent={moveEvent} onBackToEvent={() => {
+    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectionUnavailable={selectionUnavailable} onBackToEvent={() => {
       setActivePane('events');
       requestAnimationFrame(() => {
         const row = document.querySelector<HTMLElement>('.event[aria-current="true"], .canvas-tree [aria-selected="true"]');
