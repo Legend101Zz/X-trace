@@ -1058,8 +1058,9 @@ mod tests {
         let operation = revision_member_id(2);
         let legacy_v4 = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 3];
         let linked_v7 = revision_member_id(4);
+        let unmatched_v7 = revision_member_id(6);
         insert_project(&conn, &project).expect("project");
-        for recording in [legacy_v4, linked_v7] {
+        for recording in [legacy_v4, linked_v7, unmatched_v7] {
             insert_recording(&conn, &recording, &project, &revision_member_id(5), "complete")
                 .expect("recording");
         }
@@ -1071,6 +1072,11 @@ mod tests {
             "INSERT INTO recording_endpoint_observations VALUES (?1, ?2, 'linked', 'spring-orders-v1', ?3, 'spring-fixture', 'default', 'POST', '/orders', NULL)",
             params![linked_v7, project, operation],
         ).expect("fixture sidecar");
+        conn.execute(
+            "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, reason_code)
+             VALUES (?1, ?2, 'unmatched', 'observation_policy_missing')",
+            params![unmatched_v7, project],
+        ).expect("historical unmatched sidecar");
         let checksum_before = applied_checksum(&conn);
         let mut wrong_prefix = catalog.clone();
         wrong_prefix[9].label = "tampered";
@@ -1084,16 +1090,24 @@ mod tests {
             assert_eq!(apply_catalog(&conn, "test", correlation, &catalog).expect("proposal"), 11);
         }
         assert_eq!(schema_version(&conn), 11);
-        let stored: (Vec<u8>, Vec<u8>, Vec<u8>, String, Option<Vec<u8>>) = conn.query_row(
-            "SELECT e.recording_id, o.operation_id, o.endpoint_fingerprint, o.created_at, e.catalog_revision_id
+        let stored: (Vec<u8>, Vec<u8>, Vec<u8>, String) = conn
+            .query_row(
+                "SELECT e.recording_id, o.operation_id, o.endpoint_fingerprint, o.created_at
              FROM recording_endpoint_observations e JOIN operations o USING(operation_id)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        ).expect("preserved fixture link");
-        assert_eq!(
-            stored,
-            (linked_v7.to_vec(), operation.to_vec(), vec![0; 32], "then".into(), None)
-        );
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("preserved fixture link");
+        assert_eq!(stored, (linked_v7.to_vec(), operation.to_vec(), vec![0; 32], "then".into()));
+        let unchanged: bool = conn.query_row(
+            "SELECT observation_policy_id IS NULL AND operation_id IS NULL AND application_component IS NULL
+               AND binding_key IS NULL AND method IS NULL AND route_template IS NULL
+               AND catalog_revision_id IS NULL AND operation_fingerprint IS NULL
+               AND disposition = 'unmatched' AND reason_code = 'observation_policy_missing'
+             FROM recording_endpoint_observations WHERE recording_id = ?1",
+            [unmatched_v7], |row| row.get(0),
+        ).expect("preserved unmatched nulls");
+        assert!(unchanged);
         let absent: i64 = conn
             .query_row(
                 "SELECT count(*) FROM recordings WHERE recording_id = ?1
@@ -1133,7 +1147,9 @@ mod tests {
         );
         insert_project(&conn, &project).expect("project");
         conn.execute(
-            "INSERT INTO projects VALUES (?1, 'other-repo', 'other', 'then', 'then', 1, 'config')",
+            "INSERT INTO projects (project_id, canonical_repo_hash, display_name, created_at, last_opened_at,
+             config_schema_version, effective_config_hash)
+             VALUES (?1, 'other-repo', 'other', 'then', 'then', 1, 'config')",
             [other_project],
         )
         .expect("second project");
@@ -1175,28 +1191,47 @@ mod tests {
                 params![scope, revision, operation],
             )
         };
-        let link = |route: &str, policy: Option<&str>, selected: Option<[u8; 16]>| {
+        let link = |route: &str,
+                    policy: Option<&str>,
+                    selected: Option<[u8; 16]>,
+                    witness: [u8; 32]| {
             conn.execute(
-            "INSERT INTO recording_endpoint_observations VALUES (?1, ?2, 'linked', ?3, ?4, 'owners', 'default', 'GET', ?5, NULL, ?6)",
-            params![recording, project, policy, operation, route, selected],
+            "INSERT INTO recording_endpoint_observations VALUES (?1, ?2, 'linked', ?3, ?4, 'owners', 'default', 'GET', ?5, NULL, ?6, ?7)",
+            params![recording, project, policy, operation, route, selected, witness],
         )
         };
+        let policy = Some("runtime-route-v1");
+        let route = "/owners/{id}";
         assert!(mark(other_project).is_err(), "eligibility must match revision project");
         assert!(
-            link("/owners/{id}", Some("runtime-route-v1"), Some(revision)).is_err(),
+            link(route, policy, Some(revision), [0; 32]).is_err(),
             "membership alone does not establish eligibility"
         );
         mark(project).expect("scanned eligible membership");
-        assert!(link("/owners/{id}", None, Some(revision)).is_err());
-        assert!(link("/owners/{id}", Some("runtime-route-v1"), None).is_err());
-        assert!(link("/owners/guessed", Some("runtime-route-v1"), Some(revision)).is_err());
-        link("/owners/{id}", Some("runtime-route-v1"), Some(revision))
-            .expect("exact eligible link");
+        assert!(link(route, None, Some(revision), [0; 32]).is_err());
+        assert!(link(route, policy, None, [0; 32]).is_err());
+        assert!(link("/owners/guessed", policy, Some(revision), [0; 32]).is_err());
+        conn.execute("UPDATE operations SET route_template = '/owners/guessed'", [])
+            .expect("construct a mismatched alias tuple");
+        assert!(
+            link("/owners/guessed", policy, Some(revision), [0; 32]).is_err(),
+            "the matched alias tuple must also match the catalog tuple"
+        );
+        conn.execute(
+            "UPDATE operations SET route_template = '/owners/{id}', endpoint_fingerprint = ?1",
+            [[1_u8; 32]],
+        )
+        .expect("construct a mismatched alias fingerprint");
+        assert!(link(route, policy, Some(revision), [1; 32]).is_err());
+        assert!(link(route, policy, Some(revision), [0; 32]).is_err());
+        conn.execute("UPDATE operations SET endpoint_fingerprint = zeroblob(32)", [])
+            .expect("restore the catalog fingerprint");
+        link(route, policy, Some(revision), [0; 32]).expect("exact eligible link");
 
         let unmatched_row = |reason: Option<&str>, selected: Option<[u8; 16]>| {
             conn.execute(
                 "INSERT INTO recording_endpoint_observations VALUES (?1, ?2, 'unmatched',
-             'runtime-route-v1', NULL, 'owners', 'default', NULL, NULL, ?3, ?4)",
+             'runtime-route-v1', NULL, 'owners', 'default', NULL, NULL, ?3, ?4, NULL)",
                 params![unmatched, project, reason, selected],
             )
         };

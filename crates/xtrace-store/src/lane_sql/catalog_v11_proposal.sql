@@ -30,7 +30,8 @@ CREATE TABLE operations_v11 (
     UNIQUE(project_id, operation_id),
     UNIQUE(project_id, fingerprint_format_version, endpoint_fingerprint),
     UNIQUE(project_id, application_component, binding_key, transport, method, route_template),
-    UNIQUE(project_id, operation_id, application_component, binding_key, method, route_template)
+    UNIQUE(project_id, operation_id, application_component, binding_key, method, route_template),
+    UNIQUE(project_id, operation_id, endpoint_fingerprint)
 ) STRICT;
 
 INSERT INTO operations_v11 (operation_id, project_id, transport, method, route_template,
@@ -40,6 +41,11 @@ SELECT operation_id, project_id, transport, method, route_template,
        application_component, binding_key, fingerprint_format_version,
        endpoint_fingerprint, created_at
 FROM operations;
+
+-- Runtime rows must agree with the catalog operation as well as the observed alias.
+CREATE UNIQUE INDEX catalog_operations_runtime_link_identity
+    ON catalog_operations(project_id, operation_id, application_component, binding_key,
+                          method, route_template, endpoint_fingerprint);
 
 -- Positive scan evidence is scoped to one immutable revision member. Old scans get no rows.
 CREATE TABLE catalog_runtime_link_routes (
@@ -67,6 +73,7 @@ CREATE TABLE recording_endpoint_observations_v11 (
     route_template        TEXT,
     reason_code           TEXT,
     catalog_revision_id   BLOB CHECK(catalog_revision_id IS NULL OR length(catalog_revision_id) = 16),
+    operation_fingerprint BLOB CHECK(operation_fingerprint IS NULL OR length(operation_fingerprint) = 32),
     CHECK((application_component IS NULL AND binding_key IS NULL)
        OR (application_component IS NOT NULL AND binding_key IS NOT NULL
            AND length(CAST(application_component AS BLOB)) BETWEEN 1 AND 128
@@ -78,11 +85,14 @@ CREATE TABLE recording_endpoint_observations_v11 (
     CHECK(coalesce(CASE disposition
       WHEN 'linked' THEN operation_id IS NOT NULL AND reason_code IS NULL
         AND application_component IS NOT NULL AND method IS NOT NULL AND route_template IS NOT NULL
-        AND ((observation_policy_id = 'runtime-route-v1' AND catalog_revision_id IS NOT NULL)
+        AND ((observation_policy_id = 'runtime-route-v1' AND catalog_revision_id IS NOT NULL
+              AND operation_fingerprint IS NOT NULL)
           OR (observation_policy_id = 'spring-orders-v1' AND catalog_revision_id IS NULL
+              AND operation_fingerprint IS NULL
               AND application_component = 'spring-fixture' AND binding_key = 'default'
               AND method = 'POST' AND route_template = '/orders'))
       WHEN 'unmatched' THEN operation_id IS NULL AND method IS NULL AND route_template IS NULL
+        AND operation_fingerprint IS NULL
         AND CASE reason_code
           WHEN 'observation_policy_missing' THEN observation_policy_id IS NULL
             AND catalog_revision_id IS NULL AND (application_component IS NULL
@@ -115,6 +125,10 @@ CREATE TABLE recording_endpoint_observations_v11 (
     FOREIGN KEY(recording_id, project_id) REFERENCES recordings(recording_id, project_id),
     FOREIGN KEY(project_id, operation_id, application_component, binding_key, method, route_template)
         REFERENCES operations_v11(project_id, operation_id, application_component, binding_key, method, route_template),
+    FOREIGN KEY(project_id, operation_id, operation_fingerprint)
+        REFERENCES operations_v11(project_id, operation_id, endpoint_fingerprint),
+    FOREIGN KEY(project_id, operation_id, application_component, binding_key, method, route_template, operation_fingerprint)
+        REFERENCES catalog_operations(project_id, operation_id, application_component, binding_key, method, route_template, endpoint_fingerprint),
     FOREIGN KEY(project_id, catalog_revision_id)
         REFERENCES catalog_revisions(project_id, revision_id),
     FOREIGN KEY(project_id, catalog_revision_id, operation_id)
