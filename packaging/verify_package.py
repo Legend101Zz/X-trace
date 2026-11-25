@@ -59,6 +59,7 @@ REQUIRED = [
     ("java_pack_agent", _any("share/xtrace/packs/java/agent/")),
     ("java_pack_files", _any("share/xtrace/packs/java/")),
     ("node_pack_manifest", _has("share/xtrace/packs/node/pack.manifest")),
+    ("node_runtime_manifest", _has("share/xtrace/packs/node/dist/manifest.sha256")),
     ("node_pack_dist", _any("share/xtrace/packs/node/dist/", ".cjs")),
     ("schema_proto", _any("share/xtrace/schema/proto/", ".proto")),
     ("schema_openapi", _has("share/xtrace/schema/xtp-client/openapi.yaml")),
