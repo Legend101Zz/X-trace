@@ -212,7 +212,7 @@ export interface components {
             yaml: boolean;
             /** @description The last catalog publication for this project or one explicit revision UUID. */
             revision: "latest" | string;
-            /** @description Every eligible operation of that revision or one stable operation UUID. */
+            /** @description Every eligible operation of the revision, a catalog operation UUID or an observed endpoint UUID prefixed with observed:. The observed selector is resolved within this project and revision using its recorded component, binding, HTTP method and declared route. A missing or ambiguous match is unavailable. */
             scope: "all" | string;
         };
         ExportApproval: {
@@ -226,7 +226,7 @@ export interface components {
             yaml: boolean;
             /** @description The last catalog publication for this project or one explicit revision UUID. */
             revision: "latest" | string;
-            /** @description Every eligible operation of that revision or one stable operation UUID. */
+            /** @description Every eligible operation of the revision, a catalog operation UUID or an observed endpoint UUID prefixed with observed:. The observed selector is resolved within this project and revision using its recorded component, binding, HTTP method and declared route. A missing or ambiguous match is unavailable. */
             scope: "all" | string;
             approval: components["schemas"]["ExportApproval"];
         };
@@ -269,6 +269,11 @@ export interface components {
             /** Format: uuid */
             revisionId: string;
             revisionOrdinal: number;
+            /**
+             * Format: uuid
+             * @description Resolved catalog operation for this revision. Null for all operations.
+             */
+            catalogOperationId: string | null;
             selectedOperations: number;
             emittedOperations: number;
             files: components["schemas"]["ExportPreviewFile"][];

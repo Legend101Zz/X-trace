@@ -536,10 +536,15 @@ components:
             - { type: string, const: latest }
             - { type: string, format: uuid }
         scope:
-          description: Every eligible operation of that revision or one stable operation UUID.
+          description: >-
+            Every eligible operation of the revision, a catalog operation UUID or an observed
+            endpoint UUID prefixed with observed:. The observed selector is resolved within this
+            project and revision using its recorded component, binding, HTTP method and declared
+            route. A missing or ambiguous match is unavailable.
           oneOf:
             - { type: string, const: all }
             - { type: string, format: uuid }
+            - { type: string, pattern: '^observed:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
     ExportApproval:
       type: object
       additionalProperties: false
@@ -560,10 +565,15 @@ components:
             - { type: string, const: latest }
             - { type: string, format: uuid }
         scope:
-          description: Every eligible operation of that revision or one stable operation UUID.
+          description: >-
+            Every eligible operation of the revision, a catalog operation UUID or an observed
+            endpoint UUID prefixed with observed:. The observed selector is resolved within this
+            project and revision using its recorded component, binding, HTTP method and declared
+            route. A missing or ambiguous match is unavailable.
           oneOf:
             - { type: string, const: all }
             - { type: string, format: uuid }
+            - { type: string, pattern: '^observed:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
         approval: { $ref: '#/components/schemas/ExportApproval' }
     ExportPreviewFile:
       type: object
@@ -595,7 +605,7 @@ components:
         mediaType: { type: string, enum: [application/json, application/yaml, application/zip] }
     ExportPreview:
       type: object
-      required: [schemaVersion, requestId, projectId, request, revisionId, revisionOrdinal, selectedOperations, emittedOperations, files, omissions, totalBytes, contentHash, approval, download]
+      required: [schemaVersion, requestId, projectId, request, revisionId, revisionOrdinal, catalogOperationId, selectedOperations, emittedOperations, files, omissions, totalBytes, contentHash, approval, download]
       properties:
         schemaVersion: { type: integer, const: 1 }
         requestId: { type: string, format: uuid }
@@ -603,6 +613,10 @@ components:
         request: { $ref: '#/components/schemas/ExportSelection' }
         revisionId: { type: string, format: uuid }
         revisionOrdinal: { type: integer, minimum: 0 }
+        catalogOperationId:
+          type: [string, 'null']
+          format: uuid
+          description: Resolved catalog operation for this revision. Null for all operations.
         selectedOperations: { type: integer, minimum: 0, maximum: 4096 }
         emittedOperations: { type: integer, minimum: 0, maximum: 4096 }
         files:

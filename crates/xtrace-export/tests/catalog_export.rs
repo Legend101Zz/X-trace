@@ -195,6 +195,7 @@ fn snapshot(
     linked: &[OperationId],
 ) -> CatalogExportSnapshot {
     CatalogExportSnapshot {
+        observed_operation_id: None,
         revision: revision(u32::try_from(views.len()).unwrap()),
         catalog_identities: views
             .iter()
@@ -211,6 +212,7 @@ fn snapshot(
             .filter(|view| match scope {
                 CatalogExportScope::All => true,
                 CatalogExportScope::Operation(id) => view.operation_id == id,
+                CatalogExportScope::ObservedOperation(_) => false,
             })
             .cloned()
             .collect(),
@@ -242,6 +244,7 @@ fn viewer_preview_and_approved_save_preserve_exact_cli_artifacts_for_each_scope_
                 operation_ids: match scope {
                     CatalogExportScope::All => None,
                     CatalogExportScope::Operation(id) => Some(vec![id.to_string()]),
+                    CatalogExportScope::ObservedOperation(_) => None,
                 },
                 yaml,
             };
@@ -279,6 +282,7 @@ fn viewer_preview_and_approved_save_preserve_exact_cli_artifacts_for_each_scope_
                             match scope {
                                 CatalogExportScope::All => 2,
                                 CatalogExportScope::Operation(_) => 1,
+                                CatalogExportScope::ObservedOperation(_) => 1,
                             }
                         );
                         assert!(file.path.contains("fixtureprivatesegment"));
@@ -565,4 +569,94 @@ fn root_recipe_preview_names_require_source_root_without_literal_slug_collisions
             }
         }
     }
+}
+
+#[test]
+fn observed_scope_approval_binds_original_selector_and_resolved_catalog_identity() {
+    let selected = operation(3, "/orders");
+    let observed_id = xtrace_domain::OperationId::new();
+    assert_ne!(observed_id, selected.operation_id);
+    let mut fixture = snapshot(
+        std::slice::from_ref(&selected),
+        CatalogExportScope::All,
+        &[selected.operation_id],
+    );
+    fixture.observed_operation_id = Some(observed_id);
+    let request =
+        viewer_request(ExportFormat::Bundle, CatalogExportScope::ObservedOperation(observed_id));
+    let preview = viewer::preview(&fixture, request).unwrap();
+    assert_eq!(preview.catalog_operation_id, Some(selected.operation_id));
+    assert_eq!(preview.request.scope, CatalogExportScope::ObservedOperation(observed_id));
+    let approved = viewer::save(&fixture, request, preview.approval()).unwrap().into_files();
+    let cli = catalog::render(
+        &catalog::prepare(&fixture.revision, &fixture.operations, &[observed(&selected)]),
+        &ExportRequest {
+            format: ExportFormat::Bundle,
+            yaml: false,
+            operation_ids: Some(vec![selected.operation_id.to_string()]),
+        },
+    )
+    .unwrap();
+    assert_eq!(approved, cli.files);
+    let mut rebound = fixture.clone();
+    let other_observed = xtrace_domain::OperationId::new();
+    rebound.observed_operation_id = Some(other_observed);
+    assert_eq!(
+        viewer::save(
+            &rebound,
+            ViewerExportRequest {
+                scope: CatalogExportScope::ObservedOperation(other_observed),
+                ..request
+            },
+            preview.approval()
+        )
+        .err(),
+        Some(ViewerExportError::StalePreview)
+    );
+    let mut direct = fixture.clone();
+    direct.observed_operation_id = None;
+    assert_eq!(
+        viewer::save(
+            &direct,
+            ViewerExportRequest {
+                scope: CatalogExportScope::Operation(selected.operation_id),
+                ..request
+            },
+            preview.approval()
+        )
+        .err(),
+        Some(ViewerExportError::StalePreview)
+    );
+    let mut missing_proof = fixture.clone();
+    missing_proof.linked_operation_ids.clear();
+    assert_eq!(
+        viewer::preview(&missing_proof, request),
+        Err(ViewerExportError::OperationUnavailable)
+    );
+    assert_eq!(
+        viewer::preview(
+            &fixture,
+            ViewerExportRequest {
+                scope: CatalogExportScope::ObservedOperation(other_observed),
+                ..request
+            }
+        ),
+        Err(ViewerExportError::OperationUnavailable)
+    );
+    let mut ambiguous = fixture.clone();
+    let mut duplicate = selected.clone();
+    duplicate.operation_id = xtrace_domain::OperationId::new();
+    ambiguous.operations.push(duplicate);
+    ambiguous.catalog_identities.push(ambiguous.catalog_identities[0].clone());
+    ambiguous.revision.operation_count = 2;
+    assert_eq!(viewer::preview(&ambiguous, request), Err(ViewerExportError::OperationUnavailable));
+    let mut changed_catalog = preview.clone();
+    changed_catalog.catalog_operation_id = Some(xtrace_domain::OperationId::new());
+    assert_ne!(changed_catalog.approval(), preview.approval());
+    let mut changed_revision = fixture;
+    changed_revision.revision.revision_id = xtrace_domain::CatalogRevisionId::new();
+    assert_eq!(
+        viewer::save(&changed_revision, request, preview.approval()).err(),
+        Some(ViewerExportError::StalePreview)
+    );
 }

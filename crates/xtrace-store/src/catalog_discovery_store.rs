@@ -1946,6 +1946,267 @@ mod tests {
     }
 
     #[test]
+    fn viewer_export_observed_ids_resolve_only_exact_backed_project_revision_members() {
+        use CatalogExportRevision::{Historical, Latest};
+        use CatalogExportScope::{All, ObservedOperation, Operation};
+        let shared = SqliteStore::open_in_memory(OpenOptions::default()).expect("store");
+        let owner =
+            test_selection(test_scope("spring-fixture"), CatalogRunNamespace::RuntimeProducer);
+        let other = test_selection(owner.scope.clone(), CatalogRunNamespace::RuntimeProducer);
+        seed_authority(&shared, &owner);
+        seed_authority(&shared, &other);
+        let project = owner.project_id();
+        let claim = test_claim(project, "spring-fixture", "orders");
+        let revision = publish_fixture_catalog(
+            &shared,
+            &owner,
+            "observed-export",
+            std::slice::from_ref(&claim),
+        );
+        publish_fixture_catalog(
+            &shared,
+            &other,
+            "other-project",
+            &[test_claim(other.project_id(), "spring-fixture", "other-orders")],
+        );
+        let history = SqliteCatalogHistoryStore::new(shared.clone());
+        let full = history
+            .read_export_snapshot(project, Historical(revision), All, || false)
+            .expect("catalog");
+        let catalog_id = full.operations[0].operation_id;
+        let observed_id = {
+            let connection = shared.lock().expect("connection");
+            seed_export_recording(&connection, claim.operation(), true);
+            let bytes: Vec<u8> = connection
+                .query_row(
+                    "SELECT operation_id FROM operations WHERE project_id=?1",
+                    params![project.as_uuid().as_bytes()],
+                    |row| row.get(0),
+                )
+                .expect("observed UUID");
+            OperationId::from_uuid(uuid::Uuid::from_slice(&bytes).expect("UUID"))
+        };
+        assert_ne!(
+            observed_id, catalog_id,
+            "recording and catalog UUID namespaces are independently allocated"
+        );
+        let resolved = history
+            .read_export_snapshot(
+                project,
+                Historical(revision),
+                ObservedOperation(observed_id),
+                || false,
+            )
+            .expect("exact observed resolution");
+        assert_eq!(resolved.observed_operation_id, Some(observed_id));
+        assert_eq!(resolved.operations.len(), 1);
+        assert_eq!(resolved.operations[0].operation_id, catalog_id);
+        assert!(resolved.linked_operation_ids.contains(&catalog_id));
+        assert_eq!(resolved.catalog_identities, full.catalog_identities);
+        assert_eq!(
+            history.read_export_snapshot(project, Latest, Operation(observed_id), || false),
+            Err(CatalogExportReadError::OperationNotFound)
+        );
+        assert!(
+            history
+                .read_export_snapshot(project, Latest, Operation(catalog_id), || false)
+                .expect("direct catalog still works")
+                .observed_operation_id
+                .is_none()
+        );
+        assert_eq!(
+            history.read_export_snapshot(
+                other.project_id(),
+                Latest,
+                ObservedOperation(observed_id),
+                || false
+            ),
+            Err(CatalogExportReadError::OperationNotFound)
+        );
+        for (component, binding, route) in [
+            ("other-component", "default", "/orders"),
+            ("spring-fixture", "other-binding", "/orders"),
+            ("spring-fixture", "default", "/orders/{id}"),
+        ] {
+            let mut separate = owner.clone();
+            separate.owner_selection_id = *uuid::Uuid::now_v7().as_bytes();
+            separate.scope.application_component = component.to_owned();
+            separate.scope.binding_key = binding.to_owned();
+            separate.scope.module_selector = format!("scope-{}", uuid::Uuid::now_v7());
+            seed_owner_selection(&shared.lock().expect("connection"), &separate);
+            let identity = EndpointIdentity {
+                project_id: project,
+                application_component: component.to_owned(),
+                binding_key: binding.to_owned(),
+                transport: Transport::Http,
+                method: HttpMethod::Post,
+                route_template: route.to_owned(),
+            };
+            let separate_revision = publish_fixture_catalog(
+                &shared,
+                &separate,
+                "unmatched-revision",
+                &[test_identity_claim(identity, "declared-orders")],
+            );
+            assert_eq!(
+                history.read_export_snapshot(
+                    project,
+                    Historical(separate_revision),
+                    ObservedOperation(observed_id),
+                    || false
+                ),
+                Err(CatalogExportReadError::OperationNotFound)
+            );
+        }
+        assert_eq!(
+            history.read_export_snapshot(project, Latest, ObservedOperation(observed_id), || false),
+            Err(CatalogExportReadError::OperationNotFound)
+        );
+        history
+            .read_export_snapshot(
+                project,
+                Historical(revision),
+                ObservedOperation(observed_id),
+                || false,
+            )
+            .expect("explicit historical membership still exists");
+        shared.lock().expect("connection").execute("DELETE FROM recording_endpoint_observations WHERE project_id=?1 AND operation_id=?2",params![project.as_uuid().as_bytes(),observed_id.as_uuid().as_bytes()]).expect("remove backing observation");
+        assert_eq!(
+            history.read_export_snapshot(
+                project,
+                Historical(revision),
+                ObservedOperation(observed_id),
+                || false
+            ),
+            Err(CatalogExportReadError::OperationNotFound)
+        );
+    }
+
+    #[test]
+    fn viewer_export_observed_resolution_rejects_changed_recording_fingerprint_without_echo() {
+        let shared = SqliteStore::open_in_memory(OpenOptions::default()).expect("store");
+        let owner =
+            test_selection(test_scope("spring-fixture"), CatalogRunNamespace::RuntimeProducer);
+        seed_authority(&shared, &owner);
+        let project = owner.project_id();
+        let claim = test_claim(project, "spring-fixture", "orders");
+        publish_fixture_catalog(
+            &shared,
+            &owner,
+            "observed-fingerprint",
+            std::slice::from_ref(&claim),
+        );
+        let observed_id = {
+            let connection = shared.lock().expect("connection");
+            seed_export_recording(&connection, claim.operation(), true);
+            let bytes: Vec<u8> = connection
+                .query_row(
+                    "SELECT operation_id FROM operations WHERE project_id=?1",
+                    params![project.as_uuid().as_bytes()],
+                    |row| row.get(0),
+                )
+                .expect("observed UUID");
+            OperationId::from_uuid(uuid::Uuid::from_slice(&bytes).expect("UUID"))
+        };
+        shared
+            .lock()
+            .expect("connection")
+            .execute(
+                "UPDATE operations SET endpoint_fingerprint=zeroblob(32) WHERE operation_id=?1",
+                params![observed_id.as_uuid().as_bytes()],
+            )
+            .expect("tamper fingerprint");
+        let error = SqliteCatalogHistoryStore::new(shared)
+            .read_export_snapshot(
+                project,
+                CatalogExportRevision::Latest,
+                CatalogExportScope::ObservedOperation(observed_id),
+                || false,
+            )
+            .expect_err("unverified tuple refused");
+        assert_eq!(error, CatalogExportReadError::Corrupt);
+        assert!(!error.to_string().contains(&observed_id.to_string()));
+    }
+
+    #[test]
+    fn viewer_export_observed_resolution_keeps_revision_and_backing_proof_in_one_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (root, database) = private_database("observed-export-snapshot");
+        let shared = SqliteStore::open(&database, OpenOptions::default()).expect("store");
+        let owner =
+            test_selection(test_scope("spring-fixture"), CatalogRunNamespace::RuntimeProducer);
+        seed_authority(&shared, &owner);
+        let project = owner.project_id();
+        let claim = test_claim(project, "spring-fixture", "orders");
+        let revision = publish_fixture_catalog(
+            &shared,
+            &owner,
+            "observed-snapshot",
+            std::slice::from_ref(&claim),
+        );
+        let observed_id = {
+            let connection = shared.lock().expect("connection");
+            seed_export_recording(&connection, claim.operation(), true);
+            let bytes: Vec<u8> = connection
+                .query_row(
+                    "SELECT operation_id FROM operations WHERE project_id=?1",
+                    params![project.as_uuid().as_bytes()],
+                    |row| row.get(0),
+                )
+                .expect("observed UUID");
+            connection
+                .execute("DELETE FROM recording_endpoint_observations", [])
+                .expect("remove initial backing proof");
+            OperationId::from_uuid(uuid::Uuid::from_slice(&bytes).expect("UUID"))
+        };
+        let writer = Connection::open(&database).expect("separate WAL writer");
+        writer.pragma_update(None, "foreign_keys", true).expect("foreign keys");
+        let writer = Arc::new(Mutex::new(writer));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let callback = {
+            let writer = writer.clone();
+            let checks = checks.clone();
+            let identity = claim.operation().clone();
+            move || {
+                // The read's revision is already pinned before its explicit observed-lookup check.
+                if checks.fetch_add(1, Ordering::Relaxed) == 2 {
+                    let writer = writer.lock().expect("writer");
+                    let transaction = writer.unchecked_transaction().expect("transaction");
+                    seed_export_recording(&transaction, &identity, true);
+                    transaction.commit().expect("concurrent link committed");
+                }
+                false
+            }
+        };
+        let history = SqliteCatalogHistoryStore::new(shared.clone());
+        assert_eq!(
+            history.read_export_snapshot(
+                project,
+                CatalogExportRevision::Historical(revision),
+                CatalogExportScope::ObservedOperation(observed_id),
+                callback
+            ),
+            Err(CatalogExportReadError::OperationNotFound)
+        );
+        assert!(checks.load(Ordering::Relaxed) >= 3);
+        let after = history
+            .read_export_snapshot(
+                project,
+                CatalogExportRevision::Historical(revision),
+                CatalogExportScope::ObservedOperation(observed_id),
+                || false,
+            )
+            .expect("next snapshot sees proof");
+        assert_eq!(after.observed_operation_id, Some(observed_id));
+        assert_ne!(after.operations[0].operation_id, observed_id);
+        assert!(after.linked_operation_ids.contains(&after.operations[0].operation_id));
+        drop(history);
+        drop(shared);
+        drop(writer);
+        fs::remove_dir_all(root).expect("remove isolated fixture");
+    }
+
+    #[test]
     fn viewer_export_latest_follows_publication_after_reopen_and_clock_rollback() {
         use CatalogExportRevision::{Historical, Latest};
         use CatalogExportScope::All;

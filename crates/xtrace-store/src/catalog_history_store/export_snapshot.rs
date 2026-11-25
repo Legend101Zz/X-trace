@@ -15,7 +15,8 @@ use xtrace_domain::catalog_discovery::{
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
-    CatalogRevisionId, ContentHash, EndpointIdentity, OperationId, OperationVersionId, ProjectId,
+    CatalogRevisionId, ContentHash, EndpointIdentity, HttpMethod, OperationId, OperationVersionId,
+    ProjectId, Transport,
 };
 
 use super::{
@@ -143,21 +144,41 @@ fn read_snapshot(
 ) -> Result<CatalogExportSnapshot, ReadError> {
     let mut budget = InputBudget::default();
     let (revision, content_digest) = read_revision(connection, project_id, revision, &mut budget)?;
+    let observed_identity = match scope {
+        CatalogExportScope::ObservedOperation(id) => {
+            check_cancelled(is_cancelled)?;
+            Some(read_observed_identity(connection, project_id, id, &mut budget)?)
+        }
+        _ => None,
+    };
+    let selection = match scope {
+        CatalogExportScope::All => OperationSelection::All,
+        CatalogExportScope::Operation(id) => OperationSelection::Catalog(id),
+        CatalogExportScope::ObservedOperation(_) => {
+            OperationSelection::Observed(observed_identity.as_ref().ok_or(ReadError::Corrupt)?)
+        }
+    };
     let (catalog_identities, selected) = read_operation_index(
         connection,
         project_id,
         &revision,
-        scope,
+        selection,
         content_digest,
         &mut budget,
         is_cancelled,
     )?;
+    let catalog_scope = match scope {
+        CatalogExportScope::ObservedOperation(_) => {
+            CatalogExportScope::Operation(selected.first().ok_or(ReadError::OperationNotFound)?.id)
+        }
+        scope => scope,
+    };
     let identities = selected.iter().map(|op| (op.id, &op.identity)).collect();
     let mut claims = read_claims(
         connection,
         project_id,
         revision.revision_id,
-        scope,
+        catalog_scope,
         &identities,
         &mut budget,
         is_cancelled,
@@ -167,7 +188,7 @@ fn read_snapshot(
     let mut observation = connection.prepare(OBSERVATION_SQL).map_err(sql_error)?;
     for op in selected {
         check_cancelled(is_cancelled)?;
-        if has_linked_observation(&mut observation, &op.identity, &mut budget)? {
+        if has_linked_observation(&mut observation, &op.identity, None, &mut budget)? {
             linked_operation_ids.insert(op.id);
         }
         let claims = claims.remove(&op.id).unwrap_or_default().claims;
@@ -183,7 +204,16 @@ fn read_snapshot(
                 b.operation_id,
             ))
     });
-    Ok(CatalogExportSnapshot { revision, catalog_identities, operations, linked_operation_ids })
+    Ok(CatalogExportSnapshot {
+        observed_operation_id: match scope {
+            CatalogExportScope::ObservedOperation(id) => Some(id),
+            _ => None,
+        },
+        revision,
+        catalog_identities,
+        operations,
+        linked_operation_ids,
+    })
 }
 
 const REVISION_SQL: &str = "
@@ -302,11 +332,18 @@ const OPERATIONS_SQL: &str = "
     WHERE e.project_id = ?1 AND e.revision_id = ?2
     LIMIT ?3";
 
+#[derive(Clone, Copy)]
+enum OperationSelection<'a> {
+    All,
+    Catalog(OperationId),
+    Observed(&'a EndpointIdentity),
+}
+
 fn read_operation_index(
     connection: &Connection,
     project_id: ProjectId,
     revision: &RevisionEntry,
-    scope: CatalogExportScope,
+    selection: OperationSelection<'_>,
     content_digest: ContentHash,
     budget: &mut InputBudget,
     is_cancelled: &dyn Fn() -> bool,
@@ -361,7 +398,12 @@ fn read_operation_index(
             route_template: op.identity.route_template.clone(),
             operation_version_id: op.version.to_string(),
         });
-        if scope == CatalogExportScope::All || scope == CatalogExportScope::Operation(op.id) {
+        let include = match selection {
+            OperationSelection::All => true,
+            OperationSelection::Catalog(id) => id == op.id,
+            OperationSelection::Observed(identity) => identity == &op.identity,
+        };
+        if include {
             selected.push(op);
         }
     }
@@ -375,7 +417,7 @@ fn read_operation_index(
     if identities.len() != count || digest.finalize().as_bytes() != content_digest.as_bytes() {
         return Err(ReadError::Corrupt);
     }
-    if selected.is_empty() && matches!(scope, CatalogExportScope::Operation(_)) {
+    if !matches!(selection, OperationSelection::All) && selected.len() != 1 {
         return Err(ReadError::OperationNotFound);
     }
     Ok((identities, selected))
@@ -404,6 +446,7 @@ fn read_claims(
     let suffix = match scope {
         CatalogExportScope::All => "",
         CatalogExportScope::Operation(_) => " AND rc.operation_id = ?5",
+        CatalogExportScope::ObservedOperation(_) => return Err(ReadError::Corrupt),
     };
     let mut statement = connection.prepare(&format!("{CLAIMS_SQL}{suffix}")).map_err(sql_error)?;
     let project = project_id.as_uuid();
@@ -415,6 +458,7 @@ fn read_claims(
             MAX_DISCOVERY_CLAIM_BYTES,
             MAX_STORED_CLAIM_JSON_BYTES
         ]),
+        CatalogExportScope::ObservedOperation(_) => return Err(ReadError::Corrupt),
         CatalogExportScope::Operation(op) => statement.query(params![
             project.as_bytes(),
             revision.as_bytes(),
@@ -454,6 +498,49 @@ fn read_claims(
     Ok(by_operation)
 }
 
+// A point lookup in the recording endpoint namespace. Declared routes are compared exactly,
+// never reconstructed from a request URL or reconciled by route alone. Both this lookup and
+// the backing observation/membership checks run in the caller's SQLite read transaction.
+fn read_observed_identity(
+    connection: &Connection,
+    project_id: ProjectId,
+    operation_id: OperationId,
+    budget: &mut InputBudget,
+) -> Result<EndpointIdentity, ReadError> {
+    let mut statement = connection.prepare("SELECT
+        CASE WHEN octet_length(application_component) BETWEEN 1 AND 128 THEN application_component END,
+        CASE WHEN octet_length(binding_key) BETWEEN 1 AND 128 THEN binding_key END,
+        CASE WHEN octet_length(method) BETWEEN 1 AND 16 THEN method END,
+        CASE WHEN octet_length(route_template) BETWEEN 1 AND 1024 THEN route_template END,
+        CASE WHEN transport = 'http' AND fingerprint_format_version = 1 AND length(endpoint_fingerprint) = 32 THEN endpoint_fingerprint END
+        FROM operations WHERE project_id = ?1 AND operation_id = ?2").map_err(sql_error)?;
+    let mut rows = statement
+        .query(params![project_id.as_uuid().as_bytes(), operation_id.as_uuid().as_bytes()])
+        .map_err(sql_error)?;
+    let row = rows.next().map_err(sql_error)?.ok_or(ReadError::OperationNotFound)?;
+    budget.admit(row, 5)?;
+    let method_text = text(row, 2)?;
+    let method = HttpMethod::parse(method_text)
+        .filter(|method| method.as_str() == method_text)
+        .ok_or(ReadError::Corrupt)?;
+    let identity = EndpointIdentity {
+        project_id,
+        application_component: text(row, 0)?.to_owned(),
+        binding_key: text(row, 1)?.to_owned(),
+        transport: Transport::Http,
+        method,
+        route_template: text(row, 3)?.to_owned(),
+    };
+    if identity.fingerprint().map_err(corrupt)?.as_bytes() != blob(row, 4)? {
+        return Err(ReadError::Corrupt);
+    }
+    let mut observation = connection.prepare(OBSERVATION_SQL).map_err(sql_error)?;
+    if !has_linked_observation(&mut observation, &identity, Some(operation_id), budget)? {
+        return Err(ReadError::OperationNotFound);
+    }
+    Ok(identity)
+}
+
 const OBSERVATION_SQL: &str = "
     SELECT CASE WHEN octet_length(e.disposition) = 6 THEN e.disposition END,
            CASE WHEN octet_length(e.application_component) BETWEEN 1 AND 128 THEN e.application_component END,
@@ -467,20 +554,24 @@ const OBSERVATION_SQL: &str = "
     LEFT JOIN recordings r ON r.project_id = e.project_id AND r.recording_id = e.recording_id
     WHERE o.project_id = ?1 AND o.application_component = ?2 AND o.binding_key = ?3
       AND o.transport = 'http' AND o.method = ?4 AND o.route_template = ?5
+      AND (?6 IS NULL OR o.operation_id = ?6)
     LIMIT 1";
 
 fn has_linked_observation(
     statement: &mut rusqlite::Statement<'_>,
     identity: &EndpointIdentity,
+    observed_operation_id: Option<OperationId>,
     budget: &mut InputBudget,
 ) -> Result<bool, ReadError> {
+    let observed_uuid = observed_operation_id.map(|id| id.as_uuid());
     let mut rows = statement
         .query(params![
             identity.project_id.as_uuid().as_bytes(),
             identity.application_component,
             identity.binding_key,
             identity.method.as_str(),
-            identity.route_template
+            identity.route_template,
+            observed_uuid.as_ref().map(|id| id.as_bytes().as_slice())
         ])
         .map_err(sql_error)?;
     let Some(row) = rows.next().map_err(sql_error)? else {
