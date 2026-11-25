@@ -1,6 +1,7 @@
 // @vitest-environment node
 // Collector lifetime regressions; these are not installed-product receipts.
 import { EventEmitter } from 'node:events';
+import { runInNewContext } from 'node:vm';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,7 +21,8 @@ function harness(write = vi.fn(async () => undefined)) {
   const page = new EventEmitter();
   let closed = false;
   const frame = {};
-  Object.assign(page, { context: () => context, isClosed: () => closed, mainFrame: () => frame });
+  Object.assign(page, { context: () => context, isClosed: () => closed, mainFrame: () => frame,
+    addInitScript: vi.fn(async () => undefined) });
   const capture = apiEvidence({ page, origin, write });
   const close = () => { closed = true; context.emit('close'); page.emit('close'); };
   const request = (path = '/api/v1/exports/preview') => {
@@ -44,6 +46,154 @@ function harness(write = vi.fn(async () => undefined)) {
 afterEach(async () => {
   vi.useRealTimers();
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true });
+});
+
+function installAuthInitScript(test, fetch, startOrigin = origin) {
+  const [script, options] = test.page.addInitScript.mock.calls[0];
+  const window = { fetch, location: new URL(startOrigin + '/') };
+  window.top = window;
+  // Match Playwright's serialized init-script execution rather than importing node closures.
+  runInNewContext('(' + script.toString() + ')(options)', {
+    window, options, URL, Request, setTimeout, clearTimeout,
+  });
+  return window;
+}
+
+const authPath = '/api/v1/auth/exchange';
+
+it('drains the original auth response without replacing the viewer promise or replaying the request', async () => {
+  const test = harness();
+  await Promise.all([test.capture.prepare(), test.capture.prepare()]);
+  expect(test.page.addInitScript).toHaveBeenCalledTimes(1);
+  const startRead = deferred();
+  const userData = deferred();
+  const payload = Buffer.from('{"authenticated":true,"requestId":"private-id"}');
+  const entry = test.request(authPath);
+  const transport = test.response(entry, { body: async () => payload });
+  let chunk = 0;
+  const reader = {
+    cancel: vi.fn(async () => undefined),
+    releaseLock: vi.fn(),
+    read: vi.fn(async () => {
+      if (chunk++ === 0) {
+        startRead.resolve();
+        return { value: await userData.promise, done: false };
+      }
+      // Model a body that has no finish signal until a browser consumer drains it.
+      transport.complete();
+      return { done: true };
+    }),
+  };
+  const original = { url: origin + authPath, ok: true, bodyUsed: false,
+    headers: new Headers({ 'content-type': 'application/json' }),
+    clone: vi.fn(() => ({ body: { getReader: () => reader } })) };
+  const promise = Promise.resolve(original);
+  const fetch = vi.fn(() => promise);
+  const window = installAuthInitScript(test, fetch);
+  const init = { method: 'POST', body: '{"token":"private-token"}' };
+  const returned = window.fetch(authPath, init);
+  expect(returned).toBe(promise);
+  expect(await returned).toBe(original);
+  expect(original.bodyUsed).toBe(false);
+  await startRead.promise;
+  const drained = test.capture.drain();
+  expect(test.capture.evidence.counts.activeRequests).toBe(1);
+  expect(transport.response.body).not.toHaveBeenCalled();
+  userData.resolve(payload);
+  await drained;
+  expect(fetch).toHaveBeenCalledExactlyOnceWith(authPath, init);
+  expect(original.clone).toHaveBeenCalledTimes(1);
+  expect(reader.cancel).not.toHaveBeenCalled();
+  expect(reader.releaseLock).toHaveBeenCalledTimes(1);
+  expect(test.write).toHaveBeenCalledExactlyOnceWith('api-0.json', payload, expect.any(AbortSignal));
+  expect(test.capture.evidence.resources.auth).toEqual({ responses: 1, written: 1 });
+  expect(test.capture.evidence.counts).toMatchObject({ terminalRequests: 1, activeRequests: 0, pendingCaptures: 0 });
+  expect(JSON.stringify(test.capture.evidence)).not.toContain('private-id');
+  expect(JSON.stringify(test.capture.evidence)).not.toContain('private-token');
+});
+
+it.each([
+  ['GET', authPath, origin, origin + authPath, 'application/json', false],
+  ['POST', '/api/v1/exports/preview', origin, origin + '/api/v1/exports/preview', 'application/json', false],
+  ['POST', 'http://127.0.0.1:4321' + authPath, origin, 'http://127.0.0.1:4321' + authPath, 'application/json', false],
+  ['POST', authPath, 'http://127.0.0.1:4321', origin + authPath, 'application/json', false],
+  ['POST', authPath, origin, origin + authPath, 'text/plain', false],
+  ['POST', authPath, origin, origin + authPath, 'application/json', true],
+])('limits browser draining to the original local auth JSON response (%s %s from %s)', async (
+  method, input, startOrigin, responseUrl, type, redirected,
+) => {
+  const test = harness();
+  await test.capture.prepare();
+  const original = { url: responseUrl, redirected, headers: new Headers({ 'content-type': type }), clone: vi.fn() };
+  const promise = Promise.resolve(original);
+  const fetch = vi.fn(() => promise);
+  const window = installAuthInitScript(test, fetch, startOrigin);
+  const returned = window.fetch(input, { method });
+  expect(returned).toBe(promise);
+  await returned;
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(original.clone).not.toHaveBeenCalled();
+});
+
+it('keeps a failed init-script acknowledgment fixed and fail-closed', async () => {
+  const test = harness();
+  test.page.addInitScript.mockRejectedValue(new Error(privateError));
+  await expect(test.capture.prepare()).rejects.toThrow('api-evidence-write');
+  expect(test.capture.evidence.failures['finish-unavailable']).toBe(1);
+  expect(JSON.stringify(test.capture.evidence)).not.toContain(privateError);
+  await expect(test.capture.drain()).rejects.toThrow('api-evidence-write');
+});
+
+it('bounds the diagnostic clone drain without crediting a missing terminal event or body', async () => {
+  vi.useFakeTimers();
+  const test = harness();
+  await test.capture.prepare();
+  const pending = deferred();
+  const started = deferred();
+  const reader = { releaseLock: vi.fn(),
+    read: vi.fn(() => { started.resolve(); return pending.promise; }),
+    cancel: vi.fn(() => {
+      pending.resolve({ done: true });
+      // Cancel of one tee branch can await disposal of the original unread branch.
+      return new Promise(() => {});
+    }) };
+  const response = { url: origin + authPath, headers: new Headers({ 'content-type': 'application/json' }),
+    clone: () => ({ body: { getReader: () => reader } }) };
+  const window = installAuthInitScript(test, () => Promise.resolve(response));
+  test.response(test.request(authPath));
+  await window.fetch(authPath, { method: 'POST' });
+  await started.promise;
+  const drained = expect(test.capture.drain()).rejects.toThrow('api-evidence-write');
+  await vi.advanceTimersByTimeAsync(10_000);
+  await drained;
+  expect(reader.cancel).toHaveBeenCalledTimes(1);
+  expect(reader.releaseLock).toHaveBeenCalledTimes(1);
+  expect(test.capture.evidence.resources.auth).toEqual({ responses: 1, written: 0 });
+  expect(test.capture.evidence.phases.finish.failed).toBe(1);
+  expect(test.write).not.toHaveBeenCalled();
+});
+
+it('never substitutes clone EOF for an actual Playwright terminal event', async () => {
+  vi.useFakeTimers();
+  const test = harness();
+  await test.capture.prepare();
+  const eof = deferred();
+  const response = { url: origin + authPath, headers: new Headers({ 'content-type': 'application/json' }),
+    clone: () => ({ body: { getReader: () => ({
+      read: async () => ({ done: true }),
+      releaseLock: () => eof.resolve(),
+    }) } }) };
+  const window = installAuthInitScript(test, () => Promise.resolve(response));
+  const transport = test.response(test.request(authPath));
+  await window.fetch(authPath, { method: 'POST' });
+  await eof.promise;
+  const drained = expect(test.capture.drain()).rejects.toThrow('api-evidence-write');
+  await vi.advanceTimersByTimeAsync(10_000);
+  await drained;
+  expect(test.capture.evidence.counts).toMatchObject({ activeRequests: 1, terminalRequests: 0 });
+  expect(test.capture.evidence.resources.auth).toEqual({ responses: 1, written: 0 });
+  expect(transport.response.body).not.toHaveBeenCalled();
+  expect(test.write).not.toHaveBeenCalled();
 });
 
 it('drains the original response and private write before the browser target closes', async () => {

@@ -11,11 +11,20 @@ from tools.release.private_roots import AdmissionError, admit_directory
 
 WIDTHS = (320, 736, 1024, 1280, 1440)
 POINTERS = ("fine", "coarse")
-PHASES = ("choose.png", "all-openapi-yaml.png", "save.png")
+PHASES = ("choose.png", "all-openapi-yaml.png", "save.png", "linked-choose.png")
 MAX_PNG = 20 * 1024 * 1024
 MAX_SCANLINE_BYTES = (max(WIDTHS) * 4 + 1) * 900
 INFLATE_BLOCK = 64 * 1024
-EXPECTED = {f"{width}-{pointer}/{phase}" for width in WIDTHS for pointer in POINTERS for phase in PHASES}
+
+
+def frame_heights(width):
+    phases = dict.fromkeys(PHASES, 900)
+    if width in (320, 736):
+        phases.update({"preview-keyboard-450.png": 450, "preview-keyboard-260.png": 260})
+    return phases
+
+
+EXPECTED = {f"{width}-{pointer}/{phase}" for width in WIDTHS for pointer in POINTERS for phase in frame_heights(width)}
 
 
 class VisualEvidenceFailure(Exception):
@@ -92,7 +101,7 @@ def private_png(path: Path, width: int, height: int) -> bytes:
 
 
 def collect_visuals(browser: Path, *, require_complete: bool):
-    """A passing proof needs exactly 30 valid frames; failed proofs retain valid partial frames."""
+    """A passing proof needs all 48 dimension-checked frames; failed proofs retain valid partial frames."""
     admit_directory(browser)
     selected, refused = [], {"missing": 0, "unsafe": 0, "invalid": 0}
     for width in WIDTHS:
@@ -101,11 +110,11 @@ def collect_visuals(browser: Path, *, require_complete: bool):
             try:
                 admit_directory(directory)
             except (OSError, ValueError, AdmissionError):
-                refused["unsafe" if directory.exists() or directory.is_symlink() else "missing"] += len(PHASES)
+                refused["unsafe" if directory.exists() or directory.is_symlink() else "missing"] += len(frame_heights(width))
                 continue
-            for phase in PHASES:
+            for phase, height in frame_heights(width).items():
                 try:
-                    data = private_png(directory / phase, width, 900)
+                    data = private_png(directory / phase, width, height)
                 except FileNotFoundError:
                     refused["missing"] += 1
                     continue
@@ -113,6 +122,6 @@ def collect_visuals(browser: Path, *, require_complete: bool):
                     refused["invalid"] += 1
                     continue
                 selected.append((f"{width}-{pointer}/{phase}", data))
-    if require_complete and (set(name for name, _ in selected) != EXPECTED or len(selected) != 30 or any(refused.values())):
+    if require_complete and (set(name for name, _ in selected) != EXPECTED or len(selected) != 48 or any(refused.values())):
         raise VisualEvidenceFailure("visual-coverage")
     return selected, refused

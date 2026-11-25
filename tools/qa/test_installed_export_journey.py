@@ -209,7 +209,7 @@ class ApiEvidenceReceiptTests(unittest.TestCase):
         cases = [{"id": "320-fine", "caseId": case_id, "scope": scope, "format": fmt, "yaml": yaml}
                  for case_id, (scope, fmt, yaml) in journey.BROWSER_CASES.items()] if passed else []
         return {"schemaVersion": 3, "identity": {"sourceSha": "a" * 40, "packageSha256": "b" * 64},
-                "apiEvidenceSource": {"schemaVersion": 1, "transport": "passive-browser-response",
+                "apiEvidenceSource": {"schemaVersion": 2, "transport": "browser-response-with-auth-clone-drain",
                                       "driverSha256": "c" * 64, "collectorSha256": "d" * 64, "visibilitySha256": "e" * 64},
                 "checkpointSequence": 8, "status": "fail", "failureSubstage": None, "browserCleanup": "pass",
                 "current": {"rowId": None, "caseId": None, "stage": "complete"}, "rows": [row], "cases": cases,
@@ -274,6 +274,18 @@ class ApiEvidenceReceiptTests(unittest.TestCase):
         receipt["schemaVersion"] = 2
         with self.assertRaisesRegex(journey.JourneyFailure, "source-parity"):
             journey.project_browser_receipt(receipt, receipt["identity"], receipt["apiEvidenceSource"])
+
+    def test_historical_passive_source_cannot_qualify_the_auth_drain_collector(self):
+        receipt = self.receipt()
+        current = dict(receipt["apiEvidenceSource"])
+        receipt["apiEvidenceSource"].update(schemaVersion=1, transport="passive-browser-response")
+        historical = journey.project_browser_receipt(receipt)
+        self.assertEqual(historical["browserApiEvidenceSource"], receipt["apiEvidenceSource"])
+        with self.assertRaisesRegex(journey.JourneyFailure, "source-parity"):
+            journey.project_browser_receipt(receipt, receipt["identity"], current)
+        receipt["apiEvidenceSource"]["schemaVersion"] = 2
+        with self.assertRaisesRegex(journey.JourneyFailure, "browser-api-source"):
+            journey.project_browser_receipt(receipt)
 
     def test_passed_capture_must_have_every_private_payload_with_matching_byte_count(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,4 +1,4 @@
-// Passive browser-response capture. This never fetches, retries, fulfills or rewrites a request.
+// Browser-response capture. This never issues, retries, fulfills or rewrites a request.
 export const API_CAPTURE_PHASES = ['headers', 'finish', 'body', 'bounds', 'write'];
 export const API_CAPTURE_CATEGORIES = ['response-limit', 'header-limit', 'request-aborted', 'request-failed',
   'context-closed', 'navigation-invalidated', 'finish-unavailable', 'body-unavailable', 'body-timeout',
@@ -31,6 +31,66 @@ export function isJsonMediaType(contentType) {
   if (typeof contentType !== 'string') return false;
   const mediaType = contentType.split(';', 1)[0].trim();
   return /^application\/(?:json|[!#$%&'*+.^_`|~a-z0-9-]+\+json)$/i.test(mediaType);
+}
+
+/**
+ * Install before navigation. The viewer uses only auth response headers to advance;
+ * drain a clone of that same response so Chromium can finish without changing the
+ * Response, promise, or body state observed by the viewer.
+ *
+ * This function runs in the browser and must be self-contained.
+ */
+function drainAuthExchange({ origin, bodyLimit, timeout }) {
+  if (window.top !== window || window.location.origin !== origin) return;
+  const fetch = window.fetch;
+  const authUrl = origin + '/api/v1/auth/exchange';
+  const json = /^application\/(?:json|[!#$%&'*+.^_\x60|~a-z0-9-]+\+json)$/i;
+  async function consume(response) {
+    if (response.url !== authUrl || response.redirected) return;
+    const type = response.headers.get('content-type')?.split(';', 1)[0].trim();
+    if (!type || !json.test(type)) return;
+    const length = Number(response.headers.get('content-length') ?? 0);
+    if (!Number.isSafeInteger(length) || length < 0 || length > bodyLimit) return;
+
+    const reader = response.clone().body?.getReader();
+    if (!reader) return;
+    let stopped = false;
+    const stop = () => {
+      stopped = true;
+      // The original tee branch may remain unread. Do not wait on its cancellation.
+      void reader.cancel().catch(() => {});
+    };
+    const timer = setTimeout(stop, timeout);
+    try {
+      let remaining = bodyLimit;
+      while (!stopped) {
+        const { value, done } = await reader.read();
+        if (done || stopped) return;
+        remaining -= value.byteLength;
+        if (remaining < 0) stop();
+      }
+    } finally {
+      clearTimeout(timer);
+      reader.releaseLock();
+    }
+  }
+  window.fetch = function (...args) {
+    const result = Reflect.apply(fetch, this, args);
+    try {
+      const [input, init] = args;
+      const request = input instanceof Request ? input : null;
+      const url = new URL(request ? request.url : input, window.location.href);
+      const method = init?.method ?? request?.method ?? 'GET';
+      if (url.href === authUrl && typeof method === 'string' && method.toUpperCase() === 'POST') {
+        // The collector still requires Playwright's real completion event and original bytes.
+        // Do not publish, supply substitute bytes, or log browser-side drain failures.
+        void result.then(consume).catch(() => {});
+      }
+    } catch {
+      // A local diagnostic must preserve the viewer's original fetch behavior.
+    }
+    return result;
+  };
 }
 
 function resource(path) {
@@ -68,6 +128,7 @@ export function apiEvidence({ page, origin, write, state }) {
   let changed = deferred();
   let generation = 0;
   let closed = false;
+  let preparation;
   const notify = () => {
     if (evidence.status === 'pass' && (evidence.counts.activeRequests || evidence.counts.pendingCaptures)) evidence.status = 'in-progress';
     changed.resolve(); changed = deferred();
@@ -195,6 +256,18 @@ export function apiEvidence({ page, origin, write, state }) {
   }
   return {
     evidence, isApi,
+    prepare() {
+      // The driver must await the init script's acknowledgment before page.goto.
+      preparation ??= beforeDeadline(
+        Promise.resolve().then(() => page.addInitScript(drainAuthExchange, {
+          origin, bodyLimit: BODY_LIMIT, timeout: DEADLINE,
+        })), Date.now() + DEADLINE, 'finish-unavailable',
+      ).catch(() => {
+        fail('finish-unavailable');
+        throw new Error('api-evidence-write');
+      });
+      return preparation;
+    },
     shouldAbort(request) {
       if (!evidence.sealed || !isApi(request)) return false;
       const record = records.get(request) ?? admit(request);

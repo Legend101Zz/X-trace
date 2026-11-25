@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 import zlib
 
-from tools.qa.export_visual_evidence import EXPECTED, MAX_PNG, PHASES, POINTERS, WIDTHS, VisualEvidenceFailure, collect_visuals, private_png
+from tools.qa.export_visual_evidence import EXPECTED, MAX_PNG, POINTERS, WIDTHS, VisualEvidenceFailure, collect_visuals, frame_heights, private_png
 
 
 SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -44,17 +44,18 @@ class VisualEvidenceTests(unittest.TestCase):
             for pointer in POINTERS if complete else ("fine",):
                 directory = root / f"{width}-{pointer}"
                 directory.mkdir(mode=0o700)
-                for phase in PHASES if complete else ("choose.png",):
+                for phase, height in (frame_heights(width) if complete else {"choose.png": 900}).items():
                     path = directory / phase
-                    path.write_bytes(png(width, 900))
+                    path.write_bytes(png(width, height))
                     path.chmod(0o600)
 
-    def test_exact_thirty_distinct_dimensioned_frames_are_required_on_pass(self):
+    def test_original_thirty_and_linked_and_short_frames_are_required_on_pass(self):
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
             root = Path(temporary)
             self.fixture(root)
             selected, refused = collect_visuals(root, require_complete=True)
-            self.assertEqual(len(selected), 30)
+            self.assertEqual(sum(name.split("/")[1] in ("choose.png", "all-openapi-yaml.png", "save.png") for name, _ in selected), 30)
+            self.assertEqual(len(selected), 48)
             self.assertEqual({name for name, _ in selected}, EXPECTED)
             self.assertFalse(any(refused.values()))
             (root / "736-fine/save.png").unlink()
@@ -67,7 +68,7 @@ class VisualEvidenceTests(unittest.TestCase):
             self.fixture(root, complete=False)
             selected, refused = collect_visuals(root, require_complete=False)
             self.assertEqual([name for name, _ in selected], ["320-fine/choose.png"])
-            self.assertEqual(refused["missing"], 29)
+            self.assertEqual(refused["missing"], 47)
             with self.assertRaisesRegex(VisualEvidenceFailure, "visual-coverage"):
                 collect_visuals(root, require_complete=True)
 
@@ -176,7 +177,7 @@ class VisualEvidenceTests(unittest.TestCase):
             self.fixture(root)
             (root / "320-fine/choose.png").write_bytes(png(320, 900, compressed=b""))
             selected, refused = collect_visuals(root, require_complete=False)
-            self.assertEqual(len(selected), 29)
+            self.assertEqual(len(selected), 47)
             self.assertEqual(refused, {"missing": 0, "unsafe": 0, "invalid": 1})
             with self.assertRaisesRegex(VisualEvidenceFailure, "visual-coverage"):
                 collect_visuals(root, require_complete=True)

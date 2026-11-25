@@ -90,8 +90,8 @@ API_MINIMA = {"auth": 1, "endpoints": 1, "linked": 1, "detail": 1, "preview": 10
 
 
 def browser_evidence_source(repo):
-    """Bind the passive collector and its driver to the pinned source checkout."""
-    return {"schemaVersion": 1, "transport": "passive-browser-response",
+    """Bind the collector, including its active browser-side auth read, and the driver to the pinned source checkout."""
+    return {"schemaVersion": 2, "transport": "browser-response-with-auth-clone-drain",
             "driverSha256": hashlib.sha256(read_bounded(repo / "web/app/scripts/installed-export-journey.mjs")).hexdigest(),
             "collectorSha256": hashlib.sha256(read_bounded(repo / "web/app/scripts/api-evidence.mjs")).hexdigest(),
             "visibilitySha256": hashlib.sha256(read_bounded(repo / "web/app/scripts/export-visibility.mjs")).hexdigest()}
@@ -200,8 +200,9 @@ def project_browser_receipt(receipt, expected_identity=None, expected_evidence_s
     if capture:
         evidence_source = receipt.get("apiEvidenceSource")
         require(isinstance(evidence_source, dict) and set(evidence_source) == {"schemaVersion", "transport", "driverSha256", "collectorSha256", "visibilitySha256"}
-                and type(evidence_source["schemaVersion"]) is int and evidence_source["schemaVersion"] == 1
-                and evidence_source["transport"] == "passive-browser-response"
+                and type(evidence_source["schemaVersion"]) is int
+                and (evidence_source["schemaVersion"], evidence_source["transport"]) in (
+                    (1, "passive-browser-response"), (2, "browser-response-with-auth-clone-drain"))
                 and all(isinstance(evidence_source[key], str) and re.fullmatch(r"[0-9a-f]{64}", evidence_source[key])
                         for key in ("driverSha256", "collectorSha256", "visibilitySha256")), "browser-api-source")
     if expected_evidence_source is not None:

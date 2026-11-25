@@ -24,7 +24,7 @@ const formats = [
 assert.match(config.identity?.sourceSha ?? '', /^[0-9a-f]{40}$/);
 assert.match(config.identity?.packageSha256 ?? '', /^[0-9a-f]{64}$/);
 const apiEvidenceSource = {
-  schemaVersion: 1, transport: 'passive-browser-response',
+  schemaVersion: 2, transport: 'browser-response-with-auth-clone-drain',
   driverSha256: createHash('sha256').update(await readFile(new URL(import.meta.url))).digest('hex'),
   collectorSha256: createHash('sha256').update(await readFile(new URL('./api-evidence.mjs', import.meta.url))).digest('hex'),
   visibilitySha256: createHash('sha256').update(await readFile(new URL('./export-visibility.mjs', import.meta.url))).digest('hex'),
@@ -152,7 +152,7 @@ async function primaryActionVisible(dialog, name) {
   assert.ok(await dialog.getByRole('button', { name, exact: true }).evaluate(visibleControl), 'primary-phase-action-viewport');
 }
 
-async function shortPreviewProbes(page, dialog, row) {
+async function shortPreviewProbes(page, dialog, row, out) {
   for (const height of [450, 260]) {
     const probe = { width: row.width, height, coarse: row.coarse, status: 'in-progress',
       checks: { viewport: 'not-reached', initialAction: height === 450 ? 'not-reached' : 'not-required',
@@ -195,6 +195,7 @@ async function shortPreviewProbes(page, dialog, row) {
         if (await action.evaluate((node) => node === document.activeElement)) { reached = true; break; }
         await page.keyboard.press('Tab');
       }
+      await page.screenshot({ path: join(out, `preview-keyboard-${height}.png`) });
       assert.ok(reached, 'short-preview-primary-keyboard-reachable');
       await primaryActionVisible(dialog, 'Save file');
       probe.checks.keyboardAction = 'pass'; checkpoint();
@@ -406,6 +407,7 @@ try {
       page.on('console', (message) => { if (message.type() === 'error') row.consoleErrors += 1; });
       capture = apiEvidence({ page, origin, state: row.apiEvidence,
         write: (name, body, signal) => writeFile(join(out, name), body, { flag: 'wx', mode: 0o600, signal }) });
+      await capture.prepare();
       await context.route('**/*', async (route) => {
         if (new URL(route.request().url()).origin !== origin) { row.externalRequests += 1; await route.abort(); }
         else if (capture.shouldAbort(route.request())) await route.abort('aborted');
@@ -447,7 +449,9 @@ try {
         await expect(dialog.getByRole('button', { name: scope === 'all' ? 'All eligible endpoints' : 'This endpoint', exact: true })).toHaveAttribute('aria-pressed', 'true');
         stage('choose-capture');
         await snapshot(page, out, `${caseId}-choose`);
-        if (scope === 'all' && format === 'openapi' && yaml) await page.screenshot({ path: join(out, 'choose.png') });
+        if (format === 'openapi' && yaml) {
+          await page.screenshot({ path: join(out, scope === 'all' ? 'choose.png' : 'linked-choose.png') });
+        }
         stage('choose-geometry');
         await geometry(page, dialog);
         stage('preview-activate');
@@ -462,7 +466,7 @@ try {
         stage('preview-focus');
         await expect(dialog.getByRole('region', { name: 'Preview export' })).toBeFocused();
         await primaryActionVisible(dialog, 'Save file');
-        if ([320, 736].includes(width) && scope === 'all' && format === 'openapi' && yaml) await shortPreviewProbes(page, dialog, row);
+        if ([320, 736].includes(width) && scope === 'all' && format === 'openapi' && yaml) await shortPreviewProbes(page, dialog, row, out);
         stage('preview-content');
         await expect(dialog.getByText(preview.contentHash, { exact: true })).toBeVisible();
         await expect(dialog.getByText('Captured request and response bodies, cookies and credentials stay out of the export.', { exact: true })).toBeVisible();

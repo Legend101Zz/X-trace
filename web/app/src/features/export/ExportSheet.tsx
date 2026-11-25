@@ -1,5 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { FocusEvent, ReactNode } from 'react';
 import type { Endpoint } from '../../types';
 import { ExportProblem, fetchExportFile, previewExport, startDownload } from './client';
 import type { ExportPreview, ExportSelection } from './client';
@@ -188,6 +188,22 @@ export function ExportSheet({ endpoint, onClose, onPhaseChange }: {
       setFeedback('Clipboard access is unavailable. Select and copy the displayed command.');
     }
   }
+  function revealFooterAction(event: FocusEvent<HTMLElement>) {
+    const button = event.target;
+    const body = button.closest<HTMLElement>('.viewer-dialog-body');
+    if (!(button instanceof HTMLButtonElement) || !body || getComputedStyle(body).overflowY !== 'auto') return;
+    // In the short layout the whole body scrolls. Native Tab can leave a partially
+    // visible button clipped when the preceding action was already in the viewport.
+    const viewportTop = body.getBoundingClientRect().top + body.clientTop;
+    const bounds = button.getBoundingClientRect();
+    const inset = 4;
+    if (bounds.top < viewportTop + inset) {
+      body.scrollBy({ top: bounds.top - viewportTop - inset, behavior: 'instant' });
+    } else if (bounds.bottom > viewportTop + body.clientHeight - inset) {
+      body.scrollBy({ top: bounds.bottom - viewportTop - body.clientHeight + inset, behavior: 'instant' });
+    }
+  }
+
   return <article className="export-sheet">
     {!onPhaseChange && <ExportProgress phase={phase} />}
     <section ref={focusTarget} tabIndex={-1} aria-label={phase + ' export'} aria-busy={busy}>
@@ -221,7 +237,7 @@ export function ExportSheet({ endpoint, onClose, onPhaseChange }: {
       {format === 'postman' && <p>Configure Postman workspace delivery in the terminal.</p>}
     </section>
     <div className="export-feedback" role="status">{busy ? phase === 'Choose' || stale ? 'Preparing preview…' : 'Preparing download…' : feedback}</div>
-    <footer className="export-actions export-footer">
+    <footer className="export-actions export-footer" onFocus={revealFooterAction}>
       {phase === 'Choose' && <><span>Nothing is saved yet. You always see a preview first.</span><button type="button" className="export-primary" disabled={busy}
         onClick={() => void submit('preview')}>Preview</button></>}
       {phase === 'Preview' && <><span>Files will be saved on this machine only. Nothing will be sent anywhere.</span><button type="button" onClick={choose}>Back</button>

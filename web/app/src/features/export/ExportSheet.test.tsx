@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ExportSheet } from './ExportSheet';
@@ -194,4 +194,26 @@ it('aborts an outstanding file request when the dialog closes', async () => {
     finish(new Response('abc', { headers: { 'Content-Type': 'application/yaml', 'Content-Disposition': 'attachment; filename="openapi.yaml"' } }));
   });
   expect(click).not.toHaveBeenCalled();
+});
+
+it('reveals the whole focused action only when the dialog body is the short-layout scroller', () => {
+  render(<div className="viewer-dialog-body" data-testid="body"><ExportSheet endpoint={endpoint} onClose={() => {}} /></div>);
+  const body = screen.getByTestId('body');
+  const action = screen.getByRole('button', { name: 'Preview' });
+  const scrollBy = vi.fn();
+  Object.defineProperties(body, { clientHeight: { value: 200 }, scrollBy: { value: scrollBy } });
+  vi.spyOn(body, 'getBoundingClientRect').mockReturnValue(new DOMRect(16, 54, 704, 200));
+  const bounds = vi.spyOn(action, 'getBoundingClientRect').mockReturnValue(new DOMRect(600, 224, 85, 44));
+  body.style.overflowY = 'hidden';
+  fireEvent.focus(action);
+  expect(scrollBy).not.toHaveBeenCalled();
+  body.style.overflowY = 'auto';
+  fireEvent.focus(action);
+  expect(scrollBy).toHaveBeenLastCalledWith({ top: 18, behavior: 'instant' });
+  bounds.mockReturnValue(new DOMRect(600, 48, 85, 44));
+  fireEvent.focus(action);
+  expect(scrollBy).toHaveBeenLastCalledWith({ top: -10, behavior: 'instant' });
+  bounds.mockReturnValue(new DOMRect(600, 110, 85, 44));
+  fireEvent.focus(action);
+  expect(scrollBy).toHaveBeenCalledTimes(2);
 });
