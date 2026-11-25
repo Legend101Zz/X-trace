@@ -139,3 +139,10 @@ Browser, TUI, restart, real export, overhead, focused capture privacy, release
 privacy and signed-ledger qualification remain required. The private ZIP is
 saved API JSON, not an export bundle. No release row is accepted by this work.
 Regression tests run on GitHub; local verification compiles Python source only.
+
+The installed upstream checkout keeps the exact commit SHA. It also fetches the
+single pinned annotated release tag needed by Fineract's Gradle versioning
+plugin. Source verification checks the tag object and its peeled commit before
+the unchanged build command runs. The build phase distinguishes a nonzero
+Gradle exit from a zero exit without the expected new JAR. The receipt projects
+only the fixed outcome and command exit code.

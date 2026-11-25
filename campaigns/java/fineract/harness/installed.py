@@ -133,8 +133,63 @@ class InstalledCampaign:
         return self.command(["sh", str(unpacked / "install.sh"), "--prefix", str(self.prefix),
                              "--data-home", str(self.root / "data")])
 
+    def upstream_tag_ref(self):
+        upstream = self.campaign["upstream"]
+        tag = upstream["stableTag"]
+        if (not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", tag)
+                or not re.fullmatch(r"[0-9a-f]{40}", upstream["sha"])
+                or not re.fullmatch(r"[0-9a-f]{40}", upstream["tagObjectSha"])
+                or upstream["ref"] != f"refs/tags/{tag}^{{}}"):
+            raise ValueError("upstream release tag pin is invalid")
+        return f"refs/tags/{tag}"
+
+    def checkout_upstream(self):
+        upstream = self.campaign["upstream"]
+        tag = self.upstream_tag_ref()
+        code = self.command(["sh", str(REPO / "tools/qa/camp_clone.sh"), upstream["canonicalUrl"],
+                             upstream["sha"], str(self.source)])
+        if code:
+            return code
+        # Fineract's pinned versioning plugin needs a matching tag even at a detached,
+        # depth-one HEAD. Fetch only that tag and retain the commit-SHA checkout.
+        return self.command(["git", "fetch", "--no-tags", "--depth", "1", "origin", f"{tag}:{tag}"],
+                            cwd=self.source)
+
+    def verify_upstream_tag(self):
+        upstream = self.campaign["upstream"]
+        tag = self.upstream_tag_ref()
+
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=self.source, env=self.env, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        if (git("cat-file", "-t", tag) != "tag"
+                or git("rev-parse", "--verify", tag) != upstream["tagObjectSha"]
+                or git("rev-parse", "--verify", tag + "^{commit}") != upstream["sha"]):
+            raise ValueError("upstream annotated release tag identity differs")
+
+    def build_upstream(self):
+        argv = shlex.split(self.campaign["build"]["command"])
+        artifact = self.source / self.campaign["build"]["artifact"]
+        state = {"status": "artifact-preexisting", "commandExitCode": None}
+        self.manifest["upstreamBuild"] = state
+        if artifact.exists() or artifact.is_symlink():
+            return 1
+        state["status"] = "not-observed"
+        code = self.command(argv, cwd=self.source)
+        state["commandExitCode"] = code
+        if code:
+            state["status"] = "command-failed"
+            return code
+        if artifact.is_symlink() or not artifact.is_file() or artifact.stat().st_size == 0:
+            state["status"] = "expected-jar-missing"
+            return 1
+        state["status"] = "artifact-present"
+        return 0
+
     def source_verify(self):
         xcamp.git_pin_check(self.source, self.campaign["upstream"]["sha"])
+        self.verify_upstream_tag()
         license = self.campaign["license"]
         files = {license["file"]: license["sha256"], **license["otherFiles"]}
         if any(xcamp.sha256_file(self.source / name) != digest for name, digest in files.items()):
@@ -150,13 +205,10 @@ class InstalledCampaign:
         operations = (
             ("prerequisite", self.prerequisites), ("archive-verify", self.verify_archive),
             ("candidate-install", self.install),
-            ("checkout-upstream", lambda: self.command(["sh", str(REPO / "tools/qa/camp_clone.sh"),
-                                                       self.campaign["upstream"]["canonicalUrl"],
-                                                       self.campaign["upstream"]["sha"], str(self.source)])),
-            ("source-verify", self.source_verify),
+            ("checkout-upstream", self.checkout_upstream), ("source-verify", self.source_verify),
             ("database-identity", lambda: self.command(["docker", "pull", "--platform", "linux/amd64",
                                                        self.campaign["runtime"]["databaseImage"]])),
-            ("build-upstream", lambda: self.command(shlex.split(self.campaign["build"]["command"]), cwd=self.source)),
+            ("build-upstream", self.build_upstream),
             ("baseline", lambda: self.command([sys.executable, "-B", str(HERE / "run.py"), "baseline"])),
             ("instrumented", lambda: self.command([sys.executable, "-B", str(HERE / "run.py"), "instrumented"])),
         )

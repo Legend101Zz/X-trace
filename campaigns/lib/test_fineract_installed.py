@@ -70,6 +70,103 @@ class FineractInstalled(unittest.TestCase):
             self.assertIn("private-path-and-credential", (root / "console/baseline.stderr").read_text())
             self.assertNotIn("private-path-and-credential", (root / "phases.json").read_text())
 
+    def test_checkout_keeps_the_commit_pin_and_fetches_only_the_exact_annotated_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(Path(tmp))
+            pin = runner.campaign["upstream"]
+            ref = "refs/tags/1.15.0"
+            with mock.patch.object(runner, "command", side_effect=[0, 0]) as command:
+                self.assertEqual(runner.checkout_upstream(), 0)
+            self.assertEqual(command.call_args_list, [
+                mock.call(["sh", str(driver.REPO / "tools/qa/camp_clone.sh"),
+                           pin["canonicalUrl"], pin["sha"], str(runner.source)]),
+                mock.call(["git", "fetch", "--no-tags", "--depth", "1", "origin", f"{ref}:{ref}"],
+                          cwd=runner.source),
+            ])
+            with mock.patch.object(runner, "command", return_value=19) as command:
+                self.assertEqual(runner.checkout_upstream(), 19)
+                self.assertEqual(command.call_count, 1)
+
+    def test_checkout_refuses_tag_pin_inconsistent_with_the_declared_peeled_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(Path(tmp))
+            runner.campaign["upstream"]["stableTag"] = "1.15.1"
+            with mock.patch.object(runner, "command") as command:
+                with self.assertRaisesRegex(ValueError, "release tag pin is invalid"):
+                    runner.checkout_upstream()
+                command.assert_not_called()
+
+    def test_release_tag_verification_checks_object_kind_hash_and_peeled_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(Path(tmp))
+            pin = runner.campaign["upstream"]
+            for results, accepted in [
+                (["tag", pin["tagObjectSha"], pin["sha"]], True),
+                (["commit"], False),
+                (["tag", "e" * 40], False),
+                (["tag", pin["tagObjectSha"], "f" * 40], False),
+            ]:
+                with self.subTest(results=results), mock.patch.object(
+                        driver.subprocess, "run",
+                        side_effect=[mock.Mock(stdout=value + "\n") for value in results]) as git:
+                    if accepted:
+                        runner.verify_upstream_tag()
+                        ref = "refs/tags/1.15.0"
+                        self.assertEqual([call.args[0] for call in git.call_args_list], [
+                            ["git", "cat-file", "-t", ref],
+                            ["git", "rev-parse", "--verify", ref],
+                            ["git", "rev-parse", "--verify", ref + "^{commit}"],
+                        ])
+                        self.assertTrue(all(call.kwargs["cwd"] == runner.source and call.kwargs["check"]
+                                            for call in git.call_args_list))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "annotated release tag identity differs"):
+                            runner.verify_upstream_tag()
+
+    def test_bootjar_reports_process_failure_separately_from_zero_without_expected_jar(self):
+        for exit_code, expected_phase, expected_status in [
+            (19, 19, "command-failed"),
+            (0, 1, "expected-jar-missing"),
+        ]:
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runner = self.runner(root)
+                with mock.patch.object(runner, "command", return_value=exit_code) as command:
+                    self.assertEqual(runner.phase("build-upstream", runner.build_upstream), expected_phase)
+                self.assertEqual(command.call_args.args[0], driver.shlex.split(runner.campaign["build"]["command"]))
+                self.assertEqual(command.call_args.kwargs, {"cwd": runner.source})
+                phase_doc = json.loads((root / "phases.json").read_text())
+                self.assertEqual(driver.privacy.upstream_build_summary(phase_doc, driver.privacy.phase_rows(phase_doc)),
+                                 {"status": expected_status, "commandExitCode": exit_code})
+                self.assertEqual(next(row for row in phase_doc["phases"] if row["name"] == "baseline")["status"], "unreached")
+
+    def test_bootjar_success_requires_a_new_nonempty_expected_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(Path(tmp))
+            artifact = runner.source / runner.campaign["build"]["artifact"]
+            artifact.parent.mkdir(parents=True)
+            def build(*_args, **_kwargs):
+                artifact.write_bytes(b"synthetic output existence witness")
+                return 0
+            with mock.patch.object(runner, "command", side_effect=build) as command:
+                self.assertEqual(runner.build_upstream(), 0)
+                self.assertEqual(runner.manifest["upstreamBuild"], {"status": "artifact-present", "commandExitCode": 0})
+                self.assertEqual(runner.build_upstream(), 1)
+                self.assertEqual(runner.manifest["upstreamBuild"], {"status": "artifact-preexisting", "commandExitCode": None})
+                self.assertEqual(command.call_count, 1)
+
+    def test_build_summary_rejects_unrecognized_values_or_inconsistent_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = self.runner(Path(tmp))
+            build = next(row for row in runner.manifest["phases"] if row["name"] == "build-upstream")
+            build.update(status="failed", exitCode=1)
+            for status, code in (("private-build-output", 1), ("command-failed", 7),
+                                 ("artifact-present", 0), ("expected-jar-missing", False)):
+                runner.manifest["upstreamBuild"] = {"status": status, "commandExitCode": code}
+                self.assertEqual(driver.privacy.upstream_build_summary(
+                    runner.manifest, driver.privacy.phase_rows(runner.manifest)),
+                    {"status": "not-observed", "commandExitCode": None})
+
     def test_driver_removes_inherited_instrumentation_and_body_dumps(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
                 "JAVA_TOOL_OPTIONS": "private", "XCAMP_LAUNCH_PREFIX": "private", "XCAMP_DUMP_BODIES": "private"}):

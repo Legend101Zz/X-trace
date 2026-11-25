@@ -114,6 +114,26 @@ def phase_rows(doc):
     return result
 
 
+def upstream_build_summary(doc, phases):
+    """Project a bounded task/expected-jar verdict without console text or paths."""
+    unknown = {"status": "not-observed", "commandExitCode": None}
+    build = doc.get("upstreamBuild") if isinstance(doc, dict) else None
+    phase = next(row for row in phases if row["name"] == "build-upstream")
+    if not isinstance(build, dict) or set(build) != {"status", "commandExitCode"}:
+        return unknown
+    status, code = build["status"], build["commandExitCode"]
+    valid_code = type(code) is int and -255 <= code <= 255
+    if phase["status"] == "passed":
+        valid = status == "artifact-present" and valid_code and code == 0
+    elif phase["status"] == "failed":
+        valid = (status == "command-failed" and valid_code and code != 0 and code == phase["exitCode"]
+                 or status == "expected-jar-missing" and valid_code and code == 0 and phase["exitCode"] == 1
+                 or status == "artifact-preexisting" and code is None and phase["exitCode"] == 1)
+    else:
+        valid = False
+    return {"status": status, "commandExitCode": code} if valid else unknown
+
+
 def injection_rows(probes, generated):
     """Project only fixed probe classes; a response alone never proves a probe passed."""
     probes = probes if isinstance(probes, list) else []
@@ -339,9 +359,11 @@ def finalize(root, public):
             source = True
         except (OSError, ValueError, subprocess.SubprocessError):
             source = False
+    observed_phases = phase_rows(phases)
     summary = dict(schema="xtrace-fineract-installed-public/1", project="fineract", nonRelease=True,
                    releaseAcceptance=False, publication="passed", sourceIdentity=verdict(source),
-                   phases=phase_rows(phases), baseline=workload(baseline, False), instrumented=workload(receipt, True),
+                   phases=observed_phases, upstreamBuild=upstream_build_summary(phases, observed_phases),
+                   baseline=workload(baseline, False), instrumented=workload(receipt, True),
                    privacy=dict(status=verdict(report["clean"]), sinks=report["sinks"], collection=report["collection"],
                                 canaryInjection=report["canaryInjection"], scannerScope=report["scannerScope"],
                                 scopeComplete=report["scopeComplete"], scopeGaps=report["scopeGaps"],
