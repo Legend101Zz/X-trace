@@ -25,6 +25,9 @@ const out = path.resolve(args.out);
 mkdirSync(path.join(out, "dom"), { recursive: true });
 const require = createRequire(path.resolve("web/app/package.json"));
 const { chromium, expect } = require("@playwright/test");
+const viewportHeight = 900;
+const deviceScaleFactor = 1;
+const replayPhases = new Set(["linear", "canvas", "returnToSteps"]);
 
 function findReady(obj) {
   if (obj && typeof obj === "object") {
@@ -63,11 +66,22 @@ function startViewer() {
 async function capture(page, row, name) {
   const stem = `${name}-${row.width}`;
   writeFileSync(path.join(out, "dom", `${stem}.txt`), await page.evaluate(() => document.body.innerText));
+  let viewport;
+  if (replayPhases.has(name)) {
+    const geometry = await page.evaluate(() => ({
+      width: window.innerWidth, height: window.innerHeight, deviceScaleFactor: window.devicePixelRatio,
+    }));
+    const filename = `viewport-${stem}.png`;
+    // Capture the displayed frame before the full-page screenshot.
+    const frame = await page.screenshot({ path: path.join(out, filename), fullPage: false, scale: "device" });
+    viewport = { ...geometry, screenshot: filename, screenshotSha256: createHash("sha256").update(frame).digest("hex") };
+  }
   const screenshot = await page.screenshot({ path: path.join(out, `${stem}.png`), fullPage: true });
   const horizontalOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
   row.steps[name] = {
     status: horizontalOverflow ? "fail" : "pass", screenshot: `${stem}.png`, horizontalOverflow,
     screenshotSha256: createHash("sha256").update(screenshot).digest("hex"),
+    viewport,
   };
 }
 
@@ -98,7 +112,7 @@ async function runWidth(browser, width) {
   let phase = "list";
   try {
     viewer = await startViewer();
-    ctx = await browser.newContext({ viewport: { width, height: 900 } });
+    ctx = await browser.newContext({ viewport: { width, height: viewportHeight }, deviceScaleFactor });
     const page = await ctx.newPage();
     page.setDefaultTimeout(10000);
     page.on("pageerror", () => { row.pageErrors += 1; });
@@ -197,7 +211,7 @@ async function runWidth(browser, width) {
   return row;
 }
 
-const report = { schemaVersion: 2, kind: "browser_journeys", sourceSha, packageSha256, widths: [] };
+const report = { schemaVersion: 3, kind: "browser_journeys", sourceSha, packageSha256, widths: [] };
 let browser;
 try {
   browser = await chromium.launch();

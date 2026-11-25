@@ -411,11 +411,11 @@ class Artifacts(unittest.TestCase):
 
 
 class Workflow(unittest.TestCase):
-    def test_diagnostics_run_before_scanning_and_are_in_the_exact_upload_tree(self):
+    def test_diagnostics_are_scanned_privately_before_the_bounded_upload(self):
         text = (ROOT / ".github/workflows/campaigns.yml").read_text()
         start = text.index("      - name: Recording skeletons")
         scan = text.index("      - name: Privacy canary scan")
-        final = text.index("      - name: Final privacy re-scan")
+        final = text.index("      - name: Freeze and scan bounded public campaign evidence")
         self.assertLess(start, scan)
         self.assertLess(scan, final)
         block = text[start:scan]
@@ -425,8 +425,11 @@ class Workflow(unittest.TestCase):
         self.assertIn('--canaries "$RUNNER_TEMP/priv/canaries.json"', block)
         self.assertIn("--require recording-diagnostics:1", text)
         self.assertIn('--loc "recording-diagnostics=$CAMP_OUT/recording-diagnostics"', text)
-        self.assertIn('--loc "upload-tree=$CAMP_OUT"', text[final:])
-        self.assertIn("path: ${{ runner.temp }}/camp-out", text[final:])
+        self.assertIn('--private "$CAMP_OUT" --public "$RUNNER_TEMP/camp-public"', text[final:])
+        self.assertIn("path: ${{ runner.temp }}/camp-public", text[final:])
+        self.assertNotIn("path: ${{ runner.temp }}/camp-out", text[final:])
+        publication = (ROOT / "tools/qa/camp_publication.py").read_text()
+        self.assertIn('{"upload-tree": [stage]}, {"upload-tree": 1}', publication)
 
 
 if __name__ == "__main__":

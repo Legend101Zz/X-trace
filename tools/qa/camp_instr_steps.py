@@ -73,25 +73,53 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
         out.append(("instrumented-fingerprints-equal-baseline", "pass" if sc and not diff else "fail",
                     f"{len(eq)}/{len(sc)} equal" + (f"; differ: {','.join(diff)}" if diff else "")))
     api = r.get("api", {})
-    if not api.get("ok"):
-        out.append(("recordings-per-scenario", "fail", f"read API unavailable: {api.get('reason', '')[:120]}"))
-        out.append(("source-identity", "fail", "no recordings read back"))
-        out.append(("api-json-artifact", "fail", "no API JSON captured"))
+    pc = r.get("problemClasses", {})
+    groups = r.get("burstRouteGroups", [])
+    problem_scope = "problems across scenario verdicts and burst route groups" if groups else "problems"
+    problem_note = f"{problem_scope}: {json.dumps(pc, sort_keys=True)}"
+    group_problems = {p.split("(", 1)[0] for group in groups for p in group["problems"]}
+    source_gaps = {"no-source-file-line", "source-binding-unacceptable", "source-binding-missing",
+                   "burst-recording-detail-unavailable", "burst-boundary-recordings-missing",
+                   "recording-detail-incomplete", "recording-evidence-incomplete", "partial-recording",
+                   "burst-source-expectation-unresolved", "burst-boundary-not-verified", "serial-boundary-not-verified"}
+    bad_src = source_gaps & (group_problems | {p for p, count in pc.items() if count})
+    bad_src.update(p for p in group_problems if p.startswith("no-") and p.endswith("-frame"))
+    mixed_groups = [g for g in groups if "burst-frame-expectations-differ" in g["problems"]]
+    if pc.get("burst-frame-expectations-differ", 0) > len(mixed_groups):
+        bad_src.add("burst-source-expectation-unresolved")
+    for group in mixed_groups:
+        coverage = group.get("frameExpectations", [])
+        if len(coverage) < 2 or any(c.get("framesCovered") is not True or c.get("sourceCovered") is not True for c in coverage):
+            bad_src.add("burst-source-expectation-unresolved")
+    list_gap = api.get("listReadGap")
+    incomplete_details = api.get("incompleteDetails", 0)
+    api_complete = api.get("ok") is True and not (list_gap or incomplete_details)
+    if list_gap:
+        bad_src.add("api-recordings-list-incomplete")
+    if incomplete_details:
+        bad_src.add("recording-detail-incomplete")
+    source_note = f"; problems: {','.join(sorted(bad_src))}" if bad_src else ""
+    read_note = f"; incomplete API listing: {list_gap[:120]}" if list_gap else ""
+    if incomplete_details:
+        read_note += f"; {incomplete_details} incomplete recording details"
+    reason = api.get("reason")
+    if not api_complete and reason and reason != list_gap:
+        read_note += f"; read API unavailable: {reason[:120]}"
+    n_rec = api.get("recordings", 0)
+    v = [s for s in sc if api_complete and (s.get("recordingVerdict") or {}).get("passed")]
+    out.append(("recordings-per-scenario", "pass" if api_complete and sc and len(v) == len(sc) else "fail",
+                f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
+                f"({n_rec} recordings); {problem_note}{read_note}"))
+    n_src = r.get("recordingsWithSource", 0)
+    out.append(("source-identity", "pass" if api_complete and n_src > 0 and not bad_src else "fail",
+                (f"{n_src} recordings carry a matched .java file and method-range start line with an accepted source binding "
+                 f"(not an executed line)" if n_src > 0 else "no recording frame carried a matched .java file and start line")
+                + source_note))
+    if not api_complete:
+        artifact_note = f"incomplete API collection ({n_rec} recording IDs listed)"
     else:
-        v = [s for s in sc if (s.get("recordingVerdict") or {}).get("passed")]
-        pc = r.get("problemClasses", {})
-        out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) else "fail",
-                    f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
-                    f"({api.get('recordings', 0)} recordings); problems: {json.dumps(pc, sort_keys=True)}"))
-        n_src = r.get("recordingsWithSource", 0)
-        bad_src = [k for k in ("no-source-file-line", "source-binding-unacceptable", "source-binding-missing") if pc.get(k)]
-        out.append(("source-identity", "pass" if n_src > 0 and not bad_src else "fail",
-                    (f"{n_src} recordings carry a matched .java file and method-range start line with an accepted source binding "
-                     f"(not an executed line)" if n_src > 0 else "no recording frame carried a matched .java file and start line")
-                    + (f"; problems: {','.join(bad_src)}" if bad_src else "")))
-        n_rec = api.get("recordings", 0)
-        out.append(("api-json-artifact", "pass" if n_rec > 0 else "fail",
-                    f"{n_rec} recordings saved as API JSON" if n_rec > 0 else "the read API returned 0 recordings, nothing to save"))
+        artifact_note = f"{n_rec} recordings saved as API JSON" if n_rec else "the read API returned 0 recordings, nothing to save"
+    out.append(("api-json-artifact", "pass" if api_complete and n_rec > 0 else "fail", artifact_note + read_note))
     # record-stop-flow, restart-reopen, partial-recording-reopen, active-line-frames and frame-values come from `flows` below
     out.append(("launcher-exit-after-sigterm", "pass" if r.get("notes", {}).get("launcherExitCode") in (0, 143, -15) else "fail",
                 f"xtrace run exited {r.get('notes', {}).get('launcherExitCode')} after SIGTERM to the launcher pid"))
@@ -105,20 +133,36 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
 
 BROWSER_WIDTHS = (320, 736, 1024, 1280, 1440)
 BROWSER_PHASES = ("list", "recordings", "linear", "canvas", "returnToSteps")
+BROWSER_VIEWPORT_PHASES = ("linear", "canvas", "returnToSteps")
+BROWSER_VIEWPORT_HEIGHT = 900
+BROWSER_DEVICE_SCALE_FACTOR = 1
 
 
-def _browser_screenshot(path: pathlib.Path, width: int, digest: object) -> bool:
+def _browser_screenshot(path: pathlib.Path, width: int, digest: object, *, height: int | None = None) -> bool:
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         return False
     try:
         image = path.read_bytes()
     except OSError:
         return False
-    return (len(image) > 45 and image.startswith(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
-            and width <= int.from_bytes(image[16:20], "big") <= width + 1
-            and int.from_bytes(image[20:24], "big") > 0
-            and image.endswith(b"\0\0\0\0IEND\xaeB`\x82")
-            and hashlib.sha256(image).hexdigest() == digest)
+    if not (len(image) > 45 and image.startswith(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
+            and image.endswith(b"\0\0\0\0IEND\xaeB`\x82")):
+        return False
+    image_width = int.from_bytes(image[16:20], "big")
+    image_height = int.from_bytes(image[20:24], "big")
+    dimensions_match = (width <= image_width <= width + 1 and image_height > 0 if height is None
+                        else (image_width, image_height) == (width, height))
+    return dimensions_match and hashlib.sha256(image).hexdigest() == digest
+
+
+def _browser_viewport_screenshot(frame_dir: pathlib.Path | None, phase: str, width: int, viewport: object) -> bool:
+    geometry = {"width": width, "height": BROWSER_VIEWPORT_HEIGHT, "deviceScaleFactor": BROWSER_DEVICE_SCALE_FACTOR}
+    if (frame_dir is None or not isinstance(viewport, dict)
+            or any(type(viewport.get(key)) is not int or viewport[key] != value for key, value in geometry.items())):
+        return False
+    filename = f"viewport-{phase}-{width}.png"
+    return viewport.get("screenshot") == filename and _browser_screenshot(
+        frame_dir / filename, width, viewport.get("screenshotSha256"), height=BROWSER_VIEWPORT_HEIGHT)
 
 
 def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
@@ -129,14 +173,17 @@ def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
 
     if not isinstance(j, dict):
         return results("fail", "fail", "browser report missing or unreadable")
+    version = j.get("schemaVersion")
+    if j.get("kind") != "browser_journeys" or type(version) is not int or version not in (1, 2, 3):
+        return results("fail", "fail", "unsupported browser report schema")
     rows = j.get("widths")
     if not isinstance(rows, list) or any(not isinstance(row, dict) or type(row.get("width")) is not int
                                         or not 0 < row["width"] <= 2**53 - 1 for row in rows):
         return results("fail", "fail", "invalid viewport rows")
     observed = [row["width"] for row in rows]
     width_note = f"observed widths {','.join(map(str, observed)) or 'none'}"
-    if j.get("schemaVersion") == 1 and j.get("kind") == "browser_journeys":
-        note = f"legacy evidence without selection proof; {width_note}"
+    if version == 1:
+        note = f"legacy evidence without selection or viewport proof; {width_note}"
         if require_current:
             return results("fail", "fail", note)
         if not rows or len(set(observed)) != len(observed) or j.get("overflowAt") != []:
@@ -160,8 +207,10 @@ def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
                     break
             legacy.append("reported" if earned and declared == "pass" else "not-implemented" if earned else "fail")
         return results(*legacy, note)
-    if j.get("schemaVersion") != 2 or j.get("kind") != "browser_journeys":
-        return results("fail", "fail", "unsupported browser report schema")
+    if version == 2:
+        width_note = f"legacy full-page evidence without viewport proof; {width_note}"
+        if require_current:
+            return results("fail", "fail", width_note)
     if len(set(observed)) != len(observed) or set(observed) != set(widths):
         return results("fail", "fail", f"incomplete, duplicate or unexpected viewports; {width_note}")
     if (not source_sha or j.get("sourceSha") != source_sha
@@ -212,6 +261,10 @@ def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
                           and _browser_screenshot(frame_dir / screenshot, w, step.get("screenshotSha256")))
                 if not earned:
                     issues.append(f"{phase} screenshot missing or invalid")
+                if (version == 3 and phase in BROWSER_VIEWPORT_PHASES
+                        and not _browser_viewport_screenshot(frame_dir, phase, w, step.get("viewport"))):
+                    issues.append(f"{phase} viewport screenshot missing or invalid")
+                    earned = False
             if not earned:
                 canvas_failed = True
                 if phase in ("list", "recordings", "linear"):
@@ -243,7 +296,7 @@ def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
         elif any(failures[mode]) or (mode == "linear" and aggregate != "pass"):
             rollups[mode] = "fail"
         else:
-            rollups[mode] = aggregate
+            rollups[mode] = "reported" if version == 2 and aggregate == "pass" else aggregate
     note = "; ".join([width_note, *notes])
     return results(rollups["linear"], rollups["canvas"], note)
 

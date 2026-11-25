@@ -24,12 +24,14 @@ For exports, use `xtrace export --format <FORMAT> --preview` first, then
 `--output <DIR>` with a fresh or empty private directory (0700). Non-empty
 destinations are refused. Publication uses one directory rename; files are 0600.
 Check that a route is observed only in its recorded component and binding.
-All known handler symbols and conflicts must be visible. Single-claim handlers
-keep their source start line. End lines, multi-claim locations and individual
-confidence are unavailable through the read port and must appear as gaps,
-with the highest confidence named explicitly.
-OpenAPI cannot hold two operations at the same method/path: inspect its
-omissions and count. Postman and cURL retain both scopes. The bundle manifest
+Inspect each available claim for its handler, source start and end lines, and
+confidence. Conflicting claims stay distinct and unavailable fields appear as
+gaps. Source evidence identifies recorded producer assertions.
+
+For a shared method and path, inspect the native OpenAPI operation and its
+`x-xtrace-alternate-operations` extension. Each alternate keeps its scope, claims,
+and observation marker. The CLI count covers native OpenAPI operations.
+Postman and cURL retain separate requests for both scopes. The bundle manifest
 has counts per format and a null policy digest with an omission when unavailable.
 No format includes observed bodies. Missing revisions or operations exit 3;
 invalid usage exits 2; a secret-shaped value exits 8 without writing output.

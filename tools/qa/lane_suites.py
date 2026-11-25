@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Select the lane CI suites for a push (stdlib only).
+"""Select the lane CI suites for a push or manual dispatch (stdlib only).
 
-Always plans cumulatively: it diffs the merge-base with origin/main to HEAD, never only the pushed
-range. A per-push range would let a later docs-only push (or a cancelled/failed earlier run) mask a changed
-crate, so green on the lane would not mean HEAD is green. It prints a JSON suite plan:
+Automatic selection uses the cumulative diff from the merge-base with origin/main to HEAD. This
+keeps a later docs-only push from masking a crate changed earlier on the branch. A manual selection
+runs only the requested suite or all present suites. It prints a JSON suite plan:
 
   {"mode": ..., "changed": N, "suites": {"<suite>": {"status": "selected" | "skipped-by-filter" | "absent", ...}}}
 
@@ -24,8 +24,8 @@ ZERO_SHA = "0" * 40
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 CRATE_RE = re.compile(r"^crates/([A-Za-z0-9_-]+)/")
 
-# Path prefixes (or exact files) that select a suite. "meta" is always selected: it is the cheap
-# smoke suite (workflow lint plus the unit tests of these tools).
+# Path prefixes (or exact files) that select a suite automatically. Automatic plans always include
+# the cheap "meta" smoke suite (workflow lint plus the unit tests of these tools).
 PREFIXES: dict[str, tuple[str, ...]] = {
     "rust": ("crates/", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/", "schema/",
              "rustfmt.toml", ".rustfmt.toml", "clippy.toml", ".clippy.toml", "deny.toml",
@@ -63,22 +63,23 @@ def _matches(path: str, prefixes: tuple[str, ...]) -> bool:
 
 
 def plan(files: list[str] | None, force: str, repo: pathlib.Path) -> dict:
-    """Build the plan. files=None (unknown basis) selects everything: never silently skip."""
-    forced = set(SUITES) if force == "all" else ({force} if force in SUITES else set())
+    """Build the plan. An automatic plan with an unknown diff selects all present suites."""
+    if force and force != "all" and force not in SUITES:
+        raise ValueError(f"invalid suite {force!r} (choose from all, {', '.join(SUITES)})")
     suites: dict[str, dict] = {}
     for name in SUITES:
-        if name == "meta":
-            suites[name] = {"status": "selected", "reason": "always"}
-            continue
         if name == "tui" and not (repo / TUI_DIR).is_dir():
             suites[name] = {"status": "absent", "reason": "crates/xtrace-tui does not exist"}
-            if name in forced and force != "all":
+            if name == force:
                 suites[name]["forced"] = True  # an explicit request for an absent suite is not a pass
-            continue
-        if files is None:
-            suites[name] = {"status": "selected", "reason": "no-diff-basis"}
-        elif name in forced:
+        elif force == "all" or force == name:
             suites[name] = {"status": "selected", "reason": "dispatch"}
+        elif force:
+            suites[name] = {"status": "skipped-by-filter", "reason": "not selected for dispatch"}
+        elif name == "meta":
+            suites[name] = {"status": "selected", "reason": "always"}
+        elif files is None:
+            suites[name] = {"status": "selected", "reason": "no-diff-basis"}
         elif any(_matches(f, PREFIXES[name]) for f in files):
             suites[name] = {"status": "selected", "reason": "path-filter"}
         elif any(_matches(f, SELECT_ALL) for f in files):
@@ -98,14 +99,17 @@ def main() -> int:
     ap.add_argument("--head", required=True)
     ap.add_argument("--before", default="")
     ap.add_argument("--base-ref", default="origin/main")
-    ap.add_argument("--force", default="", help="suite name or 'all' (workflow_dispatch)")
+    ap.add_argument("--force", default="", help="run only the named suite, or 'all' for every present suite")
     ap.add_argument("--github-output", default="")
     args = ap.parse_args()
     repo = pathlib.Path(args.repo).resolve()
     mode, files = changed_files(repo, args.head, args.before, args.base_ref)
     if args.force:
         mode = f"dispatch+{mode}"
-    suites = plan(files, args.force, repo)
+    try:
+        suites = plan(files, args.force, repo)
+    except ValueError as error:
+        ap.error(str(error))
     doc = {"mode": mode, "changed": None if files is None else len(files), "suites": suites}
     print(json.dumps(doc, sort_keys=True, indent=1))
     if args.github_output:

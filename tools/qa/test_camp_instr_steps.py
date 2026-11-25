@@ -22,12 +22,13 @@ def by(steps):
     return {n: (st, note) for n, st, note in steps}
 
 
-def browser_png(width: int, gray: int = 0) -> bytes:
+def browser_png(width: int, gray: int = 0, *, height: int = 1) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, 1, 8, 0, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(b"\0" + bytes([gray]) * width)) + chunk(b"IEND", b""))
+    scanline = b"\0" + bytes([gray]) * width
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(scanline * height)) + chunk(b"IEND", b""))
 
 
 class T(unittest.TestCase):
@@ -50,6 +51,95 @@ class T(unittest.TestCase):
             r = {"scenarios": [sc("a")], "api": {"ok": True, "recordings": 5}, "problemClasses": {cls: 2}, "recordingsWithSource": 1,
                  "notes": {"launcherExitCode": 0}}
             self.assertEqual(by(s.instrumented_steps(r))["source-identity"][0], "fail", cls)
+
+    def test_shared_burst_diagnostics_reach_summary_without_crediting_scenarios(self):
+        r = {"scenarios": [sc("serial"), sc("burst-a", rec=False), sc("burst-b", rec=False)],
+             "api": {"ok": True, "recordings": 3},
+             "burstRouteGroups": [{"evidenceScope": "burst-route-group", "recordingsMatchingRoute": 2,
+                                   "recordingsWithSource": 0, "problems": ["source-binding-missing"]}],
+             "problemClasses": {"attribution-ambiguous": 2, "source-binding-missing": 1},
+             "recordingsWithSource": 1}
+        d = by(s.instrumented_steps(r))
+        self.assertEqual(d["instrumented-run"][0], "pass")
+        self.assertEqual(d["recordings-per-scenario"][0], "fail")
+        self.assertIn("1/3 scenarios", d["recordings-per-scenario"][1])
+        self.assertIn("burst route groups", d["recordings-per-scenario"][1])
+        self.assertIn('"source-binding-missing": 1', d["recordings-per-scenario"][1])
+        self.assertEqual(d["source-identity"][0], "fail")
+        self.assertIn("source-binding-missing", d["source-identity"][1])
+
+    def test_missing_burst_boundary_recordings_fail_source_identity_with_other_sources(self):
+        for fully_dropped in (False, True):
+            with self.subTest(fully_dropped=fully_dropped):
+                observed = int(not fully_dropped)
+                scenarios = [sc("serial"), sc("burst-a", rec=False)]
+                problems = ["count-below-minimum(need 2, have 1)"]
+                if fully_dropped:
+                    problems = ["burst-route-count-mismatch(requests 1, recordings 0)", "no-recording-for-route",
+                                "count-below-minimum(need 1, have 0)"]
+                else:
+                    scenarios.append(sc("burst-b", rec=False))
+                problems.append("burst-boundary-recordings-missing(missing 1)")
+                classes = {"attribution-ambiguous": len(scenarios) - 1, **{p.split("(")[0]: 1 for p in problems}}
+                groups = [{"requests": 1, "recordingsMatchingRoute": observed,
+                           "recordingsWithSource": observed, "problems": problems}]
+                if fully_dropped:
+                    classes["burst-drops"] = 1
+                    groups.append({"requests": 1, "recordingsMatchingRoute": 1, "recordingsWithSource": 1, "problems": []})
+                sourced = 1 + sum(g["recordingsWithSource"] for g in groups)
+                r = {"scenarios": scenarios, "api": {"ok": True, "recordings": sourced},
+                     "burstRouteGroups": groups, "problemClasses": classes, "recordingsWithSource": sourced}
+                d = by(s.instrumented_steps(r))
+                self.assertEqual(d["instrumented-run"][0], "pass")
+                self.assertEqual(d["recordings-per-scenario"][0], "fail")
+                self.assertIn(f"1/{len(scenarios)} scenarios", d["recordings-per-scenario"][1])
+                self.assertIn('"burst-boundary-recordings-missing": 1', d["recordings-per-scenario"][1])
+                self.assertEqual(d["source-identity"][0], "fail")
+                self.assertIn(f"{sourced} recordings carry a matched .java file", d["source-identity"][1])
+                self.assertIn("burst-boundary-recordings-missing", d["source-identity"][1])
+
+    def test_failed_readback_still_reports_unavailable_burst_details(self):
+        r = {"scenarios": [sc("burst", rec=False)], "api": {"ok": False, "reason": "recordings list HTTP 503"},
+             "burstRouteGroups": [{"problems": ["burst-recording-detail-unavailable(missing 2)", "no-source-file-line"]}],
+             "problemClasses": {"burst-recording-detail-unavailable": 1, "no-source-file-line": 1}}
+        d = by(s.instrumented_steps(r))
+        self.assertEqual(d["recordings-per-scenario"][0], "fail")
+        self.assertIn("recordings list HTTP 503", d["recordings-per-scenario"][1])
+        self.assertIn('"burst-recording-detail-unavailable": 1', d["recordings-per-scenario"][1])
+        self.assertEqual(d["source-identity"][0], "fail")
+        self.assertIn("burst-recording-detail-unavailable", d["source-identity"][1])
+        self.assertEqual(d["api-json-artifact"][0], "fail")
+
+    def test_api_level_read_gaps_fail_source_identity_with_sourced_recordings(self):
+        r = {"scenarios": [sc("a")], "api": {"ok": True, "recordings": 2}, "recordingsWithSource": 1}
+        self.assertEqual(by(s.instrumented_steps(r))["source-identity"][0], "pass")
+        for gap, problem, artifact in (
+            ({"listReadGap": "recordings list HTTP 503"}, "api-recordings-list-incomplete", "incomplete API listing"),
+            ({"incompleteDetails": 1}, "recording-detail-incomplete", "1 incomplete recording details"),
+        ):
+            with self.subTest(gap=gap):
+                d = by(s.instrumented_steps({**r, "api": {**r["api"], **gap}}))
+                self.assertEqual(d["source-identity"][0], "fail")
+                self.assertIn(problem, d["source-identity"][1])
+                self.assertIn("1 recordings carry a matched .java file", d["source-identity"][1])
+                self.assertIn(artifact, d["api-json-artifact"][1])
+                self.assertEqual(d["api-json-artifact"][0], "fail")
+                self.assertEqual(d["recordings-per-scenario"][0], "fail")
+
+    def test_mixed_burst_source_coverage_needs_support_for_every_expectation(self):
+        r = {"scenarios": [sc("a", rec=False), sc("b", rec=False)], "api": {"ok": True, "recordings": 2},
+             "recordingsWithSource": 2, "problemClasses": {"burst-frame-expectations-differ": 1}}
+        group = {"problems": ["burst-frame-expectations-differ"], "recordingsWithSource": 2}
+        for coverage in (None, [True], [True, False], [True, True]):
+            with self.subTest(coverage=coverage):
+                entry = group if coverage is None else {**group, "frameExpectations": [
+                    {"framesCovered": True, "sourceCovered": covered} for covered in coverage]}
+                d = by(s.instrumented_steps({**r, "burstRouteGroups": [entry]}))
+                self.assertEqual(d["recordings-per-scenario"][0], "fail")
+                self.assertIn("0/2 scenarios", d["recordings-per-scenario"][1])
+                self.assertEqual(d["source-identity"][0], "pass" if coverage == [True, True] else "fail")
+                if coverage != [True, True]:
+                    self.assertIn("burst-source-expectation-unresolved", d["source-identity"][1])
 
     def test_overhead_needs_five_repeats(self):
         agg = {"baseline": {"p50Ms": 1, "p95Ms": 2, "n": 14}, "instrumented": {"p50Ms": 2, "p95Ms": 3, "n": 14}, "p50Ratio": 2, "p95Ratio": 1.5}
@@ -131,6 +221,7 @@ class T(unittest.TestCase):
 
         self.assertEqual(diagnostic(j), ("reported", "reported"))
         self.assertIn("320,736,1280", by(s.browser_steps(j))["browser-journeys-linear"][1])
+        self.assertIn("viewport proof", by(s.browser_steps(j))["browser-journeys-linear"][1])
         self.assertEqual(diagnostic(dict(j, overflowAt=[320])), ("fail", "fail"))
         self.assertEqual(diagnostic(dict(j, linear="fail")), ("fail", "reported"))
 
@@ -164,7 +255,7 @@ class T(unittest.TestCase):
 
     def test_packaged_browser_evidence(self):
         source_sha, package_sha = "1" * 40, "2" * 64
-        j = {"schemaVersion": 2, "kind": "browser_journeys", "sourceSha": source_sha, "packageSha256": package_sha,
+        j = {"schemaVersion": 3, "kind": "browser_journeys", "sourceSha": source_sha, "packageSha256": package_sha,
              "linear": "pass", "canvas": "pass", "overflowAt": [], "widths": []}
         with tempfile.TemporaryDirectory() as tmp:
             frames = pathlib.Path(tmp)
@@ -172,17 +263,35 @@ class T(unittest.TestCase):
                 steps = {}
                 for name in ("list", "recordings", "linear", "canvas", "returnToSteps"):
                     frame = f"{name}-{w}.png"
-                    image = browser_png(w)
+                    image = browser_png(w, height=1200)
                     (frames / frame).write_bytes(image)
                     steps[name] = {"status": "pass", "screenshot": frame, "horizontalOverflow": False,
                                    "screenshotSha256": hashlib.sha256(image).hexdigest()}
+                    if name in ("linear", "canvas", "returnToSteps"):
+                        viewport = f"viewport-{frame}"
+                        viewport_image = browser_png(w, height=900)
+                        (frames / viewport).write_bytes(viewport_image)
+                        steps[name]["viewport"] = {"width": w, "height": 900, "deviceScaleFactor": 1,
+                                                   "screenshot": viewport,
+                                                   "screenshotSha256": hashlib.sha256(viewport_image).hexdigest()}
                 j["widths"].append({"width": w, "steps": steps, "pageErrors": 0, "selectionContinuous": True})
 
-            def verdict(report, expected_source=source_sha):
-                checked = by(s.browser_steps(report, frame_dir=frames, source_sha=expected_source, package_sha256=package_sha))
+            def verdict(report, expected_source=source_sha, *, require_current=True):
+                checked = by(s.browser_steps(report, frame_dir=frames, source_sha=expected_source,
+                                             package_sha256=package_sha, require_current=require_current))
                 return checked["browser-journeys-linear"][0], checked["browser-journeys-canvas"][0]
 
             self.assertEqual(verdict(j), ("pass", "pass"))
+            legacy = copy.deepcopy(j)
+            legacy["schemaVersion"] = 2
+            for row in legacy["widths"]:
+                for step in row["steps"].values():
+                    step.pop("viewport", None)
+            self.assertEqual(verdict(legacy, require_current=False), ("reported", "reported"))
+            self.assertEqual(verdict(legacy), ("fail", "fail"))
+            legacy_current = s.browser_steps(legacy, frame_dir=frames, source_sha=source_sha,
+                                             package_sha256=package_sha, require_current=True)
+            self.assertTrue(all("without viewport proof" in note for _, _, note in legacy_current))
             self.assertEqual(verdict(j, "3" * 40), ("fail", "fail"))
             for width_change in (j["widths"][:-1], j["widths"][:-1] + j["widths"][:1]):
                 self.assertEqual(verdict(dict(j, widths=width_change)), ("fail", "fail"))
@@ -215,6 +324,35 @@ class T(unittest.TestCase):
                 del row["steps"]["returnToSteps"]
                 row["selectionContinuous"] = False
             self.assertEqual(verdict(unavailable), ("pass", "not-implemented"))
+
+            for phase, expected in (("linear", ("fail", "fail")), ("canvas", ("pass", "fail")),
+                                    ("returnToSteps", ("pass", "fail"))):
+                with self.subTest(missing_viewport=phase):
+                    changed = copy.deepcopy(j)
+                    del changed["widths"][0]["steps"][phase]["viewport"]
+                    self.assertEqual(verdict(changed), expected)
+
+            for key, value in (("width", 1024), ("height", 899), ("deviceScaleFactor", 2),
+                               ("deviceScaleFactor", True), ("screenshotSha256", "0" * 64),
+                               ("screenshot", "viewport-linear-736.png"), ("screenshot", "canvas-736.png")):
+                with self.subTest(viewport_field=key, value=value):
+                    changed = copy.deepcopy(j)
+                    changed["widths"][1]["steps"]["canvas"]["viewport"][key] = value
+                    self.assertEqual(verdict(changed), ("pass", "fail"))
+
+            viewport = frames / "viewport-canvas-736.png"
+            original = viewport.read_bytes()
+            for width, height in ((737, 900), (736, 899), (736, 901)):
+                with self.subTest(viewport_png_dimensions=(width, height)):
+                    changed = copy.deepcopy(j)
+                    image = browser_png(width, height=height)
+                    viewport.write_bytes(image)
+                    changed["widths"][1]["steps"]["canvas"]["viewport"]["screenshotSha256"] = hashlib.sha256(image).hexdigest()
+                    self.assertEqual(verdict(changed), ("pass", "fail"))
+            viewport.unlink()
+            self.assertEqual(verdict(j), ("pass", "fail"))
+            viewport.write_bytes(original)
+
             screenshot = frames / "canvas-736.png"
             for malformed in (browser_png(320), browser_png(736)[:-4], b"\x89PNG\r\n\x1a\n"):
                 screenshot.write_bytes(malformed)

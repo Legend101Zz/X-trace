@@ -94,6 +94,16 @@ cargo run --locked -p xtrace-cli --bin xtrace -- export --project-dir "$project_
 printf 'Collection file: %s/collection.postman.json\n' "$export_dir"
 ```
 
+The same command accepts `--format openapi`, `curl`, and `bundle`. OpenAPI describes routes,
+parameters, and catalog evidence. Its alternate-operation extension keeps the evidence for each
+scope that shares a method and path. Postman creates request templates with an empty base URL.
+cURL provides shell recipes for review before execution. The developer bundle contains all three
+formats and a manifest with file hashes, operation counts and omissions.
+
+Use a fresh or empty private output directory. X-trace publishes the completed output as one
+directory and refuses a non-empty destination. The outputs describe what the catalog recorded
+and omit captured request and response bodies.
+
 Recordings live in the local X-trace data directory. The application repository holds its project pointer at `.xtrace/config.toml`. Treat the viewer URL as a temporary credential. [Local security model](docs/security-local.md)
 
 ## Release status

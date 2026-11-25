@@ -15,11 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 9b9478fc0db19fa1b7e82fa3918adb17c4ff899f
+          ref: 6a89321667a06276dbc05db1d9c644ea4b629dde
           persist-credentials: false
       - name: Check exact product head and browser receipt judge
         run: |
-          test "$(git rev-parse HEAD)" = "9b9478fc0db19fa1b7e82fa3918adb17c4ff899f"
+          test "$(git rev-parse HEAD)" = "6a89321667a06276dbc05db1d9c644ea4b629dde"
           python3 -B - <<'PY'
           import contextlib
           import io
@@ -36,7 +36,7 @@ jobs:
                                  ".github/workflows/lane.yml", ".github/workflows/campaigns.yml"]),
           ]
           names = ["test_legacy_browser_report_identifies_exercised_widths", "test_packaged_browser_evidence"]
-          summary = ["Product SHA 9b9478fc0db19fa1b7e82fa3918adb17c4ff899f"]
+          summary = ["Product SHA 6a89321667a06276dbc05db1d9c644ea4b629dde"]
           checks_ok = True
           for name, command in checks:
               passed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0

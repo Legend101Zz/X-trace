@@ -42,6 +42,19 @@ def privacy_details(marker="XTplain.0123456789abcdef"):
     return details
 
 
+def viewer_pages(details, gap=None):
+    pages = [(200, {"recordings": [{"recordingId": rid} for rid in details],
+                    "nextAfter": "next" if gap == "listing" else None})]
+    if gap == "listing":
+        pages.append((503, {"detail": "private"}))
+    for index, (rid, detail) in enumerate(details.items()):
+        interrupted = index == 0 and gap == "detail"
+        pages.append((200, {**detail, "recordingId": rid, "nextCursor": "next" if interrupted else None}))
+        if interrupted:
+            pages.append(ConnectionResetError("private"))
+    return pages
+
+
 class Judges(unittest.TestCase):
     wanted = [("GET", "/vets"), ("GET", "/owners/{ownerId}")]
 
@@ -568,6 +581,61 @@ class Drivers(unittest.TestCase):
                 flow.standard()
             self.assertEqual(flow.results["standard-no-values"]["status"], "fail")
 
+    def test_privacy_requires_complete_live_and_final_api_reads(self):
+        import xcamp
+        from tools.qa import canary
+
+        canaries = canary.make_canaries()
+        focused_steps = ("active-line-frames", "frame-values", *xflows.PRIVACY_STEPS[:3])
+        details_by_mode = {
+            "focused": privacy_details(),
+            "standard": {"standard": {**rec("GET", "/owners"), "outcome": {"kind": "responded", "httpStatus": 200}}},
+        }
+        for mode, details in details_by_mode.items():
+            for phase, gap in ((None, None), ("live", "listing"), ("live", "detail"),
+                               ("final", "listing"), ("final", "detail")):
+                with self.subTest(mode=mode, phase=phase, gap=gap):
+                    flow = self.flow()
+                    observed = {}
+                    live_pages = viewer_pages({})
+                    for rid, detail in details.items():
+                        observed[rid] = detail
+                        live_pages.extend(viewer_pages(observed, gap if phase == "live" else None))
+                        if phase == "live":
+                            break
+                    live_client, final_client = Mock(deadline=None), Mock(deadline=None)
+                    live_client.get.side_effect = live_pages
+                    final_pages = viewer_pages(details, gap if phase == "final" else None)
+                    final_client.get.side_effect = final_pages
+                    ready = {"origin": flow._stack.return_value.base, "url": "http://x/#" + "A" * 43}
+                    with patch.dict(xflows.os.environ), patch.object(flow, "_canaries", return_value=canaries), \
+                         patch.object(xflows, "list_ids", return_value=set()), \
+                         patch.object(xflows.secrets, "token_hex", return_value="0123456789abcdef"), \
+                         patch.object(xflows.xinstr, "start_viewer", return_value=(Mock(), ready)), \
+                         patch.object(xflows.xinstr, "ViewerClient", side_effect=[live_client, final_client]), \
+                         patch.object(xflows.xinstr, "stop_process_group"), \
+                         patch.object(xcamp, "http_request", return_value={"status": 200}) as request:
+                        getattr(flow, mode)()
+                    self.assertEqual(live_client.get.call_count, len(live_pages))
+                    self.assertEqual(final_client.get.call_count, len(final_pages))
+                    self.assertEqual(request.call_count, 1 if phase == "live" else len(details))
+                    self.assertIsNone(live_client.deadline)
+                    steps = focused_steps if mode == "focused" else ("standard-no-values",)
+                    for step in steps:
+                        self.assertEqual(flow.results[step]["status"], "fail" if gap else "pass", flow.results)
+                        if phase:
+                            expected = ("canary recording read failed" if phase == "live"
+                                        else "privacy capture read API unavailable")
+                            self.assertEqual(flow.results[step]["note"], expected)
+                    first_id = next(iter(details))
+                    artifact_dir = flow.out_dir / f"api-{mode}"
+                    if phase == "live":
+                        artifact_dir /= first_id
+                    saved = json.loads((artifact_dir / f"recording-{first_id}.json").read_text())
+                    self.assertEqual(saved["events"], details[first_id]["events"])
+                    if gap == "detail":
+                        self.assertEqual(saved["_detailReadGap"], "detail transport failure")
+
     def test_record_and_restart_parse_one_whole_pretty_document(self):
         flow = self.flow()
         for command, doc in (("record", self.armed()),
@@ -725,6 +793,27 @@ class Drivers(unittest.TestCase):
                 getattr(flow, command)()
             self.assertEqual(flow.results[step]["status"], "fail")
             flow._record.assert_not_called()
+
+    def test_restart_does_not_prove_reopening_from_api_prefixes(self):
+        details = {"old": rec()}
+        for before_gap, after_gap in ((None, None), ("listing", None), (None, "detail")):
+            with self.subTest(before_gap=before_gap, after_gap=after_gap):
+                flow = self.flow()
+                flow._record = Mock(side_effect=[(0, {"started": {"pid": 71}}, ""), (0, {}, "")])
+                before, after = Mock(deadline=None), Mock(deadline=None)
+                before.get.side_effect = viewer_pages(details, before_gap)
+                after.get.side_effect = viewer_pages(details, after_gap)
+                ready = {"origin": flow._stack.return_value.base, "url": "http://x/#" + "A" * 43}
+                with patch.object(xflows, "pid_alive", return_value=True), \
+                     patch.object(xflows.xinstr, "start_viewer", return_value=(Mock(), ready)), \
+                     patch.object(xflows.xinstr, "ViewerClient", side_effect=[before, after]), \
+                     patch.object(xflows.xinstr, "stop_process_group"):
+                    flow.restart_reopen()
+                step = flow.results["restart-reopen"]
+                self.assertEqual(step["status"], "fail" if before_gap or after_gap else "pass", step)
+                if before_gap or after_gap:
+                    self.assertIn("recordings list HTTP 503" if before_gap else "detail transport failure", step["note"])
+                self.assertEqual(flow._record.call_args_list[-1].args, ("stop",))
 
     def test_partial_without_bootstrap_reports_stop_not_invoked(self):
         flow = self.flow()
