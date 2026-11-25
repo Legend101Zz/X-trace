@@ -102,6 +102,33 @@ paths:
         provenance:
           - "adapter_registration"
           - "static_analysis"
+      x-xtrace-alternate-operations:
+        -
+          responses:
+            "200":
+              description: "duplicate binding"
+          tags:
+            - "orders"
+          x-xtrace:
+            application_component: "orders"
+            binding_key: "spring:GET /orders"
+            claim_count: 1
+            claims:
+              -
+                claim_id: "c-dup"
+                confidence_basis_points: null
+                handler_symbol: null
+                limitation_codes: null
+                provenance: "static_analysis"
+                source_evidence: null
+            claims_projection: "available"
+            effective_state: "registered"
+            handler_conflict: null
+            handler_symbols: null
+            operation_id: "op-zdup"
+            provenance:
+              - "static_analysis"
+          x-xtrace-observation: "inferred"
       x-xtrace-observation: "inferred"
     post:
       operationId: "postOrders"

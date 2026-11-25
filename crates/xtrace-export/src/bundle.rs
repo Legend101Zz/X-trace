@@ -91,7 +91,8 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
          Review recipes before running them.\n\n\
          manifest.json records revision, catalog hash, policy digest (null when unavailable),\n\
          file hashes, counts per format and omissions. OpenAPI can represent only one\n\
-         operation per method and path; other scopes remain in Postman and cURL.\n\n\
+         native operation per method and path. Other scopes have metadata in its\n\
+         x-xtrace-alternate-operations extension and separate requests in Postman and cURL.\n\n\
          Omissions (format prefixes identify where each omission applies):\n",
     );
     for omission in &omissions {

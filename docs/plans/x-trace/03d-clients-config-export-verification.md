@@ -284,7 +284,10 @@ Projection sorts operations by normalized route, method rank, and stable ID. JSO
 
 ### 9.1 OpenAPI 3.1
 
-- One path item per display route and operation per method.
+- One path item per display route and native operation per method. When catalog scopes share that method and
+  path, the first scope in projection order takes the native slot. Its `x-xtrace-alternate-operations` extension
+  keeps each remaining scope's projected fields, stable catalog identity and evidence separately. Native counts
+  and duplicate-method/path omissions still describe the standard OpenAPI slots.
 - `operationId` is deterministic and collision-resolved from group, handler display name, method, and path; X-trace `OperationId` is stored in `x-xtrace-operation-id`.
 - Path parameters are always declared and required.
 - Schemas merge compatible claims and expose conflicts/unknowns rather than inventing certainty.

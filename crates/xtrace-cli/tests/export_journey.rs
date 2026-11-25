@@ -1559,6 +1559,24 @@ fn observations_keep_component_and_binding_scope_and_counts_match_each_format() 
                 let op = &spec["paths"]["/orders"]["post"];
                 assert_eq!(op["x-xtrace"]["effective_state"], "static_only");
                 assert_eq!(op["x-xtrace-observation"], "inferred");
+                let alternates = op["x-xtrace-alternate-operations"].as_array().unwrap();
+                assert_eq!(alternates.len(), 1);
+                let observed = &alternates[0];
+                assert_eq!(observed["x-xtrace-observation"], "observed");
+                let metadata = &observed["x-xtrace"];
+                assert_eq!(metadata["effective_state"], "observed");
+                assert_eq!(metadata["application_component"], "spring-fixture");
+                assert_eq!(metadata["binding_key"], "default");
+                assert_ne!(metadata["operation_id"], op["x-xtrace"]["operation_id"]);
+                assert_eq!(metadata["claims_projection"], "available");
+                assert_eq!(metadata["claim_count"], 1);
+                let claim = &metadata["claims"][0];
+                assert_eq!(claim["handler_symbol"], "OrderController.create");
+                assert_eq!(claim["confidence_basis_points"], 5000);
+                let evidence = &claim["source_evidence"][0];
+                assert_eq!(evidence["relative_path"], "OrderController.java");
+                assert_eq!(evidence["start_line"], 23);
+                assert_eq!(evidence["end_line"], 24);
                 let omissions = json(&result)["omissions"].as_array().unwrap().clone();
                 assert_eq!(
                     omissions

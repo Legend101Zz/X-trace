@@ -71,9 +71,11 @@ fn example_value(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
 }
 
-fn operation_json(op: &PreparedOp, operation_id: &str) -> Value {
+fn operation_json(op: &PreparedOp, operation_id: Option<&str>) -> Value {
     let mut out = Map::new();
-    out.insert("operationId".into(), json!(operation_id));
+    if let Some(operation_id) = operation_id {
+        out.insert("operationId".into(), json!(operation_id));
+    }
     if !op.component.is_empty() {
         out.insert("tags".into(), json!([op.component]));
     }
@@ -136,10 +138,13 @@ fn operation_json(op: &PreparedOp, operation_id: &str) -> Value {
 #[must_use]
 pub fn document(prepared: &Prepared) -> (Value, Vec<Omission>) {
     let mut omissions = prepared.omissions.clone();
-    // Two operations can share (method, path); OpenAPI cannot hold both.
-    let mut winners: Vec<&PreparedOp> = Vec::new();
+    // Each method/path has one native slot. Keep alternate scopes as complete,
+    // separately projected metadata so their claims never affect that slot.
+    let mut winners = Vec::new();
+    let mut scopes = BTreeMap::<(&str, &str), Vec<&PreparedOp>>::new();
     for op in &prepared.ops {
-        if let Some(first) = winners.iter().find(|w| w.method == op.method && w.path == op.path) {
+        let group = scopes.entry((&op.path, &op.method)).or_default();
+        if let Some(first) = group.first() {
             omissions.push(Omission {
                 operation_id: op.operation_id.clone(),
                 what: "operation".to_owned(),
@@ -148,14 +153,19 @@ pub fn document(prepared: &Prepared) -> (Value, Vec<Omission>) {
         } else {
             winners.push(op);
         }
+        group.push(op);
     }
     let ids = operation_ids(&winners);
     let mut paths: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
-    for (op, id) in winners.iter().zip(&ids) {
-        paths
-            .entry(op.path.clone())
-            .or_default()
-            .insert(op.method.to_ascii_lowercase(), operation_json(op, id));
+    for (op, id) in winners.into_iter().zip(&ids) {
+        let mut operation = operation_json(op, Some(id));
+        let alternates = &scopes[&(op.path.as_str(), op.method.as_str())][1..];
+        if !alternates.is_empty() {
+            operation["x-xtrace-alternate-operations"] = Value::Array(
+                alternates.iter().map(|alternate| operation_json(alternate, None)).collect(),
+            );
+        }
+        paths.entry(op.path.clone()).or_default().insert(op.method.to_ascii_lowercase(), operation);
     }
     let rev = &prepared.revision;
     let policy_digest = (!rev.policy_digest.is_empty()).then_some(rev.policy_digest.as_str());
