@@ -296,7 +296,11 @@ fn admission_error(
     _error: xtrace_private_storage::PrivateStorageError,
 ) -> AttachError {
     #[cfg(test)]
-    hooks::ADMISSION_FAILURE.with(|slot| slot.set(Some((context, _error))));
+    {
+        // A later refusal must not inherit a recovered admission's origin.
+        hooks::ADMISSION_SITE.with(|slot| slot.set(None));
+        hooks::ADMISSION_FAILURE.with(|slot| slot.set(Some((context, _error))));
+    }
     AttachError::PrivateStorage(context)
 }
 
@@ -447,9 +451,15 @@ impl PackCache {
         .map_err(|error| admission_error("the Java helper cache changed", error))?;
         let path = cache.join(PACKS_DIR);
         let packs = open_or_create_private_child(&parent, PACKS_DIR)?;
-        admit_directory_descriptor(&path, &packs, true)?;
+        admit_directory_descriptor(&path, &packs, true).inspect_err(|_| {
+            #[cfg(test)]
+            hooks::ADMISSION_SITE.with(|slot| slot.set(Some(hooks::AdmissionSite::OpenPacks)));
+        })?;
         let state = open_or_create_private_child(&packs, STATE_DIR)?;
-        admit_directory_descriptor(&path.join(STATE_DIR), &state, true)?;
+        admit_directory_descriptor(&path.join(STATE_DIR), &state, true).inspect_err(|_| {
+            #[cfg(test)]
+            hooks::ADMISSION_SITE.with(|slot| slot.set(Some(hooks::AdmissionSite::OpenState)));
+        })?;
         let metadata = packs
             .metadata()
             .map_err(|_| AttachError::PrivateStorage("the Java pack cache is unavailable"))?;
@@ -464,8 +474,18 @@ impl PackCache {
 
     /// Re-checks that the retained descriptors still name the admitted cache.
     fn revalidate(&self) -> Result<(), AttachError> {
-        admit_directory_descriptor(&self.path, &self.packs, true)?;
-        admit_directory_descriptor(&self.path.join(STATE_DIR), &self.state, true)
+        admit_directory_descriptor(&self.path, &self.packs, true).inspect_err(|_| {
+            #[cfg(test)]
+            hooks::ADMISSION_SITE
+                .with(|slot| slot.set(Some(hooks::AdmissionSite::RevalidatePacks)));
+        })?;
+        admit_directory_descriptor(&self.path.join(STATE_DIR), &self.state, true).inspect_err(
+            |_| {
+                #[cfg(test)]
+                hooks::ADMISSION_SITE
+                    .with(|slot| slot.set(Some(hooks::AdmissionSite::RevalidateState)));
+            },
+        )
     }
 
     /// Lists the cache root through the admitted descriptor, failing closed on any surprise.
@@ -766,7 +786,10 @@ impl PackCache {
             })?,
             true,
         )?;
-        admit_directory_descriptor(incoming_path, &snapshot, true)?;
+        admit_directory_descriptor(incoming_path, &snapshot, true).inspect_err(|_| {
+            #[cfg(test)]
+            hooks::ADMISSION_SITE.with(|slot| slot.set(Some(hooks::AdmissionSite::IncomingRoot)));
+        })?;
         for directory in ["attach", "agent", "agent/runtime"] {
             create_private_directory(&snapshot, directory)?;
             xtrace_private_storage::open_private_directory_descriptor_with_profile(
@@ -1523,9 +1546,33 @@ fn open_child_directory(
 mod hooks {
     type Hook = Box<dyn Fn(&str, &std::fs::File)>;
 
+    /// Fixed call-site labels only: never derive diagnostics from a cache path or name.
+    #[derive(Clone, Copy)]
+    pub(super) enum AdmissionSite {
+        OpenPacks,
+        OpenState,
+        RevalidatePacks,
+        RevalidateState,
+        IncomingRoot,
+    }
+
+    impl AdmissionSite {
+        pub(super) const fn label(self) -> &'static str {
+            match self {
+                Self::OpenPacks => "open-packs",
+                Self::OpenState => "open-state",
+                Self::RevalidatePacks => "revalidate-packs",
+                Self::RevalidateState => "revalidate-state",
+                Self::IncomingRoot => "incoming-root",
+            }
+        }
+    }
+
     thread_local! {
         static HOOKS: std::cell::RefCell<Vec<(&'static str, Hook)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        pub(super) static ADMISSION_SITE: std::cell::Cell<Option<AdmissionSite>> =
+            const { std::cell::Cell::new(None) };
         pub(super) static ADMISSION_FAILURE:
             std::cell::Cell<Option<(&'static str, xtrace_private_storage::PrivateStorageError)>> =
             const { std::cell::Cell::new(None) };
@@ -1976,15 +2023,24 @@ mod tests {
                         std::thread::Builder::new()
                             .name(worker_name.clone())
                             .spawn_scoped(scope, move || {
+                                hooks::ADMISSION_SITE.with(|slot| slot.set(None));
                                 let (outcome, admission) =
                                     capture_attach(|| pack.snapshot_into(cache));
-                                (outcome.map(|_| ()), admission)
+                                let site = hooks::ADMISSION_SITE.with(std::cell::Cell::take);
+                                // Carry only the fixed origin across the join boundary.
+                                (outcome.map(|_| ()), admission, site)
                             })
                             .expect("spawn attach worker")
                     })
                     .collect::<Vec<_>>();
                 for handle in handles {
-                    let (outcome, admission) = handle.join().expect("worker");
+                    let (outcome, admission, site) = handle.join().expect("worker");
+                    // Recovered admissions cannot describe a successful operation.
+                    if outcome.is_err() && admission.is_some() {
+                        if let Some(site) = site {
+                            eprintln!("first-attach admission phase: {}", site.label());
+                        }
+                    }
                     assert_concurrent_attach_success(outcome.as_ref().map(|_| ()), admission);
                 }
             });

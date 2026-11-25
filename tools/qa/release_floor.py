@@ -49,10 +49,21 @@ def configured_floor(root: pathlib.Path, timeout: int):
     original = run_gates.GATES
     original_run = run_gates._run
     configured = instrumented_gates(original, root, timeout)
+    web_test_argv = next((gate.argv for gate in original if gate.name == "web-tests"), None)
     wrapped = {gate.argv: lane_run.parser().parse_args(gate.argv[4:])
                for gate in configured if gate.name in RUST_TEST_GATES}
 
     def supervised_run(argv, **kwargs):
+        # Only the unchanged web-test command receives a private wrapper outcome path.
+        # Never let an inherited setting leak into another gate or a child workload.
+        if tuple(argv) == web_test_argv or "XTRACE_WEB_TEST_OUTCOME_PATH" in kwargs["env"]:
+            env = dict(kwargs["env"])
+            env.pop("XTRACE_WEB_TEST_OUTCOME_PATH", None)
+            if tuple(argv) == web_test_argv:
+                env["XTRACE_WEB_TEST_OUTCOME_PATH"] = str(
+                    (kwargs["log_path"].parent / "web-tests-outcome.json").absolute()
+                )
+            kwargs["env"] = env
         args = wrapped.get(tuple(argv))
         if args is None:
             return original_run(argv, **kwargs)

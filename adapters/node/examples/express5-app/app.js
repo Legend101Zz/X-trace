@@ -50,4 +50,8 @@ app.use(function appErrorHandler(_error, _request, response, _next) {
   response.status(500).send('failed');
 });
 
-const server = app.listen(Number(process.env.APP_PORT), '127.0.0.1', () => console.log('EXPRESS_READY'));
+const server = app.listen(Number(process.env.APP_PORT), '127.0.0.1', () => {
+  console.log('EXPRESS_READY');
+  // An ephemeral-port caller must use this server's bound port, without a released reservation.
+  if (process.env.APP_PORT === '0') console.log(`EXPRESS_PORT=${server.address().port}`);
+});

@@ -2835,7 +2835,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(env["XTRACE_TEST_PRIVATE_SCRATCH"], str(private))  # type: ignore[index]
         cardinality = self.cache / "c"
         self.assertEqual(env["XTRACE_TEST_CARDINALITY_SCRATCH"], str(cardinality))  # type: ignore[index]
-        branches = (private_io / name for name in ("direct", "umask", "held-request", "catalog", "first-attach"))
+        branches = (private_io / name for name in ("direct", "umask", "held-request", "catalog", "first-attach", "long-path-init"))
         for directory in (temp, private, cardinality, private_io, *branches):
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
 
