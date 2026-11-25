@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 
 const [recordingId, encodedSequences, operationId, legacyV4Id] = process.argv.slice(2);
 assert.ok(recordingId && encodedSequences && operationId && legacyV4Id, 'recording, endpoint, and expected event data are required');
@@ -86,6 +86,12 @@ try {
     throw new Error('Browser could not select the genuine linked recording in the packaged viewer');
   }
   await page.locator('.event-seq').first().waitFor();
+  const firstEvent = page.locator('.event').first();
+  await page.keyboard.press('Tab');
+  await firstEvent.focus();
+  await expect(firstEvent).toBeFocused();
+  await expect(firstEvent).toHaveCSS('outline-offset', '-2px');
+  await expect(firstEvent).toHaveCSS('outline-style', 'solid');
   const observed = await page.locator('.event-seq').allTextContents();
   assert.deepEqual(observed, expectedSequences, 'browser event order differs from the product query projection');
   await page.getByRole('tab', { name: 'evidence' }).click();
@@ -271,6 +277,52 @@ try {
   assert.deepEqual(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length })), { local: 0, session: 0 });
   assert.deepEqual(await page.evaluate(() => indexedDB.databases()), []);
   assert.equal(await page.evaluate(() => document.referrer), '');
+  // Exercise appearance only after verifying that normal replay has not written to browser storage.
+  const theme = page.getByRole('combobox', { name: 'Theme' });
+  const assertPalette = async (name, background) => {
+    await expect(page.locator('html')).toHaveAttribute('data-theme', name);
+    await expect(page.locator('body')).toHaveCSS('background-color', background);
+  };
+  await expect(theme).toHaveValue('system');
+  await expect(theme.locator('option')).toHaveText(['System', 'Dark', 'Light', 'High contrast']);
+  await page.emulateMedia({ colorScheme: 'light' });
+  await assertPalette('light', 'rgb(246, 245, 242)');
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await assertPalette('dark', 'rgb(17, 20, 22)');
+
+  await theme.selectOption('light');
+  await assertPalette('light', 'rgb(246, 245, 242)');
+  await page.emulateMedia({ colorScheme: 'light' });
+  await theme.selectOption('dark');
+  await assertPalette('dark', 'rgb(17, 20, 22)');
+  await theme.selectOption('hc');
+  await assertPalette('hc', 'rgb(0, 0, 0)');
+  await expect(theme).toHaveCSS('border-top-width', '2px');
+
+  for (const width of [320, 736, 1024]) {
+    await page.setViewportSize({ width, height: 844 });
+    const hasOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+    assert.equal(hasOverflow, false, `the themed viewer must fit at ${width}px`);
+    const size = await theme.boundingBox();
+    assert.ok(size && size.height >= (width < 1024 ? 44 : 32), `Theme target too short at ${width}px`);
+    await theme.focus();
+    await page.keyboard.press('Shift+Tab');
+    await expect(theme).not.toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(theme).toBeFocused();
+    await expect(theme).toHaveCSS('outline-color', 'rgb(255, 207, 92)');
+    await expect(theme).toHaveCSS('outline-width', '2px');
+  }
+
+  await theme.selectOption('system');
+  await assertPalette('light', 'rgb(246, 245, 242)');
+  await theme.selectOption('hc');
+  assert.deepEqual(await page.evaluate(() => ({ preferences: Object.entries(localStorage), session: sessionStorage.length })),
+    { preferences: [['xtrace.viewer.theme', 'hc']], session: 0 });
+  // Reloading the spent link exercises startup and persisted appearance without exchanging another token.
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await expect(theme).toHaveValue('hc');
+  await assertPalette('hc', 'rgb(0, 0, 0)');
   assert.equal(unexpectedRequestCount, 0, 'browser made a request outside the loopback origin');
   assert.equal(consoleErrorCount, 0, 'browser console reported an error');
   if (screenshotDirectory) {
@@ -280,4 +332,4 @@ try {
   await browser.close();
 }
 
-process.stdout.write('browser journey passed: persisted event order, matched source evidence, and unavailable evidence verified\n');
+process.stdout.write('browser journey passed: persisted event order, matched source evidence, unavailable evidence, and viewer theme preferences verified\n');

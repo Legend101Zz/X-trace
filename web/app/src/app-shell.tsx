@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { ThemePreference } from './theme-preference';
 import type { AuthState, Pane } from './types';
 
 const PANES = ['recordings', 'events', 'evidence'] as const;
@@ -32,6 +33,7 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, ch
     <main className="workspace">
       {children}
     </main>
+    <footer className="viewer-preferences"><ThemePreference /></footer>
     <div className="sr-only" role="status" aria-live="polite">{announcement}</div>
     {auth === 'checking' ? <div className="sr-only" role="status">Authenticating viewer link</div> : null}
     {auth === 'expired' ? <div role="alert" className="auth-overlay"><div><strong>Viewer session expired</strong><p>Restart the foreground viewer to create a new one-time link.</p></div></div> : null}
