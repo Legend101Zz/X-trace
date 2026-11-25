@@ -6,7 +6,7 @@
 //! until the runtime has a verified pack, persisted owner selection, and
 //! immutable source-snapshot authority.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -272,6 +272,20 @@ pub trait CatalogDiscoveryWritePort: Send + Sync {
         selection: &AdmittedCatalogSelection,
         finish: &DiscoveryRunFinish,
     ) -> Result<(), PortError>;
+
+    /// Publishes local scanner-only positive route eligibility with the revision.
+    fn finish_local_scan(
+        &self,
+        _selection: &AdmittedCatalogSelection,
+        _finish: &DiscoveryRunFinish,
+        _eligible_claims: &HashSet<ContentHash>,
+    ) -> Result<(), PortError> {
+        Err(PortError::new(
+            crate::error::PortErrorKind::Validation,
+            "local scan route evidence is unavailable",
+            CorrelationId::new(),
+        ))
+    }
 }
 
 /// Durable catalog command service.
@@ -366,6 +380,28 @@ impl CatalogDiscoveryService {
             return Err(CatalogDiscoveryError::Refused(DiscoveryRefusal::ScopeNotAuthorized));
         }
         self.writer.finish_run(&selection, finish).map_err(CatalogDiscoveryError::Port)
+    }
+
+    /// Finishes a local static scan with positive evidence produced before the
+    /// analyzer's declaration was reduced to its canonical route identity.
+    pub fn finish_local_scan(
+        &self,
+        context: CatalogProducerContext,
+        finish: &DiscoveryRunFinish,
+        eligible_claims: &HashSet<ContentHash>,
+    ) -> Result<(), CatalogDiscoveryError> {
+        let selection = self
+            .admission
+            .resolve_run(context, finish.run_id)
+            .map_err(CatalogDiscoveryError::Refused)?;
+        if !selection_matches_context(&selection, context)
+            || context.namespace != CatalogRunNamespace::LocalStaticScanner
+        {
+            return Err(CatalogDiscoveryError::Refused(DiscoveryRefusal::ScopeNotAuthorized));
+        }
+        self.writer
+            .finish_local_scan(&selection, finish, eligible_claims)
+            .map_err(CatalogDiscoveryError::Port)
     }
 
     #[cfg(test)]

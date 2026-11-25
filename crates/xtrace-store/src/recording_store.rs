@@ -33,11 +33,14 @@ use xtrace_application::recording_queries::{
     PersistedSource, PersistedValue, RecordingCapacity, RecordingCompletionEvidence,
     RecordingEventWindow, RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
 };
+use xtrace_domain::catalog_discovery::{DiscoveryScope, DiscoveryScopeKind};
+use xtrace_domain::endpoint_normalization::{is_runtime_link_scope_id, normalize_link_template};
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::is_projectable_source_path;
 use xtrace_domain::{
-    ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
-    ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
+    CatalogRevisionId, ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION,
+    EndpointIdentity, HttpMethod, ProjectId, RecordingId, RuntimeSessionId, SourceBinding,
+    SourceRange, Transport, WallTime,
 };
 use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
@@ -441,27 +444,18 @@ impl SqliteRecordingStore<'_> {
             let fingerprint: Vec<u8> = row.get(7).map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
-            let identity = EndpointIdentity {
+            validate_operation_identity(
                 project_id,
-                application_component: "spring-fixture".to_owned(),
-                binding_key: "default".to_owned(),
-                transport: Transport::Http,
-                method: HttpMethod::Post,
-                route_template: "/orders".to_owned(),
-            };
-            let expected =
-                identity.fingerprint().map_err(|_| endpoint_identity_corrupt(correlation_id))?;
-            if transport != "http"
-                || method != "POST"
-                || route != "/orders"
-                || component != "spring-fixture"
-                || binding != "default"
-                || version != i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION)
-                || fingerprint.as_slice() != expected.as_bytes()
-            {
-                return Err(endpoint_identity_corrupt(correlation_id));
-            }
-            validate_operation_has_observation(
+                &transport,
+                &method,
+                &route,
+                &component,
+                &binding,
+                version,
+                &fingerprint,
+                correlation_id,
+            )?;
+            let policy = validate_operation_has_observation(
                 &connection,
                 project_id,
                 &operation_bytes,
@@ -474,7 +468,7 @@ impl SqliteRecordingStore<'_> {
                 binding,
                 method,
                 route_template: route,
-                observation_policy: "spring-orders-v1".to_owned(),
+                observation_policy: policy.to_owned(),
             });
         }
         let has_more = result.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -554,9 +548,9 @@ impl SqliteRecordingStore<'_> {
             .checked_add(1)
             .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
         let sql = if operation_id.is_some() {
-            "SELECT r.recording_id, r.status, r.opened_at, COUNT(s.segment_ordinal), COALESCE(SUM(s.event_count),0), MIN(s.first_recording_seq), MAX(s.last_recording_seq), o.disposition, o.observation_policy_id, o.operation_id, o.application_component, o.binding_key, o.method, o.route_template, o.reason_code, o.project_id FROM recordings r JOIN recording_endpoint_observations o ON o.recording_id=r.recording_id LEFT JOIN recording_segments s ON s.recording_id=r.recording_id WHERE r.project_id=?1 AND o.project_id=?1 AND o.operation_id=?2 AND (?3 IS NULL OR r.opened_at < ?3 OR (r.opened_at = ?3 AND r.recording_id < ?4)) GROUP BY r.recording_id ORDER BY r.opened_at DESC,r.recording_id DESC LIMIT ?5"
+            "SELECT r.recording_id, r.status, r.opened_at, COUNT(s.segment_ordinal), COALESCE(SUM(s.event_count),0), MIN(s.first_recording_seq), MAX(s.last_recording_seq), o.disposition, o.observation_policy_id, o.operation_id, o.application_component, o.binding_key, o.method, o.route_template, o.reason_code, o.project_id, o.catalog_revision_id, o.operation_fingerprint FROM recordings r JOIN recording_endpoint_observations o ON o.recording_id=r.recording_id LEFT JOIN recording_segments s ON s.recording_id=r.recording_id WHERE r.project_id=?1 AND o.project_id=?1 AND o.operation_id=?2 AND (?3 IS NULL OR r.opened_at < ?3 OR (r.opened_at = ?3 AND r.recording_id < ?4)) GROUP BY r.recording_id ORDER BY r.opened_at DESC,r.recording_id DESC LIMIT ?5"
         } else {
-            "SELECT r.recording_id, r.status, r.opened_at, COUNT(s.segment_ordinal), COALESCE(SUM(s.event_count),0), MIN(s.first_recording_seq), MAX(s.last_recording_seq), o.disposition, o.observation_policy_id, o.operation_id, o.application_component, o.binding_key, o.method, o.route_template, o.reason_code, o.project_id FROM recordings r LEFT JOIN recording_endpoint_observations o ON o.recording_id=r.recording_id LEFT JOIN recording_segments s ON s.recording_id=r.recording_id WHERE r.project_id=?1 AND (o.recording_id IS NULL OR o.disposition <> 'linked') AND (?2 IS NULL OR r.opened_at < ?2 OR (r.opened_at = ?2 AND r.recording_id < ?3)) GROUP BY r.recording_id ORDER BY r.opened_at DESC,r.recording_id DESC LIMIT ?4"
+            "SELECT r.recording_id, r.status, r.opened_at, COUNT(s.segment_ordinal), COALESCE(SUM(s.event_count),0), MIN(s.first_recording_seq), MAX(s.last_recording_seq), o.disposition, o.observation_policy_id, o.operation_id, o.application_component, o.binding_key, o.method, o.route_template, o.reason_code, o.project_id, o.catalog_revision_id, o.operation_fingerprint FROM recordings r LEFT JOIN recording_endpoint_observations o ON o.recording_id=r.recording_id LEFT JOIN recording_segments s ON s.recording_id=r.recording_id WHERE r.project_id=?1 AND (o.recording_id IS NULL OR o.disposition <> 'linked') AND (?2 IS NULL OR r.opened_at < ?2 OR (r.opened_at = ?2 AND r.recording_id < ?3)) GROUP BY r.recording_id ORDER BY r.opened_at DESC,r.recording_id DESC LIMIT ?4"
         };
         let mut statement = connection.prepare(sql).map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
@@ -601,47 +595,21 @@ impl SqliteRecordingStore<'_> {
             let raw_operation: Option<Vec<u8>> = row.get(9).map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
-            let component: Option<String> = row.get(10).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let binding: Option<String> = row.get(11).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let method: Option<String> = row.get(12).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let route: Option<String> = row.get(13).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let reason: Option<String> = row.get(14).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let sidecar_project: Option<Vec<u8>> = row.get(15).map_err(|error| {
+            let reason = row.get(14).map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
             let operation = raw_operation
                 .as_deref()
                 .map(|bytes| parse_stored_operation_id(bytes, correlation_id))
                 .transpose()?;
-            if let Some(disposition) = disposition {
-                let raw_op = raw_operation.clone();
-                let project = sidecar_project.unwrap_or_default();
-                validate_stored_observation(
-                    &connection,
-                    project_id,
-                    &(
-                        disposition,
-                        policy.clone(),
-                        raw_op,
-                        component,
-                        binding,
-                        method,
-                        route,
-                        reason.clone(),
-                        project,
-                    ),
-                    correlation_id,
-                )?;
+            if disposition.is_some() {
+                let stored = stored_observation(row, 7).map_err(|error| {
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
+                })?;
+                validate_stored_observation(&connection, project_id, &stored, correlation_id)?;
             }
             if operation_id.is_some() && operation != operation_id {
                 return Err(endpoint_identity_corrupt(correlation_id));
@@ -1471,7 +1439,6 @@ impl SqliteRecordingStore<'_> {
         let mut connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
 
-        let disposition = classify_observation(&request.endpoint_observation);
         let transaction = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -1485,14 +1452,26 @@ impl SqliteRecordingStore<'_> {
                 correlation_id,
             ));
         }
+        let classify = || {
+            if request.endpoint_observation.policy_id.as_deref() == Some("runtime-route-v1") {
+                classify_runtime_observation(
+                    &transaction,
+                    request.project_id,
+                    &request.endpoint_observation,
+                    correlation_id,
+                )
+            } else {
+                Ok(classify_observation(&request.endpoint_observation))
+            }
+        };
         if let Some(existing) = load_recording(&transaction, request.recording_id, correlation_id)?
         {
             verify_existing_identity(&existing, request, correlation_id)?;
             let existing_observation = transaction.query_row(
                 "SELECT disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code, project_id \
-                 FROM recording_endpoint_observations WHERE recording_id = ?1",
+                 , catalog_revision_id, operation_fingerprint FROM recording_endpoint_observations WHERE recording_id = ?1",
                 rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Vec<u8>>(8)?)),
+                |row| stored_observation(row, 0),
             ).optional().map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
             let Some(existing_observation) = existing_observation else {
                 return Ok(BeginRecordingReceipt {
@@ -1506,7 +1485,7 @@ impl SqliteRecordingStore<'_> {
                 &existing_observation,
                 correlation_id,
             )?;
-            if !observation_matches(&existing_observation, &disposition) {
+            if !observation_matches(&existing_observation, &classify()?) {
                 return Err(recording_conflict(
                     "recording observation conflicts with an existing recording",
                     correlation_id,
@@ -1518,7 +1497,11 @@ impl SqliteRecordingStore<'_> {
             });
         }
 
-        let operation_id = if disposition.reason_code.is_none() {
+        let disposition = classify()?;
+        let operation_id = if let Some((id, _)) = disposition.runtime_operation {
+            mirror_catalog_operation(&transaction, request.project_id, id, correlation_id)?;
+            Some(id)
+        } else if disposition.reason_code.is_none() {
             Some(find_or_insert_operation(
                 &transaction,
                 request.project_id,
@@ -1533,8 +1516,8 @@ impl SqliteRecordingStore<'_> {
             rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec(), request.project_id.as_uuid().as_bytes().to_vec(), request.runtime_session_id.as_uuid().as_bytes().to_vec(), request.opened_at.to_rfc3339()],
         ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
         transaction.execute(
-            "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec(), request.project_id.as_uuid().as_bytes().to_vec(), if operation_id.is_some() { "linked" } else { "unmatched" }, disposition.policy_id, operation_id.map(|id| id.as_uuid().as_bytes().to_vec()), disposition.application_component, disposition.binding_key, disposition.method, disposition.route_template, disposition.reason_code],
+            "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code, catalog_revision_id, operation_fingerprint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec(), request.project_id.as_uuid().as_bytes().to_vec(), if operation_id.is_some() { "linked" } else { "unmatched" }, disposition.policy_id, operation_id.map(|id| id.as_uuid().as_bytes().to_vec()), disposition.application_component, disposition.binding_key, disposition.method, disposition.route_template, disposition.reason_code, disposition.revision_id.map(|id| id.as_uuid().as_bytes().to_vec()), disposition.runtime_operation.map(|(_, hash)| hash.to_vec())],
         ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
         recording_limitations::insert(
             &transaction,
@@ -5450,17 +5433,18 @@ fn recording_conflict(message: &'static str, correlation_id: CorrelationId) -> R
     )
 }
 
-#[derive(Clone, Copy)]
-struct SafeObservation {
+struct SafeObservation<'a> {
     policy_id: Option<&'static str>,
-    application_component: Option<&'static str>,
-    binding_key: Option<&'static str>,
+    application_component: Option<&'a str>,
+    binding_key: Option<&'a str>,
     method: Option<&'static str>,
-    route_template: Option<&'static str>,
+    route_template: Option<String>,
     reason_code: Option<&'static str>,
+    revision_id: Option<CatalogRevisionId>,
+    runtime_operation: Option<(xtrace_domain::OperationId, [u8; 32])>,
 }
 
-fn classify_observation(input: &EndpointObservationInput) -> SafeObservation {
+fn classify_observation(input: &EndpointObservationInput) -> SafeObservation<'static> {
     const POLICY: &str = "spring-orders-v1";
     const COMPONENT: &str = "spring-fixture";
     const BINDING: &str = "default";
@@ -5499,17 +5483,19 @@ fn classify_observation(input: &EndpointObservationInput) -> SafeObservation {
         application_component: Some(COMPONENT),
         binding_key: Some(BINDING),
         method: Some("POST"),
-        route_template: Some("/orders"),
+        route_template: Some("/orders".to_owned()),
         reason_code: None,
+        revision_id: None,
+        runtime_operation: None,
     }
 }
 
-fn unmatched(
+fn unmatched<'a>(
     policy_id: Option<&'static str>,
-    application_component: Option<&'static str>,
-    binding_key: Option<&'static str>,
+    application_component: Option<&'a str>,
+    binding_key: Option<&'a str>,
     reason_code: &'static str,
-) -> SafeObservation {
+) -> SafeObservation<'a> {
     SafeObservation {
         policy_id,
         application_component,
@@ -5517,7 +5503,163 @@ fn unmatched(
         method: None,
         route_template: None,
         reason_code: Some(reason_code),
+        revision_id: None,
+        runtime_operation: None,
     }
+}
+
+fn classify_runtime_observation<'a>(
+    connection: &rusqlite::Connection,
+    project: ProjectId,
+    input: &'a EndpointObservationInput,
+    correlation: CorrelationId,
+) -> Result<SafeObservation<'a>, RecordingStoreError> {
+    const POLICY: Option<&str> = Some("runtime-route-v1");
+    let (component, binding) =
+        match (input.application_component.as_deref(), input.binding_key.as_deref()) {
+            (None, None) => return Ok(unmatched(POLICY, None, None, "identity_context_missing")),
+            (Some(component), Some(binding))
+                if is_runtime_link_scope_id(component) && is_runtime_link_scope_id(binding) =>
+            {
+                (component, binding)
+            }
+            _ => return Ok(unmatched(POLICY, None, None, "identity_context_invalid")),
+        };
+    let unavailable = || unmatched(POLICY, None, None, "catalog_revision_unavailable");
+    let Some(selection) = input.runtime_catalog else {
+        return Ok(unavailable());
+    };
+    let Some(revision) = selection.revision_id else {
+        return Ok(unavailable());
+    };
+    let Some(scope) = qualified_runtime_revision(connection, project, revision, correlation)?
+    else {
+        return Ok(unavailable());
+    };
+    if scope.application_component != component
+        || scope.binding_key != binding
+        || scope.framework_family != selection.dialect.framework().as_str()
+    {
+        return Ok(unavailable());
+    }
+    let reject = |reason| {
+        let mut result = unmatched(POLICY, Some(component), Some(binding), reason);
+        result.revision_id = Some(revision);
+        result
+    };
+    let Some(method) = HttpMethod::parse(&input.method) else {
+        return Ok(reject("method_unsupported"));
+    };
+    let Some(route) = normalize_link_template(selection.dialect.framework(), &input.route_template)
+    else {
+        return Ok(reject("route_template_unavailable_or_ineligible"));
+    };
+    let identity = EndpointIdentity {
+        project_id: project,
+        application_component: component.to_owned(),
+        binding_key: binding.to_owned(),
+        transport: Transport::Http,
+        method,
+        route_template: route,
+    };
+    let Some(operation) = runtime_catalog_operation(connection, revision, &identity, correlation)?
+    else {
+        return Ok(reject("no_catalog_match"));
+    };
+    Ok(SafeObservation {
+        policy_id: POLICY,
+        application_component: Some(component),
+        binding_key: Some(binding),
+        method: Some(method.as_str()),
+        route_template: Some(identity.route_template),
+        reason_code: None,
+        revision_id: Some(revision),
+        runtime_operation: Some(operation),
+    })
+}
+
+fn qualified_runtime_revision(
+    connection: &rusqlite::Connection,
+    project: ProjectId,
+    revision: CatalogRevisionId,
+    correlation: CorrelationId,
+) -> Result<Option<DiscoveryScope>, RecordingStoreError> {
+    let row = connection
+        .query_row(
+            "SELECT r.scope_json, v.scope_digest FROM catalog_revisions v
+         JOIN catalog_discovery_runs r ON r.project_id = v.project_id AND r.run_id = v.run_id
+         JOIN catalog_discovery_retry_keys k ON k.project_id = r.project_id AND k.run_id = r.run_id
+         WHERE v.project_id = ?1 AND v.revision_id = ?2 AND r.status = 'complete'
+           AND r.scope_digest = v.scope_digest AND r.source_revision_id = v.source_revision_id
+           AND k.retry_namespace = 'local_static_scanner'",
+            rusqlite::params![project.as_uuid().as_bytes(), revision.as_uuid().as_bytes()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation), correlation)
+        })?;
+    let Some((json, digest)) = row else { return Ok(None) };
+    let scope: DiscoveryScope =
+        serde_json::from_str(&json).map_err(|_| endpoint_identity_corrupt(correlation))?;
+    if scope.digest().map_err(|_| endpoint_identity_corrupt(correlation))?.as_bytes().as_slice()
+        != digest
+    {
+        return Err(endpoint_identity_corrupt(correlation));
+    }
+    if scope.kind != DiscoveryScopeKind::StaticRepository
+        || scope.producer_family != "local-static-scan"
+        || !matches!(scope.framework_family.as_str(), "spring-mvc" | "express")
+    {
+        return Ok(None);
+    }
+    Ok(Some(scope))
+}
+
+fn runtime_catalog_operation(
+    connection: &rusqlite::Connection,
+    revision: CatalogRevisionId,
+    identity: &EndpointIdentity,
+    correlation: CorrelationId,
+) -> Result<Option<(xtrace_domain::OperationId, [u8; 32])>, RecordingStoreError> {
+    let row = connection.query_row(
+        "SELECT o.operation_id, o.fingerprint_format, o.endpoint_fingerprint
+         FROM catalog_runtime_link_routes l
+         JOIN catalog_operations o ON o.project_id = l.project_id AND o.operation_id = l.operation_id
+         JOIN catalog_revision_entries e ON e.project_id = l.project_id
+           AND e.revision_id = l.revision_id AND e.operation_id = l.operation_id
+         WHERE l.project_id = ?1 AND l.revision_id = ?2 AND o.application_component = ?3
+           AND o.binding_key = ?4 AND o.transport = 'http' AND o.method = ?5
+           AND o.route_template = ?6 AND e.change_kind IN ('added','unchanged','changed')",
+        rusqlite::params![identity.project_id.as_uuid().as_bytes(), revision.as_uuid().as_bytes(),
+            identity.application_component, identity.binding_key, identity.method.as_str(), identity.route_template],
+        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+    ).optional().map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation), correlation))?;
+    let Some((raw_id, format, digest)) = row else { return Ok(None) };
+    let fingerprint = identity.fingerprint().map_err(|_| endpoint_identity_corrupt(correlation))?;
+    if format != i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION) || digest != fingerprint.as_bytes()
+    {
+        return Err(endpoint_identity_corrupt(correlation));
+    }
+    Ok(Some((parse_stored_operation_id(&raw_id, correlation)?, *fingerprint.as_bytes())))
+}
+
+fn mirror_catalog_operation(
+    transaction: &rusqlite::Transaction<'_>,
+    project: ProjectId,
+    operation: xtrace_domain::OperationId,
+    correlation: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    transaction.execute(
+        "INSERT INTO operations (operation_id, project_id, transport, method, route_template,
+            application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at)
+         SELECT operation_id, project_id, transport, method, route_template, application_component,
+            binding_key, fingerprint_format, endpoint_fingerprint, created_at
+         FROM catalog_operations WHERE project_id = ?1 AND operation_id = ?2
+         ON CONFLICT (operation_id) DO NOTHING",
+        rusqlite::params![project.as_uuid().as_bytes(), operation.as_uuid().as_bytes()],
+    ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation), correlation))?;
+    Ok(())
 }
 
 type StoredObservation = (
@@ -5530,17 +5672,50 @@ type StoredObservation = (
     Option<String>,
     Option<String>,
     Vec<u8>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
 );
 
-fn observation_matches(stored: &StoredObservation, expected: &SafeObservation) -> bool {
+fn stored_observation(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<StoredObservation> {
+    Ok((
+        row.get(offset)?,
+        row.get(offset + 1)?,
+        row.get(offset + 2)?,
+        row.get(offset + 3)?,
+        row.get(offset + 4)?,
+        row.get(offset + 5)?,
+        row.get(offset + 6)?,
+        row.get(offset + 7)?,
+        row.get(offset + 8)?,
+        row.get(offset + 9)?,
+        row.get(offset + 10)?,
+    ))
+}
+
+fn observation_matches(stored: &StoredObservation, expected: &SafeObservation<'_>) -> bool {
     let linked = expected.reason_code.is_none();
     stored.0 == if linked { "linked" } else { "unmatched" }
         && stored.1.as_deref() == expected.policy_id
         && stored.3.as_deref() == expected.application_component
         && stored.4.as_deref() == expected.binding_key
         && stored.5.as_deref() == expected.method
-        && stored.6.as_deref() == expected.route_template
+        && stored.6 == expected.route_template
         && stored.7.as_deref() == expected.reason_code
+        && stored.9.as_deref()
+            == expected
+                .revision_id
+                .as_ref()
+                .map(|id| *id.as_uuid().as_bytes())
+                .as_ref()
+                .map(<[u8; 16]>::as_slice)
+        && stored.10.as_deref()
+            == expected.runtime_operation.as_ref().map(|(_, hash)| hash.as_slice())
+        && expected
+            .runtime_operation
+            .is_none_or(|(id, _)| stored.2.as_deref() == Some(id.as_uuid().as_bytes().as_slice()))
 }
 
 fn validate_stored_observation(
@@ -5553,6 +5728,12 @@ fn validate_stored_observation(
         stored.8.as_slice().try_into().map_err(|_| endpoint_identity_corrupt(correlation_id))?;
     let stored_project = ProjectId::from_uuid(uuid::Uuid::from_bytes(stored_project));
     if stored_project != project_id {
+        return Err(endpoint_identity_corrupt(correlation_id));
+    }
+    if stored.1.as_deref() == Some("runtime-route-v1") {
+        return validate_runtime_observation(transaction, project_id, stored, correlation_id);
+    }
+    if stored.9.is_some() || stored.10.is_some() {
         return Err(endpoint_identity_corrupt(correlation_id));
     }
     match stored.0.as_str() {
@@ -5569,7 +5750,20 @@ fn validate_stored_observation(
             {
                 return Err(endpoint_identity_corrupt(correlation_id));
             }
-            validate_linked_operation(transaction, project_id, operation_bytes, correlation_id)
+            let identity = validate_linked_operation(
+                transaction,
+                project_id,
+                operation_bytes,
+                correlation_id,
+            )?;
+            if identity.method != HttpMethod::Post
+                || identity.route_template != "/orders"
+                || identity.application_component != "spring-fixture"
+                || identity.binding_key != "default"
+            {
+                return Err(endpoint_identity_corrupt(correlation_id));
+            }
+            Ok(())
         }
         "unmatched" => {
             if stored.2.is_some() || stored.5.is_some() || stored.6.is_some() {
@@ -5596,6 +5790,98 @@ fn validate_stored_observation(
         }
         _ => Err(endpoint_identity_corrupt(correlation_id)),
     }
+}
+
+fn validate_runtime_observation(
+    connection: &rusqlite::Connection,
+    project: ProjectId,
+    stored: &StoredObservation,
+    correlation: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    let corrupt = || endpoint_identity_corrupt(correlation);
+    if stored.0 == "unmatched" {
+        if stored.2.is_some() || stored.5.is_some() || stored.6.is_some() || stored.10.is_some() {
+            return Err(corrupt());
+        }
+        match stored.7.as_deref() {
+            Some(
+                "identity_context_missing"
+                | "identity_context_invalid"
+                | "catalog_revision_unavailable",
+            ) if stored.3.is_none() && stored.4.is_none() && stored.9.is_none() => return Ok(()),
+            Some(
+                "method_unsupported"
+                | "no_catalog_match"
+                | "route_template_unavailable_or_ineligible",
+            ) => {}
+            _ => return Err(corrupt()),
+        }
+    } else if stored.0 != "linked" || stored.7.is_some() {
+        return Err(corrupt());
+    }
+    let raw = stored.9.as_deref().ok_or_else(corrupt)?;
+    let revision =
+        CatalogRevisionId::from_uuid(uuid::Uuid::from_slice(raw).map_err(|_| corrupt())?);
+    let scope = qualified_runtime_revision(connection, project, revision, correlation)?
+        .ok_or_else(corrupt)?;
+    let (Some(component), Some(binding)) = (stored.3.as_deref(), stored.4.as_deref()) else {
+        return Err(corrupt());
+    };
+    if component != scope.application_component
+        || binding != scope.binding_key
+        || !is_runtime_link_scope_id(component)
+        || !is_runtime_link_scope_id(binding)
+    {
+        return Err(corrupt());
+    }
+    if stored.0 == "unmatched" {
+        return Ok(());
+    }
+    let raw_operation = stored.2.as_deref().ok_or_else(corrupt)?;
+    let operation = parse_stored_operation_id(raw_operation, correlation)?;
+    let raw_method = stored.5.as_deref().ok_or_else(corrupt)?;
+    let method = HttpMethod::parse(raw_method)
+        .filter(|method| method.as_str() == raw_method)
+        .ok_or_else(corrupt)?;
+    let route = stored.6.as_deref().ok_or_else(corrupt)?;
+    let identity = EndpointIdentity {
+        project_id: project,
+        application_component: component.to_owned(),
+        binding_key: binding.to_owned(),
+        transport: Transport::Http,
+        method,
+        route_template: route.to_owned(),
+    };
+    let (catalog_operation, fingerprint) =
+        runtime_catalog_operation(connection, revision, &identity, correlation)?
+            .ok_or_else(corrupt)?;
+    if operation != catalog_operation || stored.10.as_deref() != Some(fingerprint.as_slice()) {
+        return Err(corrupt());
+    }
+    let matching_alias: bool = connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM operations WHERE project_id = ?1 AND operation_id = ?2
+         AND application_component = ?3 AND binding_key = ?4 AND transport = 'http'
+         AND method = ?5 AND route_template = ?6 AND fingerprint_format_version = 1
+         AND endpoint_fingerprint = ?7)",
+            rusqlite::params![
+                project.as_uuid().as_bytes(),
+                raw_operation,
+                component,
+                binding,
+                raw_method,
+                route,
+                fingerprint
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation), correlation)
+        })?;
+    if !matching_alias {
+        return Err(corrupt());
+    }
+    Ok(())
 }
 
 fn valid_optional_context(component: Option<&str>, binding: Option<&str>) -> bool {
@@ -5628,7 +5914,7 @@ fn validate_linked_operation(
     project_id: ProjectId,
     operation_bytes: &[u8],
     correlation_id: CorrelationId,
-) -> Result<(), RecordingStoreError> {
+) -> Result<EndpointIdentity, RecordingStoreError> {
     let operation_id = parse_stored_operation_id(operation_bytes, correlation_id)?;
     type StoredOperation = (String, String, String, String, String, i64, Vec<u8>);
     let row: Option<StoredOperation> = transaction
@@ -5643,33 +5929,60 @@ fn validate_linked_operation(
     else {
         return Err(endpoint_identity_corrupt(correlation_id));
     };
-    let identity = EndpointIdentity {
+    validate_operation_identity(
         project_id,
-        application_component: "spring-fixture".to_owned(),
-        binding_key: "default".to_owned(),
-        transport: Transport::Http,
-        method: HttpMethod::Post,
-        route_template: "/orders".to_owned(),
-    };
-    let expected_fingerprint = identity.fingerprint().map_err(|_| {
-        RecordingStoreError::new(
-            RecordingStoreErrorKind::Internal,
-            "XTR-STORE-ENDPOINT-FINGERPRINT",
-            "endpoint identity encoding failed",
-            correlation_id,
-        )
-    })?;
+        &transport,
+        &method,
+        &route,
+        &component,
+        &binding,
+        format_version,
+        &fingerprint,
+        correlation_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments, reason = "persisted endpoint tuple and its fingerprint")]
+fn validate_operation_identity(
+    project_id: ProjectId,
+    transport: &str,
+    method: &str,
+    route: &str,
+    component: &str,
+    binding: &str,
+    format_version: i64,
+    fingerprint: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<EndpointIdentity, RecordingStoreError> {
+    let canonical_method = HttpMethod::parse(method)
+        .filter(|parsed| parsed.as_str() == method)
+        .ok_or_else(|| endpoint_identity_corrupt(correlation_id))?;
     if transport != "http"
-        || method != "POST"
-        || route != "/orders"
-        || component != "spring-fixture"
-        || binding != "default"
+        || !is_runtime_link_scope_id(component)
+        || !is_runtime_link_scope_id(binding)
         || format_version != i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION)
-        || fingerprint.as_slice() != expected_fingerprint.as_bytes()
+        || normalize_link_template(
+            xtrace_domain::endpoint_normalization::RouteFramework::SpringMvc,
+            route,
+        )
+        .as_deref()
+            != Some(route)
     {
         return Err(endpoint_identity_corrupt(correlation_id));
     }
-    Ok(())
+    let identity = EndpointIdentity {
+        project_id,
+        application_component: component.to_owned(),
+        binding_key: binding.to_owned(),
+        transport: Transport::Http,
+        method: canonical_method,
+        route_template: route.to_owned(),
+    };
+    let expected = identity.fingerprint().map_err(|_| endpoint_identity_corrupt(correlation_id))?;
+    if fingerprint != expected.as_bytes() {
+        return Err(endpoint_identity_corrupt(correlation_id));
+    }
+    Ok(identity)
 }
 
 fn validate_operation_has_observation(
@@ -5677,53 +5990,33 @@ fn validate_operation_has_observation(
     project_id: ProjectId,
     operation_bytes: &[u8],
     correlation_id: CorrelationId,
-) -> Result<(), RecordingStoreError> {
+) -> Result<&'static str, RecordingStoreError> {
     let operation_id = parse_stored_operation_id(operation_bytes, correlation_id)?;
     validate_linked_operation(connection, project_id, operation_bytes, correlation_id)?;
     let mut statement = connection.prepare(
-        "SELECT disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code, project_id FROM recording_endpoint_observations WHERE operation_id = ?1",
+        "SELECT disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code, project_id,
+           catalog_revision_id, operation_fingerprint FROM recording_endpoint_observations WHERE operation_id = ?1",
     ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
-    let mut rows =
-        statement.query([operation_id.as_uuid().as_bytes().to_vec()]).map_err(|error| {
+    let rows = statement
+        .query_map([operation_id.as_uuid().as_bytes()], |row| stored_observation(row, 0))
+        .map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })?;
-    let mut found_link = false;
-    while let Some(row) = rows.next().map_err(|error| {
-        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-    })? {
-        let stored: StoredObservation = (
-            row.get(0).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-            row.get(1).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-            row.get(2).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-            row.get(3).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-            row.get(4).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-            row.get(5).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-            row.get(6).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-            row.get(7).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-            row.get(8).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?,
-        );
+    let mut policy = None;
+    for row in rows {
+        let stored = row.map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         validate_stored_observation(connection, project_id, &stored, correlation_id)?;
-        found_link |= stored.0 == "linked" && stored.2.as_deref() == Some(operation_bytes);
+        if stored.0 == "linked" && stored.2.as_deref() == Some(operation_bytes) {
+            if stored.1.as_deref() == Some("spring-orders-v1") {
+                policy = Some("spring-orders-v1");
+            } else if policy.is_none() {
+                policy = Some("runtime-route-v1");
+            }
+        }
     }
-    if found_link { Ok(()) } else { Err(endpoint_identity_corrupt(correlation_id)) }
+    policy.ok_or_else(|| endpoint_identity_corrupt(correlation_id))
 }
 
 fn session_context(
@@ -6087,6 +6380,7 @@ mod tests {
                     application_component: Some("other".to_owned()),
                     binding_key: Some("default".to_owned()),
                     method: "PRIVATE".to_owned(),
+                    runtime_catalog: None,
                     route_template: "/secret".to_owned(),
                 },
                 "identity_context_invalid",
@@ -6097,6 +6391,7 @@ mod tests {
                     application_component: Some("spring-fixture".to_owned()),
                     binding_key: Some("default".to_owned()),
                     method: "PRIVATE".to_owned(),
+                    runtime_catalog: None,
                     route_template: "/secret".to_owned(),
                 },
                 "method_unsupported",
@@ -6107,6 +6402,7 @@ mod tests {
                     application_component: Some("spring-fixture".to_owned()),
                     binding_key: Some("default".to_owned()),
                     method: "POST".to_owned(),
+                    runtime_catalog: None,
                     route_template: "/secret?canary".to_owned(),
                 },
                 "route_unapproved",
@@ -6278,6 +6574,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         assert_eq!(
@@ -6340,6 +6637,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "BREW_PRIVATE_METHOD".to_owned(),
+            runtime_catalog: None,
             route_template: "/private-canary?token=secret".to_owned(),
         };
         view.begin_recording(&rejected).expect("unmatched start is accepted");
@@ -6357,6 +6655,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/route-canary?secret=value".to_owned(),
         };
         view.begin_recording(&rejected_route).expect("rejected route is unmatched");
@@ -6417,6 +6716,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         view.begin_recording(&linked).expect("linked begin");
@@ -6489,6 +6789,7 @@ mod tests {
                 application_component: Some("spring-fixture".to_owned()),
                 binding_key: Some("default".to_owned()),
                 method: "POST".to_owned(),
+                runtime_catalog: None,
                 route_template: "/orders".to_owned(),
             };
             view.begin_recording(&linked).expect("linked begin");
@@ -6682,6 +6983,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         for project_id in [first_project, second_project] {
@@ -6720,6 +7022,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         let mut first =
@@ -7641,6 +7944,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         view.begin_recording(&linked_a).expect("linked A");
@@ -7722,6 +8026,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         view.begin_recording(&linked).expect("linked recording");
@@ -7769,6 +8074,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         linked_v7.endpoint_observation = linked.endpoint_observation.clone();
@@ -7890,6 +8196,7 @@ mod tests {
                         application_component: Some("spring-fixture".to_owned()),
                         binding_key: Some("default".to_owned()),
                         method: "POST".to_owned(),
+                        runtime_catalog: None,
                         route_template: "/orders".to_owned(),
                     };
                 }
@@ -7923,6 +8230,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         view.begin_recording(&linked).expect("linked recording");
@@ -8008,6 +8316,7 @@ mod tests {
                 application_component: Some("spring-fixture".to_owned()),
                 binding_key: Some("default".to_owned()),
                 method: "POST".to_owned(),
+                runtime_catalog: None,
                 route_template: "/orders".to_owned(),
             };
             view.begin_recording(&linked).expect("linked recording");
@@ -9402,6 +9711,7 @@ mod tests {
             application_component: Some("spring-fixture".to_owned()),
             binding_key: Some("default".to_owned()),
             method: "POST".to_owned(),
+            runtime_catalog: None,
             route_template: "/orders".to_owned(),
         };
         let unmatched =

@@ -118,6 +118,11 @@ impl Migrations {
                 label: "v0010_session_health",
                 statements: &[SESSION_HEALTH_SCHEMA],
             },
+            MigrationRecord {
+                version: 11,
+                label: "v0011_catalog_runtime_links",
+                statements: &[include_str!("lane_sql/catalog_v11_proposal.sql")],
+            },
         ]
     }
 
@@ -1034,22 +1039,10 @@ mod tests {
         assert_eq!(second, Migrations::latest_version());
     }
 
-    const PROPOSED_CATALOG_LINKS: &str = include_str!("lane_sql/catalog_v11_proposal.sql");
-
-    fn catalog_link_proposal() -> Vec<MigrationRecord> {
-        let mut catalog = Migrations::catalog()[..10].to_vec();
-        catalog.push(MigrationRecord {
-            version: 11,
-            label: "v0011_catalog_runtime_links",
-            statements: &[PROPOSED_CATALOG_LINKS],
-        });
-        catalog
-    }
-
     #[test]
     fn proposed_catalog_link_upgrade_keeps_existing_rows_and_migration_prefix() {
         let conn = new_memory();
-        let catalog = catalog_link_proposal();
+        let catalog = Migrations::catalog();
         let prefix = &catalog[..10];
         let correlation = CorrelationId::new();
         apply_catalog(&conn, "test", correlation, prefix).expect("initialize v10");
@@ -1087,7 +1080,7 @@ mod tests {
         assert!(!table_exists(&conn, "catalog_runtime_link_routes"));
 
         for _ in 0..2 {
-            assert_eq!(apply_catalog(&conn, "test", correlation, &catalog).expect("proposal"), 11);
+            assert_eq!(apply_pending(&conn, "test", correlation).expect("v11"), 11);
         }
         assert_eq!(schema_version(&conn), 11);
         let stored: (Vec<u8>, Vec<u8>, Vec<u8>, String) = conn
@@ -1132,8 +1125,7 @@ mod tests {
     #[test]
     fn proposed_catalog_link_shapes_require_eligible_project_revision_member() {
         let conn = new_memory();
-        apply_catalog(&conn, "test", CorrelationId::new(), &catalog_link_proposal())
-            .expect("proposal");
+        apply_pending(&conn, "test", CorrelationId::new()).expect("v11");
         let (project, other_project) = (id(1), id(2));
         let (operation, version, revision, selection, run, session, recording, unmatched) = (
             revision_member_id(3),
@@ -1549,7 +1541,7 @@ mod tests {
             apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v9"),
             Migrations::latest_version()
         );
-        assert_eq!(Migrations::latest_version(), 10);
+        assert_eq!(Migrations::latest_version(), 11);
         assert_ne!(applied_checksum(&conn), v8_checksum, "checksum changes with v9");
         let legacy: i64 = conn
             .query_row(

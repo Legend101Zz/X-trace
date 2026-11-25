@@ -75,6 +75,8 @@ A repeated start with equivalent rejected inputs receives the same result; rejec
 their digests are never retained, logged, or echoed. Legacy sidecar-absent starts remain absent on
 retry. Current scan, stale UI state and concurrent scan publication cannot cause a historical
 recording to be reclassified. Keep the project's existing query cursor order and bounds.
+Fixture endpoint positions keep their v1 cursor. General endpoint positions use v2 with
+canonical-template and scope checks, while preserving the same sort and project binding.
 
 ## Additive read contract
 
@@ -88,7 +90,7 @@ queries expose the link and detail remains the existing exact-ID read.
 
 Keep the existing unmatched codes. For the runtime policy, use `catalog_revision_unavailable`
 for a missing, inaccessible, incomplete, non-static or wrong-scope revision; `method_unsupported` for an unsupported
-method after resolving scope; `route_unmatched_after_normalization` for missing or ineligible
+method after resolving scope; `route_template_unavailable_or_ineligible` for missing or ineligible
 template syntax; and `no_catalog_match` for a safe canonical identity absent or ineligible in the
 selected revision. Use that precedence after policy and identity checks. Persist only closed
 reasons and fields validated for that disposition. The selected revision ID is audit metadata in

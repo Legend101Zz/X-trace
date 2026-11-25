@@ -166,9 +166,12 @@ pub enum XtraceCommand {
             conflicts_with = "java_agent"
         )]
         node_mode: Option<String>,
-        /// Explicitly opt into the finite observed-endpoint rule.
+        /// Explicitly opt into an observed-endpoint policy.
         #[arg(long = "observed-endpoint-policy")]
         observed_endpoint_policy: Option<String>,
+        /// Immutable scan revision for the runtime-route-v1 observation policy.
+        #[arg(long = "observed-endpoint-revision", value_name = "UUID")]
+        observed_endpoint_revision: Option<String>,
         /// Stable, run-scoped application component (must be paired with --binding-key).
         #[arg(long = "application-component", requires = "binding_key")]
         application_component: Option<String>,
@@ -300,6 +303,7 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
             node_adapter,
             node_mode,
             observed_endpoint_policy,
+            observed_endpoint_revision,
             application_component,
             binding_key,
             capture,
@@ -307,17 +311,46 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
         } => {
             validate_safe_run_identity(application_component.as_deref(), binding_key.as_deref())?;
             let capture_options = capture.validate()?;
+            use xtrace_application::recording::{
+                EndpointObservationInput, RuntimeCatalogDialect, RuntimeCatalogSelection,
+            };
+            use xtrace_domain::ids::Id as _;
+            let runtime_policy = observed_endpoint_policy.as_deref() == Some("runtime-route-v1");
+            let observed_endpoint_revision = observed_endpoint_revision
+                .as_deref()
+                .map(str::parse::<xtrace_domain::CatalogRevisionId>)
+                .transpose()
+                .map_err(|_| {
+                    CliError::InvalidArgument(
+                        "observed endpoint revision must be a UUIDv7".to_owned(),
+                    )
+                })?;
+            if observed_endpoint_revision.is_some_and(|id| {
+                !runtime_policy
+                    || id.as_uuid().get_version_num() != 7
+                    || id.as_uuid().get_variant() != uuid::Variant::RFC4122
+            }) {
+                return Err(CliError::InvalidArgument(
+                    "observed endpoint revision requires runtime-route-v1 and a UUIDv7".to_owned(),
+                ));
+            }
+            let run_observation = EndpointObservationInput {
+                policy_id: observed_endpoint_policy,
+                application_component,
+                binding_key,
+                runtime_catalog: runtime_policy.then_some(RuntimeCatalogSelection {
+                    revision_id: observed_endpoint_revision,
+                    dialect: if java_agent.is_some() {
+                        RuntimeCatalogDialect::SpringMvc
+                    } else {
+                        RuntimeCatalogDialect::Express
+                    },
+                }),
+                ..EndpointObservationInput::default()
+            };
             if let Some(java_agent) = java_agent {
-                crate::run::run(
-                    project_dir,
-                    java_agent,
-                    observed_endpoint_policy,
-                    application_component,
-                    binding_key,
-                    capture_options,
-                    command,
-                )
-                .await
+                crate::run::run(project_dir, java_agent, run_observation, capture_options, command)
+                    .await
             } else if let Some(node_adapter) = node_adapter {
                 let node_mode = node_mode.unwrap_or_else(|| "auto".to_owned());
                 if capture.any_given() {
@@ -327,16 +360,13 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
                             .to_string(),
                     ));
                 }
-                if observed_endpoint_policy.is_some()
-                    || application_component.is_some()
-                    || binding_key.is_some()
-                {
+                if run_observation.policy_id.as_deref() == Some("spring-orders-v1") {
                     return Err(CliError::InvalidArgument(
-                        "Node capture does not yet support endpoint observation options"
-                            .to_string(),
+                        "spring-orders-v1 requires a Java launch".to_owned(),
                     ));
                 }
-                crate::run::run_node(project_dir, node_adapter, node_mode, command).await
+                crate::run::run_node(project_dir, node_adapter, node_mode, run_observation, command)
+                    .await
             } else {
                 Err(CliError::InvalidArgument(
                     "run requires either --java-agent or --node-adapter".to_string(),
@@ -350,21 +380,10 @@ fn validate_safe_run_identity(
     component: Option<&str>,
     binding: Option<&str>,
 ) -> Result<(), CliError> {
-    fn valid(value: &str) -> bool {
-        let bytes = value.as_bytes();
-        !bytes.is_empty()
-            && bytes.len() <= 64
-            && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-            && bytes.iter().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'.' | b'_' | b'-')
-            })
-    }
-    if component
-        .zip(binding)
-        .is_some_and(|(component, binding)| !valid(component) || !valid(binding))
-    {
+    use xtrace_domain::endpoint_normalization::is_runtime_link_scope_id;
+    if component.zip(binding).is_some_and(|(component, binding)| {
+        !is_runtime_link_scope_id(component) || !is_runtime_link_scope_id(binding)
+    }) {
         return Err(CliError::InvalidArgument(
             "application component and binding key must be safe IDs".to_string(),
         ));

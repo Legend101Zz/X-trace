@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use xtrace_application::recording::EndpointObservationInput;
+
 use crate::error::CliError;
 
 #[cfg(unix)]
@@ -12,37 +14,18 @@ const DAEMON_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 pub(crate) async fn run(
     project_dir: PathBuf,
     java_agent: PathBuf,
-    observed_endpoint_policy: Option<String>,
-    application_component: Option<String>,
-    binding_key: Option<String>,
+    run_observation: EndpointObservationInput,
     capture: crate::capture_args::CaptureOptions,
     command: Vec<OsString>,
 ) -> Result<i32, CliError> {
     #[cfg(not(unix))]
     {
-        let _ = (
-            project_dir,
-            java_agent,
-            observed_endpoint_policy,
-            application_component,
-            binding_key,
-            capture,
-            command,
-        );
+        let _ = (project_dir, java_agent, run_observation, capture, command);
         Err(CliError::DaemonUnsupportedPlatform)
     }
     #[cfg(unix)]
     {
-        run_unix(
-            project_dir,
-            java_agent,
-            observed_endpoint_policy,
-            application_component,
-            binding_key,
-            capture,
-            command,
-        )
-        .await
+        run_unix(project_dir, java_agent, run_observation, capture, command).await
     }
 }
 
@@ -51,17 +34,18 @@ pub(crate) async fn run_node(
     project_dir: PathBuf,
     adapter_dist: PathBuf,
     mode: String,
+    run_observation: EndpointObservationInput,
     command: Vec<OsString>,
 ) -> Result<i32, CliError> {
     #[cfg(not(unix))]
     {
-        let _ = (project_dir, adapter_dist, mode, command);
+        let _ = (project_dir, adapter_dist, mode, run_observation, command);
         Err(CliError::DaemonUnsupportedPlatform)
     }
     #[cfg(unix)]
     {
         let mode = xtrace_runtime::node::NodeMode::parse(&mode).map_err(CliError::NodeRun)?;
-        run_node_unix(project_dir, adapter_dist, mode, command).await
+        run_node_unix(project_dir, adapter_dist, mode, run_observation, command).await
     }
 }
 
@@ -70,6 +54,7 @@ async fn run_node_unix(
     project_dir: PathBuf,
     adapter_dist: PathBuf,
     mode: xtrace_runtime::node::NodeMode,
+    run_observation: EndpointObservationInput,
     command: Vec<OsString>,
 ) -> Result<i32, CliError> {
     use tokio::sync::oneshot;
@@ -79,7 +64,12 @@ async fn run_node_unix(
     // explicit adapter distribution have passed preflight.
     let launch = NodeLaunch::validate(&adapter_dist, mode, &command).map_err(CliError::NodeRun)?;
     let mut signals = NodeSignals::install().map_err(CliError::NodeRun)?;
-    let prepared = crate::daemon::prepare(project_dir, &crate::paths::read_env_path).await?;
+    let prepared = crate::daemon::prepare_with_observation(
+        project_dir,
+        &crate::paths::read_env_path,
+        run_observation,
+    )
+    .await?;
     let crate::daemon::PreparedDaemon { bound, bootstrap_path, mut runtime_dir, lock } = prepared;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let mut daemon_task = tokio::spawn(async move {
@@ -162,9 +152,7 @@ async fn run_node_unix(
 async fn run_unix(
     project_dir: PathBuf,
     java_agent: PathBuf,
-    observed_endpoint_policy: Option<String>,
-    application_component: Option<String>,
-    binding_key: Option<String>,
+    run_observation: EndpointObservationInput,
     capture: crate::capture_args::CaptureOptions,
     command: Vec<OsString>,
 ) -> Result<i32, CliError> {
@@ -182,19 +170,13 @@ async fn run_unix(
     // An operator-selected endpoint observation policy attributes routes to application-owned
     // handlers, so it is only meaningful when application scope is known. `spring-orders-v1` is
     // itself a fixture literal: the store confines it to the fixture component/binding tuple.
-    if observed_endpoint_policy.is_some() && scope.application_packages.is_empty() {
+    if run_observation.policy_id.is_some() && scope.application_packages.is_empty() {
         return Err(CliError::InvalidArgument(
             "--observed-endpoint-policy needs a resolved application scope: pass --app-package \
              or launch a Spring Boot fat jar whose BOOT-INF/classes names the application packages"
                 .to_string(),
         ));
     }
-    let run_observation = xtrace_application::recording::EndpointObservationInput {
-        policy_id: observed_endpoint_policy,
-        application_component,
-        binding_key,
-        ..xtrace_application::recording::EndpointObservationInput::default()
-    };
     // The JVM may be started from any directory, so the repository the operator named is passed
     // to the agent in the private capture file; source roots resolve against it.
     let source_base = crate::commands::resolve_repo(&project_dir)?;

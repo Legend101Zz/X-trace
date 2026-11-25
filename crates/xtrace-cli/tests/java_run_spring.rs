@@ -1550,6 +1550,7 @@ fn add_endpoint_cli_fixture_recordings(
         application_component: Some("spring-fixture".to_owned()),
         binding_key: Some("default".to_owned()),
         method: "POST".to_owned(),
+        runtime_catalog: None,
         route_template: "/orders".to_owned(),
     };
     let linked_ids = [

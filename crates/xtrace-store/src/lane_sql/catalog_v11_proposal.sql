@@ -1,6 +1,6 @@
 -- Proposed v0011 catalog link and static route eligibility DDL (Refs #112).
 -- This rebuild preserves the installed migration prefix and the v3 observation rows.
--- Do not register until ADR 0015 and the typed readers and writers are ready.
+-- Activation on main is coordinated with the typed readers and writers in ADR 0015.
 PRAGMA defer_foreign_keys = ON;
 
 CREATE TABLE operations_v11 (
@@ -116,7 +116,7 @@ CREATE TABLE recording_endpoint_observations_v11 (
             AND application_component = 'spring-fixture' AND binding_key = 'default'
           WHEN 'no_catalog_match' THEN observation_policy_id = 'runtime-route-v1'
             AND catalog_revision_id IS NOT NULL AND application_component IS NOT NULL
-          WHEN 'route_unmatched_after_normalization' THEN observation_policy_id = 'runtime-route-v1'
+          WHEN 'route_template_unavailable_or_ineligible' THEN observation_policy_id = 'runtime-route-v1'
             AND catalog_revision_id IS NOT NULL AND application_component IS NOT NULL
           ELSE 0
         END

@@ -5,7 +5,7 @@
 //! catalog state until owner selection, verified-pack, and source authorities
 //! are wired into that boundary.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
@@ -270,6 +270,22 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
         finish: &DiscoveryRunFinish,
     ) -> Result<(), PortError> {
         self.finish_run_with_view(&SelectionView::from(selection), finish)
+    }
+
+    fn finish_local_scan(
+        &self,
+        selection: &AdmittedCatalogSelection,
+        finish: &DiscoveryRunFinish,
+        eligible_claims: &HashSet<ContentHash>,
+    ) -> Result<(), PortError> {
+        if selection.namespace() != CatalogRunNamespace::LocalStaticScanner {
+            return Err(refusal_error());
+        }
+        self.finish_with_route_evidence(
+            &SelectionView::from(selection),
+            finish,
+            Some(eligible_claims),
+        )
     }
 }
 
@@ -654,6 +670,15 @@ impl SqliteCatalogDiscoveryStore {
         selection: &SelectionView,
         finish: &DiscoveryRunFinish,
     ) -> Result<(), PortError> {
+        self.finish_with_route_evidence(selection, finish, None)
+    }
+
+    fn finish_with_route_evidence(
+        &self,
+        selection: &SelectionView,
+        finish: &DiscoveryRunFinish,
+        eligible_claims: Option<&HashSet<ContentHash>>,
+    ) -> Result<(), PortError> {
         let correlation_id = CorrelationId::new();
         let mut connection = self.store.lock().map_err(map_store_error)?;
         let transaction = connection
@@ -688,6 +713,16 @@ impl SqliteCatalogDiscoveryStore {
             &run.scope,
         )?;
         let actual_claim_count = chunks.iter().map(|chunk| chunk.claims.len()).sum::<usize>();
+        if let Some(eligible) = eligible_claims {
+            let observed = chunks
+                .iter()
+                .flat_map(|chunk| &chunk.claims)
+                .filter_map(ValidatedEndpointClaim::digest)
+                .filter(|digest| eligible.contains(digest));
+            if observed.count() != eligible.len() {
+                return Err(validation_error());
+            }
+        }
         let actual_claim_bytes = chunks
             .iter()
             .flat_map(|chunk| &chunk.claims)
@@ -769,6 +804,7 @@ impl SqliteCatalogDiscoveryStore {
             finish,
             &chunks,
             &limitation_json,
+            eligible_claims,
             correlation_id,
         )?;
         transaction.commit().map_err(|error| map_rusqlite(error, correlation_id))
@@ -1272,6 +1308,7 @@ fn load_and_verify_chunks(
     Ok(chunks)
 }
 
+#[allow(clippy::too_many_arguments, reason = "one immutable revision transaction")]
 fn publish_revision(
     transaction: &Transaction<'_>,
     selection: &SelectionView,
@@ -1279,6 +1316,7 @@ fn publish_revision(
     finish: &DiscoveryRunFinish,
     chunks: &[DiscoveryChunk],
     limitation_json: &str,
+    eligible_claims: Option<&HashSet<ContentHash>>,
     correlation_id: CorrelationId,
 ) -> Result<(), PortError> {
     let revision_id = CatalogRevisionId::new();
@@ -1364,6 +1402,20 @@ fn publish_revision(
             "INSERT INTO catalog_revision_entries (project_id, revision_id, operation_id, operation_version_id, change_kind, source_availability) VALUES (?1, ?2, ?3, ?4, ?5, 'unverified')",
             params![selection.project_id().as_uuid().as_bytes().to_vec(), revision_id.as_uuid().as_bytes().to_vec(), operation_id.as_uuid().as_bytes().to_vec(), version_id.as_uuid().as_bytes().to_vec(), kind],
         ).map_err(|error| map_rusqlite(error, correlation_id))?;
+        if eligible_claims.is_some_and(|eligible| {
+            let handler = claims.first().and_then(|claim| claim.handler_symbol());
+            claims.iter().all(|claim| {
+                claim.provenance() == ClaimProvenance::StaticInferred
+                    && claim.handler_symbol() == handler
+                    && claim.limitation_codes().is_empty()
+                    && claim.digest().is_some_and(|digest| eligible.contains(&digest))
+            })
+        }) {
+            transaction.execute(
+                "INSERT INTO catalog_runtime_link_routes (project_id, revision_id, operation_id) VALUES (?1, ?2, ?3)",
+                params![selection.project_id().as_uuid().as_bytes(), revision_id.as_uuid().as_bytes(), operation_id.as_uuid().as_bytes()],
+            ).map_err(|error| map_rusqlite(error, correlation_id))?;
+        }
         for claim in claims {
             let claim_id = find_or_create_claim(
                 transaction,

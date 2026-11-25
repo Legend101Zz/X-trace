@@ -189,6 +189,86 @@ pub fn normalize_route(
     Parser::new(framework, template).run()
 }
 
+/// Normalizes the intentionally small route dialect used for scoped recording links.
+/// Nothing in this function matches a concrete path against a route pattern.
+#[must_use]
+pub fn normalize_link_template(framework: RouteFramework, template: &str) -> Option<String> {
+    let syntax = match framework {
+        RouteFramework::SpringMvc | RouteFramework::Express => framework,
+        _ => return None,
+    };
+    let path = template.strip_prefix('/')?;
+    if template.len() > MAX_ROUTE_BYTES {
+        return None;
+    }
+    let name = |value: &str| {
+        let mut bytes = value.bytes();
+        bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    if !path.is_empty()
+        && !path.split('/').all(|segment| {
+            let parameter = match syntax {
+                RouteFramework::Express => segment.strip_prefix(':'),
+                _ => segment.strip_prefix('{').and_then(|value| value.strip_suffix('}')),
+            };
+            parameter.map_or_else(
+                || {
+                    !matches!(segment, "" | "." | "..")
+                        && segment.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'-' | b'_' | b'.' | b'~')
+                        })
+                },
+                name,
+            )
+        })
+    {
+        return None;
+    }
+    normalize_route(syntax, template).ok().map(|route| route.identity)
+}
+
+/// Validates a run-scoped component or binding without retaining rejected input.
+#[must_use]
+pub fn is_runtime_link_scope_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes().first().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn scoped_link_normalization_preserves_only_the_bounded_template_dialect() {
+    assert_eq!(
+        normalize_link_template(RouteFramework::Express, "/owners/:ownerId").as_deref(),
+        Some("/owners/{id}")
+    );
+    assert_eq!(
+        normalize_link_template(RouteFramework::SpringMvc, "/owners/{ownerId}").as_deref(),
+        Some("/owners/{id}")
+    );
+    assert_eq!(normalize_link_template(RouteFramework::Express, "/").as_deref(), Some("/"));
+    for route in [
+        "",
+        "/owners/",
+        "/owners//:id",
+        "/owners/:id?",
+        "/owners/:id([0-9]+)",
+        "/owners/%34%32",
+        "/owners/*rest",
+        "/owners/42?private=value",
+        "https://fixture/owners/42",
+        "/owners/..",
+        "/owners/{id}",
+    ] {
+        assert!(normalize_link_template(RouteFramework::Express, route).is_none(), "{route}");
+    }
+}
+
 /// Joins path parts (class prefix, mount path, method path, base path) and
 /// normalizes the result. Empty parts are skipped. The strict-slash flag is
 /// taken from the last non-empty part.
