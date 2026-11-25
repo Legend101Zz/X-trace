@@ -1,0 +1,36 @@
+name: Build reviewed replay scroll assets
+on:
+  push:
+    branches: [codex/replay-map-assets-98]
+permissions:
+  contents: read
+jobs:
+  build-viewer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 29496bb96ddf7571b5abfba4f1eb0f85a6b1d244
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Build and verify the reviewed viewer source
+        working-directory: web/app
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = 29496bb96ddf7571b5abfba4f1eb0f85a6b1d244
+          npm ci > "$RUNNER_TEMP/web-ci.log" 2>&1
+          npm run typecheck > "$RUNNER_TEMP/web-typecheck.log" 2>&1
+          (cd ../.. && python3 -B -m tools.qa.lane_run run --suite web --variant 22 --step web-unit --min-passed 75 --max-ignored 0 --out "$RUNNER_TEMP/web-fragments" -- npm test --prefix web/app)
+          npm run build > "$RUNNER_TEMP/web-build.log" 2>&1
+          npm run embed > "$RUNNER_TEMP/web-embed.log" 2>&1
+          npm run check:embedded > "$RUNNER_TEMP/web-parity.log" 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: replay-map-generated-assets
+          path: crates/xtrace-daemon/assets/ui/
+          if-no-files-found: error
+          retention-days: 7
