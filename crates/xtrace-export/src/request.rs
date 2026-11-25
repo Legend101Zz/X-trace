@@ -68,7 +68,7 @@ pub struct RevisionInput {
     pub ordinal: u32,
     /// Hex digest of the catalog content.
     pub catalog_hash: String,
-    /// Hex digest of the policy applied.
+    /// Hex digest of the policy applied, or empty when unknown.
     pub policy_digest: String,
     /// Application display name.
     pub application_name: String,
@@ -185,40 +185,62 @@ pub struct ClaimInput {
     pub claim_id: String,
     /// Provenance label.
     pub provenance: String,
+    /// Whether an empty provenance label was explicitly supplied.
+    pub empty_provenance_reported: bool,
     /// Confidence in basis points.
     pub confidence_basis_points: Option<u16>,
     /// Limitation codes.
     pub limitation_codes: Vec<String>,
+    /// Whether an empty list was explicitly reported. Nonempty lists report codes directly.
+    pub empty_limitations_reported: bool,
     /// Parameters.
     pub params: Vec<ParamInput>,
     /// Responses.
     pub responses: Vec<ResponseInput>,
     /// Examples.
     pub examples: Vec<ExampleInput>,
-    /// Handler.
+    /// Handler location from legacy input.
     pub handler: Option<HandlerInput>,
+    /// Handler symbol recorded on a claim, independent of its source evidence.
+    pub handler_symbol: Option<String>,
+    /// Persisted evidence items. An empty list means the claim recorded none.
+    /// Legacy input with no evidence projection leaves this as `None`.
+    pub source_evidence: Option<Vec<xtrace_domain::catalog_discovery::ClaimSourceEvidence>>,
     /// Request body media type, when the claim declares a body.
     pub request_body_media_type: Option<String>,
 }
 
-/// Facts retained by a summary-only catalog read port. These are not a claim:
-/// locations and confidence must never be attributed to an arbitrary handler.
+impl ClaimInput {
+    pub(crate) fn reported_provenance(&self) -> Option<&str> {
+        (self.empty_provenance_reported || !self.provenance.is_empty())
+            .then_some(self.provenance.as_str())
+    }
+
+    pub(crate) fn reported_limitations(&self) -> Option<&[String]> {
+        (self.empty_limitations_reported || !self.limitation_codes.is_empty())
+            .then_some(self.limitation_codes.as_slice())
+    }
+}
+
+/// Aggregate catalog facts, which may be supplied alongside individual claims.
+/// Locations and confidence must never be attributed to an arbitrary handler.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogSummaryInput {
-    /// Number of underlying claims, whose individual projections are unavailable.
+    /// Number of underlying claims.
     pub claim_count: usize,
-    /// All distinct handler symbols, without inferred locations.
-    pub handler_symbols: Vec<String>,
-    /// Whether the catalog reports conflicting handlers.
-    pub handler_conflict: bool,
+    /// Complete set of reported handler symbols. An empty list reports no symbols.
+    /// `None` means the set is unknown.
+    pub handler_symbols: Option<Vec<String>>,
+    /// Reported conflict flag. Export checks it against any supplied handler set.
+    pub handler_conflict: Option<bool>,
     /// Location attributable to a handler only when exactly one claim exists.
     pub single_claim_handler: Option<HandlerInput>,
     /// Highest confidence across claims, not an individual claim's confidence.
-    pub highest_confidence_basis_points: u16,
-    /// Distinct provenance labels.
-    pub provenance: Vec<String>,
-    /// Union of claim limitations.
-    pub limitation_codes: Vec<String>,
+    pub highest_confidence_basis_points: Option<u16>,
+    /// Distinct provenance labels when reported.
+    pub provenance: Option<Vec<String>>,
+    /// Union of claim limitations when reported.
+    pub limitation_codes: Option<Vec<String>>,
 }
 
 /// One catalog operation.
@@ -236,11 +258,12 @@ pub struct OperationInput {
     pub binding_key: String,
     /// Effective state.
     pub effective_state: EffectiveState,
-    /// False when the claims projection was unavailable (claims is then empty).
+    /// Whether claim rows were supplied. An available list may be empty or partial.
+    /// Rows are ignored when the projection is unavailable.
     pub claims_available: bool,
     /// Claims.
     pub claims: Vec<ClaimInput>,
-    /// Explicitly labelled aggregate facts when individual claims cannot be read.
+    /// Explicitly labelled aggregate facts about the underlying claims.
     pub catalog_summary: Option<CatalogSummaryInput>,
 }
 
