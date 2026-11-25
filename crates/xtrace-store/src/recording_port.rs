@@ -503,6 +503,8 @@ mod tests {
     // Each workload owns its fixture, so later workloads can recover a poisoned guard.
     static CARDINALITY_WORKLOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    mod backward_windows;
+
     fn fixture() -> (tempfile::TempDir, SqliteStore, Project) {
         let temp_base = std::path::PathBuf::from(
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
@@ -768,6 +770,7 @@ mod tests {
             recording_id,
             limit: 10,
             after_sequence: None,
+            before_sequence: None,
         };
         let first_window = reader.show_recording(&request).expect("read indexed frames");
         assert_eq!(
@@ -959,6 +962,7 @@ mod tests {
                 recording_id,
                 limit: 10,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect("read invalid terminal capture");
         assert_eq!(
@@ -998,6 +1002,7 @@ mod tests {
                 recording_id: partial_id,
                 limit: 10,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect("read partial finish");
         assert_eq!(
@@ -1047,6 +1052,7 @@ mod tests {
                 recording_id,
                 limit: 10,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect_err("one persisted event cannot have come from a full history");
         assert_eq!(error.kind(), PortErrorKind::Corruption);
@@ -1096,6 +1102,7 @@ mod tests {
                 recording_id,
                 limit: 10,
                 after_sequence: None,
+                before_sequence: None,
             });
             if expect_corruption {
                 let error =
@@ -1194,6 +1201,7 @@ mod tests {
                     recording_id,
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 })
                 .expect_err("two matching labels cannot replace terminal proof");
             assert_eq!(error.kind(), PortErrorKind::Corruption);
@@ -1570,6 +1578,7 @@ mod tests {
             recording_id: request.recording_id,
             limit: 10,
             after_sequence: None,
+            before_sequence: None,
         };
         let unknown = reader
             .show_recording(&ShowWindowRequest {
@@ -1577,6 +1586,7 @@ mod tests {
                 recording_id: RecordingId::new(),
                 limit: 10,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect_err("unknown recording is rejected");
         assert_eq!(unknown.kind(), PortErrorKind::NotFound);
@@ -1757,6 +1767,11 @@ mod tests {
         );
         assert!(second.events[0].line.is_none(), "method entry cannot invent an active line");
         assert!(second.next_cursor.is_none());
+        let back = show(second.prev_cursor.clone());
+        assert_eq!(back.events[0].sequence, "2");
+        assert!(back.events[0].frame_id.is_none(), "journal request update remains frame-less");
+        assert!(back.prev_cursor.is_none());
+        assert_eq!(show(back.next_cursor).events[0].sequence, "3");
         let json = serde_json::to_string(&second).expect("projected journal JSON");
         assert!(!json.contains("JOURNAL_VALUE_CANARY"));
         assert!(!json.contains("JOURNAL_STACK_CANARY"));
@@ -1765,6 +1780,7 @@ mod tests {
             recording_id: anchor.recording_id,
             limit: 10,
             after_sequence: None,
+            before_sequence: None,
         };
         assert_eq!(
             reader.show_recording(&cross_project).expect_err("project boundary").kind(),
@@ -1826,6 +1842,7 @@ mod tests {
             recording_id: anchor.recording_id,
             limit: 10,
             after_sequence: None,
+            before_sequence: None,
         };
         let live = reader.show_recording(&request).expect("journal events");
         let kinds = |window: &RecordingEventWindow| {
@@ -2034,6 +2051,7 @@ mod tests {
                 recording_id,
                 limit: 10,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect("read completed capture");
         assert_eq!(page.segment_count, "2");
@@ -2083,6 +2101,7 @@ mod tests {
                 recording_id,
                 limit: 2,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect("sealed prefix followed by a journal tail");
         assert_eq!(
@@ -2097,6 +2116,7 @@ mod tests {
                 recording_id,
                 limit: 2,
                 after_sequence: Some(3),
+                before_sequence: None,
             })
             .expect("continue into the live tail");
         assert_eq!(
@@ -2120,6 +2140,7 @@ mod tests {
                 recording_id,
                 limit: 10,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect("read recovered tail");
         assert_eq!(
@@ -2314,6 +2335,7 @@ mod tests {
                     recording_id,
                     limit: 317,
                     after_sequence: Some(next - 1),
+                    before_sequence: None,
                 })
                 .expect("even the first page scans exactly the readable maximum");
             assert_eq!(page.segment_count, MAX_RECORDING_SEGMENTS.to_string());
@@ -2473,6 +2495,7 @@ mod tests {
                 recording_id,
                 limit: 1,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect("readable before recovery");
         assert_eq!(pending.status, RecordingStatus::Recording);
@@ -2505,6 +2528,7 @@ mod tests {
                     recording_id,
                     limit: 137,
                     after_sequence,
+                    before_sequence: None,
                 })
                 .expect("paginated read remains openable");
             assert_eq!(page.completion, RecordingCompletionEvidence::Partial);
@@ -2615,6 +2639,7 @@ mod tests {
                 recording_id,
                 limit: 1_000,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect("read capped capture");
         assert_eq!(
@@ -2633,6 +2658,7 @@ mod tests {
                 recording_id,
                 limit: 1_000,
                 after_sequence: Some(last_kept - 3),
+                before_sequence: None,
             })
             .expect("read capped capture tail");
         let tail =
@@ -2915,6 +2941,7 @@ mod tests {
                 recording_id: persisted.recording_id,
                 limit,
                 after_sequence: after,
+                before_sequence: None,
             })
             .expect("window")
     }
@@ -2999,6 +3026,7 @@ mod tests {
                     recording_id: other_id,
                     limit: 20,
                     after_sequence: None,
+                    before_sequence: None,
                 })
                 .expect("other recording window")
         };

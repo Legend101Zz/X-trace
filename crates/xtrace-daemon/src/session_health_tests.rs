@@ -159,6 +159,7 @@ fn session_context_tracks_latest_reports_only_for_recordings_of_that_session() {
                     recording_id: metadata.recording_id,
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 })
                 .expect("recording window");
             assert_eq!(window.session_context, metadata.session_context);

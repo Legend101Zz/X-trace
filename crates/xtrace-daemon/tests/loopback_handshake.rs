@@ -2529,6 +2529,7 @@ async fn malformed_finish_can_replay_on_same_runtime_and_restart_keeps_open_capt
             recording_id,
             limit: 10,
             after_sequence: None,
+            before_sequence: None,
         })
         .expect("read completed replay");
     assert_eq!(completed_window.segment_count, "1");
@@ -2614,6 +2615,7 @@ async fn malformed_finish_can_replay_on_same_runtime_and_restart_keeps_open_capt
             recording_id,
             limit: 10,
             after_sequence: None,
+            before_sequence: None,
         })
         .expect("read completed frame index after reopen");
     assert_eq!(completed_reopen_window.events[0].frame_id, completed_window.events[0].frame_id);
@@ -2807,6 +2809,7 @@ async fn capture_over_the_event_cap_ends_partial_with_exact_per_priority_drops()
             recording_id,
             limit: 1_000,
             after_sequence: Some(last_kept - 3),
+            before_sequence: None,
         })
         .expect("verified persisted prefix reads back");
     assert_eq!(window.completion, RecordingCompletionEvidence::Partial);
@@ -3006,6 +3009,7 @@ async fn canary_absent_from_xtf_bytes_and_sqlite() {
             recording_id,
             limit: 10,
             after_sequence: None,
+            before_sequence: None,
         })
         .expect("read back the audited recording");
     let projected = serde_json::to_string(&window.events).expect("serialize events");

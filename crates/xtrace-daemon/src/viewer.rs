@@ -2685,6 +2685,51 @@ mod tests {
             cursor = body["nextCursor"].as_str().map(str::to_owned);
             assert_eq!(cursor.is_some(), page < 2);
         }
+        // This is the actual HTTP route over persisted XTF, not a canned read-port
+        // response. Cross the forward-page boundary in both directions with a new limit.
+        let get_page = |suffix: &str| {
+            format!(
+                "GET /api/v1/recordings/{recording_id}?{suffix} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            )
+        };
+        let raw = get_page(&format!(
+            "limit=3&aroundFrame={}",
+            returned[6]["frameId"].as_str().expect("frame")
+        ));
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "persisted window must return HTTP 200");
+        let page: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1).expect("JSON");
+        assert_eq!(page["firstSequence"], "7");
+        let previous = page["prevCursor"].as_str().expect("HTTP backward cursor");
+        let raw = get_page(&format!("limit=2&cursor={previous}"));
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "persisted window must return HTTP 200");
+        let back: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1).expect("JSON");
+        assert_eq!(back["firstSequence"], "5");
+        assert_eq!(back["lastSequence"], "6");
+        assert_eq!(back["events"][0]["sequence"], "5");
+        assert_eq!(back["events"][1]["sequence"], "6");
+        let forward = back["nextCursor"].as_str().expect("HTTP forward cursor");
+        let response = request(&viewer.host, &get_page(&format!("limit=3&cursor={forward}"))).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "persisted window must return HTTP 200");
+        let again: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1).expect("JSON");
+        assert_eq!(again["firstSequence"], "7");
+        assert_eq!(again["lastSequence"], "9");
+        // A valid token scoped to this recording cannot be replayed on another route.
+        let foreign = RecordingId::new();
+        let raw = format!(
+            "GET /api/v1/recordings/{foreign}?cursor={previous} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "invalid cursor must return HTTP 400");
+        assert!(response.contains("XTR-VALIDATION-RECORDING-CURSOR"));
+        let response = request(&viewer.host, &get_page("cursor=v2.bad")).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "invalid cursor must return HTTP 400");
         assert_eq!(returned.len(), 8);
         for (event, sequence) in returned.iter().zip(2..=9) {
             assert_eq!(event["sequence"], sequence.to_string());
