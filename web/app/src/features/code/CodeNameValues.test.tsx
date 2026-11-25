@@ -8,14 +8,19 @@ import { javaNameMatches } from './java-name-matches';
 afterEach(cleanup);
 
 const observed = (name: string): Binding => ({
-  name, nameOrigin: 'declared', role: 'local', value: { state: 'captured', preview: 'safe' },
+  name, nameOrigin: 'declared', role: 'local',
+  value: { state: 'captured', preview: 'safe', shape: 'string', contentHash: 'a'.repeat(64) },
 });
 
 function lineEvent(excerpt: string, line: number, bindings: Binding[]): ReplayEvent {
+  const boundary = { state: 'boundary' } as const;
   return {
     kind: 'recording_event_kind:line_cursor', line, sequence: '9', bindings,
+    frameId: null, monotonicNs: '1', exception: null, sourceBinding: 'observed_unattested',
+    fieldTruncations: [], depth: null, parentFrameId: null, asyncParentFrameId: null, gap: null,
+    navigation: { previous: boundary, next: boundary, into: boundary, over: boundary, out: boundary },
     source: { status: 'matched', path: 'Example.java', startLine: 1, endLine: line, truncated: false, excerpt },
-  } as ReplayEvent;
+  };
 }
 
 it('matches Unicode identifiers exactly and skips comments, quoted text and numeric suffixes', () => {
@@ -50,7 +55,12 @@ it.each([
   ['unavailable', 'Not observed; the reason is shown.'],
   ['dropped', 'Value or event was dropped before it was stored.'],
 ] as const)('withholds %s preview content and restores focus on Escape', (state, wording) => {
-  const binding = { ...observed('value'), value: { state, preview: 'DISCARDED-CANARY', reason: 'unsafe_to_render' } } as Binding;
+  // Simulate a stray preview on an otherwise well-formed withheld value.
+  const preview = 'DISCARDED-CANARY';
+  const value: Binding['value'] & { preview: string } = state === 'redacted'
+    ? { state, preview, ruleId: 'fixture-redaction', shapeHint: null }
+    : { state, preview, reason: state === 'dropped' ? 'queue_full' : 'unsafe_to_render' };
+  const binding: Binding = { ...observed('value'), value };
   const text = 'call(value);';
   render(<CodeNameValues event={lineEvent(text, 1, [binding])} text={text} />);
   const token = screen.getByRole('button', { name: 'Recorded value for value, matched by name' });
@@ -68,7 +78,9 @@ it.each([
 });
 
 it('shows sanctioned captured and truncated previews for the exact clicked name', () => {
-  const bindings = [observed('left'), { ...observed('right'), value: { state: 'truncated', preview: 'prefix' } }] as Binding[];
+  const bindings: Binding[] = [observed('left'), {
+    ...observed('right'), value: { state: 'truncated', preview: 'prefix', originalSizeLowerBound: '10', limit: '6' },
+  }];
   const text = 'compare(left, right);';
   render(<CodeNameValues event={lineEvent(text, 1, bindings)} text={text} />);
   const left = screen.getByRole('button', { name: 'Recorded value for left, matched by name' });
