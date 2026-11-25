@@ -23,9 +23,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8b928c1d
-        with:
-          toolchain: stable
+      - name: Rust toolchain (stable, from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
       - name: Build, install, and scan real pinned Petclinic sources
         run: |
           set -euo pipefail
