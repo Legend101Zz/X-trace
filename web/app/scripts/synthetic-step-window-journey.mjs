@@ -59,8 +59,26 @@ try {
     const stepsTab = page.getByRole('tab', { name: 'Steps', exact: true });
     if (await stepsTab.isVisible()) await stepsTab.click();
     const scrollStart = performance.now();
-    await verifyMountedWindow(page, expected);
-    samples.push({ width, fullWindowScrollAndAssertionMs: Math.round(performance.now() - scrollStart) });
+    const peakMountedRows = await verifyMountedWindow(page, expected);
+    const fullWindowScrollAndAssertionMs = Math.round(performance.now() - scrollStart);
+    const scrollToNewRowsMs = await page.getByRole('list', { name: 'Loaded replay steps' }).evaluate(async (list) => {
+      const content = list.closest('.steps-content');
+      const port = content && getComputedStyle(content).overflowY === 'auto' ? content : list.closest('#events-panel');
+      const range = () => Array.from(list.querySelectorAll('[data-step-sequence]'), (row) => row.getAttribute('aria-posinset')).join(',');
+      const before = range();
+      const start = performance.now();
+      port.scrollTop = 0;
+      for (let frame = 0; frame < 60; frame += 1) {
+        await new Promise(requestAnimationFrame);
+        if (range() !== before) {
+          await new Promise(requestAnimationFrame);
+          return Math.round(performance.now() - start);
+        }
+      }
+      return null;
+    });
+    assert.ok(scrollToNewRowsMs !== null, 'ordinary scroll mounts a different bounded range');
+    samples.push({ width, peakMountedRows, scrollToNewRowsMs, fullWindowScrollAndAssertionMs });
     const midpoint = Math.floor(expected.length / 2);
     await jumpToLoadedSequence(page, expected[midpoint]);
     await current.press('ArrowDown');
