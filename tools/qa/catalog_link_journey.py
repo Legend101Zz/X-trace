@@ -1,5 +1,6 @@
 """Hosted scan-to-launch-to-read proof using the real scanners and adapters."""
 
+import argparse
 import http.client
 import json
 import os
@@ -10,7 +11,6 @@ import shlex
 import shutil
 import signal
 import subprocess
-import sys
 import time
 
 
@@ -24,31 +24,96 @@ def require(condition, code):
 
 
 class Journey:
-    def __init__(self, workspace, cli, root, framework):
+    def __init__(self, workspace, cli, root, framework, installed_prefix=None):
         self.workspace = workspace
         self.cli = cli
         self.root = root
         self.framework = framework
+        self.installed_prefix = installed_prefix
         self.project = root / "project"
         self.project.mkdir(parents=True)
         self.source = self.project / "src"
         self.source.mkdir()
         self.env = dict(os.environ, XTRACE_DATA_HOME=str(root / "data"))
+        if installed_prefix is not None:
+            self.env.pop("XTRACE_JAVA_ANALYZER", None)
+            self.env.pop("XTRACE_NODE_ANALYZER", None)
+            self.env.pop("XTRACE_PREFIX", None)
         self.seed = secrets.token_hex(12)
 
-    def call(self, code, *args):
+    def call(self, code, *args, expected_exit=0):
         try:
             output = subprocess.run([self.cli, *args, "--project-dir", self.project], env=self.env,
                                     capture_output=True, timeout=30)
         except subprocess.TimeoutExpired:
             raise JourneyFailure("cli_deadline_" + code) from None
         require(self.seed.encode() not in output.stdout + output.stderr, "cli_canary")
-        require(output.returncode == 0, code)
+        require(output.returncode == expected_exit, code)
         try:
             parsed = json.loads(output.stdout)
         except json.JSONDecodeError:
             raise JourneyFailure("invalid_json_" + code) from None
         return parsed.get("data", parsed)
+
+    def check_reconciliation(self, revision, endpoint, confirmed):
+        result = self.call("reconcile", "catalog", "reconcile", "--revision", revision, "--json")
+        rows = result["reconciliation"]["rows"]
+        require(result["revisionId"] == revision and len(rows) == 1
+                and (rows[0]["method"], rows[0]["routeTemplate"]) == endpoint
+                and rows[0]["status"] == ("confirmed" if confirmed else "static_only")
+                and rows[0]["recordingCount"] == (2 if confirmed else 0)
+                and result["confirmed"] == int(confirmed)
+                and result["unobserved"] == int(not confirmed), "reconciled_recording_count")
+
+    def check_installed_restart(self, revision, endpoint, catalog_id, recording_ids):
+        before = self.call("record_installed", "record")
+        try:
+            after = self.call("restart_installed", "restart")
+            started = after["started"]["runtime_session_id"]
+            require(after["kind"] == "restarted" and after["previously_running"] is True
+                    and after["stopped"]["runtime_session_id"] == before["runtime_session_id"]
+                    and started != before["runtime_session_id"], "real_restart_session_changed")
+            self.check_reconciliation(revision, endpoint, confirmed=True)
+            linked = self.call("links_after_daemon_restart", "endpoint", "recordings", catalog_id)["items"]
+            require({row["recordingId"] for row in linked} == recording_ids,
+                    "restart_preserved_linked_recordings")
+        finally:
+            stopped = self.call("stop_installed", "stop")
+            require(stopped["kind"] == "stopped", "daemon_stopped_after_restart")
+        self.check_reconciliation(revision, endpoint, confirmed=True)
+
+    def check_static_refusals(self, scan, app, matched, scope, endpoint, catalog_id):
+        conflict_source = self.project / "conflicts"
+        conflict_source.mkdir()
+        for label in ("First", "Second"):
+            (conflict_source / f"{label}.java").write_text(
+                "import org.springframework.web.bind.annotation.GetMapping;\n"
+                "import org.springframework.web.bind.annotation.RestController;\n"
+                f"@RestController public class {label} {{\n"
+                '  @GetMapping("/owners/{ownerId}")\n'
+                f'  public String {label.lower()}() {{ return "ok"; }}\n'
+                "}\n"
+            )
+        command = list(scan)
+        command[command.index("--source") + 1] = conflict_source
+        conflict = self.call("conflicting_scan", *command)
+        revision = conflict["catalogRevisionId"]
+        details = self.call("conflicts", "catalog", "conflicts", "--revision", revision, "--json")
+        conflicts = details["conflicts"]
+        require(conflict["status"] == "persisted_complete" and len(conflicts) == 1
+                and (conflicts[0]["method"], conflicts[0]["routeTemplate"]) == endpoint
+                and len(conflicts[0]["handlers"]) == 2 and conflicts[0]["operationId"] == catalog_id,
+                "conflict_visible_with_stable_catalog_id")
+        self.launch("conflict", app, matched[:1], component=scope, revision=revision)
+        # Keep at least one valid claim, so the incomplete discovery run is durably recorded.
+        (conflict_source / "Broken.java").write_text("class Broken { @GetMapping(")
+        incomplete = self.call("incomplete_scan", *command, expected_exit=10)
+        require(incomplete["status"] == "incomplete_recorded"
+                and incomplete["catalogRevisionId"] is None and incomplete["runId"],
+                "incomplete_scan_without_revision")
+        latest = self.call("history_after_incomplete", "catalog", "history", "--json")["revisions"]
+        require(len(latest) == 3 and revision in {row["revisionId"] for row in latest},
+                "complete_history_survived_incomplete_scan")
 
     def launch(self, label, app, requests, *, component="owners", revision=None, policy=True):
         args = [self.cli, "run", "--project-dir", self.project]
@@ -102,6 +167,9 @@ class Journey:
     def run(self):
         ws = self.workspace
         self.call("init", "init")
+        if self.installed_prefix is not None:
+            require(self.call("installed_store_status", "status")["store_schema_version"] == 11,
+                    "installed_v11_store")
         if self.framework == "express":
             analyzer = self.root / "node-analyzer"
             script = ws / "adapters/node/packages/analyzer/dist/main.js"
@@ -130,9 +198,15 @@ process.once('SIGTERM', () => server.close());
         else:
             java = ws / "adapters/java"
             analyzer = java / "static-analyzer/build/install/xtrace-java-static/bin/xtrace-java-static"
+            agent = java / "agent-bootstrap/build/agent-dist/xtrace-java-agent.jar"
+            if self.installed_prefix is not None:
+                payload = (self.installed_prefix / "current/share/xtrace").resolve(strict=True)
+                agent = payload / "packs/java/agent/xtrace-java-agent.jar"
+                analyzer = None
+                require(agent.is_file(), "installed_launch_agent")
             src = self.source / "SpringLinkFixture.java"
             shutil.copyfile(ws / "tools/qa/fixtures/catalog-link/SpringLinkFixture.java", src)
-            app = ["--java-agent", java / "agent-bootstrap/build/agent-dist/xtrace-java-agent.jar",
+            app = ["--java-agent", agent,
                    "--app-package", "dev.xtrace.catalogfixture", "--", "java", "-cp",
                    os.environ["XTRACE_LINK_SPRING_CLASSPATH"], "dev.xtrace.catalogfixture.SpringLinkFixture",
                    "--server.port=0", "--server.address=127.0.0.1",
@@ -141,8 +215,10 @@ process.once('SIGTERM', () => server.close());
             matched = [("GET", "/owners/42", 200), ("GET", "/owners/" + self.seed, 200)]
             negatives = []
         scope = f"link-{self.framework}"
-        scan = ["scan", "--source", self.source, "--framework", self.framework, "--analyzer", analyzer,
+        scan = ["scan", "--source", self.source, "--framework", self.framework,
                 "--application-component", scope, "--binding-key", "default", "--json"]
+        if analyzer is not None:
+            scan.extend(["--analyzer", analyzer])
         first = self.call("scan_complete", *scan)
         require(first["status"] == "persisted_complete", "scan_not_complete")
         revision = first["catalogRevisionId"]
@@ -153,6 +229,8 @@ process.once('SIGTERM', () => server.close());
         catalog_id = operations[0]
         require(self.call("static_endpoint_list", "endpoint", "list")["items"] == [],
                 "scan_claimed_observation")
+        if self.installed_prefix is not None:
+            self.check_reconciliation(revision, endpoint, confirmed=False)
         original = src.read_text()
         if self.framework == "express":
             changed = original.replace("'/:ownerId'", "'/different'")
@@ -167,6 +245,8 @@ process.once('SIGTERM', () => server.close());
                     revision=second["catalogRevisionId"])
         self.launch("wrong_scope", app, matched[:1], component="wrong-scope", revision=revision)
         self.launch("default", app, matched[:1], policy=False)
+        if self.installed_prefix is not None:
+            self.check_static_refusals(scan, app, matched, scope, endpoint, catalog_id)
         rows = self.call("endpoint_list", "endpoint", "list")["items"]
         require(len(rows) == 1 and rows[0]["operationId"] == catalog_id
                 and (rows[0]["method"], rows[0]["routeTemplate"]) == endpoint
@@ -180,6 +260,8 @@ process.once('SIGTERM', () => server.close());
         reasons = ["no_catalog_match", "catalog_revision_unavailable", "observation_policy_missing"]
         if self.framework == "express":
             reasons.extend(["no_catalog_match", "route_template_unavailable_or_ineligible"])
+        if self.installed_prefix is not None:
+            reasons.append("no_catalog_match")
         require(sorted(row["unmatchedReason"] for row in unmatched) == sorted(reasons)
                 and all(row["operationId"] is None for row in unmatched), "unmatched_reasons")
         ids = {row["recordingId"] for row in linked + unmatched}
@@ -190,15 +272,27 @@ process.once('SIGTERM', () => server.close());
             require(detail["recording_id"] == row["recordingId"]
                     and detail["completion"] == "complete" and detail["outcome"]["kind"] == "responded",
                     "linked_recording_detail")
+        if self.installed_prefix is not None:
+            self.check_installed_restart(revision, endpoint, catalog_id, {row["recordingId"] for row in linked})
         print(f"{self.framework}: one stable operation, {len(linked)} linked, {len(unmatched)} unmatched")
 
 
 if __name__ == "__main__":
     os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("workspace", type=Path)
+    parser.add_argument("cli", type=Path)
+    parser.add_argument("root", type=Path)
+    parser.add_argument("--installed-prefix", type=Path)
+    args = parser.parse_args()
     try:
-        workspace, cli, root = map(Path, sys.argv[1:])
-        for framework in ("express", "spring-mvc"):
-            Journey(workspace, cli, root / framework, framework).run()
+        if args.installed_prefix is not None:
+            require(args.cli == args.installed_prefix / "bin/xtrace"
+                    and args.cli.resolve(strict=True) == (args.installed_prefix / "current/bin/xtrace").resolve(strict=True),
+                    "public_installer_launcher")
+        frameworks = ("spring-mvc",) if args.installed_prefix is not None else ("express", "spring-mvc")
+        for framework in frameworks:
+            Journey(args.workspace, args.cli, args.root / framework, framework, args.installed_prefix).run()
     except JourneyFailure as error:
         raise SystemExit(f"catalog link journey failed: {error}") from None
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, http.client.HTTPException) as error:
