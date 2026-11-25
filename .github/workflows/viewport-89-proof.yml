@@ -1,0 +1,65 @@
+name: Viewport browser judge proof
+
+on:
+  push:
+    branches:
+      - codex/viewport-89-proof
+
+permissions:
+  contents: read
+
+jobs:
+  viewport-89-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 9b9478fc0db19fa1b7e82fa3918adb17c4ff899f
+          persist-credentials: false
+      - name: Check exact product head and browser receipt judge
+        run: |
+          test "$(git rev-parse HEAD)" = "9b9478fc0db19fa1b7e82fa3918adb17c4ff899f"
+          python3 -B - <<'PY'
+          import contextlib
+          import io
+          import os
+          import subprocess
+          import unittest
+
+          from tools.qa.test_camp_instr_steps import T
+
+          checks = [
+              ("javascript-syntax", ["node", "--check", "tools/qa/browser_journeys.mjs"]),
+              ("workflow-lint", ["python3", "-B", "-m", "tools.qa.workflow_lint",
+                                 ".github/workflows/ci.yml", ".github/workflows/package.yml",
+                                 ".github/workflows/lane.yml", ".github/workflows/campaigns.yml"]),
+          ]
+          names = ["test_legacy_browser_report_identifies_exercised_widths", "test_packaged_browser_evidence"]
+          summary = ["Product SHA 9b9478fc0db19fa1b7e82fa3918adb17c4ff899f"]
+          checks_ok = True
+          for name, command in checks:
+              passed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+              checks_ok &= passed
+              summary.append(f"{name} {'pass' if passed else 'fail'}")
+
+          tests_ok = True
+          executed = ignored = 0
+          for name in names:
+              private = io.StringIO()
+              with contextlib.redirect_stdout(private), contextlib.redirect_stderr(private):
+                  result = unittest.TextTestRunner(stream=private).run(unittest.TestSuite([T(name)]))
+              skipped = len(result.skipped) + len(result.expectedFailures)
+              passed = result.wasSuccessful() and result.testsRun == 1 and skipped == 0
+              tests_ok &= passed
+              executed += result.testsRun
+              ignored += skipped
+              summary.append(f"{name} {'pass' if passed else 'fail'}")
+          summary.append(f"Browser judge tests executed {executed}; ignored {ignored}")
+
+          receipt = "\n".join(summary) + "\n"
+          print(receipt, end="")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write(receipt)
+          raise SystemExit(0 if checks_ok and tests_ok and executed == len(names) and ignored == 0 else 1)
+          PY
