@@ -46,7 +46,7 @@ export interface paths {
         };
         /**
          * List bounded persisted endpoint observations.
-         * @description Lists only persisted observations accepted under the finite spring-orders-v1 operator-selected policy. The policy does not attest which adapter or application produced the event, and this endpoint does not claim framework handler discovery or catalog completeness.
+         * @description Lists persisted operations with linked recordings under the spring-orders-v1 or runtime-route-v1 operator-selected policy. Each operation shows a representative policy. Use a linked recording's own policy for its disposition. Neither policy attests which adapter or application produced the event, and this endpoint does not claim framework handler discovery or catalog completeness.
          */
         get: operations["listObservedEndpoints"];
         put?: never;
@@ -221,21 +221,21 @@ export interface components {
             operationId: string;
             /** Format: uuid */
             projectId: string;
-            /** @constant */
-            applicationComponent: "spring-fixture";
-            /** @constant */
-            binding: "default";
-            /** @constant */
-            method: "POST";
-            /** @constant */
-            routeTemplate: "/orders";
+            /** @description Application component included in the linked operation's identity. */
+            applicationComponent: string;
+            /** @description Binding included in the linked operation's identity. */
+            binding: string;
+            /** @enum {string} */
+            method: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "TRACE" | "CONNECT";
+            /** @description Canonical linked operation template with at most 32 whole-segment {id} parameters. */
+            routeTemplate: string;
             /** @constant */
             observation: "observed";
             /**
-             * @description Operator-selected policy; it does not attest the adapter or application.
-             * @constant
+             * @description Representative operator-selected policy. When both policies have a valid link to the operation, the representative is spring-orders-v1. This field does not attest the adapter or application.
+             * @enum {string}
              */
-            observationPolicy: "spring-orders-v1";
+            observationPolicy: "spring-orders-v1" | "runtime-route-v1";
         };
         ObservedRecordingPage: {
             items: components["schemas"]["ObservedRecording"][];
@@ -257,10 +257,16 @@ export interface components {
             sessionContext: components["schemas"]["SessionContext"];
             /** Format: uuid */
             operationId: string | null;
-            /** @enum {string|null} */
-            observationPolicy: "spring-orders-v1" | null;
-            /** @enum {string|null} */
-            unmatchedReason: "observation_policy_missing" | "observation_policy_invalid" | "identity_context_missing" | "identity_context_invalid" | "method_unsupported" | "route_unapproved" | null;
+            /**
+             * @description Accepted policy recorded on this recording's sidecar, if available.
+             * @enum {string|null}
+             */
+            observationPolicy: "spring-orders-v1" | "runtime-route-v1" | null;
+            /**
+             * @description Closed unmatched reason, if recorded. Historical recordings may have no recorded reason.
+             * @enum {string|null}
+             */
+            unmatchedReason: "observation_policy_missing" | "observation_policy_invalid" | "identity_context_missing" | "identity_context_invalid" | "method_unsupported" | "route_unapproved" | "catalog_revision_unavailable" | "route_template_unavailable_or_ineligible" | "no_catalog_match" | null;
         };
         RecordingDetail: {
             /** @constant */

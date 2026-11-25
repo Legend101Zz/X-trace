@@ -1,0 +1,9 @@
+.value-list { list-style: none; margin: 4px 0 0; padding: 0; min-width: 0; }
+.value-binding { border-bottom: 1px solid var(--line); padding-block: 6px; overflow-wrap: anywhere; }
+.value-name { display: flex; flex-wrap: wrap; gap: 4px 8px; }
+.value-state { color: var(--muted); font-weight: 600; }
+.value-metadata { color: var(--muted); font-size: 11px; }
+.value-preview { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+.value-why > summary { color: var(--amber); cursor: pointer; }
+.value-why > summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+@media (max-width: 1023px), (pointer: coarse) { .value-why > summary { min-height: 44px; } }
