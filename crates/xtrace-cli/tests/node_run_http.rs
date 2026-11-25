@@ -96,6 +96,100 @@ fn direct_node_http_run_persists_private_concurrent_cjs_and_esm_recordings_acros
     assert_recording_evidence(&reopened, &repo, &data_home);
 }
 
+#[test]
+fn direct_node_https_run_persists_one_private_authenticated_tls_response() {
+    let root = temp_root();
+    let repo = root.path().join("repository");
+    let data_home = root.path().join("data");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let init = cli()
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize project");
+    assert!(init.status.success(), "init failed: {}", diagnostic(&init));
+
+    let tls = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+        .expect("generate ephemeral loopback TLS identity");
+    std::fs::write(root.path().join("cert.pem"), tls.cert.pem())
+        .expect("write fixture certificate");
+    std::fs::write(root.path().join("key.pem"), tls.key_pair.serialize_pem())
+        .expect("write fixture key in private temporary root");
+    let app = root.path().join("https-app.cjs");
+    std::fs::write(
+        &app,
+        r#"const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const https = require('node:https');
+const host = '127.0.0.1';
+const cert = fs.readFileSync('cert.pem');
+const key = fs.readFileSync('key.pem');
+const target = '/resource?token=QUERY_CANARY_TLS';
+const authorization = 'bearer-NODE_PRIVATE_CANARY_TLS';
+const server = https.createServer({ cert, key }, (request, response) => {
+  assert.equal(request.url === target, true, 'server received the request target');
+  assert.equal(request.headers.authorization === authorization, true, 'server received authorization');
+  response.writeHead(201);
+  response.end('accepted');
+});
+server.listen(0, host, () => {
+  const request = https.get({
+    host, port: server.address().port, path: target, headers: { authorization },
+    ca: cert, rejectUnauthorized: true, agent: false,
+  }, (response) => {
+    assert.equal(response.socket.encrypted, true);
+    assert.equal(response.socket.authorized, true);
+    assert.equal(response.statusCode, 201);
+    response.resume();
+    response.on('end', () => server.close(() => console.log('NODE_HTTPS_RESPONSE_VERIFIED')));
+  });
+  request.on('error', () => {
+    process.exitCode = 1;
+    server.close();
+  });
+});
+"#,
+    )
+    .expect("write direct Node HTTPS app");
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adapter_dist = workspace.join("adapters/node/packages/adapter-core/dist");
+    assert!(
+        adapter_dist.join("manifest.sha256").is_file(),
+        "run `npm run build:core --offline` before this test"
+    );
+    let mut child = RunChild(
+        cli()
+            .args(["run", "--project-dir"])
+            .arg(&repo)
+            .arg("--node-adapter")
+            .arg(adapter_dist)
+            .args(["--node-mode", "cjs", "--", "node"])
+            .arg(&app)
+            .current_dir(root.path())
+            .env("XTRACE_DATA_HOME", &data_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start supervised Node HTTPS app"),
+    );
+    let status = wait_for_child(&mut child, Duration::from_secs(15));
+    let mut stdout = String::new();
+    child.stdout.take().expect("xtrace stdout").read_to_string(&mut stdout).expect("read stdout");
+    let mut stderr = String::new();
+    child.stderr.take().expect("xtrace stderr").read_to_string(&mut stderr).expect("read stderr");
+    assert!(status.success(), "Node HTTPS run failed with {status}");
+    assert!(stdout.lines().any(|line| line == "NODE_HTTPS_RESPONSE_VERIFIED"));
+    for canary in ["NODE_PRIVATE_CANARY", "QUERY_CANARY", "bearer-"] {
+        assert!(!stdout.contains(canary) && !stderr.contains(canary), "HTTPS process leaked data");
+    }
+
+    let page = list_recordings(&repo, &data_home);
+    assert_eq!(page["recordings"].as_array().expect("recordings").len(), 1);
+    assert_recording_evidence(&page, &repo, &data_home);
+}
+
 /// `--node-mode auto` injects the `--require` preload only; it must capture CommonJS and ES module
 /// entries once each without perturbing a CommonJS entry's `nextTick`/microtask ordering.
 #[test]
@@ -436,6 +530,8 @@ fn assert_recording_evidence(page: &Value, repo: &Path, data_home: &Path) {
         // `unavailable.completion` reports whether durable terminal evidence exists; it is no
         // HTTP outcome projection. The recording must carry verified completion evidence.
         assert_eq!(detail["completion"], "complete", "terminal evidence must be verified");
+        assert_eq!(detail["outcome"]["kind"], "responded");
+        assert_eq!(detail["outcome"]["httpStatus"], 201);
         assert_eq!(detail["unavailable"]["completion"], "available");
         assert_eq!(detail["unavailable"]["values"], "unavailable");
         for canary in ["NODE_PRIVATE_CANARY", "QUERY_CANARY", "bearer-", "Content-Type"] {

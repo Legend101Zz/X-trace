@@ -1568,6 +1568,7 @@ dependencies = [
  "clap",
  "fs4",
  "prost",
+ "rcgen",
  "rusqlite",
  "rustix",
  "serde",
