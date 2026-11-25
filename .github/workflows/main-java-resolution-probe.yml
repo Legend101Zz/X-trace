@@ -84,6 +84,14 @@ jobs:
                       observations["fixedResolutionSignals"] = [
                           label for label, pattern in facts.items() if re.search(pattern, data)
                       ]
+                      request_pattern = (
+                          rb"Could not (GET|HEAD) 'https://repo\.maven\.apache\.org/[^'\r\n]{1,2048}'\."
+                          rb"\s{0,12}Received status code ([1-5][0-9]{2})\b"
+                      )
+                      observations["mavenCentralHttpOutcomes"] = [
+                          {"method": method.decode("ascii"), "status": int(status)}
+                          for method, status in sorted(set(re.findall(request_pattern, data)))[:12]
+                      ]
               if exit_code or gate.name == "java-strict":
                   break
           private_roots.atomic_write_private(
