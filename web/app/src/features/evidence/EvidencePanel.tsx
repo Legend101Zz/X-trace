@@ -1,10 +1,17 @@
+import { useId, useMemo, useState } from 'react';
 import { useViewport } from '../shell/viewport';
-import { NavigationControls } from './NavigationControls';
-import type { NavAction, NavFrameNavigation } from '../../replay/navigation';
+import type { NavAction } from '../../replay/navigation';
+import { missingEvidence } from '../../replay/missing';
+import type { MissingTarget } from '../../replay/missing';
 import { CodeEvidence } from '../code/CodeEvidence';
 import { Values } from './Values';
-import { sessionContextText } from '../../replay/outcome';
+import { Missing } from './Missing';
+import { EvidenceDetails } from './EvidenceDetails';
 import type { Detail, ReplayEvent } from '../../types';
+import './inspector-tabs.css';
+
+const TABS = ['Values', 'Missing', 'Details'] as const;
+type Tab = (typeof TABS)[number];
 
 export interface EvidencePanelProps {
   active: boolean;
@@ -14,35 +21,51 @@ export interface EvidencePanelProps {
   selectionUnavailable: string | null;
   onBackToEvent: () => void;
   onNavigate: (action: NavAction, frameId: string) => void;
+  onGoToMissing: (target: MissingTarget) => void;
 }
 
-export function EvidencePanel({ active, currentStatus, detail, event, selectionUnavailable, onBackToEvent, onNavigate }: EvidencePanelProps) {
+export function EvidencePanel({ active, currentStatus, detail, event, selectionUnavailable, onBackToEvent, onNavigate, onGoToMissing }: EvidencePanelProps) {
   const hasCodePane = useViewport('(min-width: 861px)');
-  const loadedFrameIds = new Set((detail?.events ?? []).flatMap((item) => item.frameId ? [item.frameId] : []));
+  const [tab, setTab] = useState<Tab>('Details');
+  const prefix = useId();
+  const reports = useMemo(() => detail ? missingEvidence(detail) : null, [detail]);
   return <section className="pane" role="tabpanel" id="evidence-panel" aria-labelledby="evidence-tab" data-active={active} aria-label="Evidence inspector">
-        <div className="pane-head"><div><div className="eyebrow">Persisted facts</div><h1>Evidence inspector</h1></div><span className="top-meta">{currentStatus}</span></div>
-        {event ? <button type="button" className="button button-primary phone-back-to-step" onClick={onBackToEvent}>Back to event {event.sequence}</button> : null}
-        <div className="inspector">
-          {detail?.sessionContext ? <div className="inspector-section"><div className="inspector-label">Session context</div><div className="inspector-value">{sessionContextText(detail.sessionContext)}</div></div> : null}
-          {event ? <>
-            <div className="inspector-section"><div className="inspector-label">Event identity</div><div className="inspector-value mono">{event.eventId || 'Unavailable'}</div>
-            <div className="inspector-value">Recorded kind · <span className="mono">{event.kind || 'Unavailable'}</span></div>
-            <div className="inspector-value">Event sequence · <span className="mono">{event.sequence}</span></div>
-            <div className="inspector-value">Recorded depth · <span className="mono">{event.depth ?? 'Unavailable'}</span></div></div>
-            {event.exception ? <div className="inspector-value">Thrown exception: <span className="mono">{event.exception.exceptionType ?? 'type not observed'}</span> · cause chain not observed</div> : null}
-            <div className="inspector-section"><div className="inspector-label">Relationships</div><div className="inspector-value">Parent: <span className="mono">{event.parentEventId || 'Unavailable'}</span></div><div className="inspector-value">Async parent: <span className="mono">{event.asyncParentEventId || 'Unavailable'}</span></div></div>
-            <div className="inspector-section"><div className="inspector-label">Persisted interaction</div>{event.interaction ? Object.entries(event.interaction).filter(([, value]) => value).map(([key, value]) => <div className="inspector-value" key={key}>{key}: <span className="mono">{value}</span></div>) : <div className="inspector-value">No interaction fields persisted</div>}</div>
-            {event.fieldTruncations.map((item) => <div key={item.field} className="evidence-state">{item.field} {item.representation} · {item.originalBytes} bytes</div>)}
-            {detail?.incompleteEvidence.map((item, index) => <div key={`${item}-${index}`} className="evidence-state">Persisted incomplete evidence: {item}</div>)}
-            {!hasCodePane ? <section className="inspector-section" aria-label="Code">
-              <h2 className="inspector-label">Recorded source evidence</h2>
-              <CodeEvidence event={event} />
-            </section> : null}
-            <Values bindings={event.bindings ?? []} />
-            <p className="evidence-state">response outcome is not event-verified</p>
-            <div className="inspector-section"><div className="inspector-label">Timing</div><div className="inspector-value">Monotonic timestamp: <span className="mono">{event.monotonicNs} ns</span></div><div className="evidence-state">Per-event duration is not recorded</div></div>
-            <NavigationControls navigation={event.navigation as NavFrameNavigation} loadedFrameIds={loadedFrameIds} actions={['previous', 'next']} onNavigate={onNavigate} />
-          </> : <div className="empty"><strong>Select an event</strong><p>{selectionUnavailable ?? "Event selection synchronizes this evidence inspector."}</p></div>}
+    <div className="pane-head"><div><div className="eyebrow">Persisted facts</div><h1>Evidence inspector</h1></div><span className="top-meta">{currentStatus}</span></div>
+    {event ? <button type="button" className="button button-primary phone-back-to-step" onClick={onBackToEvent}>Back to event {event.sequence}</button> : null}
+    <div className="inspector">
+      {!hasCodePane && event ? <section className="inspector-section" aria-label="Code">
+        <h2 className="inspector-label">Recorded source evidence</h2>
+        <CodeEvidence event={event} />
+      </section> : null}
+      {event ? <p className="evidence-state">response outcome is not event-verified</p> : null}
+      {detail && reports ? <>
+        <div className="inspector-tabs" role="tablist" aria-label="Inspector evidence" onKeyDown={(event) => {
+          const index = TABS.indexOf(tab);
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? TABS.length - 1
+            : event.key === 'ArrowLeft' ? (index + TABS.length - 1) % TABS.length
+              : event.key === 'ArrowRight' ? (index + 1) % TABS.length : null;
+          if (next === null || event.altKey || event.ctrlKey || event.metaKey) return;
+          event.preventDefault();
+          const label = TABS[next];
+          setTab(label);
+          document.getElementById(`${prefix}-tab-${label}`)?.focus();
+        }}>
+          {TABS.map((label) => <button type="button" className="button" key={label}
+            id={`${prefix}-tab-${label}`} role="tab" aria-selected={tab === label} tabIndex={tab === label ? 0 : -1}
+            aria-controls={`${prefix}-panel-${label}`} onClick={() => setTab(label)}>
+            {label}{label === 'Values' && event ? ` (${event.bindings?.length ?? 0})` : null}
+            {label === 'Missing' ? ` (${reports.window.length})` : null}
+          </button>)}
         </div>
-      </section>;
+        {TABS.map((label) => <div key={label} id={`${prefix}-panel-${label}`} role="tabpanel"
+          aria-labelledby={`${prefix}-tab-${label}`} hidden={tab !== label}>
+          {tab === label && label === 'Values' ? event ? <Values bindings={event.bindings ?? []} />
+            : <p className="evidence-state">{selectionUnavailable ?? 'Select an event for recorded bindings.'}</p> : null}
+          {tab === label && label === 'Missing' ? <Missing {...reports} onGoTo={onGoToMissing} /> : null}
+          {tab === label && label === 'Details'
+            ? <EvidenceDetails detail={detail} event={event} selectionUnavailable={selectionUnavailable} showSourceExplanation={hasCodePane} onNavigate={onNavigate} /> : null}
+        </div>)}
+      </> : <div className="empty"><strong>Select an event</strong><p>Event selection synchronizes this evidence inspector.</p></div>}
+    </div>
+  </section>;
 }

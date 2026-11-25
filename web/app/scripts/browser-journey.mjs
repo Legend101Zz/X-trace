@@ -128,6 +128,7 @@ try {
   await page.getByText(/Adapter reported a compile-time source binding; current source matches the recorded identity/).waitFor();
   const sourceExcerpt = await page.locator('.source-excerpt').textContent();
   assert.ok(sourceExcerpt?.includes('repository.save'), 'browser displays the matched bounded Spring source excerpt');
+  await page.getByRole('tablist', { name: 'Inspector evidence' }).getByRole('tab', { name: /^Values/ }).click();
   await page.getByText('No value bindings were recorded for this event').waitFor();
   await page.getByText(/response outcome is not event-verified/i).waitFor();
   await page.setViewportSize({ width: 1280, height: 720 });
@@ -329,7 +330,8 @@ try {
       assert.ok(!body.includes(canary), `API response included privacy canary ${canary}`);
     }
   }
-  const verifiedEvents = JSON.parse(apiPayloads.detailBody).events;
+  const verifiedDetail = JSON.parse(apiPayloads.detailBody);
+  const verifiedEvents = verifiedDetail.events;
   assert.deepEqual(verifiedEvents.map((event) => event.sequence), expectedSequences);
   assert.deepEqual(renderedStepKinds, verifiedEvents.map((event) => event.kind), 'Steps only renders kinds returned by the real recording read API');
   const knownKinds = new Set(['unspecified', 'request_update', 'frame_enter', 'frame_exit', 'frame_throw', 'line_cursor',
@@ -359,6 +361,8 @@ try {
   assert.ok(methodIndex >= 0, 'the standard Spring fixture returned a hash-matched method extent');
   const methodEvent = verifiedEvents[methodIndex];
   const expectedLines = methodEvent.source.excerpt.split('\n');
+  const actualGapCount = verifiedEvents.filter(({ kind, gap }) => kind === 'recording_event_kind:gap' || gap != null).length;
+  let observedMissingLabels;
   for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1440, 900]]) {
     await page.setViewportSize({ width, height });
     const eventsTab = page.getByRole('tab', { name: 'events' });
@@ -373,14 +377,45 @@ try {
       `Code numbers and preserves the real source rows at ${width}px`);
     assert.equal(await code.locator('[aria-current="location"], .source-inline').count(), 0,
       `an observed method extent alone must not highlight a line or place inline bindings at ${width}px`);
+    const inspectorTabs = page.getByRole('tablist', { name: 'Inspector evidence' });
+    await inspectorTabs.getByRole('tab', { name: /^Values/ }).click();
     const values = page.getByRole('region', { name: 'Values', exact: true });
     await expect(values.getByRole('heading')).toHaveText(`Values (${methodEvent.bindings.length})`);
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
       `Code and Values fit on the page at ${width}px`);
+    const detailsTab = inspectorTabs.getByRole('tab', { name: 'Details', exact: true });
+    await detailsTab.click();
+    const details = page.getByRole('region', { name: 'Event details', exact: true });
+    await expect(details.getByText(methodEvent.kind, { exact: true })).toBeVisible();
+    if (methodEvent.eventId) await expect(details.locator('[data-event-field="event-id"]')).toHaveText(methodEvent.eventId);
+    await expect(details.getByText(`${methodEvent.monotonicNs} ns`, { exact: true })).toBeVisible();
+    const recording = page.getByRole('region', { name: 'Recording details', exact: true });
+    if (verifiedDetail.capacity) await expect(recording.getByText(`Capacity drops · ${verifiedDetail.capacity.capacityDroppedEvents}`, { exact: true })).toBeVisible();
+    else await expect(recording.getByText('Event capacity facts unavailable')).toBeVisible();
+
+    await detailsTab.press('ArrowLeft');
+    const missingTab = inspectorTabs.getByRole('tab', { name: /^Missing/ });
+    await expect(missingTab).toBeFocused();
+    await expect(missingTab).toHaveAttribute('aria-selected', 'true');
+    const loaded = page.getByRole('region', { name: 'Loaded window missing evidence', exact: true });
+    await expect(loaded.locator('.missing-entry').filter({ has: page.getByText('Recorded gap', { exact: true }) })).toHaveCount(actualGapCount);
+    const labels = [...new Set(await loaded.locator('.missing-entry > strong').allTextContents())].sort();
+    if (observedMissingLabels) assert.deepEqual(labels, observedMissingLabels, 'loaded Missing categories remain stable across widths');
+    observedMissingLabels = labels;
+    const target = loaded.getByRole('button', { name: /^Go to event/ }).first();
+    if (await target.count()) {
+      const sequence = /[0-9]+$/.exec(await target.textContent())?.[0];
+      assert.ok(verifiedEvents.some((event) => event.sequence === sequence), 'Missing exposes only a loaded event target');
+      await target.click();
+      const row = page.locator('.event[aria-current="true"]');
+      await expect(row.locator('.event-seq')).toHaveText(sequence);
+      await expect(row).toBeFocused();
+    }
   }
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole('tab', { name: 'events' }).click();
   process.stdout.write('packaged Code and Values: hash-matched method extent, source numbering, no active line based on method range, and binding count at 320/736/1024/1440\n');
+  process.stdout.write(`packaged Inspector Details and Missing checked at 320/736/1024/1440; observed loaded row categories: ${observedMissingLabels.join(', ') || 'none'}\n`);
   process.stdout.write('focused Code proof: not exercised by the standard fixture browser journey\n');
   assert.equal(new URL(page.url()).hash, '', 'bootstrap fragment must be removed before exchange');
   const cookies = await context.cookies();

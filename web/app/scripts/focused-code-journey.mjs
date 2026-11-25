@@ -54,6 +54,7 @@ try {
     const shownLocal = active.locator('.value-binding').filter({ hasText: 'descriptionPresent' });
     assert.ok(await shownLocal.locator('.value-preview').textContent() === local.value.preview,
       `selected real local preview matches the read API inline at ${width}px`);
+    await page.getByRole('tablist', { name: 'Inspector evidence' }).getByRole('tab', { name: /^Values/ }).click();
     assert.ok((await page.getByRole('region', { name: 'Values', exact: true }).textContent()).includes('descriptionPresent'),
       `selected real local is in Values at ${width}px`);
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
