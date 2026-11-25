@@ -1,11 +1,11 @@
-name: focused-object-io-temporary
+name: concurrent-store-object-io-temporary
 on:
   push:
     branches: [codex/focused-object-io-diagnostic]
 permissions:
   contents: read
 jobs:
-  singleton-acknowledgement:
+  store-library:
     runs-on: ubuntu-24.04
     timeout-minutes: 80
     steps:
@@ -19,11 +19,15 @@ jobs:
         run: |
           umask 077
           root="${RUNNER_TEMP:?}/xt"
-          mkdir -m 700 "$root" "$root/c" "$root/tmp" "$root/priv" "$root/diagnostic"
+          mkdir -m 700 "$root" "$root/c" "$root/tmp" "$root/priv" "$root/diagnostic" "$root/frag" "$root/frag/ci-diag"
+          mkdir -m 700 "$root/private-io" "$root/private-io/direct" "$root/private-io/umask" "$root/private-io/held-request" "$root/private-io/catalog"
+          mkdir -m 700 "$root/private-io/first-attach" "$root/private-io/long-path-init"
           {
             echo "TMPDIR=$root/tmp"
             echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv"
             echo "XTRACE_TEST_CARDINALITY_SCRATCH=$root/c"
+            echo "XTRACE_TEST_PRIVATE_IO_ROOT=$root/private-io"
+            echo "XTRACE_CI_DIAG_DIR=$root/frag/ci-diag"
             echo "XTRACE_OBJECT_DIAGNOSTIC_ROOT=$root"
           } >> "$GITHUB_ENV"
       - name: Verify diagnostic attribution before running the workload
@@ -31,33 +35,66 @@ jobs:
           set -eu
           umask 077
           root="$XTRACE_OBJECT_DIAGNOSTIC_ROOT/diagnostic"
-          cargo test --locked -p xtrace-store --lib \
+          cargo test --locked -p xtrace-store --lib --all-features \
             recording_store::object_diagnostic::tests \
             -- --nocapture > "$root/diagnostic-unit.log" 2>&1
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$root/diagnostic-unit.log"
-          cargo test --locked -p xtrace-store --lib \
+          cargo test --locked -p xtrace-store --lib --all-features \
             recording_port::tests::journal_sync_errors_prevent_acknowledgement_and_report_original_io_facts \
             -- --exact --nocapture > "$root/correlated-io.log" 2>&1
           grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$root/correlated-io.log"
-      - name: Run the unchanged focused singleton test
+      - name: Run the store library with default test concurrency
         run: |
-          set -eu
+          set -euo pipefail
           umask 077
           root="$XTRACE_OBJECT_DIAGNOSTIC_ROOT"
+          capacity="$root/diagnostic/capacity.txt"
+          sample() {
+            local phase="$1" stats
+            if stats=$(stat -f -c 'available_blocks=%a free_inodes=%d block_size=%S' "$root/c" 2>/dev/null); then
+              printf 'phase=%s elapsed_seconds=%d %s\n' "$phase" "$SECONDS" "$stats"
+            else
+              printf 'phase=%s elapsed_seconds=%d capacity=unavailable\n' "$phase" "$SECONDS"
+            fi
+          }
+          monitor() {
+            local sleeper= index
+            stop_sleep() {
+              if [[ -n "$sleeper" ]]; then
+                kill -TERM "$sleeper" 2>/dev/null || true
+                wait "$sleeper" 2>/dev/null || true
+              fi
+              exit 0
+            }
+            trap stop_sleep INT TERM
+            for ((index = 0; index < 240; index += 1)); do
+              sleep 20 &
+              sleeper=$!
+              wait "$sleeper" || break
+              sleeper=
+              sample periodic
+            done
+          }
+          sample start > "$capacity"
+          monitor >> "$capacity" &
+          monitor_pid=$!
+          cleanup() {
+            kill -TERM "$monitor_pid" 2>/dev/null || true
+            wait "$monitor_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           status=0
-          {
-            echo 'scratch capacity before test'
-            stat -f -c 'available_blocks=%a free_inodes=%d block_size=%S' "$root/c"
-          } > "$root/diagnostic/capacity.txt"
-          cargo test --locked -p xtrace-store --lib             recording_port::tests::singleton_acknowledgements_at_focused_cap_recover_with_bounded_segments_and_pages             -- --exact --nocapture > "$root/diagnostic/singleton.log" 2>&1 || status=$?
-          {
-            echo 'scratch capacity after test cleanup'
-            stat -f -c 'available_blocks=%a free_inodes=%d block_size=%S' "$root/c"
-          } >> "$root/diagnostic/capacity.txt"
-          if [ "$status" -eq 0 ] && ! grep -q 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$root/diagnostic/singleton.log"; then
+          cargo test --locked -p xtrace-store --lib --all-features --no-fail-fast \
+            > "$root/diagnostic/store-lib.log" 2>&1 || status=$?
+          cleanup
+          trap - EXIT
+          sample end >> "$capacity"
+          if [[ "$status" -eq 0 ]] && ! grep -Fq 'test recording_port::tests::singleton_acknowledgements_at_focused_cap_recover_with_bounded_segments_and_pages ... ok' "$root/diagnostic/store-lib.log"; then
             status=1
           fi
-          echo "Focused singleton diagnostic exit: $status" >> "$GITHUB_STEP_SUMMARY"
+          echo "Concurrent store-library diagnostic exit: $status" >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Encrypt raw diagnostic logs
         if: always() && env.XTRACE_OBJECT_DIAGNOSTIC_ROOT != ''
@@ -68,12 +105,12 @@ jobs:
           umask 077
           root="$XTRACE_OBJECT_DIAGNOSTIC_ROOT"
           printf '%s' "$EVIDENCE_CERT" | base64 -d > "$root/evidence.crt"
-          tar -C "$root" -cf "$root/singleton-diagnostic.tar" diagnostic
-          openssl cms -encrypt -binary -aes-256-cbc             -in "$root/singleton-diagnostic.tar" -outform DER             -out "$RUNNER_TEMP/singleton-diagnostic.enc" "$root/evidence.crt"
+          tar -C "$root" -cf "$root/store-object-io-diagnostic.tar" diagnostic frag/ci-diag
+          openssl cms -encrypt -binary -aes-256-cbc             -in "$root/store-object-io-diagnostic.tar" -outform DER             -out "$RUNNER_TEMP/store-object-io-diagnostic.enc" "$root/evidence.crt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always() && env.XTRACE_OBJECT_DIAGNOSTIC_ROOT != ''
         with:
-          name: encrypted-singleton-diagnostic
-          path: ${{ runner.temp }}/singleton-diagnostic.enc
+          name: encrypted-store-object-io-diagnostic
+          path: ${{ runner.temp }}/store-object-io-diagnostic.enc
           if-no-files-found: error
           retention-days: 1
