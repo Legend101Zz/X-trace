@@ -22,6 +22,7 @@
 
 pub mod bundle;
 pub mod canonical;
+pub mod catalog;
 pub mod curl;
 pub mod input_json;
 pub mod openapi;
