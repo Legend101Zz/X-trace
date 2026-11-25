@@ -51,10 +51,12 @@ async function pageWithoutMovingAnchor(page, button, expectedCount) {
     const owner = body && getComputedStyle(body).overflowY === 'auto' ? body : element.closest('#events-panel');
     const viewport = owner.getBoundingClientRect();
     const rows = [...element.querySelectorAll('[data-step-sequence]')];
-    const first = rows.find((row) => {
-      const box = row.getBoundingClientRect();
-      return box.bottom > viewport.top && box.top < viewport.bottom;
-    });
+    const intersectsViewport = (node) => {
+      const box = node.getBoundingClientRect();
+      return box.height > 0 && box.bottom > viewport.top && box.top < viewport.bottom;
+    };
+    const first = rows.find(intersectsViewport);
+    const placeholderVisible = [...element.querySelectorAll('.steps-spacer')].some(intersectsViewport);
     const original = originalSequence === null ? first : rows.find((row) => row.dataset.stepSequence === originalSequence);
     const offset = (row) => row ? Math.round((row.getBoundingClientRect().top - viewport.top) * 10) / 10 : null;
     return {
@@ -74,14 +76,22 @@ async function pageWithoutMovingAnchor(page, button, expectedCount) {
         pageScrollTop: Math.round(window.scrollY),
         listTop: Math.round(element.getBoundingClientRect().top - viewport.top),
         mountedRows: rows.length,
+        placeholderVisible,
         desktopScrollOwner: owner === body,
       },
     };
   }, originalSequence);
-  const original = await anchor();
-  assert.ok(original.sequence !== null, 'the loaded list has a visible scroll anchor');
-  const samples = { beforeFocus: original.geometry };
+  const samples = {};
   try {
+    // A scroll can reveal an overscan placeholder before React mounts the actual rows.
+    // Sample only once the viewport intersects a real row and no virtual spacer.
+    let original;
+    await expect.poll(async () => {
+      original = await anchor();
+      samples.lastReadiness = original.geometry;
+      return original.sequence !== null && !original.geometry.placeholderVisible;
+    }).toBe(true);
+    samples.beforeFocus = original.geometry;
     await button.evaluate((node) => node.focus({ preventScroll: true }));
     samples.afterFocus = (await anchor(original.sequence)).geometry;
     await page.keyboard.press('Enter');
@@ -90,7 +100,8 @@ async function pageWithoutMovingAnchor(page, button, expectedCount) {
     await expect.poll(async () => {
       const now = await anchor(original.sequence);
       samples.final = now.geometry;
-      return now.sequence === original.sequence && Math.abs(now.exactOffset - original.exactOffset) <= 2;
+      return !now.geometry.placeholderVisible && now.sequence === original.sequence
+        && Math.abs(now.exactOffset - original.exactOffset) <= 2;
     }).toBe(true);
   } catch (error) {
     error.anchorGeometry = samples;
