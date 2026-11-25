@@ -1,0 +1,35 @@
+name: Campaign public archive proof
+on:
+  push:
+    branches: [diagnostic/campaign-archive-20261125]
+permissions:
+  contents: read
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          path: driver
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 522b2a95607ba7cefb8cefbafe167e377274e7ee
+          persist-credentials: false
+          path: subject
+      - name: Allowlist and verify the five synthetic public trees
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/archive-proof"
+          mkdir -m 700 "$root"
+          test "$(git -C subject rev-parse HEAD)" = 522b2a95607ba7cefb8cefbafe167e377274e7ee
+          python3 -B driver/tools/qa/archive_probe/produce.py "$GITHUB_WORKSPACE/subject" "$root" "$GITHUB_RUN_ID"
+          python3 -B driver/tools/qa/archive_probe/verify.py "$root/public" "$GITHUB_RUN_ID"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: synthetic-public-campaign-archive
+          path: ${{ runner.temp }}/archive-proof/public
+          if-no-files-found: error
+          retention-days: 14
