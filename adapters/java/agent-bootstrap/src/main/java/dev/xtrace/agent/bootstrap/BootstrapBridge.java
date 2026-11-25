@@ -506,37 +506,43 @@ public final class BootstrapBridge {
     return value.length() <= max ? value : value.substring(0, max);
   }
 
-  /** Emits the coarse H2 execute boundary without reading SQL or bind values. */
-  public static void databaseStart() {
+  /** Opens a coarse JDBC boundary without reading SQL, bind values or driver objects. */
+  public static String databaseStart(JdbcOperation operation) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (!captureActive(context) || sink == null || context.databaseActive) return;
+    if (operation == null || !captureActive(context) || sink == null
+        || context.databaseToken != null) return null;
     flushLine(context);
-    context.databaseActive = true;
     context.databaseEventId = "";
     String eventId = context.nextEventId();
+    context.databaseToken = eventId;
+    context.databaseOperation = operation;
     if (safeEvent(
         sink,
         context,
         eventId,
         context.currentParent(),
         BridgeEventKind.DATABASE_START,
-        "h2.executeUpdate",
+        operation.symbol(false),
         0)) {
       context.databaseEventId = eventId;
     } else {
       context.dropped++;
     }
+    return eventId;
   }
 
-  /** Emits the coarse H2 completion boundary. */
-  public static void databaseEnd(boolean threw) {
+  /** Only the entry that opened this boundary can close it. */
+  public static void databaseEnd(String token, boolean threw) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (!captureActive(context) || sink == null || !context.databaseActive) return;
+    if (token == null || !captureActive(context) || sink == null
+        || context.databaseToken != token) return;
     flushLine(context);
     String start = context.databaseEventId;
-    context.databaseActive = false;
+    JdbcOperation operation = context.databaseOperation;
+    context.databaseToken = null;
+    context.databaseOperation = null;
     context.databaseEventId = "";
     String eventId = context.nextEventId();
     if (!safeEvent(
@@ -545,7 +551,7 @@ public final class BootstrapBridge {
         eventId,
         start.isEmpty() ? context.currentParent() : start,
         BridgeEventKind.DATABASE_END,
-        threw ? "h2.executeUpdate.failed" : "h2.executeUpdate",
+        operation.symbol(threw),
         threw ? 1 : 0)) {
       context.dropped++;
     }
@@ -742,7 +748,8 @@ public final class BootstrapBridge {
     private boolean unresolvedReported;
     private String lastThrowEventId = "";
     private Throwable lastThrown;
-    private boolean databaseActive;
+    private String databaseToken;
+    private JdbcOperation databaseOperation;
     private String databaseEventId = "";
     private long dropped;
     private boolean linePending;

@@ -567,7 +567,7 @@ final class RecordingWriterSessionTest {
       }, queue, sink, Duration.ofSeconds(5));
     } else {
       // Use the production SessionTransport, not the permissive FakeTransport in writer unit tests.
-      writer = new RecordingWriter(session, queue, sink);
+      writer = new RecordingWriter(session, queue, sink, false);
     }
     try {
       assertTrue(sink.offerStart(FIRST, 1, "GET", "/first"));

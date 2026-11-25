@@ -1,6 +1,7 @@
 package demo.framework;
 
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
+import dev.xtrace.agent.bootstrap.JdbcOperation;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -59,8 +60,8 @@ public final class RepositoryProxyFactory {
       }
       if (method.getDeclaringClass() == Advised.class) return false;
       if (method.getDeclaringClass() == DecoratingProxy.class) return repository;
-      BootstrapBridge.databaseStart();
-      BootstrapBridge.databaseEnd(false);
+      var database = BootstrapBridge.databaseStart(JdbcOperation.H2_UPDATE);
+      BootstrapBridge.databaseEnd(database, false);
       if (method.getName().equals("findById")) {
         return ((Integer) arguments[0]) == 1 ? java.util.Optional.of("found") : java.util.Optional.empty();
       }

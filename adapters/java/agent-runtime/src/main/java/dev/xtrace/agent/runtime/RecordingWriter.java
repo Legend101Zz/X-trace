@@ -7,6 +7,7 @@ import dev.xtrace.adapter.XtpSession;
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
 import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.bootstrap.BridgeSink;
+import dev.xtrace.agent.bootstrap.JdbcOperation;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -89,9 +90,11 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private volatile long shutdownStartedNs;
   private volatile String capturePolicyId = "";
 
-  RecordingWriter(XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink)
+  RecordingWriter(
+      XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink, boolean pgJdbcEnabled)
       throws ClientException {
-    this(new SessionTransport(session), queue, sink, SHUTDOWN_TIMEOUT);
+    this(new SessionTransport(session), queue, sink, SHUTDOWN_TIMEOUT,
+        MAX_PENDING_EVENT_BYTES, pgJdbcEnabled);
   }
 
   RecordingWriter(
@@ -106,6 +109,13 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   RecordingWriter(
       Transport session, BoundedEventQueue queue, RuntimeBridgeSink sink,
       Duration shutdownTimeout, long maxPendingEventBytes) throws ClientException {
+    this(session, queue, sink, shutdownTimeout, maxPendingEventBytes, false);
+  }
+
+  private RecordingWriter(
+      Transport session, BoundedEventQueue queue, RuntimeBridgeSink sink,
+      Duration shutdownTimeout, long maxPendingEventBytes, boolean pgJdbcEnabled)
+      throws ClientException {
     if (shutdownTimeout.isZero() || shutdownTimeout.isNegative()) {
       throw new IllegalArgumentException("shutdown timeout must be positive");
     }
@@ -117,7 +127,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     this.sink = sink;
     this.shutdownTimeout = shutdownTimeout;
     this.maxPendingEventBytes = maxPendingEventBytes;
-    sendCapabilities();
+    sendCapabilities(pgJdbcEnabled);
     this.thread = new Thread(this, "xtrace-java-writer");
     this.thread.setDaemon(true);
   }
@@ -759,11 +769,14 @@ final class RecordingWriter implements AutoCloseable, Runnable {
               .setPath(event.detail() == 0 ? "unavailable" : Long.toString(event.detail())));
     } else if (kind == RecordingEventKind.RECORDING_EVENT_KIND_DATABASE_START
         || kind == RecordingEventKind.RECORDING_EVENT_KIND_DATABASE_END) {
-      builder.setInteraction(
-          Interaction.newBuilder()
-              .setKind(InteractionKind.INTERACTION_KIND_DATABASE)
-              .setDriver("h2")
-              .setMethod("executeUpdate"));
+      JdbcOperation operation = JdbcOperation.forSymbol(event.symbol());
+      if (operation != null) {
+        builder.setInteraction(
+            Interaction.newBuilder()
+                .setKind(InteractionKind.INTERACTION_KIND_DATABASE)
+                .setDriver(operation.driver())
+                .setMethod(operation.method()));
+      }
     }
     return builder.build();
   }
@@ -813,14 +826,15 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         .build();
   }
 
-  private void sendCapabilities() throws ClientException {
+  private void sendCapabilities(boolean pgJdbcEnabled) throws ClientException {
     Capability frames =
         Capability.newBuilder()
             .setName("method_frames")
             .putConfig("scope", "application_scope")
             .build();
-    Capability database =
-        Capability.newBuilder().setName("database").putConfig("driver", "h2").build();
+    Capability.Builder database =
+        Capability.newBuilder().setName("database").putConfig("driver", "h2");
+    if (pgJdbcEnabled) database.putConfig("drivers", "h2,pgjdbc");
     session.send(
         "java-premain-capabilities",
         "",
