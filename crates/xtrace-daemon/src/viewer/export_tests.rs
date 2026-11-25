@@ -382,7 +382,11 @@ with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as z:
         let _ = viewer.shutdown.send(());
         viewer.task.await.unwrap().unwrap();
     }
-    #[tokio::test]
+    // The timeout must be created on the timer driver's paused epoch. Pausing only
+    // after the reader starts leaves a fractional-millisecond deadline, which Tokio
+    // rounds up. An exact advance can then stop before that tick, and the blocked
+    // spawn_blocking reader inhibits the auto-advance needed to reach it.
+    #[tokio::test(start_paused = true)]
     async fn route_deadline_cancels_worker_and_retains_permit_until_actual_completion() {
         let (started, start) = tokio::sync::oneshot::channel();
         let started = std::sync::Mutex::new(Some(started));
@@ -421,11 +425,19 @@ with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as z:
             .body(Body::from(selection("openapi").to_string()))
             .unwrap();
         let mut app = router(state.clone());
+        let admitted_at = tokio::time::Instant::now();
         let request =
             tokio::spawn(async move { tower::Service::call(&mut app, request).await.unwrap() });
         let cancellation = start.await.unwrap();
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(14)).await;
+        assert_eq!(tokio::time::Instant::now(), admitted_at);
+        assert!(!request.is_finished(), "a blocked read has not completed the route");
+        tokio::time::advance(Duration::from_secs(13)).await;
+        assert!(!request.is_finished(), "the original 14-second deadline has not expired");
+        assert_eq!(state.query_lane.0.active.load(Ordering::Acquire), 1);
+        assert_eq!(state.query_lane.0.permits.available_permits(), 1);
+        assert_eq!(state.export_slots.available_permits(), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(tokio::time::Instant::now() - admitted_at, Duration::from_secs(14));
         let response = request.await.unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(cancellation.is_cancelled());
