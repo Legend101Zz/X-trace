@@ -32,7 +32,7 @@ cleanup() {
 }
 trap cleanup EXIT
 export HOME="$work/home"; mkdir -p "$HOME"
-unset XTRACE_DATA_HOME XDG_DATA_HOME XTRACE_PREFIX
+unset XTRACE_DATA_HOME XDG_DATA_HOME XTRACE_PREFIX XTRACE_JAVA_ANALYZER
 pass=0
 ok() { pass=$((pass+1)); echo "ok $pass - $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -42,7 +42,7 @@ sh "$(dirname "$0")/../install.sh" verify-dist "$dist" >/dev/null && ok "release
 mkdir "$work/x1" && tar -xzf "$archive" -C "$work/x1"
 top=$(ls "$work/x1")
 v1="$work/x1/$top"
-prefix="$work/prefix"
+prefix="$work/install prefix"
 
 # --- fresh profile install
 case "$(uname -s)" in Darwin) data="$HOME/Library/Application Support/xtrace" ;; *) data="$HOME/.local/share/xtrace" ;; esac
@@ -59,6 +59,29 @@ case "$(uname -s)" in Darwin) data="$HOME/Library/Application Support/xtrace" ;;
 repo="$work/repo"; mkdir -p "$repo"
 "$prefix/bin/xtrace" init --project-dir "$repo" >"$work/init.json" 2>&1 || { cat "$work/init.json"; fail "xtrace init"; }
 ok "init created a project in the fresh profile"
+# The real installed Java analyzer must resolve its launcher and JARs through the public CLI path.
+launcher="$prefix/current/share/xtrace/analyzers/java/bin/xtrace-java-static"
+[ -x "$launcher" ] && ok "installed Spring analyzer launcher is executable" || fail "installed analyzer launcher"
+mkdir "$repo/src"
+cat > "$repo/src/PackagedController.java" <<'EOF'
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+@RestController
+class PackagedController {
+  @GetMapping("/packaged-scan")
+  String route() { return "fixture"; }
+}
+EOF
+(cd "$work" && "$prefix/bin/xtrace" scan --project-dir "$repo" --source "$repo/src" --framework spring-mvc --json) >"$work/scan.json" 2>&1 || fail "installed Spring scan"
+grep -q '"routeTemplate": "/packaged-scan"' "$work/scan.json" &&
+  grep -Eq '"catalogRevisionId": *"[0-9a-f-]+"' "$work/scan.json" &&
+  ok "installed Spring scanner persisted the annotated route" || fail "installed Spring scan did not publish the route"
+mv "$launcher" "$work/missing-analyzer"
+if "$prefix/bin/xtrace" scan --project-dir "$repo" --source "$repo/src" --framework spring-mvc --json >"$work/missing-scan.json" 2>&1; then
+  fail "scan accepted a missing analyzer"
+fi
+mv "$work/missing-analyzer" "$launcher"
+ok "scan refuses a missing installed Spring analyzer"
 "$prefix/bin/xtrace" record --project-dir "$repo" >"$work/rec.json" 2>&1 || { cat "$work/rec.json"; fail "xtrace record"; }
 grep -q '"kind": "record_started"' "$work/rec.json" && ok "record started a detached daemon" || fail "record started a detached daemon"
 "$prefix/bin/xtrace" stop --project-dir "$repo" >"$work/stop.json" 2>&1 || { cat "$work/stop.json"; fail "xtrace stop"; }
@@ -85,6 +108,10 @@ if "$v1/install.sh" --prefix "$prefix" >/dev/null 2>&1; then fail "downgrade was
 cp -R "$v1" "$work/bad"; echo tamper >> "$work/bad/bin/xtrace"
 if "$work/bad/install.sh" --prefix "$work/prefix2" >/dev/null 2>&1; then fail "tampered payload installed"; else ok "tampered payload refused"; fi
 [ ! -e "$work/prefix2/current" ] && ok "refused install left no partial prefix state" || fail "refused install left no partial prefix state"
+echo tamper >> "$prefix/current/share/xtrace/analyzers/java/bin/xtrace-java-static"
+if "$prefix/current/install.sh" verify --prefix "$prefix" >/dev/null 2>&1; then fail "verify missed analyzer tampering"; else ok "verify detects modified installed analyzer"; fi
+cp "$work/v2/share/xtrace/analyzers/java/bin/xtrace-java-static" "$launcher"
+"$prefix/current/install.sh" verify --prefix "$prefix" >/dev/null || fail "restored analyzer payload did not verify"
 echo tamper >> "$prefix/current/bin/xtrace"
 if "$prefix/current/install.sh" verify --prefix "$prefix" >/dev/null 2>&1; then fail "verify missed tampering"; else ok "verify detects modified installed file"; fi
 
@@ -96,6 +123,6 @@ if "$v1/install.sh" --prefix "$data/inner" >/dev/null 2>&1; then fail "prefix in
 [ ! -e "$prefix/bin/xtrace" ] && [ ! -e "$prefix/versions" ] && ok "uninstall removed program files" || fail "uninstall removed program files"
 [ "$(cat "$data/projects/p1/rec-1.xtf")" = r1 ] && ok "uninstall left user data untouched" || fail "uninstall left user data untouched"
 [ -d "$prefix/backups" ] && ok "uninstall kept backups" || fail "uninstall kept backups"
-EXPECTED=25
+EXPECTED=29
 [ "$pass" -eq "$EXPECTED" ] || fail "expected $EXPECTED checks, ran $pass"
 echo "all $pass checks passed"
