@@ -166,16 +166,31 @@ public final class BootstrapBridge {
 
   /** Opens a request context for one matched route and emits its sanitized request identity. */
   public static boolean requestStart(String method, String route) {
+    return requestStart(method, route, 0, false);
+  }
+
+  /** Closes a route-less root from a completed standard filter-chain observation. */
+  static void filterRefusal(String method, long started, int status, boolean errorPending) {
+    if (!hasContext() && requestStart(method, "", started, true)) {
+      if (errorPending) provisionalRequestEnd(status, null);
+      else requestEnd(status, (Throwable) null);
+    }
+  }
+
+  private static boolean requestStart(
+      String method, String route, long chainStarted, boolean filterOnly) {
     RequestContext stale = CONTEXT.get();
     // A request whose end was deferred for exception resolution but never resolved on this
     // thread is closed without a status so it cannot leak into the next request. Only the
     // exception that caused deferral can propagate, never a handled frame throw.
     if (stale != null && stale.deferred) requestEnd(0, stale.deferredThrown);
-    if (CONTEXT.get() != null || !validMethod(method) || !validRoute(route)) return false;
+    if (CONTEXT.get() != null || !validMethod(method) || (!filterOnly && !validRoute(route))) {
+      return false;
+    }
     BridgeSink sink = SINK.get();
     if (sink == null) return false;
     String recordingId = UuidV7.random().toString();
-    long started = System.nanoTime();
+    long started = filterOnly ? chainStarted : System.nanoTime();
     RequestContext context = new RequestContext(recordingId, started);
     if (!safeStart(sink, context, method, route)) {
       safeIncomplete(sink, BridgeSink.INCOMPLETE_START_REJECTED);
@@ -189,7 +204,7 @@ public final class BootstrapBridge {
         requestId,
         "",
         BridgeEventKind.REQUEST_UPDATE,
-        "http.request " + method + " " + route,
+        "http.request " + method + (route.isEmpty() ? "" : " " + route),
         0)) {
       context.requestEventId = requestId;
     } else {

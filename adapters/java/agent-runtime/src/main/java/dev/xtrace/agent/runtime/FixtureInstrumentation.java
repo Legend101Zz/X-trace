@@ -15,6 +15,7 @@ import static net.bytebuddy.matcher.ElementMatchers.returns;
 import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
+import dev.xtrace.agent.bootstrap.ServletFilterBridge;
 import dev.xtrace.adapter.ClientException;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
@@ -112,6 +113,7 @@ final class FixtureInstrumentation {
       throw new IllegalStateException("fixture instrumentation is already installed");
     }
     SafeListener listener = new SafeListener(onFailure, scope, limitations);
+    if (!attach) ServletFilterBridge.enable();
     AgentBuilder builder =
         new AgentBuilder.Default()
             .disableClassFormatChanges()
@@ -446,6 +448,9 @@ final class FixtureInstrumentation {
         Throwable throwable) {
       if (recordedScope(classLoader, typeName, false) == ApplicationScope.APPLICATION) limitations.report();
       if (isExplicitTarget(typeName)) {
+        if (DISPATCHER.equals(typeName) || SPRING_ADAPTER.equals(typeName)) {
+          ServletFilterBridge.boundaryUnavailable();
+        }
         try {
           onFailure.run();
         } catch (Throwable ignored) {
