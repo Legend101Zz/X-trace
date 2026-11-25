@@ -41,7 +41,10 @@ class Journey:
                                 capture_output=True, timeout=30)
         require(self.seed.encode() not in output.stdout + output.stderr, "cli_canary")
         require(output.returncode == 0, code)
-        parsed = json.loads(output.stdout)
+        try:
+            parsed = json.loads(output.stdout)
+        except json.JSONDecodeError:
+            raise JourneyFailure("invalid_json_" + code) from None
         return parsed.get("data", parsed)
 
     def launch(self, label, app, requests, *, component="owners", revision=None, policy=True):
@@ -141,9 +144,11 @@ process.stdin.once('data', () => { process.stdin.pause(); server.close(); });
         first = self.call("scan_complete", *scan)
         require(first["status"] == "persisted_complete", "scan_not_complete")
         revision = first["catalogRevisionId"]
-        listing = self.call("catalog_list", "catalog", "list", "--revision", revision)
-        catalog_id, = (op["operationId"] for op in listing["operations"]
-                       if (op["method"], op["routeTemplate"]) == endpoint)
+        listing = self.call("catalog_list", "catalog", "list", "--revision", revision, "--json")
+        operations = [op["operationId"] for op in listing["operations"]
+                      if (op["method"], op["routeTemplate"]) == endpoint]
+        require(len(operations) == 1, "catalog_identity")
+        catalog_id = operations[0]
         require(self.call("static_endpoint_list", "endpoint", "list")["items"] == [],
                 "scan_claimed_observation")
         original = src.read_text()
@@ -194,5 +199,5 @@ if __name__ == "__main__":
             Journey(workspace, cli, root / framework, framework).run()
     except JourneyFailure as error:
         raise SystemExit(f"catalog link journey failed: {error}") from None
-    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, http.client.HTTPException):
-        raise SystemExit("catalog link journey failed: runner, timeout, or invalid evidence") from None
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, http.client.HTTPException) as error:
+        raise SystemExit(f"catalog link journey failed: {type(error).__name__}") from None
