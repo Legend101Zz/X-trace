@@ -36,8 +36,11 @@ def limit_output():
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_OUTPUT, MAX_OUTPUT))
 
 
-def collect(root: Path) -> bool:
+def collect(root: Path, *, list_limit: int = 100, detail_limit: int = 1000) -> bool:
     """Bound both pagination and wall time; partial CLI reads remain failures."""
+    if (type(list_limit) is not int or not 1 <= list_limit <= 100
+            or type(detail_limit) is not int or not 1 <= detail_limit <= 1000):
+        raise ValueError("invalid collection page limit")
     info = root.stat()
     if root.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("collection root is not owner-only")
@@ -65,7 +68,7 @@ def collect(root: Path) -> bool:
                 status["commandExits"].append(result.returncode)
             except subprocess.TimeoutExpired:
                 status["commandExits"].append(None)
-                raise CollectionFailure("command-timeout") from None
+                raise CollectionFailure("deadline" if remaining <= 30 else "command-timeout") from None
         if result.returncode:
             raise CollectionFailure("nonzero-exit", result.returncode)
         if stdout.stat().st_size > MAX_OUTPUT or stderr.stat().st_size > MAX_OUTPUT:
@@ -82,7 +85,7 @@ def collect(root: Path) -> bool:
     try:
         ids, after, seen = [], None, set()
         for page in range(MAX_PAGES):
-            args = ["list", "--limit", "100"] + (["--after", after] if after else [])
+            args = ["list", "--limit", str(list_limit)] + (["--after", after] if after else [])
             status["listCommands"] += 1
             doc = command(args, f"list-{page:02d}")
             rows = doc.get("recordings")
@@ -114,7 +117,7 @@ def collect(root: Path) -> bool:
         for index, rid in enumerate(ids):
             cursor, seen = None, set()
             for page in range(MAX_PAGES):
-                args = ["show", rid, "--limit", "1000"] + (["--cursor", cursor] if cursor else [])
+                args = ["show", rid, "--limit", str(detail_limit)] + (["--cursor", cursor] if cursor else [])
                 status["detailCommands"] += 1
                 doc = command(args, f"detail-{index:03d}-{page:02d}")
                 if doc.get("recording_id") != rid:

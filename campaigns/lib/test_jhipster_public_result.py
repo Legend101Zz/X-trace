@@ -534,6 +534,15 @@ class CollectSinks(unittest.TestCase):
         with zipfile.ZipFile(self.root / "sinks/recordings.zip") as archive:
             self.assertEqual(archive.namelist(), ["api-0000.json"])
 
+    def test_focused_proof_can_request_smaller_real_pages_without_raising_bounds(self):
+        with mock.patch.object(sinks.subprocess, "run", side_effect=self.run_cli) as run:
+            self.assertTrue(sinks.collect(self.root, list_limit=1, detail_limit=2))
+        self.assertEqual(run.call_args_list[0].args[0][3:5], ["--limit", "1"])
+        self.assertEqual(run.call_args_list[1].args[0][4:6], ["--limit", "2"])
+        for list_limit, detail_limit in ((0, 2), (101, 2), (1, 0), (1, 1001), (True, 2)):
+            with self.subTest(listLimit=list_limit, detailLimit=detail_limit), self.assertRaises(ValueError):
+                sinks.collect(self.root, list_limit=list_limit, detail_limit=detail_limit)
+
     def test_nonzero_preserves_private_output_and_unobserved_cli(self):
         def fail(args, **kwargs):
             kwargs["stderr"].write(b"private transport diagnostic")
@@ -556,6 +565,18 @@ class CollectSinks(unittest.TestCase):
         self.assertFalse(status["complete"])
         self.assertEqual(public.cli_diagnostics(status)["firstFailure"],
                          {"stage": "list", "reason": "command-timeout", "exitCode": None})
+
+    def test_timeout_capped_by_remaining_overall_budget_is_deadline(self):
+        with mock.patch.object(sinks.time, "monotonic", side_effect=[0, 175]), \
+                mock.patch.object(sinks.subprocess, "run", side_effect=subprocess.TimeoutExpired(
+                    "private-command", 5)) as run:
+            self.assertFalse(sinks.collect(self.root))
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+        status = json.loads((self.root / "sinks/cli-status.json").read_text())
+        self.assertEqual(status["commandExits"], [None])
+        self.assertEqual(public.cli_diagnostics(status)["firstFailure"],
+                         {"stage": "list", "reason": "deadline", "exitCode": None})
+        self.assertFalse(status["complete"])
 
     def test_detail_schema_failure_after_listing_preserves_safe_counts_and_artifact(self):
         def malformed(args, **kwargs):

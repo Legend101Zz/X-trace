@@ -111,6 +111,26 @@ class JHipsterBoundaryDiagnostics(unittest.TestCase):
         self.assertNotIn(PRIVATE, json.dumps(diagnostic))
         self.assertIsNone(client.deadline)
 
+    def test_list_only_partial_poll_never_reuses_previous_detail_counters(self):
+        previous = root("http.request GET /known")
+        previous["sessionContext"] = {"runtimeSessionId": PRIVATE, "rejectedRequests": "3"}
+        good = {"ok": True, "details": {"known": previous}}
+        fail = {"ok": False, "details": {}, "recordings": [{"recordingId": "newly-listed"}],
+                "reason": PRIVATE, "readFailure": {"stage": "list", "reason": "deadline"}}
+        with mock.patch.object(xinstr.time, "monotonic", return_value=1), \
+                mock.patch.object(xinstr, "collect_api", side_effect=[good, fail]):
+            boundary = xinstr.wait_burst_boundary(mock.Mock(), Path("unused"), SENT, EXPECTED, {}, 10,
+                                                 diagnose=True)
+        diagnostic = boundary["diagnostic"]
+        self.assertFalse(boundary["verified"])
+        self.assertEqual((diagnostic["polls"], diagnostic["snapshotPoll"]), (2, 2))
+        self.assertEqual(diagnostic["snapshot"], {
+            "listedNewRecordings": 1, "newRecordings": 0, "namedMatched": 0, "optionalNamed": 0,
+            "missingNamed": 1, "capacityRejected": 0, "unexpectedRoots": 0,
+            "unclassifiedRecordings": 0, "unreadRecordings": 0, "routeLess": []})
+        self.assertNotIn(PRIVATE, json.dumps(diagnostic))
+        self.assertIsNotNone(diag.projection(manifest("verified", [dict(diagnostic, ordinal=1, kind="serial")])))
+
     def test_strict_serial_still_rejects_partial_exact_named_recording(self):
         known = root("http.request GET /known", completion="partial", status=200)
         good = {"ok": True, "details": {"known": known}}

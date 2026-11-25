@@ -652,7 +652,7 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
             polls += 1
             api = collect_api(client, out_dir)
             # Keep observed counts for diagnosis even when the snapshot cannot verify the boundary.
-            if api["ok"] or api["details"]:
+            if api["ok"] or api["details"] or api.get("recordings"):
                 boundary = burst_accounting(api["details"], sent, expectations, before, before_capacity, optional_roots)
             if diagnose and (api["ok"] or api["details"] or api.get("recordings")):
                 observed = api["details"], api.get("recordings"), boundary
