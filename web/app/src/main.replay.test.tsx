@@ -41,7 +41,7 @@ async function openRecording() {
   render(<App />);
   fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
-  await screen.findByText('Controller.create');
+  await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('Controller.create');
   fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
 }
 
