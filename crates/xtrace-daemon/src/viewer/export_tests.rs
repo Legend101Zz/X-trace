@@ -36,6 +36,7 @@ mod export_contract_tests {
         second.route_template = "/".to_owned();
         let views = vec![view, second];
         CatalogExportSnapshot {
+            observed_operation_id: None,
             revision: RevisionEntry {
                 revision_id: xtrace_domain::CatalogRevisionId::new(),
                 ordinal: 1,
@@ -595,5 +596,77 @@ with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as z:
         assert_eq!(state.export_slots.available_permits(), 1);
         drop(clone);
         assert_eq!(state.export_slots.available_permits(), 2);
+    }
+    #[tokio::test]
+    async fn observed_scope_echoes_original_selector_and_exposes_only_resolved_catalog_id() {
+        let original = snapshot();
+        let catalog_id = original.operations[0].operation_id;
+        let observed_id = OperationId::new();
+        assert_ne!(observed_id, catalog_id);
+        let viewer = start_exports(move |_, _, scope, _| {
+            let mut selected = original.clone();
+            match scope {
+                CatalogExportScope::All => {}
+                CatalogExportScope::Operation(id) => {
+                    selected.operations.retain(|op| op.operation_id == id)
+                }
+                CatalogExportScope::ObservedOperation(id) if id == observed_id => {
+                    selected.observed_operation_id = Some(id);
+                    selected.operations.retain(|op| op.operation_id == catalog_id);
+                    selected.linked_operation_ids.insert(catalog_id);
+                }
+                CatalogExportScope::ObservedOperation(_) => {
+                    return Err(CatalogExportReadError::OperationNotFound);
+                }
+            }
+            if selected.operations.is_empty() {
+                return Err(CatalogExportReadError::OperationNotFound);
+            }
+            Ok(selected)
+        })
+        .await;
+        let cookie = authenticate(&viewer).await;
+        let mut body = selection("bundle");
+        body["scope"] = format!("observed:{observed_id}").into();
+        let (headers, bytes) = post(&viewer, &cookie, "preview", &body).await;
+        assert!(headers.starts_with("HTTP/1.1 200"));
+        let preview: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(preview["request"]["scope"], format!("observed:{observed_id}"));
+        assert_eq!(preview["catalogOperationId"], catalog_id.to_string());
+        assert_eq!(preview["selectedOperations"], 1);
+        body["approval"] = preview["approval"].clone();
+        assert!(post(&viewer, &cookie, "save", &body).await.0.starts_with("HTTP/1.1 200"));
+        body["scope"] = catalog_id.to_string().into();
+        assert!(post(&viewer, &cookie, "save", &body).await.0.starts_with("HTTP/1.1 409"));
+        let mut missing = selection("bundle");
+        missing["scope"] = format!("observed:{}", OperationId::new()).into();
+        assert!(post(&viewer, &cookie, "preview", &missing).await.0.starts_with("HTTP/1.1 404"));
+        let mut malformed = selection("bundle");
+        malformed["scope"] = "observed:not-an-id".into();
+        assert!(post(&viewer, &cookie, "preview", &malformed).await.0.starts_with("HTTP/1.1 400"));
+        for noncanonical in [
+            "ABCDEF01-2345-6789-ABCD-EF0123456789".to_owned(),
+            observed_id.to_string().replace('-', ""),
+            format!("{{{observed_id}}}"),
+            format!("urn:uuid:{observed_id}"),
+        ] {
+            malformed["scope"] = format!("observed:{noncanonical}").into();
+            for action in ["preview", "save"] {
+                if action == "save" {
+                    malformed["approval"] = preview["approval"].clone();
+                } else {
+                    malformed.as_object_mut().unwrap().remove("approval");
+                }
+                assert!(post(&viewer, &cookie, action, &malformed)
+                    .await
+                    .0
+                    .starts_with("HTTP/1.1 400"));
+            }
+        }
+        let (_, all) = post(&viewer, &cookie, "preview", &selection("bundle")).await;
+        let all: serde_json::Value = serde_json::from_slice(&all).unwrap();
+        assert!(all["catalogOperationId"].is_null());
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.unwrap().unwrap();
     }
 }

@@ -167,6 +167,9 @@ pub enum CatalogExportScope {
     All,
     /// Exactly this operation, when it belongs to the revision.
     Operation(OperationId),
+    /// One recording-backed observed endpoint, resolved by its exact tuple within the
+    /// selected revision. Its UUID belongs to the recording endpoint index, not the catalog.
+    ObservedOperation(OperationId),
 }
 
 /// Lightweight identity of one revision member used in export metadata.
@@ -187,6 +190,9 @@ pub struct CatalogExportOperationIdentity {
 /// Catalog export evidence read together for one admitted project.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogExportSnapshot {
+    /// Original observed endpoint selector whose backed tuple resolved the selected catalog
+    /// operation inside this snapshot, or `None` for direct catalog and all-operation reads.
+    pub observed_operation_id: Option<OperationId>,
     /// Resolved revision, with the count of all of its members.
     pub revision: RevisionEntry,
     /// Full revision identities for the shared CLI/viewer catalog digest and application name.

@@ -120,6 +120,14 @@ impl ExportBody {
         };
         let scope = if self.scope == "all" {
             CatalogExportScope::All
+        } else if let Some(id) = self.scope.strip_prefix("observed:") {
+            let operation_id: xtrace_domain::OperationId =
+                id.parse().map_err(|_| Failure::Invalid)?;
+            // UUID parsing also accepts spellings outside the selector's canonical grammar.
+            if operation_id.to_string() != id {
+                return Err(Failure::Invalid);
+            }
+            CatalogExportScope::ObservedOperation(operation_id)
         } else {
             CatalogExportScope::Operation(self.scope.parse().map_err(|_| Failure::Invalid)?)
         };
@@ -153,6 +161,7 @@ fn choices(request: ViewerExportRequest) -> Choices {
         scope: match request.scope {
             CatalogExportScope::All => "all".to_owned(),
             CatalogExportScope::Operation(id) => id.to_string(),
+            CatalogExportScope::ObservedOperation(id) => format!("observed:{id}"),
         },
     }
 }
@@ -189,6 +198,7 @@ struct PreviewMetadata {
     request_id: CorrelationId,
     project_id: ProjectId,
     request: Choices,
+    catalog_operation_id: Option<OperationId>,
     revision_id: CatalogRevisionId,
     revision_ordinal: u32,
     selected_operations: usize,
@@ -223,6 +233,7 @@ fn metadata(
         request_id,
         project_id,
         request: choices(preview.request),
+        catalog_operation_id: preview.catalog_operation_id,
         revision_id: preview.revision_id,
         revision_ordinal: preview.revision_ordinal,
         selected_operations: preview.selected_operations,

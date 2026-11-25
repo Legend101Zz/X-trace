@@ -10,7 +10,7 @@ use blake3::{Hash, Hasher};
 use xtrace_application::catalog_discovery::history::{
     CatalogExportRevision, CatalogExportScope, CatalogExportSnapshot,
 };
-use xtrace_domain::{CatalogRevisionId, HttpMethod, ids::Id};
+use xtrace_domain::{CatalogRevisionId, HttpMethod, OperationId, ids::Id};
 
 use crate::catalog::{self, CatalogExportError};
 use crate::{ExportError, ExportFile, ExportFormat, ExportOutput, ExportRequest, Omission};
@@ -77,6 +77,9 @@ pub struct PreviewOmission {
 pub struct ViewerExportPreview {
     /// Choices used to compute this preview.
     pub request: ViewerExportRequest,
+    /// Actual selected catalog identity, including resolution of an observed selector.
+    /// `None` means all revision members were selected.
+    pub catalog_operation_id: Option<OperationId>,
     /// Revision actually read.
     pub revision_id: CatalogRevisionId,
     /// Ordinal of the resolved revision.
@@ -109,7 +112,7 @@ impl ViewerExportPreview {
     #[must_use]
     pub fn approval(&self) -> ViewerExportApproval {
         let mut hash = Hasher::new();
-        hash.update(b"xtrace.viewer.export.approval.v1\0");
+        hash.update(b"xtrace.viewer.export.approval.v2\0");
         match self.request.revision {
             CatalogExportRevision::Latest => {
                 hash.update(&[0]);
@@ -126,6 +129,19 @@ impl ViewerExportPreview {
             CatalogExportScope::Operation(id) => {
                 hash.update(&[1]);
                 hash.update(id.as_uuid().as_bytes());
+            }
+            CatalogExportScope::ObservedOperation(id) => {
+                hash.update(&[2]);
+                hash.update(id.as_uuid().as_bytes());
+            }
+        }
+        match self.catalog_operation_id {
+            Some(id) => {
+                hash.update(&[1]);
+                hash.update(id.as_uuid().as_bytes());
+            }
+            None => {
+                hash.update(&[0]);
             }
         }
         hash_text(&mut hash, self.request.format.name());
@@ -370,6 +386,12 @@ fn validate_resolution(
     snapshot: &CatalogExportSnapshot,
     request: ViewerExportRequest,
 ) -> Result<(), ViewerExportError> {
+    match (request.scope, snapshot.observed_operation_id) {
+        (CatalogExportScope::ObservedOperation(requested), Some(resolved))
+            if requested == resolved => {}
+        (CatalogExportScope::All | CatalogExportScope::Operation(_), None) => {}
+        _ => return Err(ViewerExportError::OperationUnavailable),
+    }
     if request.yaml && request.format != ExportFormat::OpenApi {
         return Err(ViewerExportError::InvalidOptions);
     }
@@ -408,6 +430,16 @@ fn render(
         }
         CatalogExportScope::Operation(id) if selected_operations == 1 => Some(vec![id.to_string()]),
         CatalogExportScope::Operation(_) => return Err(IncompleteCatalog),
+        CatalogExportScope::ObservedOperation(_) if selected_operations == 1 => {
+            let id = snapshot.operations[0].operation_id;
+            if !snapshot.linked_operation_ids.contains(&id) {
+                return Err(ViewerExportError::OperationUnavailable);
+            }
+            Some(vec![id.to_string()])
+        }
+        CatalogExportScope::ObservedOperation(_) => {
+            return Err(ViewerExportError::OperationUnavailable);
+        }
     };
     let input = catalog::prepare_snapshot(snapshot);
     let request_for_renderer =
@@ -446,6 +478,12 @@ fn summarize(
         summarize_files(&output.files, request, selected_operations, root_names_unambiguous)?;
     let metadata = ViewerExportPreview {
         request,
+        catalog_operation_id: match request.scope {
+            CatalogExportScope::All => None,
+            CatalogExportScope::Operation(_) | CatalogExportScope::ObservedOperation(_) => {
+                snapshot.operations.first().map(|op| op.operation_id)
+            }
+        },
         revision_id: snapshot.revision.revision_id,
         revision_ordinal: snapshot.revision.ordinal,
         selected_operations,

@@ -56,7 +56,11 @@ The OpenAPI contract documents both routes and their generated browser types.
 2. Request one format and either all operations of the selected project revision or one stable operation ID in
    that revision. The visible scope label names the revision; "all" does not promise every recording or the latest
    revision of every catalog scope. An unmatched recording or runtime-only endpoint without revision membership
-   has an explicit unavailable reason. Do not substitute a similarly named route.
+   has an explicit unavailable reason. The persisted observed endpoint ID and catalog operation ID have separate
+   allocation histories. The browser supplies the observed selector. The store resolves its exact project, component,
+   binding, HTTP transport, method and declared route to one member of the requested revision within the same read
+   transaction. Missing or ambiguous membership stops the export. Preview echoes the requested selector and returns
+   the resolved catalog operation ID for CLI parity. Direct catalog UUID selection remains supported.
 3. Preview exposes format, options, resolved revision and selection, selected and emitted operation counts, and
    the byte count, logical mode and exact-byte digest of each file. OpenAPI counts native method/path slots, which
    may be fewer than the selected operations when alternate scopes are attached to a native slot. Fixed artifact
@@ -84,8 +88,9 @@ latest again or reading the same explicitly requested historical revision. It al
 again. A valid new snapshot is compared with the approved revision and digest before releasing the exact file
 collection from that render. When the approved projection changes, the UI offers Refresh preview.
 
-The approval digest includes resolved revision and ordinal, requested revision policy, scope and selected ID if
-present, format/options, selected and emitted counts, the safe file inventory, total bytes and the grouped
+The v2 approval digest binds the requested selector kind and original ID, including an observed endpoint ID,
+and the resolved catalog operation ID for single-endpoint scopes. It also includes the resolved revision and
+ordinal, requested revision policy, format/options, selected and emitted counts, safe file inventory, total bytes and grouped
 omissions. It also includes the existing exporter content digest over sorted, length-prefixed actual file paths,
 logical modes and exact bytes. Two projections can have identical files but distinct safe omissions or other
 approval metadata. A latest revision change also requires refresh even if the observed files match. For a
