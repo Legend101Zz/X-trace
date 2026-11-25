@@ -28,23 +28,15 @@ jobs:
           root="$XTRACE_ACL_MEASUREMENT_ROOT"
           export CARGO_TARGET_DIR="$root/target"
           export XTRACE_ACL_PROBE_SCRATCH="$root/fixture"
-          cargo build --locked -p xtrace-private-storage --message-format=json             > "$root/diagnostic/cargo.jsonl" 2> "$root/diagnostic/cargo.log"
-          python3 -B - "$root" > "$root/diagnostic/compile.log" 2>&1 <<'PY'
-          import json, pathlib, subprocess, sys, tomllib
-          root = pathlib.Path(sys.argv[1])
-          pin, = [pkg["version"] for pkg in tomllib.loads(pathlib.Path("Cargo.lock").read_text())["package"] if pkg["name"] == "rustix"]
-          artifacts = set()
-          for line in (root / "diagnostic/cargo.jsonl").read_text().splitlines():
-              receipt = json.loads(line)
-              if receipt["reason"] == "compiler-artifact" and receipt["target"]["name"] == "rustix":
-                  assert receipt["package_id"].rsplit("#", 1)[-1] == "rustix@" + pin
-                  artifacts.update(path for path in receipt["filenames"] if path.endswith(".rlib"))
-          artifact, = artifacts
-          subprocess.run(["rustc", "--edition=2024", "-C", "opt-level=0", "-C", "debuginfo=1",
-                          "-L", f"dependency={pathlib.Path(artifact).parent}", "--extern", f"rustix={artifact}",
-                          "tools/qa/fixtures/linux_acl_probe_measurement.rs", "-o", root / "acl-probe"], check=True)
-          PY
-          "$root/acl-probe" > "$root/diagnostic/measurement.log" 2>&1
+          # Use Cargo's normal dependency resolution and linker for the standalone
+          # fixture. The temporary example is removed when this step exits.
+          fixture=crates/xtrace-private-storage/examples/acl_probe_measurement.rs
+          test ! -e "$fixture"
+          mkdir -p "$(dirname "$fixture")"
+          trap 'rm -f -- "$fixture"' EXIT
+          cp tools/qa/fixtures/linux_acl_probe_measurement.rs "$fixture"
+          cargo run --locked -p xtrace-private-storage --example acl_probe_measurement \
+            > "$root/diagnostic/measurement.log" 2> "$root/diagnostic/compile.log"
           python3 -B - "$root/diagnostic/measurement.log" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import collections, pathlib, re, statistics, sys
           rows = collections.defaultdict(list)
