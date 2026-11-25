@@ -1,0 +1,51 @@
+name: Replay unit failure location
+on:
+  push:
+    branches: [codex/proof-replay-unit-location-118]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 5142310091f193fc8eda4092bc6edb8ffd202d77
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Locate previous replay suite failure
+        run: |
+          set -eu
+          umask 077
+          test "$(git rev-parse 'HEAD^{tree}')" = 22f5ef57bc7dd3034e5a642cd28e8d494c07e84e
+          cd web/app
+          d=$(mktemp -d "$RUNNER_TEMP/replay-diagnostic.XXXXXX")
+          export REPLAY_DIAG="$d"
+          npm ci --ignore-scripts --no-audit --no-fund >"$d/deps" 2>&1
+          command_status=0
+          npm exec -- vitest run src/main.replay.test.tsx --reporter=json --outputFile="$d/results" >"$d/output" 2>&1 || command_status=$?
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          p=pathlib.Path(os.environ['REPLAY_DIAG'])/'results'
+          assert p.is_file() and p.stat().st_size < 8000000
+          v=json.loads(p.read_bytes())
+          rows=v['testResults']
+          src=pathlib.Path('src/main.replay.test.tsx')
+          assert len(rows)==1 and pathlib.Path(rows[0]['name']).resolve()==src.resolve()
+          code=src.read_text().splitlines()
+          cases=rows[0]['assertionResults']
+          assert 0<len(cases)<200
+          for case in cases:
+              if case['status']=='passed': continue
+              starts=[n for n,s in enumerate(code,1) if s.lstrip().startswith("it("+repr(case['title'])+",")]
+              messages=' '.join(case.get('failureMessages',[]))
+              locs=sorted({int(m) for m in re.findall(r'main\.replay\.test\.tsx:(\d{1,5})',messages) if 0<int(m)<=len(code)})
+              families={k for k,pattern in [('focus','toHaveFocus'),('multiple','multiple elements'),('missing','Unable to find'),('timer','function'),('equal','to be'),('attribute','to have attribute'),('timeout','timed out')] if pattern in messages}
+              print('Case declaration',starts,'source lines',locs,'categories',sorted(families))
+          print('Replay assertions passed',sum(c['status']=='passed' for c in cases),'of',len(cases))
+          assert all(c['status']=='passed' for c in cases)
+          PY
+          exit "$command_status"
