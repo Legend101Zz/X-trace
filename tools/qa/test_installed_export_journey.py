@@ -190,6 +190,175 @@ class BrowserReceiptTests(unittest.TestCase):
                 journey.load_browser_receipt(path)
 
 
+class ApiEvidenceReceiptTests(unittest.TestCase):
+    def evidence(self):
+        resources = {name: {"responses": journey.API_MINIMA.get(name, 0), "written": journey.API_MINIMA.get(name, 0)}
+                     for name in journey.API_RESOURCES}
+        count = sum(group["written"] for group in resources.values())
+        counts = {name: 0 for name in journey.API_COUNTS}
+        counts.update(requests=count, responses=count, jsonResponses=count, terminalRequests=count, bytesWritten=2 * count)
+        return {"schemaVersion": 1, "status": "pass", "sealed": True, "counts": counts,
+                "phases": {name: {"started": count, "passed": count, "failed": 0} for name in journey.API_PHASES},
+                "resources": resources, "failures": {name: 0 for name in journey.API_CATEGORIES}}
+
+    def receipt(self, passed=False):
+        row = {"width": 320, "coarse": False, "cases": 10 if passed else 0, "status": "pass" if passed else "fail",
+               "cleanupStatus": "pass", "cleanupStage": None, "pageErrors": 0, "consoleErrors": 0, "externalRequests": 0,
+               "failureSubstage": None if passed else "preview-focus", "failureCase": None, "cleanupFailures": [],
+               "apiEvidence": self.evidence()}
+        cases = [{"id": "320-fine", "caseId": case_id, "scope": scope, "format": fmt, "yaml": yaml}
+                 for case_id, (scope, fmt, yaml) in journey.BROWSER_CASES.items()] if passed else []
+        return {"schemaVersion": 3, "identity": {"sourceSha": "a" * 40, "packageSha256": "b" * 64},
+                "apiEvidenceSource": {"schemaVersion": 1, "transport": "passive-browser-response",
+                                      "driverSha256": "c" * 64, "collectorSha256": "d" * 64, "visibilitySha256": "e" * 64},
+                "checkpointSequence": 8, "status": "fail", "failureSubstage": None, "browserCleanup": "pass",
+                "current": {"rowId": None, "caseId": None, "stage": "complete"}, "rows": [row], "cases": cases,
+                "heightProbes": [{"width": 320, "height": height, "coarse": False, "status": "pass",
+                                  "checks": {name: "not-required" if name == "initialAction" and height == 260 else "pass"
+                                             for name in journey.HEIGHT_PROBE_CHECKS}} for height in (450, 260)] if passed else []}
+
+    def test_projection_preserves_fixed_capture_stages_and_source_identity(self):
+        receipt = self.receipt()
+        projection = journey.project_browser_receipt(receipt, receipt["identity"], receipt["apiEvidenceSource"])
+        self.assertEqual(projection["browserRows"][0]["apiEvidence"], receipt["rows"][0]["apiEvidence"])
+        self.assertEqual(projection["browserApiEvidenceSource"], receipt["apiEvidenceSource"])
+        self.assertEqual(projection["viewports"], 0)
+        projection["browserRows"][0]["apiEvidence"]["counts"]["requests"] = 0
+        self.assertGreater(receipt["rows"][0]["apiEvidence"]["counts"]["requests"], 0)
+
+    def test_unknown_text_boolean_counters_and_unbalanced_lifetimes_are_rejected(self):
+        for mutation in (
+                lambda value: value.update(path="private-input-canary"),
+                lambda value: value["failures"].update({"private-input-canary": 1}),
+                lambda value: value["counts"].update(requests=True),
+                lambda value: value["counts"].update(activeRequests=1),
+                lambda value: value["phases"]["write"].update(passed=0),
+                lambda value: value["resources"]["preview"].update(written=0),
+                lambda value: value["counts"].update(pendingCaptures=1),
+                lambda value: value["failures"].update({"body-unavailable": 1}),
+                lambda value: value.update(sealed=False)):
+            with self.subTest(mutation=mutation), self.assertRaises(journey.JourneyFailure):
+                value = self.evidence()
+                mutation(value)
+                journey.project_api_evidence(value, True)
+
+    def test_a_canceled_json_body_is_reported_failed_without_counting_it_as_no_response(self):
+        value = self.evidence()
+        count = value["counts"]["jsonResponses"]
+        value["status"] = "fail"
+        value["counts"]["bytesWritten"] -= 2
+        for phase in ("body", "bounds", "write"):
+            value["phases"][phase].update(started=count - 1, passed=count - 1)
+        value["phases"]["finish"].update(passed=count - 1, failed=1)
+        value["resources"]["preview"]["written"] -= 1
+        value["failures"]["request-aborted"] = 1
+        projection = journey.project_api_evidence(value, False)
+        self.assertEqual(projection["counts"]["abortedBeforeResponse"], 0)
+        self.assertEqual(projection["phases"]["finish"]["failed"], 1)
+        with self.assertRaisesRegex(journey.JourneyFailure, "coverage"):
+            journey.project_api_evidence(value, True)
+
+    def test_resource_coverage_cannot_be_replaced_by_extra_preview_payloads(self):
+        value = self.evidence()
+        value["resources"]["preview"]["responses"] += 1
+        value["resources"]["preview"]["written"] += 1
+        value["resources"]["auth"] = {"responses": 0, "written": 0}
+        with self.assertRaisesRegex(journey.JourneyFailure, "coverage"):
+            journey.project_api_evidence(value, True)
+
+    def test_source_identity_rejects_old_schema_and_changed_capture_source(self):
+        receipt = self.receipt()
+        changed = dict(receipt["apiEvidenceSource"], collectorSha256="e" * 64)
+        with self.assertRaisesRegex(journey.JourneyFailure, "source-parity"):
+            journey.project_browser_receipt(receipt, receipt["identity"], changed)
+        receipt["schemaVersion"] = 2
+        with self.assertRaisesRegex(journey.JourneyFailure, "source-parity"):
+            journey.project_browser_receipt(receipt, receipt["identity"], receipt["apiEvidenceSource"])
+
+    def test_passed_capture_must_have_every_private_payload_with_matching_byte_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt = self.receipt(passed=True)
+            directory = root / "320-fine"
+            directory.mkdir(mode=0o700)
+            count = receipt["rows"][0]["apiEvidence"]["counts"]["jsonResponses"]
+            for index in range(count):
+                path = directory / f"api-{index}.json"
+                path.write_bytes(b"{}")
+                path.chmod(0o600)
+            checkpoint = root / "browser.private.json"
+            checkpoint.write_text(json.dumps(receipt))
+            checkpoint.chmod(0o600)
+            _, projection = journey.load_browser_receipt(checkpoint, receipt["identity"], receipt["apiEvidenceSource"])
+            self.assertEqual(projection["viewports"], 1)
+            last = directory / f"api-{count - 1}.json"
+            last.unlink()
+            with self.assertRaisesRegex(journey.JourneyFailure, "api-files"):
+                journey.load_browser_receipt(checkpoint)
+            last.write_bytes(b"[]")
+            last.chmod(0o644)
+            with self.assertRaisesRegex(journey.JourneyFailure, "api-files"):
+                journey.load_browser_receipt(checkpoint)
+            last.chmod(0o600)
+            last.write_bytes(b"[] ")
+            with self.assertRaisesRegex(journey.JourneyFailure, "api-files"):
+                journey.load_browser_receipt(checkpoint)
+
+
+class HeightProbeReceiptTests(unittest.TestCase):
+    def probe(self, height=450, status="in-progress"):
+        return {"width": 320, "height": height, "coarse": False, "status": status,
+                "checks": {name: "not-required" if name == "initialAction" and height == 260 else "not-reached"
+                           for name in journey.HEIGHT_PROBE_CHECKS}}
+
+    def test_partial_and_failed_probes_round_trip_without_credit(self):
+        for height in (450, 260):
+            for check in ("viewport", "initialAction", "contentScroll", "keyboardAction"):
+                if height == 260 and check == "initialAction":
+                    continue
+                probe = self.probe(height)
+                for name in journey.HEIGHT_PROBE_CHECKS:
+                    if name == check:
+                        break
+                    if probe["checks"][name] != "not-required":
+                        probe["checks"][name] = "pass"
+                rows = [{"width": 320, "coarse": False, "status": "in-progress"}]
+                self.assertEqual(journey.project_height_probes([probe], rows, "in-progress"), [probe])
+                probe["checks"][check] = "fail"
+                probe["checks"]["restore"] = "pass"
+                probe["status"] = "fail"
+                self.assertEqual(journey.project_height_probes([probe], rows, "fail"), [probe])
+
+    def test_missing_duplicate_wrong_height_and_raw_probe_fields_are_rejected(self):
+        rows = [{"width": 320, "coarse": False, "status": "pass"}]
+        with self.assertRaisesRegex(journey.JourneyFailure, "coverage"):
+            journey.project_height_probes([], rows, "fail")
+        rows[0]["status"] = "fail"
+        probe = self.probe()
+        for probes in ([probe, probe], [dict(probe, height=480)], [dict(probe, coarse=1)],
+                       [dict(probe, path="private-input-canary")], [dict(probe, status="pass")]):
+            with self.subTest(probes=probes), self.assertRaises(journey.JourneyFailure):
+                journey.project_height_probes(probes, rows, "fail")
+
+    def test_full_height_matrix_is_separate_from_the_900_pixel_cases(self):
+        rows, probes = [], []
+        for width in journey.WIDTHS:
+            for coarse in (False, True):
+                rows.append({"width": width, "coarse": coarse, "status": "pass"})
+                if width in (320, 736):
+                    for height in (450, 260):
+                        probe = self.probe(height, "pass")
+                        probe.update(width=width, coarse=coarse)
+                        for name in journey.HEIGHT_PROBE_CHECKS:
+                            if probe["checks"][name] != "not-required":
+                                probe["checks"][name] = "pass"
+                        probes.append(probe)
+        self.assertEqual(len(journey.project_height_probes(probes, rows, "pass")), 8)
+        self.assertEqual(len(rows), 10)
+        with self.assertRaisesRegex(journey.JourneyFailure, "coverage"):
+            journey.project_height_probes(probes[:-1], rows, "pass")
+
+
 class DownloadJudgeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

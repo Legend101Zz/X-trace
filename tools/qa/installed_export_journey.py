@@ -79,15 +79,112 @@ def require(condition, code):
         raise JourneyFailure(code)
 
 
-def project_browser_receipt(receipt, expected_identity=None):
+API_PHASES = ("headers", "finish", "body", "bounds", "write")
+API_CATEGORIES = ("response-limit", "header-limit", "request-aborted", "request-failed", "context-closed",
+                  "navigation-invalidated", "finish-unavailable", "body-unavailable", "body-timeout",
+                  "body-limit", "write-failed", "write-timeout", "drain-timeout", "coverage-gap")
+API_RESOURCES = ("auth", "endpoints", "linked", "recordings", "detail", "preview", "save", "other")
+API_COUNTS = ("requests", "responses", "jsonResponses", "nonJsonResponses", "terminalRequests",
+              "abortedBeforeResponse", "teardownAborted", "activeRequests", "pendingCaptures", "bytesWritten")
+API_MINIMA = {"auth": 1, "endpoints": 1, "linked": 1, "detail": 1, "preview": 10, "save": 4}
+
+
+def browser_evidence_source(repo):
+    """Bind the passive collector and its driver to the pinned source checkout."""
+    return {"schemaVersion": 1, "transport": "passive-browser-response",
+            "driverSha256": hashlib.sha256(read_bounded(repo / "web/app/scripts/installed-export-journey.mjs")).hexdigest(),
+            "collectorSha256": hashlib.sha256(read_bounded(repo / "web/app/scripts/api-evidence.mjs")).hexdigest(),
+            "visibilitySha256": hashlib.sha256(read_bounded(repo / "web/app/scripts/export-visibility.mjs")).hexdigest()}
+
+
+def project_api_evidence(value, row_passed):
+    """Closed numeric/categorical projection; never accept unknown text or unbalanced capture stages."""
+    require(isinstance(value, dict) and set(value) == {"schemaVersion", "status", "sealed", "counts", "phases", "resources", "failures"}
+            and type(value["schemaVersion"]) is int and value["schemaVersion"] == 1
+            and value["status"] in ("not-reached", "in-progress", "pass", "fail") and type(value["sealed"]) is bool,
+            "browser-api-schema")
+    counts, phases, resources, failures = (value[key] for key in ("counts", "phases", "resources", "failures"))
+    def integers(group, keys, maximum=1_000_000):
+        return (isinstance(group, dict) and set(group) == set(keys)
+                and all(type(item) is int and 0 <= item <= maximum for item in group.values()))
+    require(isinstance(counts, dict) and set(counts) == set(API_COUNTS)
+            and all(type(item) is int and 0 <= item <= (4096 * MAX_LOG if key == "bytesWritten" else 1_000_000)
+                    for key, item in counts.items()), "browser-api-counts")
+    require(isinstance(phases, dict) and set(phases) == set(API_PHASES)
+            and all(integers(group, ("started", "passed", "failed"))
+                    and group["started"] >= group["passed"] + group["failed"] for group in phases.values()),
+            "browser-api-phases")
+    require(isinstance(resources, dict) and set(resources) == set(API_RESOURCES)
+            and all(integers(group, ("responses", "written")) and group["written"] <= group["responses"] for group in resources.values())
+            and integers(failures, API_CATEGORIES), "browser-api-categories")
+    require(counts["requests"] == counts["terminalRequests"] + counts["activeRequests"]
+            and counts["responses"] == counts["jsonResponses"] + counts["nonJsonResponses"] <= counts["requests"]
+            and counts["abortedBeforeResponse"] + counts["teardownAborted"] <= counts["terminalRequests"]
+            and sum(group["responses"] for group in resources.values()) == counts["jsonResponses"] == phases["headers"]["started"]
+            and sum(group["written"] for group in resources.values()) == phases["write"]["passed"]
+            and all(phases[following]["started"] <= phases[previous]["passed"]
+                    for previous, following in zip(API_PHASES, API_PHASES[1:])), "browser-api-parity")
+    failed_captures = sum(group["failed"] for group in phases.values())
+    require(counts["jsonResponses"] == phases["write"]["passed"] + failed_captures + counts["pendingCaptures"]
+            and (not any(failures.values()) or value["status"] == "fail"), "browser-api-parity")
+    if value["status"] == "pass":
+        require(value["sealed"] and not any(failures.values()) and counts["activeRequests"] == counts["pendingCaptures"] == 0
+                and counts["requests"] == counts["responses"] + counts["abortedBeforeResponse"] + counts["teardownAborted"]
+                and counts["jsonResponses"] == phases["write"]["passed"] <= 4096
+                and all(group["started"] == group["passed"] == counts["jsonResponses"] and group["failed"] == 0 for group in phases.values()),
+                "browser-api-outcome")
+    if row_passed:
+        require(value["status"] == "pass" and all(resources[name]["written"] >= minimum for name, minimum in API_MINIMA.items()),
+                "browser-api-coverage")
+    if value["status"] == "not-reached":
+        require(not value["sealed"] and not any(counts.values()) and not any(failures.values()), "browser-api-outcome")
+    # All keys were checked, and JSON primitives are copied so callers cannot mutate the source receipt.
+    return json.loads(json.dumps(value))
+
+
+HEIGHT_PROBE_CHECKS = ("viewport", "initialAction", "contentScroll", "keyboardAction", "restore")
+HEIGHT_PROBE_EXPECTED = {(width, height, coarse) for width in (320, 736) for height in (450, 260) for coarse in (False, True)}
+
+
+def project_height_probes(probes, rows, status):
+    require(isinstance(probes, list) and len(probes) <= 8, "browser-height-probes")
+    seen, passed = set(), set()
+    identities = {(row["width"], row["coarse"]) for row in rows}
+    for probe in probes:
+        require(isinstance(probe, dict) and set(probe) == {"width", "height", "coarse", "status", "checks"}
+                and type(probe["width"]) is int and type(probe["height"]) is int and type(probe["coarse"]) is bool,
+                "browser-height-probe-schema")
+        identity = (probe["width"], probe["height"], probe["coarse"])
+        require(identity in HEIGHT_PROBE_EXPECTED and identity not in seen
+                and (probe["width"], probe["coarse"]) in identities, "browser-height-probe-identity")
+        seen.add(identity)
+        checks = probe["checks"]
+        require(probe["status"] in ("in-progress", "pass", "fail") and isinstance(checks, dict) and set(checks) == set(HEIGHT_PROBE_CHECKS)
+                and all(isinstance(item, str) and item in ("not-reached", "pass", "fail") for key, item in checks.items() if key != "initialAction")
+                and (checks["initialAction"] == "not-required" if probe["height"] == 260 else checks["initialAction"] in ("not-reached", "pass", "fail")),
+                "browser-height-probe-checks")
+        require(probe["status"] != "pass" or all(checks[key] == "pass" for key in HEIGHT_PROBE_CHECKS if key != "initialAction")
+                and checks["initialAction"] == ("pass" if probe["height"] == 450 else "not-required"), "browser-height-probe-outcome")
+        require(probe["status"] != "fail" or "fail" in checks.values(), "browser-height-probe-outcome")
+        if probe["status"] == "pass":
+            passed.add(identity)
+    for row in rows:
+        if row["status"] == "pass" and row["width"] in (320, 736):
+            require(all((row["width"], height, row["coarse"]) in passed for height in (450, 260)), "browser-height-probe-coverage")
+    require(status != "pass" or passed == HEIGHT_PROBE_EXPECTED, "browser-height-probe-coverage")
+    return json.loads(json.dumps(probes))
+
+
+def project_browser_receipt(receipt, expected_identity=None, expected_evidence_source=None):
     """Project partial private evidence only after validating closed, bounded fields.
 
     Failure stacks, URLs, DOM and commands never enter the public summary. A passed
     row counts only after its teardown, and browser teardown has its own outcome.
     """
-    require(isinstance(receipt, dict) and type(receipt.get("schemaVersion")) is int and receipt["schemaVersion"] in (1, 2),
+    require(isinstance(receipt, dict) and type(receipt.get("schemaVersion")) is int and receipt["schemaVersion"] in (1, 2, 3),
             "browser-receipt-schema")
-    progress = receipt["schemaVersion"] == 2
+    progress = receipt["schemaVersion"] >= 2
+    capture = receipt["schemaVersion"] == 3
     build_identity = None
     if progress:
         build_identity = receipt.get("identity")
@@ -99,6 +196,16 @@ def project_browser_receipt(receipt, expected_identity=None):
         require(type(sequence) is int and 1 <= sequence <= 10_000_000, "browser-receipt-sequence")
     if expected_identity is not None:
         require(progress and build_identity == expected_identity, "browser-receipt-identity-parity")
+    evidence_source = None
+    if capture:
+        evidence_source = receipt.get("apiEvidenceSource")
+        require(isinstance(evidence_source, dict) and set(evidence_source) == {"schemaVersion", "transport", "driverSha256", "collectorSha256", "visibilitySha256"}
+                and type(evidence_source["schemaVersion"]) is int and evidence_source["schemaVersion"] == 1
+                and evidence_source["transport"] == "passive-browser-response"
+                and all(isinstance(evidence_source[key], str) and re.fullmatch(r"[0-9a-f]{64}", evidence_source[key])
+                        for key in ("driverSha256", "collectorSha256", "visibilitySha256")), "browser-api-source")
+    if expected_evidence_source is not None:
+        require(capture and evidence_source == expected_evidence_source, "browser-api-source-parity")
     rows, cases = receipt.get("rows"), receipt.get("cases")
     require(isinstance(rows, list) and len(rows) <= 10 and isinstance(cases, list) and len(cases) <= 100,
             "browser-receipt-bounds")
@@ -139,6 +246,8 @@ def project_browser_receipt(receipt, expected_identity=None):
                     and (cleanup_status != "fail" or failures)
                     and (row_status != "pass" or cleanup_status == "pass"), "browser-receipt-row-cleanup")
             clean = {"cleanupStatus": cleanup_status, "cleanupStage": cleanup_stage}
+        if capture:
+            clean["apiEvidence"] = project_api_evidence(row.get("apiEvidence"), row_status == "pass")
         projected.append({"width": width, "coarse": coarse, "cases": count, "status": row_status,
                           "failureSubstage": stage, "failureCase": case, "cleanupFailures": list(failures), **errors, **clean})
     counts, seen = Counter(), set()
@@ -172,10 +281,13 @@ def project_browser_receipt(receipt, expected_identity=None):
               "browserCleanup": cleanup, "browserRows": projected}
     if progress:
         result.update(browserIdentity=dict(build_identity), browserCurrent=dict(current), browserCheckpointSequence=receipt["checkpointSequence"])
+    if capture:
+        result["browserApiEvidenceSource"] = dict(evidence_source)
+        result["browserHeightProbes"] = project_height_probes(receipt.get("heightProbes"), projected, status)
     return result
 
 
-def load_browser_receipt(path, expected_identity=None):
+def load_browser_receipt(path, expected_identity=None, expected_evidence_source=None):
     """Read one atomically replaced checkpoint; malformed/truncated bytes never project."""
     require(path.is_file() and not path.is_symlink(), "browser-receipt-file")
     metadata = path.stat()
@@ -184,7 +296,26 @@ def load_browser_receipt(path, expected_identity=None):
         receipt = json.loads(read_bounded(path, MAX_BROWSER_RECEIPT))
     except (ValueError, UnicodeError) as error:
         raise JourneyFailure("browser-receipt-json") from error
-    return receipt, project_browser_receipt(receipt, expected_identity)
+    projection = project_browser_receipt(receipt, expected_identity, expected_evidence_source)
+    if receipt["schemaVersion"] == 3:
+        for row in receipt["rows"]:
+            if row["status"] != "pass":
+                continue
+            directory = path.parent / f"{row['width']}-{'coarse' if row['coarse'] else 'fine'}"
+            require(directory.is_dir() and not directory.is_symlink(), "browser-api-files")
+            info = directory.stat()
+            require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700, "browser-api-files")
+            count = row["apiEvidence"]["counts"]["jsonResponses"]
+            total = 0
+            for index in range(count):
+                payload = directory / f"api-{index}.json"
+                require(payload.is_file() and not payload.is_symlink(), "browser-api-files")
+                info = payload.stat()
+                require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= MAX_LOG,
+                        "browser-api-files")
+                total += len(read_bounded(payload))
+            require(total == row["apiEvidence"]["counts"]["bytesWritten"], "browser-api-files")
+    return receipt, projection
 
 
 def private_json(path, value):
@@ -520,7 +651,7 @@ def run(args, private, report):
     identity = {"sourceSha": args.source_sha, "packageSha256": args.package_sha256}
     browser = None
     try:
-        browser, projection = load_browser_receipt(browser_dir / "browser.private.json", identity)
+        browser, projection = load_browser_receipt(browser_dir / "browser.private.json", identity, browser_evidence_source(repo))
         report.update(projection)
     except JourneyFailure as error:
         report["browserReceiptFailure"] = str(error)

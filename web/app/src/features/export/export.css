@@ -9,16 +9,41 @@
   border-radius: var(--radius);
 }
 .viewer-dialog:has(.export-sheet)::backdrop { background: var(--scrim); }
-.viewer-dialog:has(.export-sheet) .viewer-dialog-body { padding: 0; }
-.viewer-dialog:has(.export-sheet) .viewer-dialog-header { flex-wrap: wrap; gap: .75rem; }
-.viewer-dialog:has(.export-sheet) .viewer-dialog-header h2 { margin: 0; flex: 1 1 auto; }
-.viewer-dialog:has(.export-sheet) .viewer-dialog-header nav { flex: 0 1 auto; min-width: 0; }
-.viewer-dialog:has(.export-sheet) .viewer-dialog-header > button { margin-inline-start: auto; }
-.export-sheet { font-size: .875rem; line-height: 1.45; overflow-wrap: anywhere; }
-.export-sheet > nav, .export-sheet > section { padding: .6rem 1rem; }
-.export-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; padding: 0; margin: 0; list-style: none; font-size: .875rem; }
+/* Only the phase content scrolls, leaving the progress and actions in view. */
+.viewer-dialog:has(.export-sheet) .viewer-dialog-body { display: flex; overflow: hidden; padding: 0; }
+.viewer-dialog:has(.export-sheet) .viewer-dialog-header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "title progress close";
+  flex-shrink: 0;
+  gap: .5rem .75rem;
+}
+.viewer-dialog:has(.export-sheet) .viewer-dialog-header h2 { grid-area: title; margin: 0; font-size: 1.125rem; }
+.viewer-dialog:has(.export-sheet) .viewer-dialog-header nav { grid-area: progress; min-width: 0; }
+.viewer-dialog:has(.export-sheet) .viewer-dialog-header > button { grid-area: close; justify-self: end; }
+.export-sheet {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  font-size: .875rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.export-sheet > section {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: .6rem 1rem;
+  overscroll-behavior: contain;
+}
+.export-sheet > section:focus-visible { outline-offset: -2px; }
+.export-sheet > nav { padding: .6rem 1rem; }
+.export-sheet > :is(nav, .export-feedback, .export-footer) { flex-shrink: 0; }
+.export-progress { display: flex; align-items: center; flex-wrap: wrap; gap: .35rem 1rem; padding: 0; margin: 0; list-style: none; font-size: .875rem; }
 .export-progress li { display: flex; gap: .35rem; align-items: center; color: var(--muted); }
-.export-progress li span { display: grid; place-items: center; width: 1.4rem; height: 1.4rem; border: 1px solid var(--line-strong); border-radius: 50%; }
+.export-progress li span { flex: none; display: grid; place-items: center; width: 1.4rem; height: 1.4rem; border: 1px solid var(--line-strong); border-radius: 50%; }
 .export-progress li[aria-current] { color: var(--text); font-weight: 600; }
 .export-progress li[aria-current] span, .export-sheet .export-primary {
   color: var(--on-accent); background: var(--amber); border-color: var(--amber);
@@ -39,10 +64,10 @@
 .export-formats button span { display: block; margin-top: .25rem; color: var(--muted); }
 .export-sheet .export-encoding { display: inline-flex; align-items: center; gap: .5rem; margin: .5rem 0; }
 .export-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
-.export-footer { padding: .7rem 1rem; justify-content: end; border-top: 1px solid var(--line); }
+.export-footer { padding: .7rem 1rem; justify-content: end; background: var(--panel); border-top: 1px solid var(--line); }
 .export-footer span { margin-inline-end: auto; color: var(--muted); }
-.export-feedback:not(:empty) { padding: .5rem 1rem; }
-.export-preview { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
+.export-feedback:not(:empty) { max-height: 20dvh; overflow: auto; padding: .5rem 1rem; }
+.export-preview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; }
 .export-preview > *, .export-files button, .export-command { min-width: 0; }
 .export-sheet code { display: block; font: .75rem/1.6 var(--mono); overflow-wrap: anywhere; }
 .export-files { display: grid; gap: .3rem; margin: 0 0 .6rem; }
@@ -62,10 +87,24 @@
 .export-command code { margin: .4rem 0; padding: .5rem; background: var(--surface); }
 @media (max-width: 40rem) {
   .viewer-dialog:has(.export-sheet) { width: 100%; max-height: 100dvh; }
-  .viewer-dialog:has(.export-sheet) .viewer-dialog-header nav { order: 1; flex-basis: 100%; }
+  .viewer-dialog:has(.export-sheet) .viewer-dialog-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "title close" "progress progress";
+  }
+  .export-progress { gap: .35rem .75rem; }
   .export-preview, .export-formats { grid-template-columns: minmax(0, 1fr); }
-  .export-footer > span { flex-basis: 100%; }
-  .export-footer > button { flex: 1 1 auto; }
+  .export-footer > span { flex-basis: 100%; margin-inline-end: 0; }
+  .export-footer > button { flex: 1 1 0; padding-inline: .4rem; }
+}
+@media (max-height: 30rem) {
+  .viewer-dialog:has(.export-sheet) { max-height: 100dvh; }
+  .viewer-dialog:has(.export-sheet) .viewer-dialog-header { padding-block: .25rem; }
+  .export-footer { padding-block: .25rem; }
+}
+@media (max-height: 17rem) {
+  /* If the chrome itself fills the screen, let the body and its actions scroll together. */
+  .viewer-dialog:has(.export-sheet) .viewer-dialog-body { display: block; overflow: auto; }
+  .export-sheet > section { overflow: visible; }
 }
 
 .request-branch > .export-trigger, #recordings-panel > .export-trigger { margin: .25rem .65rem; }

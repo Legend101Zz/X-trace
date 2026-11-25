@@ -123,7 +123,12 @@ export function ExportSheet({ endpoint, onClose, onPhaseChange }: {
   // Unmounting the modal invalidates both in-flight responses and browser downloads.
   useLayoutEffect(() => () => { active.current?.abort(); }, []);
   useEffect(() => {
-    if (phase !== 'Choose') focusTarget.current?.focus();
+    const panel = focusTarget.current;
+    if (!panel) return;
+    panel.scrollTop = 0;
+    const body = panel.closest<HTMLElement>('.viewer-dialog-body');
+    if (body) body.scrollTop = 0;
+    if (phase !== 'Choose') panel.focus({ preventScroll: true });
   }, [phase]);
   useEffect(() => { onPhaseChange?.(phase); }, [phase, onPhaseChange]);
 
@@ -135,7 +140,7 @@ export function ExportSheet({ endpoint, onClose, onPhaseChange }: {
     setPreview(null);
     setFeedback('');
     setPhase('Choose');
-    requestAnimationFrame(() => focusTarget.current?.focus());
+    requestAnimationFrame(() => focusTarget.current?.focus({ preventScroll: true }));
   }
 
   async function submit(action: 'preview' | 'save') {

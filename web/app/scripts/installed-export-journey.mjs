@@ -1,12 +1,18 @@
 // Hosted-only proof against the embedded viewer; all input and output are private.
 // stdin: {xtrace, projectDir, out, operationId, catalogOperationId, recordingId}; stdout is fixed counts only.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { apiEvidence, newApiEvidence } from './api-evidence.mjs';
+import { visibleControl } from './export-visibility.mjs';
 import { spawn } from 'node:child_process';
 import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { open, mkdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium, expect } from '@playwright/test';
 
+// Browser screenshots use the process umask rather than a per-call mode option.
+process.umask(0o077);
 let input = '';
 for await (const chunk of process.stdin) input += chunk;
 const config = JSON.parse(input);
@@ -17,7 +23,13 @@ const formats = [
 ];
 assert.match(config.identity?.sourceSha ?? '', /^[0-9a-f]{40}$/);
 assert.match(config.identity?.packageSha256 ?? '', /^[0-9a-f]{64}$/);
-const report = { schemaVersion: 2, identity: config.identity, rows: [], cases: [], status: 'in-progress',
+const apiEvidenceSource = {
+  schemaVersion: 1, transport: 'passive-browser-response',
+  driverSha256: createHash('sha256').update(await readFile(new URL(import.meta.url))).digest('hex'),
+  collectorSha256: createHash('sha256').update(await readFile(new URL('./api-evidence.mjs', import.meta.url))).digest('hex'),
+  visibilitySha256: createHash('sha256').update(await readFile(new URL('./export-visibility.mjs', import.meta.url))).digest('hex'),
+};
+const report = { schemaVersion: 3, identity: config.identity, apiEvidenceSource, rows: [], cases: [], heightProbes: [], status: 'in-progress',
   failureSubstage: null, browserCleanup: 'not-reached', checkpointSequence: 0,
   current: { rowId: null, caseId: null, stage: 'browser-launch' } };
 let browser, activeRow = null, activeCase = null;
@@ -135,6 +147,78 @@ async function stop({ child, stdout, stderr, state }) {
   assert.equal(child.exitCode, 0, 'viewer-exit-status');
 }
 
+async function primaryActionVisible(dialog, name) {
+  // Read initial geometry only: an actionability click or scrollIntoView would hide the defect.
+  assert.ok(await dialog.getByRole('button', { name, exact: true }).evaluate(visibleControl), 'primary-phase-action-viewport');
+}
+
+async function shortPreviewProbes(page, dialog, row) {
+  for (const height of [450, 260]) {
+    const probe = { width: row.width, height, coarse: row.coarse, status: 'in-progress',
+      checks: { viewport: 'not-reached', initialAction: height === 450 ? 'not-reached' : 'not-required',
+        contentScroll: 'not-reached', keyboardAction: 'not-reached', restore: 'not-reached' } };
+    report.heightProbes.push(probe);
+    let check = 'viewport';
+    let passed = false;
+    checkpoint();
+    try {
+      await page.setViewportSize({ width: row.width, height });
+      assert.deepEqual(page.viewportSize(), { width: row.width, height }, 'short-preview-viewport');
+      assert.equal(await page.evaluate(() => matchMedia('(pointer: coarse)').matches), row.coarse, 'short-preview-pointer');
+      assert.ok(await page.evaluate(() => matchMedia('(max-height: 480px)').matches), 'short-preview-compact-branch');
+      assert.equal(await page.evaluate(() => matchMedia('(max-height: 272px)').matches), height === 260, 'short-preview-fallback-branch');
+      probe.checks.viewport = 'pass'; checkpoint();
+      if (height === 450) {
+        check = 'initialAction';
+        await primaryActionVisible(dialog, 'Save file');
+        probe.checks.initialAction = 'pass'; checkpoint();
+      }
+      check = 'contentScroll';
+      const content = dialog.getByRole('region', { name: 'Preview export', exact: true });
+      const scroller = height === 260 ? dialog.locator('.viewer-dialog-body') : content;
+      assert.ok(await scroller.evaluate((node) => getComputedStyle(node).overflowY === 'auto'
+        && node.clientHeight > 0 && node.scrollHeight > node.clientHeight), 'short-preview-content-scrollable');
+      await scroller.evaluate((node) => { node.scrollTop = 0; });
+      await content.evaluate((node) => node.focus({ preventScroll: true }));
+      await page.keyboard.press('PageDown');
+      await expect.poll(() => scroller.evaluate((node) => node.scrollTop)).toBeGreaterThan(0);
+      const bottom = await scroller.evaluate((node) => node.scrollTop);
+      await page.keyboard.press('PageUp');
+      await expect.poll(() => scroller.evaluate((node) => node.scrollTop)).toBeLessThan(bottom);
+      probe.checks.contentScroll = 'pass'; checkpoint();
+      check = 'keyboardAction';
+      await dialog.getByRole('button', { name: 'Close', exact: true }).focus();
+      const action = dialog.getByRole('button', { name: 'Save file', exact: true });
+      const stops = await dialog.locator('button, select, input, textarea, a[href], summary, [tabindex]').count();
+      let reached = false;
+      for (let index = 0; index <= stops; index += 1) {
+        if (await action.evaluate((node) => node === document.activeElement)) { reached = true; break; }
+        await page.keyboard.press('Tab');
+      }
+      assert.ok(reached, 'short-preview-primary-keyboard-reachable');
+      await primaryActionVisible(dialog, 'Save file');
+      probe.checks.keyboardAction = 'pass'; checkpoint();
+      passed = true;
+    } catch (error) {
+      probe.checks[check] = 'fail';
+      throw error;
+    } finally {
+      try {
+        await page.setViewportSize({ width: row.width, height: 900 });
+        assert.deepEqual(page.viewportSize(), { width: row.width, height: 900 }, 'short-preview-restored-viewport');
+        probe.checks.restore = 'pass';
+      } catch (error) {
+        probe.checks.restore = 'fail';
+        passed = false;
+        throw error;
+      } finally {
+        probe.status = passed ? 'pass' : 'fail';
+        checkpoint();
+      }
+    }
+  }
+}
+
 async function geometry(page, dialog) {
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'document-overflow');
   assert.ok(await dialog.evaluate((node) => {
@@ -218,7 +302,13 @@ async function trap(page, dialog) {
   }
   controls.sort((left, right) => (left.index || Infinity) - (right.index || Infinity));
   assert.ok(controls.length > 0, 'focus-stops');
-  const focused = async (control) => assert.ok(await control.handle.evaluate((node) => node === document.activeElement), 'sequential-focus-order');
+  const focused = async (control) => {
+    assert.ok(await control.handle.evaluate((node) => node === document.activeElement), 'sequential-focus-order');
+    assert.ok(await control.handle.evaluate((node) => {
+      const box = node.getBoundingClientRect();
+      return box.left >= 0 && box.right <= innerWidth + 1 && box.top >= 0 && box.bottom <= innerHeight + 1;
+    }), 'sequential-focus-reachable');
+  };
   await controls[0].handle.focus();
   for (const control of controls) {
     await focused(control);
@@ -293,16 +383,13 @@ try {
     const id = `${width}-${coarse ? 'coarse' : 'fine'}`;
     const out = join(config.out, id);
     await mkdir(out, { mode: 0o700 });
-    const row = { width, coarse, cases: 0, status: 'in-progress', cleanupStatus: 'not-reached', cleanupStage: null, pageErrors: 0, consoleErrors: 0, externalRequests: 0, failureSubstage: null, failureCase: null, cleanupFailures: [] };
+    const row = { width, coarse, cases: 0, status: 'in-progress', cleanupStatus: 'not-reached', cleanupStage: null, pageErrors: 0, consoleErrors: 0, externalRequests: 0, failureSubstage: null, failureCase: null, cleanupFailures: [], apiEvidence: newApiEvidence() };
     activeRow = row; activeCase = null;
     report.failureSubstage = null;
     report.rows.push(row);
     stage('viewer-start');
     let rowWorkPassed = false;
-    let running, context;
-    const apiWrites = new Set();
-    let apiCount = 0;
-    let apiWriteFailed = false;
+    let running, context, capture;
     try {
       running = await viewer(out, row);
       stage('viewer-url');
@@ -317,23 +404,11 @@ try {
       page.setDefaultTimeout(10_000);
       page.on('pageerror', () => { row.pageErrors += 1; });
       page.on('console', (message) => { if (message.type() === 'error') row.consoleErrors += 1; });
-      let apiIndex = 0;
-      page.on('response', (response) => {
-        if (new URL(response.url()).origin === origin && new URL(response.url()).pathname.startsWith('/api/v1/') && response.headers()['content-type']?.includes('application/json')) {
-          const name = `api-${apiIndex++}.json`;
-          if (++apiCount > 4096) { apiWriteFailed = true; return; }
-          const capture = (async () => {
-            assert.ok(Number(response.headers()['content-length'] ?? 0) <= 32 * 1024 * 1024, 'api-body-limit');
-            const body = await bounded(response.body(), 10_000, 'api-body-timeout');
-            assert.ok(body.length <= 32 * 1024 * 1024, 'api-body-limit');
-            await writeFile(join(out, name), body, { flag: 'wx', mode: 0o600 });
-          })().catch(() => { apiWriteFailed = true; });
-          apiWrites.add(capture);
-          void capture.finally(() => apiWrites.delete(capture));
-        }
-      });
+      capture = apiEvidence({ page, origin, state: row.apiEvidence,
+        write: (name, body, signal) => writeFile(join(out, name), body, { flag: 'wx', mode: 0o600, signal }) });
       await context.route('**/*', async (route) => {
         if (new URL(route.request().url()).origin !== origin) { row.externalRequests += 1; await route.abort(); }
+        else if (capture.shouldAbort(route.request())) await route.abort('aborted');
         else await route.continue();
       });
       context.on('request', (request) => { if (new URL(request.url()).origin !== origin) row.externalRequests += 1; });
@@ -362,6 +437,7 @@ try {
         if (expanded !== (scope === 'one')) await endpoint.click();
         const opener = page.getByRole('button', { name: scope === 'all' ? 'Export endpoints…' : 'Export this endpoint…', exact: true });
         await opener.click();
+        await primaryActionVisible(dialog, 'Preview');
         stage('choose-keyboard');
         await keyboard(page, dialog, opener);
         stage('choose-format');
@@ -385,6 +461,8 @@ try {
         assert.equal(preview.catalogOperationId, scope === 'all' ? null : config.catalogOperationId, 'catalog-scope-resolution');
         stage('preview-focus');
         await expect(dialog.getByRole('region', { name: 'Preview export' })).toBeFocused();
+        await primaryActionVisible(dialog, 'Save file');
+        if ([320, 736].includes(width) && scope === 'all' && format === 'openapi' && yaml) await shortPreviewProbes(page, dialog, row);
         stage('preview-content');
         await expect(dialog.getByText(preview.contentHash, { exact: true })).toBeVisible();
         await expect(dialog.getByText('Captured request and response bodies, cookies and credentials stay out of the export.', { exact: true })).toBeVisible();
@@ -419,6 +497,7 @@ try {
         assert.equal(await bounded(download.failure(), 10_000, 'download-status-timeout'), null, 'download-failed');
         stage('save-focus');
         await expect(dialog.getByRole('region', { name: 'Save export', exact: true })).toBeFocused();
+        await primaryActionVisible(dialog, 'Done');
         stage('save-content');
         await expect(dialog.getByRole('heading', { name: 'Download started', exact: true })).toBeVisible();
         stage('save-capture');
@@ -466,11 +545,11 @@ try {
       await writeFile(join(out, 'failure.private.txt'), String(error?.stack ?? error), { mode: 0o600 });
     } finally {
       row.cleanupStatus = 'in-progress';
-      // Close the context before draining captures: response.body() can otherwise
-      // wait forever for a live JSON response whose request is still open.
+      // Drain finite JSON responses before invalidating their browser target. The fence
+      // aborts only new cleanup-time requests; observed JSON bodies may never be omitted.
       for (const [name, operation] of [
+        ['api-evidence-write', async () => { if (capture) await capture.drain(); }],
         ['context-close', async () => { if (context) await bounded(context.close(), 10_000, 'context-close-timeout'); }],
-        ['api-evidence-write', async () => { await bounded(Promise.all([...apiWrites]), 10_000, 'api-evidence-timeout'); assert.equal(apiWriteFailed, false, 'api-evidence-write'); }],
         ['viewer-stop', async () => { if (running) await stop(running); }],
       ]) {
         row.cleanupStage = name;
@@ -481,6 +560,12 @@ try {
           await writeFile(join(out, `${name}.failure.private.txt`), String(error?.stack ?? error), { mode: 0o600 });
         }
         checkpoint();
+      }
+      if (capture) {
+        try { capture.verifyCoverage(); }
+        catch {
+          if (!row.cleanupFailures.includes('api-evidence-write')) row.cleanupFailures.push('api-evidence-write');
+        }
       }
       row.cleanupStage = null;
       row.cleanupStatus = row.cleanupFailures.length ? 'fail' : 'pass';
