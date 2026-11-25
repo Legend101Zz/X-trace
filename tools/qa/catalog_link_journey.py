@@ -37,8 +37,11 @@ class Journey:
         self.seed = secrets.token_hex(12)
 
     def call(self, code, *args):
-        output = subprocess.run([self.cli, *args, "--project-dir", self.project], env=self.env,
-                                capture_output=True, timeout=30)
+        try:
+            output = subprocess.run([self.cli, *args, "--project-dir", self.project], env=self.env,
+                                    capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise JourneyFailure("cli_deadline_" + code) from None
         require(self.seed.encode() not in output.stdout + output.stderr, "cli_canary")
         require(output.returncode == 0, code)
         try:
@@ -56,7 +59,7 @@ class Journey:
         log = self.root / (label + ".log")
         err = self.root / (label + ".stderr")
         with log.open("wb") as output, err.open("wb") as error:
-            child = subprocess.Popen([*args, *app], env=self.env, stdin=subprocess.PIPE,
+            child = subprocess.Popen([*args, *app], env=self.env, stdin=subprocess.DEVNULL,
                                      stdout=output, stderr=error)
         try:
             deadline = time.monotonic() + 40
@@ -80,12 +83,12 @@ class Journey:
                     response.read()
                 finally:
                     connection.close()
-            if self.framework == "express":
-                child.stdin.write(b"close\n")
-                child.stdin.flush()
-            else:
-                child.send_signal(signal.SIGTERM)
-            require(child.wait(timeout=25) in (0, 143), "shutdown_" + label)
+            child.send_signal(signal.SIGTERM)
+            try:
+                status = child.wait(timeout=25)
+            except subprocess.TimeoutExpired:
+                raise JourneyFailure(f"shutdown_deadline_{self.framework}_{label}") from None
+            require(status in (0, 143), "shutdown_" + label)
         finally:
             if child.poll() is None:
                 child.send_signal(signal.SIGTERM)
@@ -94,7 +97,6 @@ class Journey:
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait(timeout=5)
-            child.stdin.close()
             require(self.seed.encode() not in log.read_bytes() + err.read_bytes(), "application_canary")
 
     def run(self):
@@ -114,7 +116,7 @@ app.use('/owners', routes);
 const server = app.listen(0, '127.0.0.1', () => {
   console.log('LINK_FIXTURE_READY ' + server.address().port);
 });
-process.stdin.once('data', () => { process.stdin.pause(); server.close(); });
+process.once('SIGTERM', () => server.close());
 """)
             main = self.project / "live.cjs"
             main.write_text(src.read_text() + "\napp.get('/unscanned', (_request, res) => res.send('extra'));\n")
