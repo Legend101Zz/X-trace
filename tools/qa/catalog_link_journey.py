@@ -41,13 +41,16 @@ class Journey:
             self.env.pop("XTRACE_PREFIX", None)
         self.seed = secrets.token_hex(12)
 
-    def call(self, code, *args, expected_exit=0):
+    def call(self, code, *args, expected_exit=0, allow_not_running=False):
         try:
             output = subprocess.run([self.cli, *args, "--project-dir", self.project], env=self.env,
                                     capture_output=True, timeout=30)
         except subprocess.TimeoutExpired:
             raise JourneyFailure("cli_deadline_" + code) from None
         require(self.seed.encode() not in output.stdout + output.stderr, "cli_canary")
+        if allow_not_running and output.returncode != 0:
+            if b'"XTR-LIFECYCLE-NOT-RUNNING"' in output.stdout + output.stderr:
+                return None
         require(output.returncode == expected_exit, code)
         try:
             parsed = json.loads(output.stdout)
@@ -66,8 +69,9 @@ class Journey:
                 and result["unobserved"] == int(not confirmed), "reconciled_recording_count")
 
     def check_installed_restart(self, revision, endpoint, catalog_id, recording_ids):
-        before = self.call("record_installed", "record")
+        before = None
         try:
+            before = self.call("record_installed", "record")
             after = self.call("restart_installed", "restart")
             started = after["started"]["runtime_session_id"]
             require(after["kind"] == "restarted" and after["previously_running"] is True
@@ -78,8 +82,10 @@ class Journey:
             require({row["recordingId"] for row in linked} == recording_ids,
                     "restart_preserved_linked_recordings")
         finally:
-            stopped = self.call("stop_installed", "stop")
-            require(stopped["kind"] == "stopped", "daemon_stopped_after_restart")
+            # This isolated project has no unrelated daemon. Reconcile even
+            # when the start launched a daemon but its command timed out.
+            stopped = self.call("stop_installed", "stop", allow_not_running=before is None)
+            require(stopped is None or stopped["kind"] == "stopped", "daemon_stopped_after_restart")
         self.check_reconciliation(revision, endpoint, confirmed=True)
 
     def check_static_refusals(self, scan, app, matched, scope, endpoint, catalog_id):
