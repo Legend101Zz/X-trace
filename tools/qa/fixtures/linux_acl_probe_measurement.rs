@@ -31,14 +31,14 @@ impl Target<'_> {
     fn probe(&self, size_only: bool) -> Result<usize, Errno> {
         if size_only {
             match self {
-                Self::Name(path) => lgetxattr(path, ACL, &mut []),
-                Self::Descriptor(file) => fgetxattr(file, ACL, &mut []),
+                Self::Name(path) => lgetxattr(*path, ACL, &mut [0_u8; 0]),
+                Self::Descriptor(file) => fgetxattr(*file, ACL, &mut [0_u8; 0]),
             }
         } else {
             let mut buffer = [0; BUFFER];
             match self {
-                Self::Name(path) => lgetxattr(path, ACL, buffer.as_mut_slice()),
-                Self::Descriptor(file) => fgetxattr(file, ACL, buffer.as_mut_slice()),
+                Self::Name(path) => lgetxattr(*path, ACL, buffer.as_mut_slice()),
+                Self::Descriptor(file) => fgetxattr(*file, ACL, buffer.as_mut_slice()),
             }
         }
     }
@@ -162,7 +162,10 @@ fn main() {
 
             let link = root.join("no-follow-link");
             symlink(&present, &link).expect("create fixture symlink");
-            assert!(getxattr(&link, ACL, &mut []).is_ok(), "followed control needs a real ACL");
+            assert!(
+                getxattr(link.as_path(), ACL, &mut [0_u8; 0]).is_ok(),
+                "followed control needs a real ACL"
+            );
             let named_link = Target::Name(&link);
             assert!(named_link.probe(false).is_err());
             assert_eq!(named_link.probe(false), named_link.probe(true));
