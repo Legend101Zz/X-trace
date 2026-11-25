@@ -86,6 +86,27 @@ def check_recording(detail):
     return route
 
 
+def remove_owned_database(root, name, env):
+    listing = command(["docker", "ps", "--all", "--quiet", "--no-trunc",
+                       "--filter", "label=xtrace.pgjdbc.proof=" + name,
+                       "--filter", "name=^/" + name + "$"],
+                      root / "docker-owned.log", env, "postgres_cleanup_lookup").strip()
+    if listing:
+        require(re.fullmatch(rb"[a-f0-9]{64}", listing), "postgres_cleanup_identity")
+        command(["docker", "rm", "-f", listing.decode("ascii")],
+                root / "docker-cleanup.log", env, "postgres_cleanup")
+
+
+def scan_private_surfaces(root, seed, out, err):
+    token = seed.encode()
+    surfaces = [out, err, root / "init.log", root / "init.stderr",
+                root / "list.log", root / "list.stderr",
+                *sorted(root.glob("recording-*.*"))]
+    surfaces.extend(path for path in (root / "data").rglob("*") if path.is_file())
+    for path in surfaces:
+        require(not path.is_file() or token not in path.read_bytes(), "canary_found")
+
+
 def exercise(root, cli, agent, classpath):
     seed = secrets.token_hex(12)
     name = "xtrace-pgjdbc-" + seed
@@ -97,13 +118,13 @@ def exercise(root, cli, agent, classpath):
     out = root / "spring.log"
     err = root / "spring.stderr"
     supervisor = None
-    docker_started = False
     try:
-        command(["docker", "run", "--detach", "--name", name, "--publish", "127.0.0.1::5432",
+        command(["docker", "create", "--name", name, "--label", "xtrace.pgjdbc.proof=" + name,
+                 "--publish", "127.0.0.1::5432",
                  "--tmpfs", "/var/lib/postgresql", "-e", "POSTGRES_USER", "-e", "POSTGRES_PASSWORD",
-                 "-e", "POSTGRES_DB=probe", IMAGE], root / "docker.log", env, "postgres_start",
+                 "-e", "POSTGRES_DB=probe", IMAGE], root / "docker.log", env, "postgres_create",
                 timeout=180)
-        docker_started = True
+        command(["docker", "start", name], root / "docker-start.log", env, "postgres_start")
         binding = command(["docker", "port", name, "5432/tcp"], root / "port.log", env,
                           "postgres_port")
         match = re.fullmatch(rb"127\.0\.0\.1:([0-9]{1,5})\s*", binding)
@@ -153,24 +174,21 @@ exit 1
             observed.add(check_recording(json.loads(response)))
         require(observed == set(EXPECTED), "recording_case_coverage")
     finally:
-        if supervisor is not None and supervisor.poll() is None:
-            supervisor.send_signal(signal.SIGTERM)
+        try:
+            if supervisor is not None and supervisor.poll() is None:
+                supervisor.send_signal(signal.SIGTERM)
+                try:
+                    supervisor.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    supervisor.kill()
+                    supervisor.wait(timeout=5)
+        finally:
             try:
-                supervisor.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                supervisor.kill()
-                supervisor.wait(timeout=5)
-        if docker_started:
-            command(["docker", "rm", "-f", name], root / "docker-cleanup.log", env, "postgres_cleanup")
-        # Scan the exact captured CLI/application surfaces and bytes written to the local data root.
-        # The PostgreSQL readiness log describes the test server itself and is private fixture input.
-        token = seed.encode()
-        surfaces = [out, err, root / "init.log", root / "init.stderr",
-                    root / "list.log", root / "list.stderr",
-                    *sorted(root.glob("recording-*.*"))]
-        surfaces.extend(path for path in (root / "data").rglob("*") if path.is_file())
-        for path in surfaces:
-            require(not path.is_file() or token not in path.read_bytes(), "canary_found")
+                # Reconcile even an uncertain create, and only when both exact name and label match.
+                remove_owned_database(root, name, env)
+            finally:
+                # The PostgreSQL startup/readiness output belongs to the private input fixture.
+                scan_private_surfaces(root, seed, out, err)
     print("verified=3 recordings; JDBC starts=8; JDBC ends=8; failed=1; no raw canary observed")
 
 
