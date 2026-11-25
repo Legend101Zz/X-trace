@@ -141,6 +141,16 @@ try {
     const shownLocal = active.locator('.value-binding').filter({ hasText: 'descriptionPresent' });
     assert.ok(await shownLocal.locator('.value-preview').textContent() === local.value.preview,
       `selected real local preview matches the read API inline at ${width}px`);
+    const settingsButton = page.getByRole('button', { name: 'Settings', exact: true });
+    const settings = page.getByRole('dialog', { name: 'Settings' });
+    await settingsButton.press('Enter');
+    await settings.getByLabel('Code font size').selectOption('16');
+    await settings.getByLabel('Inline values in code').selectOption('off');
+    await settings.getByRole('button', { name: 'Close', exact: true }).press('Escape');
+    await expect(settingsButton).toBeFocused();
+    await expect(active.locator('.source-text')).toHaveCSS('font-size', '16px');
+    await expect(active.locator('.source-inline')).toHaveCount(0);
+    await expect(active).toHaveAttribute('data-source-line', String(event.line));
     const valuesTab = tabs.getByRole('tab', { name: /^Values/ });
     if (width < 861) {
       await tabs.getByRole('tab', { name: 'Code', exact: true }).press('ArrowRight');
@@ -153,6 +163,10 @@ try {
       await page.screenshot({ path: join(screenshotDirectory, `focused-values-${width}-viewport.png`) });
       await page.screenshot({ path: join(screenshotDirectory, `focused-values-${width}.png`), fullPage: true });
     }
+    await settingsButton.press('Enter');
+    await settings.getByLabel('Code font size').selectOption('12');
+    await settings.getByLabel('Inline values in code').selectOption('on');
+    await settings.getByRole('button', { name: 'Close', exact: true }).press('Escape');
     const details = tabs.getByRole('tab', { name: 'Details', exact: true });
     await details.click();
     await expect(page.locator('[data-event-field="symbol"]')).toHaveText(event.symbol);

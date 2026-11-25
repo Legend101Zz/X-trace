@@ -23,7 +23,7 @@ assert.ok(syntheticUnmatchedId && expectedUnmatchedIds.includes(syntheticUnmatch
 
 const browser = await chromium.launch({ headless: true });
 try {
-  const context = await browser.newContext();
+  const context = await browser.newContext({ timezoneId: 'America/New_York' });
   const page = await context.newPage();
   page.setDefaultTimeout(8000);
   page.setDefaultNavigationTimeout(10000);
@@ -434,7 +434,13 @@ try {
   assert.deepEqual(await page.evaluate(() => indexedDB.databases()), []);
   assert.equal(await page.evaluate(() => document.referrer), '');
   // Exercise appearance only after verifying that normal replay has not written to browser storage.
-  const theme = page.getByRole('combobox', { name: 'Theme' });
+  const settingsButton = page.getByRole('button', { name: 'Settings', exact: true });
+  const helpButton = page.getByRole('button', { name: 'Help', exact: true });
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  const help = page.getByRole('dialog', { name: 'Help' });
+  const theme = settings.getByRole('combobox', { name: 'Theme' });
+  const closeSettings = () => settings.getByRole('button', { name: 'Close', exact: true }).press('Escape');
+  await settingsButton.click();
   const assertPalette = async (name, background) => {
     await expect(page.locator('html')).toHaveAttribute('data-theme', name);
     await expect(page.locator('body')).toHaveCSS('background-color', background);
@@ -455,7 +461,7 @@ try {
   await assertPalette('hc', 'rgb(0, 0, 0)');
   await expect(theme).toHaveCSS('border-top-width', '2px');
 
-  for (const width of [320, 736, 1024]) {
+  for (const width of [320, 736, 1024, 1440]) {
     await page.setViewportSize({ width, height: 844 });
     const hasOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
     assert.equal(hasOverflow, false, `the themed viewer must fit at ${width}px`);
@@ -468,6 +474,40 @@ try {
     await expect(theme).toBeFocused();
     await expect(theme).toHaveCSS('outline-color', 'rgb(255, 207, 92)');
     await expect(theme).toHaveCSS('outline-width', '2px');
+    const close = settings.getByRole('button', { name: 'Close', exact: true });
+    await close.focus();
+    await page.keyboard.press('Shift+Tab');
+    const animations = settings.getByLabel('Animations');
+    await expect(animations).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(close).toBeFocused();
+    await page.locator('.viewer-dialog-actions button').first().evaluate((opener) => opener.focus());
+    await expect(close).toBeFocused();
+    await saveScreenshot(`viewer-settings-${width}.png`, 'settings-modal', width, 844);
+
+    await closeSettings();
+    await expect(settingsButton).toBeFocused();
+    await helpButton.press('Enter');
+    const helpClose = help.getByRole('button', { name: 'Close', exact: true });
+    await expect(helpClose).toBeFocused();
+    await expect(help.getByRole('heading', { name: 'Words we use' })).toBeVisible();
+    await expect(help.getByText(/Events were not recorded here; the reason is shown/)).toBeVisible();
+    const glossary = help.getByRole('tab', { name: 'Glossary' });
+    await glossary.press('ArrowRight');
+    const keyboard = help.getByRole('tab', { name: 'Keyboard' });
+    await expect(keyboard).toBeFocused();
+    await expect(help.getByText('Alt + M', { exact: true })).toBeVisible();
+    const selected = await page.locator('#events-panel .event[aria-current="true"] .event-seq').textContent();
+    await page.keyboard.press('Alt+ArrowDown');
+    assert.equal(await page.locator('#events-panel .event[aria-current="true"] .event-seq').textContent(), selected,
+      'Help traps replay shortcuts as well as focus');
+    await page.keyboard.press('Tab');
+    await expect(helpClose).toBeFocused();
+    await glossary.click();
+    await saveScreenshot(`viewer-help-${width}.png`, 'help-glossary', width, 844);
+    await helpClose.press('Escape');
+    await expect(helpButton).toBeFocused();
+    await settingsButton.press('Enter');
   }
 
   await theme.selectOption('system');
@@ -475,6 +515,25 @@ try {
   await theme.selectOption('hc');
   assert.deepEqual(await page.evaluate(() => ({ preferences: Object.entries(localStorage), session: sessionStorage.length })),
     { preferences: [['xtrace.viewer.theme', 'hc']], session: 0 });
+  const utcTime = page.locator('.recording-list time').first();
+  const previousTime = await utcTime.textContent();
+  await settings.getByLabel('Animations').selectOption('reduce');
+  await settings.getByLabel('Density').selectOption('compact');
+  await settings.getByLabel('Recording times').selectOption('utc');
+  await closeSettings();
+  const selectedEvent = page.locator('#events-panel .event[aria-current="true"]');
+  assert.equal(await selectedEvent.evaluate((row) => getComputedStyle(row).animationName), 'none',
+    'viewer reduced-motion setting suppresses animation without an OS override');
+  if (await page.evaluate(() => matchMedia('(pointer: fine)').matches)) {
+    await expect(selectedEvent).toHaveCSS('padding-top', '6px');
+  }
+  await expect(utcTime).toContainText('UTC');
+  assert.notEqual(await utcTime.textContent(), previousTime, 'UTC visibly changes the real recording time');
+  await settingsButton.press('Enter');
+  await settings.getByLabel('Animations').selectOption('system');
+  await settings.getByLabel('Density').selectOption('comfortable');
+  await settings.getByLabel('Recording times').selectOption('local');
+  await closeSettings();
   await page.emulateMedia({ reducedMotion: 'reduce' });
   const eventAnimation = await page.locator('.event[aria-current="true"]').evaluate((row) => getComputedStyle(row).animationName);
   assert.equal(eventAnimation, 'none', 'reduced motion disables event selection animation');
@@ -536,9 +595,11 @@ try {
   await expect(codeSplitter).toHaveAttribute('aria-valuenow', '52');
   await expect(codeSplitter).toBeFocused();
 
-  const inspectorDock = page.getByLabel('Inspector dock');
+  const inspectorDock = settings.getByLabel('Inspector dock');
   await expect(inspectorSplitter).toHaveAttribute('aria-orientation', 'horizontal');
+  await settingsButton.press('Enter');
   await inspectorDock.selectOption('right');
+  await closeSettings();
   await expect(inspectorSplitter).toHaveAttribute('aria-orientation', 'vertical');
   assert.equal(await page.evaluate(() => localStorage.getItem('xtrace.viewer.inspector-dock')), 'right');
   const inspectorBounds = await inspectorSplitter.boundingBox();
@@ -553,7 +614,9 @@ try {
   await page.getByRole('button', { name: 'Reset panels' }).click();
   await expect(requestsSplitter).toHaveAttribute('aria-valuenow', '22');
   await expect(inspectorSplitter).toHaveAttribute('aria-valuenow', '26');
+  await settingsButton.press('Enter');
   await inspectorDock.selectOption('bottom');
+  await closeSettings();
   await expect(inspectorSplitter).toHaveAttribute('aria-orientation', 'horizontal');
   await codeSplitter.press('Home');
   await expect(codeSplitter).toHaveAttribute('aria-valuenow', '28');
@@ -567,7 +630,9 @@ try {
   await expect(page.getByRole('button', { name: 'Requests', exact: true })).toBeFocused();
   // Reloading the spent link exercises startup and persisted appearance without exchanging another token.
   await page.reload({ waitUntil: 'domcontentloaded' });
+  await settingsButton.press('Enter');
   await expect(theme).toHaveValue('hc');
+  await closeSettings();
   await assertPalette('hc', 'rgb(0, 0, 0)');
   await expect(codeSplitter).toHaveAttribute('aria-valuenow', '28');
   assert.equal(unexpectedRequestCount, 0, 'browser made a request outside the loopback origin');

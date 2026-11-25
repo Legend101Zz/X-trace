@@ -147,10 +147,8 @@
   .steps-and-code .event-time { grid-column: 1; }
 }
 
-.dock-preference { display: none; }
 .steps-content { display: contents; }
 @media (min-width: 861px) {
-  .dock-preference { display: inline-flex; gap: 8px; align-items: center; }
   .steps-and-code > .pane { overflow: hidden; }
   .steps-and-code > .pane > .steps-content { display: block; flex: 1 1 auto; min-height: 0; overflow: auto; }
   .viewer-workspace[data-dock='bottom'] {
