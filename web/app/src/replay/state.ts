@@ -1,4 +1,4 @@
-/** Replay-core reducer (selection, filter, playback). Tested in isolation; the App currently dispatches only `set-mode`, selection is still the App's `selectedEvent` index, and filter/playback actions are not wired into production yet. */
+/** Replay-core reducer for event selection and view mode. Filter and playback are reserved for later wiring. */
 
 export type ReplayMode = 'linear' | 'canvas';
 export type PlaybackSpeed = 0.5 | 1 | 2 | 4;
@@ -18,9 +18,9 @@ export interface Playback {
 export interface ReplayState {
   operationId: string;
   recordingId: string;
-  /** Selected frame; null when no frame is selected. Both views key off this one value. */
+  /** Frame containing the selected event, if the event has a frame. */
   frameId: string | null;
-  /** Event sequence of the selected frame (decimal string, as on the wire). */
+  /** Selected event sequence within the recording. Null before an event is selected. */
   sequence: string | null;
   mode: ReplayMode;
   filter: ReplayFilter;
@@ -29,7 +29,8 @@ export interface ReplayState {
 
 export type ReplayAction =
   | { type: 'select-operation'; operationId: string }
-  | { type: 'select-recording'; recordingId: string }
+  | { type: 'select-recording'; recordingId: string; restore?: Pick<ReplayState, 'frameId' | 'sequence'> }
+  | { type: 'initialize-selection'; recordingId: string; frameId: string | null; sequence: string }
   | { type: 'select-frame'; frameId: string | null; sequence: string | null }
   | { type: 'set-mode'; mode: ReplayMode }
   | { type: 'set-filter'; kinds: readonly string[] }
@@ -62,7 +63,10 @@ export function replayReducer(state: ReplayState, action: ReplayAction): ReplayS
       return { ...clearSelection(state), operationId: action.operationId, recordingId: '' };
     case 'select-recording':
       if (action.recordingId === state.recordingId) return state;
-      return { ...clearSelection(state), recordingId: action.recordingId };
+      return { ...clearSelection(state), recordingId: action.recordingId, ...action.restore };
+    case 'initialize-selection':
+      if (state.recordingId !== action.recordingId || state.sequence !== null) return state;
+      return { ...state, frameId: action.frameId, sequence: action.sequence };
     case 'select-frame':
       // A manual selection ends playback: the person took the wheel.
       return { ...state, frameId: action.frameId, sequence: action.sequence, playback: { ...state.playback, status: 'paused', stopReason: null } };

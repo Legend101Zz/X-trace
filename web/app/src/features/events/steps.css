@@ -1,0 +1,34 @@
+.step-row {
+  margin-inline-start: min(var(--event-indent, 0px), 12%, 72px);
+}
+
+.step-row + .step-row { margin-top: 3px; }
+
+.step-why {
+  margin: 4px 0 6px;
+  padding: 4px 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.step-why > summary {
+  color: var(--amber);
+  cursor: pointer;
+  min-height: 28px;
+}
+
+.step-why > summary:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: -2px;
+}
+
+.replay-toolbar { padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.replay-toolbar .button-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.replay-toolbar .replay-reason { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.replay-toolbar .button[aria-disabled='true'] { color: var(--muted); cursor: default; }
+
+@media (max-width: 1023px), (pointer: coarse) {
+  .step-why > summary { min-height: 44px; }
+}

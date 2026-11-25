@@ -54,8 +54,10 @@ function audit(): string[] {
   for (const svg of document.querySelectorAll('svg')) {
     if (svg.getAttribute('aria-hidden') !== 'true' && !svg.querySelector('title')) problems.push('svg is neither hidden nor titled');
   }
-  const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
-  if (tabs.filter((tab) => tab.getAttribute('tabindex') === '0').length !== 1) problems.push('tablist must have exactly one tab stop');
+  for (const tablist of document.querySelectorAll('[role="tablist"]')) {
+    const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+    if (tabs.filter((tab) => tab.getAttribute('tabindex') === '0').length !== 1) problems.push('tablist must have exactly one tab stop');
+  }
   if (document.querySelector('[role="tree"]')) {
     const stops = Array.from(document.querySelectorAll('[role="treeitem"]')).filter((item) => item.getAttribute('tabindex') === '0');
     if (stops.length !== 1) problems.push(`tree must have exactly one tab stop, found ${stops.length}`);
@@ -98,7 +100,7 @@ describe('accessibility rules over the rendered viewer', () => {
 
   it('has no structural violations in the Canvas view', async () => {
     await openRecording();
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     expect(screen.getByRole('tree')).toBeInTheDocument();
     expect(audit()).toEqual([]);
   });
@@ -114,7 +116,7 @@ describe('accessibility rules over the rendered viewer', () => {
   it('keyboard-only: Tab visits the active tab, then controls in DOM order, with one tree stop', async () => {
     const user = userEvent.setup();
     await openRecording();
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     (document.activeElement as HTMLElement | null)?.blur();
     const order: string[] = [];
     for (let step = 0; step < 60; step += 1) {
@@ -130,7 +132,7 @@ describe('accessibility rules over the rendered viewer', () => {
     // Expand buttons inside the tree are reachable by pointer, not by Tab (roving tabindex).
     expect(order.some((entry) => entry.startsWith('button:Expand') || entry.startsWith('button:Collapse'))).toBe(false);
     // The tree stop comes after the Linear/Canvas switch.
-    const canvasIndex = order.indexOf('button:Canvas');
+    const canvasIndex = order.indexOf('button:Map');
     const treeIndex = order.findIndex((entry) => entry.startsWith('treeitem:'));
     expect(canvasIndex).toBeGreaterThan(-1);
     expect(treeIndex).toBeGreaterThan(canvasIndex);

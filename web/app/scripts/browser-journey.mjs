@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 
 const [recordingId, encodedSequences, operationId, legacyV4Id] = process.argv.slice(2);
 assert.ok(recordingId && encodedSequences && operationId && legacyV4Id, 'recording, endpoint, and expected event data are required');
@@ -67,7 +67,15 @@ try {
   assert.equal(await page.getByRole('tab', { name: 'recordings' }).getAttribute('aria-selected'), 'true', 'mobile opens on the endpoint catalog');
   await saveScreenshot('viewer-mobile-endpoints.png', 'observed-endpoints', 390, 844);
 
-  await page.locator('.endpoint-card').click();
+  const requestSearch = page.getByRole('searchbox', { name: 'Search loaded requests' });
+  await requestSearch.fill('no-matching-fixture-request');
+  await expect(page.locator('.endpoint-card')).toHaveCount(0);
+  await requestSearch.fill('/orders');
+  const endpointCard = page.locator('.endpoint-card');
+  await expect(endpointCard).toHaveAttribute('aria-expanded', 'false');
+  await endpointCard.click();
+  await expect(endpointCard).toHaveAttribute('aria-expanded', 'true');
+  await requestSearch.fill('');
   const linkedRows = page.locator('.recording-list .recording');
   await linkedRows.first().waitFor();
   const linkedIds = await linkedRows.locator('.recording-title').allTextContents();
@@ -79,6 +87,18 @@ try {
   await page.getByText('POST /orders', { exact: false }).waitFor();
   await page.getByText('Component: spring-fixture · Binding: default').waitFor();
   await saveScreenshot('viewer-mobile-linked-recordings.png', 'linked-recordings', 390, 844);
+  const assertGroupedCatalog = async (scope) => {
+    for (const width of [320, 736, 1024]) {
+      await page.setViewportSize({ width, height: 844 });
+      await expect(page.locator('.recording-date-heading').first()).toBeVisible();
+      const time = page.locator('.recording-list time[datetime]').first();
+      await expect(time).toBeVisible();
+      const fits = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
+      assert.ok(fits, `${scope} catalog should fit at ${width}px`);
+    }
+    await page.setViewportSize({ width: 390, height: 844 });
+  };
+  await assertGroupedCatalog('linked');
   const recordingButton = page.getByRole('button', { name: new RegExp(recordingId) });
   try {
     await recordingButton.click({ timeout: 5000 });
@@ -86,6 +106,12 @@ try {
     throw new Error('Browser could not select the genuine linked recording in the packaged viewer');
   }
   await page.locator('.event-seq').first().waitFor();
+  const firstEvent = page.locator('.event').first();
+  await page.keyboard.press('Tab');
+  await firstEvent.focus();
+  await expect(firstEvent).toBeFocused();
+  await expect(firstEvent).toHaveCSS('outline-offset', '-2px');
+  await expect(firstEvent).toHaveCSS('outline-style', 'solid');
   const observed = await page.locator('.event-seq').allTextContents();
   assert.deepEqual(observed, expectedSequences, 'browser event order differs from the product query projection');
   await page.getByRole('tab', { name: 'evidence' }).click();
@@ -130,9 +156,10 @@ try {
   await eventKind.evaluate((node, text) => { node.textContent = text; }, originalKind);
   await saveScreenshot('viewer-mobile-genuine-events.png', 'genuine-event-window', 390, 844);
 
-  // Linear and Canvas on the real recording at 320, 736 and 1024 px: no horizontal page scroll,
+  // Steps and Map on the real recording at 320, 736, 1024 and 1440 px: no horizontal page scroll,
   // one shared selection, a single roving tab stop in the tree, keyboard stepping, screenshots.
-  for (const [width, height] of [[320, 640], [736, 900], [1024, 768]]) {
+  let renderedStepKinds;
+  for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1440, 900]]) {
     await page.setViewportSize({ width, height });
     const eventsTab = page.getByRole('tab', { name: 'events' });
     if (await eventsTab.isVisible()) await eventsTab.click();
@@ -141,13 +168,30 @@ try {
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
       assert.ok(overflow <= 0, `${view} view scrolls the page horizontally by ${overflow}px at ${width}px`);
     };
-    await page.getByRole('button', { name: 'Linear', exact: true }).click();
+    await page.getByRole('button', { name: 'Steps', exact: true }).click();
     await page.locator('.event').first().waitFor();
-    await noHorizontalScroll('linear');
+    await noHorizontalScroll('steps');
+    const observedRows = page.locator('.event');
+    const toolbar = page.getByRole('group', { name: 'Replay navigation' });
+    const methods = observedRows.locator('.event-kind');
+    assert.ok((await methods.allTextContents()).some((text) => /^Called .+/.test(text)), 'the Spring recording displays an observed call sentence');
+    const kinds = await observedRows.evaluateAll((rows) => rows.map((row) => row.dataset.eventKind));
+    if (renderedStepKinds) assert.deepEqual(kinds, renderedStepKinds, 'Steps retains observed kinds and order across viewport changes');
+    renderedStepKinds = kinds;
+    const currentRow = page.locator('.event[aria-current="true"]');
+    const originalSequence = await currentRow.locator('.event-seq').textContent();
+    const next = toolbar.getByRole('button', { name: 'Next', exact: true });
+    const forward = await next.getAttribute('aria-disabled') !== 'true';
+    await (forward ? next : toolbar.getByRole('button', { name: 'Back', exact: true })).click();
+    await expect(currentRow.locator('.event-seq')).not.toHaveText(originalSequence);
+    await currentRow.focus();
+    await currentRow.press(forward ? 'ArrowUp' : 'ArrowDown');
+    await expect(currentRow.locator('.event-seq')).toHaveText(originalSequence);
+    await expect(currentRow).toBeFocused();
     await saveScreenshot(`viewer-replay-linear-${width}.png`, 'linear-real-recording', width, height);
     const selectedLinear = async () => page.locator('.event').evaluateAll((rows) => rows.findIndex((row) => row.getAttribute('aria-current') === 'true'));
     const startIndex = await selectedLinear();
-    await page.getByRole('button', { name: 'Canvas', exact: true }).click();
+    await page.getByRole('button', { name: 'Map', exact: true }).click();
     await page.getByRole('tree').waitFor();
     const items = page.getByRole('treeitem');
     const itemCount = await items.count();
@@ -159,11 +203,11 @@ try {
     if (itemCount > 1) {
       await page.locator('.canvas-tree [role="treeitem"][tabindex="0"]').focus();
       await page.keyboard.press('ArrowDown');
-      await page.getByRole('button', { name: 'Linear', exact: true }).click();
+      await page.getByRole('button', { name: 'Steps', exact: true }).click();
       await page.locator('.event').first().waitFor();
       assert.notEqual(await selectedLinear(), startIndex, `ArrowDown in Canvas moved the selection Linear shows at ${width}px`);
     } else {
-      await page.getByRole('button', { name: 'Linear', exact: true }).click();
+      await page.getByRole('button', { name: 'Steps', exact: true }).click();
     }
     assert.equal(await page.locator('.event[aria-current="true"]').count(), 1, 'exactly one selected event in Linear');
   }
@@ -184,13 +228,20 @@ try {
   await page.locator('.event').nth(1).click();
   await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
   await page.getByRole('status').filter({ hasText: /Event .* selected/ }).waitFor();
+  const backToStep = page.getByRole('button', { name: /Back to event/ });
+  assert.ok((await backToStep.boundingBox())?.height >= 44, 'phone Back to event meets its touch target');
+  await backToStep.press('Enter');
+  const currentEvent = page.locator('.event[aria-current="true"]');
+  await expect(currentEvent).toBeFocused();
+  const priorSequence = await currentEvent.locator('.event-seq').textContent();
   await page.getByRole('tab', { name: 'recordings' }).click();
   await page.getByRole('tabpanel', { name: 'recordings' }).waitFor({ state: 'visible' });
-  await page.getByRole('button', { name: 'Unmatched recordings' }).click();
+  await page.getByRole('button', { name: 'Not linked to an endpoint' }).click();
   const historicalRow = page.getByRole('button', { name: new RegExp(legacyV4Id) });
   await historicalRow.waitFor();
   await historicalRow.getByText('No historical reason recorded').waitFor();
   for (const id of expectedUnmatchedIds) await page.getByRole('button', { name: new RegExp(id) }).waitFor();
+  await assertGroupedCatalog('unmatched');
   await page.setViewportSize({ width: 1280, height: 720 });
   await saveScreenshot('viewer-desktop-unmatched.png', 'unmatched-recordings', 1280, 720);
   await page.setViewportSize({ width: 390, height: 844 });
@@ -204,6 +255,24 @@ try {
   await page.getByRole('tab', { name: 'events' }).click();
   await page.getByText('No projected events').waitFor();
   await saveScreenshot('viewer-mobile-historical-unmatched.png', 'historical-unmatched-detail', 390, 844);
+  const recordingTabs = page.getByRole('tablist', { name: 'Open recordings' });
+  const originalRecordingTab = recordingTabs.getByRole('tab', { name: new RegExp(recordingId) });
+  const historicalTab = recordingTabs.getByRole('tab', { name: new RegExp(legacyV4Id) });
+  await expect(historicalTab).toHaveAttribute('aria-selected', 'true');
+  await page.setViewportSize({ width: 320, height: 640 });
+  await saveScreenshot('viewer-shell-phone-tabs-320.png', 'two-recording-tabs-on-phone', 320, 640);
+  await historicalTab.press('ArrowLeft');
+  await expect(originalRecordingTab).toBeFocused();
+  await expect(originalRecordingTab).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.event[aria-current="true"] .event-seq')).toHaveText(priorSequence);
+  await originalRecordingTab.press('ArrowRight');
+  await expect(historicalTab).toBeFocused();
+  await page.getByText('No projected events').waitFor();
+  await historicalTab.press('Delete');
+  await expect(historicalTab).toHaveCount(0);
+  await expect(originalRecordingTab).toBeFocused();
+  await expect(page.locator('.event[aria-current="true"] .event-seq')).toHaveText(priorSequence);
+
   const apiPayloads = await page.evaluate(async ({ id, operationId, legacyV4Id, expectedUnmatchedIds }) => {
     const headers = { 'X-XTrace-Client': 'viewer-v1' };
     const listResponse = await fetch('/api/v1/recordings?limit=50', { headers, credentials: 'same-origin' });
@@ -260,7 +329,30 @@ try {
       assert.ok(!body.includes(canary), `API response included privacy canary ${canary}`);
     }
   }
-  assert.deepEqual(JSON.parse(apiPayloads.detailBody).events.map((event) => event.sequence), expectedSequences);
+  const verifiedEvents = JSON.parse(apiPayloads.detailBody).events;
+  assert.deepEqual(verifiedEvents.map((event) => event.sequence), expectedSequences);
+  assert.deepEqual(renderedStepKinds, verifiedEvents.map((event) => event.kind), 'Steps only renders kinds returned by the real recording read API');
+  const knownKinds = new Set(['unspecified', 'request_update', 'frame_enter', 'frame_exit', 'frame_throw', 'line_cursor',
+    'value_snapshot', 'database_start', 'database_end', 'outbound_http_start', 'outbound_http_end',
+    'async_link', 'exception', 'response', 'gap']);
+  const observedKindReceipt = [...new Set(verifiedEvents.map(({ kind }) => {
+    const name = kind.startsWith('recording_event_kind:') ? kind.slice('recording_event_kind:'.length) : '';
+    return knownKinds.has(name) ? name : 'other';
+  }))].sort();
+  process.stdout.write(`packaged Steps observed event kinds: ${observedKindReceipt.join(', ')}\n`);
+  const intoIndex = verifiedEvents.findIndex((event) => event.navigation?.into?.state === 'target'
+    && verifiedEvents.some(({ frameId }) => frameId === event.navigation.into.frameId));
+  if (intoIndex >= 0) {
+    const expectedTarget = verifiedEvents.find(({ frameId }) => frameId === verifiedEvents[intoIndex].navigation.into.frameId);
+    await page.locator('.event').nth(intoIndex).click();
+    const eventsTab = page.getByRole('tab', { name: 'events' });
+    if (await eventsTab.isVisible()) await eventsTab.click();
+    const stepIn = page.getByRole('group', { name: 'Replay navigation' }).getByRole('button', { name: 'Step in', exact: true });
+    await expect(stepIn).toHaveAttribute('aria-disabled', 'false');
+    await stepIn.click();
+    await expect(page.locator('.event[aria-current="true"] .event-seq')).toHaveText(expectedTarget.sequence);
+    process.stdout.write('packaged Steps navigation: exercised a server-resolved in-window Step in target\n');
+  }
   assert.equal(new URL(page.url()).hash, '', 'bootstrap fragment must be removed before exchange');
   const cookies = await context.cookies();
   assert.equal(cookies.length, 1, 'one browser-session cookie should be issued');
@@ -271,6 +363,132 @@ try {
   assert.deepEqual(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length })), { local: 0, session: 0 });
   assert.deepEqual(await page.evaluate(() => indexedDB.databases()), []);
   assert.equal(await page.evaluate(() => document.referrer), '');
+  // Exercise appearance only after verifying that normal replay has not written to browser storage.
+  const theme = page.getByRole('combobox', { name: 'Theme' });
+  const assertPalette = async (name, background) => {
+    await expect(page.locator('html')).toHaveAttribute('data-theme', name);
+    await expect(page.locator('body')).toHaveCSS('background-color', background);
+  };
+  await expect(theme).toHaveValue('system');
+  await expect(theme.locator('option')).toHaveText(['System', 'Dark', 'Light', 'High contrast']);
+  await page.emulateMedia({ colorScheme: 'light' });
+  await assertPalette('light', 'rgb(246, 245, 242)');
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await assertPalette('dark', 'rgb(17, 20, 22)');
+
+  await theme.selectOption('light');
+  await assertPalette('light', 'rgb(246, 245, 242)');
+  await page.emulateMedia({ colorScheme: 'light' });
+  await theme.selectOption('dark');
+  await assertPalette('dark', 'rgb(17, 20, 22)');
+  await theme.selectOption('hc');
+  await assertPalette('hc', 'rgb(0, 0, 0)');
+  await expect(theme).toHaveCSS('border-top-width', '2px');
+
+  for (const width of [320, 736, 1024]) {
+    await page.setViewportSize({ width, height: 844 });
+    const hasOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+    assert.equal(hasOverflow, false, `the themed viewer must fit at ${width}px`);
+    const size = await theme.boundingBox();
+    assert.ok(size && size.height >= (width < 1024 ? 44 : 32), `Theme target too short at ${width}px`);
+    await theme.focus();
+    await page.keyboard.press('Shift+Tab');
+    await expect(theme).not.toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(theme).toBeFocused();
+    await expect(theme).toHaveCSS('outline-color', 'rgb(255, 207, 92)');
+    await expect(theme).toHaveCSS('outline-width', '2px');
+  }
+
+  await theme.selectOption('system');
+  await assertPalette('light', 'rgb(246, 245, 242)');
+  await theme.selectOption('hc');
+  assert.deepEqual(await page.evaluate(() => ({ preferences: Object.entries(localStorage), session: sessionStorage.length })),
+    { preferences: [['xtrace.viewer.theme', 'hc']], session: 0 });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  const eventAnimation = await page.locator('.event[aria-current="true"]').evaluate((row) => getComputedStyle(row).animationName);
+  assert.equal(eventAnimation, 'none', 'reduced motion disables event selection animation');
+  await page.setViewportSize({ width: 736, height: 900 });
+  const touch = await context.newCDPSession(page);
+  await touch.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+  const inspectorSplitter = page.getByRole('separator', { name: 'Resize Inspector' });
+  await expect(inspectorSplitter).toHaveAttribute('aria-orientation', 'horizontal');
+  await inspectorSplitter.press('ArrowUp');
+  await expect(inspectorSplitter).toHaveAttribute('aria-valuenow', '28');
+  await expect(inspectorSplitter).toBeFocused();
+  const coarseHitHeight = await inspectorSplitter.evaluate((handle) => {
+    if (!matchMedia('(pointer: coarse)').matches) throw new Error('coarse pointer emulation required');
+    return parseFloat(getComputedStyle(handle, '::before').height);
+  });
+  assert.ok(coarseHitHeight >= 44, 'stacked Inspector splitter exposes a 44px coarse-pointer target');
+  await saveScreenshot('viewer-shell-tablet-736.png', 'stacked-inspector-and-coarse-splitter', 736, 900);
+  await touch.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+  await touch.detach();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), 'desktop shell fits at 1440px');
+  await page.getByRole('button', { name: 'Reset panels' }).click();
+  const requestsSplitter = page.getByRole('separator', { name: 'Resize Requests' });
+  const codeSplitter = page.getByRole('separator', { name: 'Resize Code' });
+  for (const width of [861, 1024]) {
+    await page.setViewportSize({ width, height: 900 });
+    await requestsSplitter.press('End');
+    await inspectorSplitter.press('End');
+    await codeSplitter.press('End');
+    await expect(codeSplitter).toBeFocused();
+    await expect(codeSplitter).toHaveCSS('outline-style', 'solid');
+    const modeFits = await page.locator('.mode-switch').evaluate((mode) => {
+      const pane = mode.closest('.pane').getBoundingClientRect();
+      return [...mode.querySelectorAll('button')].every((button) => {
+        const box = button.getBoundingClientRect();
+        return box.left >= pane.left && box.right <= pane.right && box.width >= 44;
+      });
+    });
+    assert.ok(modeFits, `replay mode controls remain within Steps at maximum panel preferences and ${width}px`);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
+      `maximum panel preferences do not overflow the page at ${width}px`);
+    await saveScreenshot(`viewer-shell-extreme-${width}.png`, 'splitter-extremes-and-visible-keyboard-focus', width, 900);
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.getByRole('button', { name: 'Reset panels' }).click();
+  await requestsSplitter.press('Home');
+  await expect(requestsSplitter).toHaveAttribute('aria-valuenow', '16');
+  await expect(requestsSplitter).toBeFocused();
+  await codeSplitter.press('ArrowLeft');
+  await expect(codeSplitter).toHaveAttribute('aria-valuenow', '52');
+  await codeSplitter.press('Enter');
+  await expect(codeSplitter).toHaveAttribute('aria-valuenow', '0');
+  await expect(page.getByRole('button', { name: 'Code', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Code', exact: true }).click();
+  await expect(codeSplitter).toHaveAttribute('aria-valuenow', '52');
+  await expect(codeSplitter).toBeFocused();
+
+  const inspectorBounds = await inspectorSplitter.boundingBox();
+  assert.ok(inspectorBounds, 'desktop Inspector splitter is visible');
+  const handleX = inspectorBounds.x + inspectorBounds.width / 2;
+  const handleY = inspectorBounds.y + inspectorBounds.height / 2;
+  await page.mouse.move(handleX, handleY);
+  await page.mouse.down();
+  await page.mouse.move(handleX - 72, handleY, { steps: 4 });
+  await page.mouse.up();
+  await expect(inspectorSplitter).toHaveAttribute('aria-valuenow', '31');
+  await page.getByRole('button', { name: 'Reset panels' }).click();
+  await expect(requestsSplitter).toHaveAttribute('aria-valuenow', '22');
+  await expect(inspectorSplitter).toHaveAttribute('aria-valuenow', '26');
+  await codeSplitter.press('Home');
+  await expect(codeSplitter).toHaveAttribute('aria-valuenow', '28');
+  await saveScreenshot('viewer-shell-desktop-1440.png', 'active-recording-tab-and-resized-panels', 1440, 900);
+  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('xtrace.viewer.panels'))),
+    { requests: 22, code: 28, inspector: 26, lastOpen: { requests: 22, code: 28, inspector: 26 } });
+  await requestsSplitter.press('Enter');
+  await expect(requestsSplitter).toHaveAttribute('aria-valuenow', '0');
+  await originalRecordingTab.press('Delete');
+  await expect(originalRecordingTab).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Requests', exact: true })).toBeFocused();
+  // Reloading the spent link exercises startup and persisted appearance without exchanging another token.
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await expect(theme).toHaveValue('hc');
+  await assertPalette('hc', 'rgb(0, 0, 0)');
+  await expect(codeSplitter).toHaveAttribute('aria-valuenow', '28');
   assert.equal(unexpectedRequestCount, 0, 'browser made a request outside the loopback origin');
   assert.equal(consoleErrorCount, 0, 'browser console reported an error');
   if (screenshotDirectory) {
@@ -280,4 +498,4 @@ try {
   await browser.close();
 }
 
-process.stdout.write('browser journey passed: persisted event order, matched source evidence, and unavailable evidence verified\n');
+process.stdout.write('browser journey passed: persisted event order, matched source evidence, unavailable evidence, viewer themes, and shell navigation verified\n');
