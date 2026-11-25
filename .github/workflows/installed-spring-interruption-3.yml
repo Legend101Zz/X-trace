@@ -1,0 +1,93 @@
+name: Installed Spring interruption
+on:
+  push:
+    branches: [diagnostic/installed-spring-interruption-3]
+permissions:
+  contents: read
+jobs:
+  interruption:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: subject
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: driver
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 8f45baf26a5c57548b354cda107b97a92092d698
+          path: subject
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+          cache-dependency-path: |
+            subject/adapters/java/build.gradle.kts
+            subject/adapters/java/settings.gradle.kts
+            subject/adapters/java/gradle.lockfile
+            subject/adapters/java/*/build.gradle.kts
+            subject/adapters/java/*/gradle.lockfile
+            subject/adapters/java/gradle/verification-metadata.xml
+            subject/adapters/java/gradle/wrapper/gradle-wrapper.properties
+      - name: Rebuild and verify the reviewed unsigned archive
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/x3"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/extract" "$root/lib" "$root/classes" "$root/caller"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          test "$(git rev-parse HEAD)" = 8f45baf26a5c57548b354cda107b97a92092d698
+          if ! python3 -B packaging/build.py --out "$root/dist" --work "$root/package-work" --platform linux-x86_64 >"$root/build.log" 2>&1; then
+            if grep -Fq 'Could not resolve' "$root/build.log"; then
+              echo 'Package build dependency resolution failed.'
+            else
+              echo 'Exact-head package build failed.'
+            fi
+            exit 1
+          fi
+          dist="$root/dist/linux-x86_64"
+          sh packaging/install.sh verify-dist "$dist" >"$root/verify-dist.log"
+          archives=("$dist"/xtrace-*-linux-x86_64.tar.gz)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          test -f "$archive"
+          python3 -B packaging/verify_package.py "$archive" --run-binary --repo . --out "$root/verify-package.json" >"$root/verify-package.log"
+          tar -xzf "$archive" -C "$root/extract"
+          entries=("$root"/extract/xtrace-*)
+          test "${#entries[@]}" -eq 1
+          prefix="$root/installed X-trace"
+          sh "${entries[0]}/install.sh" --prefix "$prefix" --data-home "$root/journey/data" >"$root/install.log"
+          sh "$prefix/current/install.sh" verify --prefix "$prefix" >"$root/verify-install.log"
+          digest=$(sha256sum "$archive" | cut -d' ' -f1)
+          echo "Verified unsigned Linux archive SHA-256: $digest" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Interrupt only the held fixture JVM and verify durable recovery
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/x3"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          if ! adapters/java/gradlew -p adapters/java --dependency-verification strict --no-daemon fixtureBootJar >"$root/fixture.log" 2>&1; then
+            echo 'Spring fixture dependency build failed.'
+            exit 1
+          fi
+          (
+            cd "$root/lib"
+            jar -xf "$GITHUB_WORKSPACE/subject/adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar" BOOT-INF/lib
+          )
+          fixture="$GITHUB_WORKSPACE/driver/tools/qa/fixtures/catalog-link/SpringInterruptedFixture.java"
+          javac --release 17 -cp "$root/lib/BOOT-INF/lib/*" -d "$root/classes" "$fixture"
+          cd "$root/caller"
+          python3 -B "$GITHUB_WORKSPACE/driver/tools/qa/installed_spring_interruption.py" \
+            "$GITHUB_WORKSPACE/subject" "$root/installed X-trace" "$root/journey" "$root/classes:$root/lib/BOOT-INF/lib/*" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
