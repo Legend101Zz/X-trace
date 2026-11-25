@@ -1,0 +1,343 @@
+# Private review template. Replace c8febb6a4c463674a0a17f75fda1fdc6724ba0a8 and __PUBLIC_CERT__ before use.
+# SOURCE_SHA must contain reviewed #102 + #84/#89 packaging/default analyzer and embedded viewer.
+# No acceptance, release signing, macOS, external application or Postman workspace claim.
+name: Installed Spring export browser proof
+on:
+  push:
+    branches: [codex/proof-installed-phase-focus-102]
+permissions:
+  contents: read
+jobs:
+  installed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: c8febb6a4c463674a0a17f75fda1fdc6724ba0a8
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # package.yml v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # package.yml v7.0.0
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # package.yml v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Admit fresh private root
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import os, pathlib, re, subprocess
+          from tools.release.private_roots import ensure_private_directory
+          sha = os.environ['SOURCE_SHA']
+          assert re.fullmatch('[0-9a-f]{40}', sha)
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == sha
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'xe'
+          # Rejected/existing roots are never inspected, chmodded, deleted or uploaded.
+          ensure_private_directory(root, must_create=True)
+          for name in ('logs', 'safe', 'tmp', 'cache', 'packages'):
+              ensure_private_directory(root / name, must_create=True)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write(f'PROOF_ROOT={root}\nTMPDIR={root}/tmp\nPLAYWRIGHT_BROWSERS_PATH={root}/cache/chromium\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('admitted=true\n')
+          PY
+      - name: Build verify install and exercise exact package privately
+        id: proof
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, sys, tarfile
+          from tools.release.private_roots import admit_directory
+          root = pathlib.Path(os.environ['PROOF_ROOT'])
+          admit_directory(root)
+          repo = pathlib.Path.cwd()
+          report = {'schemaVersion': 1, 'releaseEvidence': False, 'status': 'fail', 'stage': 'source-check', 'exitCode': 1, 'sourceSha': os.environ['SOURCE_SHA'], 'packageSha256': None, 'countsComplete': False}
+          labels = {'source-check', 'b3sum-download', 'b3sum-extract', 'b3sum-vector', 'package-build', 'archive-verify', 'dist-verify', 'archive-extract', 'fresh-install', 'installed-verify', 'fixture-build', 'browser-dependencies', 'chromium-install', 'source-clean', 'installed-journey'}
+          env = dict(os.environ)
+          for key in ('XTRACE_JAVA_ANALYZER', 'XTRACE_NODE_ANALYZER', 'XTRACE_JAVA_PACK', 'XTRACE_JAVA_AGENT', 'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'):
+              env.pop(key, None)
+          index = 0
+          def command(label, args, cwd=repo, timeout=3600):
+              global index
+              assert label in labels
+              index += 1
+              report.update(stage=label, exitCode=1)
+              with (root/'logs'/f'{index}.stdout').open('xb') as out, (root/'logs'/f'{index}.stderr').open('xb') as err:
+                  try:
+                      result = subprocess.run(args, cwd=cwd, env=env, stdout=out, stderr=err, timeout=timeout, check=False)
+                      code = result.returncode
+                  except subprocess.TimeoutExpired:
+                      code = 124
+              report['exitCode'] = code
+              if code:
+                  raise RuntimeError('stage-failed')
+          try:
+              command('source-check', ['git', 'diff', '--exit-code', 'HEAD'])
+              debdir = root/'packages'
+              command('b3sum-download', ['apt-get', 'download', 'b3sum'], cwd=debdir)
+              debs = list(debdir.glob('b3sum_*.deb'))
+              assert len(debs) == 1
+              command('b3sum-extract', ['dpkg-deb', '-x', str(debs[0]), str(debdir/'b3')])
+              env['PATH'] = str(debdir/'b3/usr/bin') + os.pathsep + env['PATH']
+              command('b3sum-vector', ['python3', '-B', '-c', 'from tools.qa.installed_export_journey import blake3_bytes; assert blake3_bytes(b"abc") == "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"'])
+              command('package-build', ['python3', '-B', 'packaging/build.py', '--out', str(root/'dist'), '--work', str(root/'build'), '--platform', 'linux-x86_64'])
+              archives = list((root/'dist/linux-x86_64').glob('xtrace-*-linux-x86_64.tar.gz'))
+              assert len(archives) == 1
+              archive = archives[0]
+              with archive.open('rb') as stream:
+                  sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
+              report['packageSha256'] = sha256
+              command('archive-verify', ['python3', '-B', 'packaging/verify_package.py', str(archive), '--repo', str(repo), '--run-binary'])
+              command('dist-verify', ['sh', 'packaging/install.sh', 'verify-dist', str(archive.parent)])
+              extracted = root/'extracted'
+              extracted.mkdir(mode=0o700)
+              report.update(stage='archive-extract', exitCode=1)
+              with tarfile.open(archive, 'r:gz') as bundle:
+                  bundle.extractall(extracted, filter='data')
+              installs = list(extracted.glob('xtrace-*/install.sh'))
+              assert len(installs) == 1
+              prefix = root/'fresh installed prefix'
+              assert not prefix.exists()
+              env['XTRACE_DATA_HOME'] = str(root/'install-data')
+              command('fresh-install', ['sh', str(installs[0]), 'install', '--prefix', str(prefix), '--data-home', str(root/'install-data')])
+              command('installed-verify', ['sh', str(prefix/'current/install.sh'), 'verify', '--prefix', str(prefix)])
+              command('fixture-build', ['./gradlew', '--no-daemon', '--dependency-verification', 'strict', ':spring-fixture:bootJar'], cwd=repo/'adapters/java')
+              command('browser-dependencies', ['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], cwd=repo/'web/app')
+              command('chromium-install', ['npm', 'exec', '--', 'playwright', 'install', 'chromium'], cwd=repo/'web/app')
+              # Builds may create ignored output but must leave tracked and untracked source clean.
+              report.update(stage='source-clean', exitCode=1)
+              dirty = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=all'], env=env)
+              assert not dirty
+              journey = root/'journey'
+              assert not journey.exists()
+              command('installed-journey', ['python3', '-B', 'tools/qa/installed_export_journey.py', '--prefix', str(prefix), '--package', str(archive), '--package-sha256', sha256, '--source-sha', os.environ['SOURCE_SHA'], '--repo', str(repo), '--fixture-jar', str(repo/'adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar'), '--java', str(pathlib.Path(os.environ['JAVA_HOME'])/'bin/java'), '--private-dir', str(journey), '--summary', str(root/'journey-summary.private.json')], timeout=1200)
+              report.update(status='pass', exitCode=0)
+          except Exception:
+              pass  # Only fixed stage and numeric exit are exported, never exception text.
+          # Only a validated sibling receipt establishes positive journey ownership.
+          # A failed admission before packageVerified never permits child traversal.
+          import stat
+          value = {}
+          summary = root/'journey-summary.private.json'
+          try:
+              info = summary.lstat()
+              if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 65536:
+                  with summary.open('rb') as stream:
+                      raw = stream.read(65537)
+                  if len(raw) <= 65536:
+                      candidate = json.loads(raw)
+                      if (isinstance(candidate, dict) and candidate.get('schemaVersion') == 1
+                              and candidate.get('kind') == 'installed-spring-export-journey'
+                              and candidate.get('sourceSha') == os.environ['SOURCE_SHA']
+                              and candidate.get('packageSha256') == report['packageSha256']):
+                          value = candidate
+          except (OSError, ValueError):
+              pass
+          reasons = ('scanned-revision-selection', 'supported-observed-scope', 'supported-orders-uuid-alias', 'absolute-prerequisites', 'approval-digest', 'archive-digest', 'archive-manifest', 'b3sum-failed', 'b3sum-known-vector', 'b3sum-prerequisite', 'browser-coverage', 'catalog-scope-resolution', 'cli-did-not-write', 'cli-inventory', 'cli-membership', 'cli-metadata', 'command-failed', 'command-output-limit', 'command-timeout', 'digest-parity', 'download-bytes', 'duplicate-preview-name', 'duplicate-recipe-ordinal', 'file-byte-digest', 'file-digest-parity', 'fixture-build-location', 'genuine-recording', 'genuine-scan-scope', 'harness-error', 'host-platform', 'installed-agent', 'installed-cli', 'installed-manifest-parity', 'installed-package-parity', 'logical-export-limit', 'observed-endpoint', 'omission-count', 'omission-group-parity', 'omission-parity', 'operation-parity', 'ordinal-parity', 'package-verification', 'prerequisites', 'preview-inventory', 'preview-mode', 'preview-name', 'preview-schema', 'preview-size', 'privacy-hit-or-coverage-gap', 'private-directory-not-fresh', 'private-file-limit', 'private-parent-permissions', 'project-init', 'provenance-shape', 'recipe-ordinal', 'recording-decoding-incomplete', 'revision-parity', 'scan-incomplete', 'selected-operation-count', 'source-dirty', 'source-revision', 'spring-exited-before-ready', 'spring-handler-not-observed', 'spring-output-drain', 'spring-output-io', 'spring-output-limit', 'spring-port-signal', 'spring-readiness', 'spring-recording-terminal', 'spring-shutdown-status', 'spring-shutdown-timeout', 'spring-workload', 'unsafe-cli-member', 'zip-bytes', 'zip-determinism', 'zip-duplicate', 'zip-membership', 'zip-mode', 'zip-path')
+          if isinstance(value.get('reason'), str) and value['reason'] in reasons:
+              report['reason'] = value['reason']
+          positive = value.get('packageVerified') is True
+          child_stages = []
+          journey = root/'journey'
+          try:
+              if not positive:
+                  raise ValueError('no-positive-ownership')
+              admit_directory(journey)
+              journey_admitted = journey.is_dir() and not journey.is_symlink()
+          except Exception:
+              journey_admitted = False
+          if journey_admitted:
+              logs = journey/'commands'
+              if logs.is_dir() and not logs.is_symlink():
+                  try:
+                      admit_directory(logs)
+                  except Exception:
+                      logs = root/'absent-diagnostic-root'
+                  # Fixed bounded numeric inventory; never recursive or unbounded globbing.
+                  for index in range(1, 1001):
+                      path = logs/f'{index}.status.json'
+                      if not path.exists():
+                          continue
+                      if path.is_symlink() or path.stat().st_size > 8192:
+                          continue
+                      try:
+                          status = json.loads(path.read_bytes())
+                      except (ValueError, OSError):
+                          continue
+                      argvpath = path.with_name(path.name.replace('.status.json', '.command.json'))
+                      if argvpath.is_symlink() or not argvpath.is_file() or argvpath.stat().st_size > 65536:
+                          continue
+                      try:
+                          args = json.loads(argvpath.read_bytes()).get('argv', [])
+                          if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+                              continue
+                      except (ValueError, OSError):
+                          continue
+                      label = None
+                      if len(args) > 1 and args[1] in ('init', 'scan', 'export'):
+                          label = {'init': 'project-init', 'scan': 'installed-default-scan', 'export': 'cli-export'}[args[1]]
+                      elif len(args) > 2 and (args[1], args[2]) in (('recording','list'), ('recording','show'), ('endpoint','list'), ('endpoint','recordings'), ('catalog','list')):
+                          label = '-'.join(args[1:3])
+                      elif len(args) > 1 and args[1].endswith('/web/app/scripts/installed-export-journey.mjs'):
+                          label = 'embedded-browser'
+                      elif len(args) > 1 and args[1].endswith('/packaging/verify_package.py'):
+                          label = 'full-package-verifier'
+                      elif len(args) > 2 and args[1].endswith('/install.sh') and args[2] == 'verify':
+                          label = 'official-installed-verifier'
+                      elif len(args) > 3 and args[0] == 'git' and args[1] == '-C' and args[3] in ('status', 'rev-parse'):
+                          label = 'source-identity'
+                      if label and type(status.get('exitCode')) is int:
+                          child_stages.append({'stage': label, 'exitCode': status['exitCode'], 'timedOut': status.get('timedOut') is True, 'outputLimited': status.get('outputLimited') is True})
+          report['commands'] = child_stages
+          for key in ('supportedOrdersUuidAlias', 'sameProjectCatalogLinked'):
+              report[key] = value[key] if positive and type(value.get(key)) is bool else None
+          if positive:
+              for key in ('genuineRequests', 'viewports', 'downloads', 'logicalFilesCompared', 'privacySurfaces'):
+                  if type(value.get(key)) is int and 0 <= value[key] <= 100000:
+                      report[key] = value[key]
+          report['browserProjection'] = 'unavailable'
+          if journey_admitted:
+              browser = journey/'browser'
+              if browser.is_dir() and not browser.is_symlink():
+                  try:
+                      from tools.qa.installed_export_journey import load_browser_receipt
+                      admit_directory(browser)
+                      result_file = browser/'browser.private.json'
+                      if result_file.exists() or result_file.is_symlink():
+                          identity = {'sourceSha': report['sourceSha'], 'packageSha256': report['packageSha256']}
+                          _, projection = load_browser_receipt(result_file, expected_identity=identity)
+                          report.update(projection)
+                          report['browserProjection'] = 'validated'
+                  except Exception:
+                      report['browserProjection'] = 'invalid'
+          if report['status'] == 'pass' and (report['browserProjection'] != 'validated' or report.get('browserStatus') != 'pass'):
+              report.update(status='fail', stage='browser-projection', exitCode=1)
+          report['countsComplete'] = positive and value.get('status') == 'pass' and report['status'] == 'pass'
+          (root/'safe/counts.json').write_text(json.dumps(report, sort_keys=True)+'\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('receipt-ready=true\n')
+          print(json.dumps(report, sort_keys=True))
+          sys.exit(0 if report['status'] == 'pass' else 1)
+          PY
+      - name: Encrypt allowlisted visual evidence only
+        id: visual
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        env:
+          # Public recipient certificate ONLY. No private key or build-step env injection.
+          RECIPIENT_CERT: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJgaIGZvHvTO1qz7A91QyCXVCBLwwDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCB2aWV3ZXIgdmlzdWFs
+            IHJldmlldzAeFw0yNjExMjUxNzQ1MjdaFw0yNjEyMDkxNzQ1MjdaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgdmlld2VyIHZpc3VhbCByZXZpZXcwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDUCDMtoLNBiFxpd01HnkpFVMon
+            DCZYbJiETXhyeSC/ecpMarzXEZ4ju0nd4LZwjL/A4Mx9T4JBA4pdFAQDPlnOfG6N
+            J+CQToj6WgpXFWUHpJp3yqfWqRRNj2LC10+slMqtzfcMRORiIYzzco9Uavy4a4zL
+            2jtcP3ShaaD6m/AsBFkCJMmZ94cJUeTgHwdDm9ERrPU0Eo1O31CWp0Oc/lmzvLFe
+            LpjJkdXSGZYrfQfc1n+iSNu1OO2ARxd2gkJPyTSE8dS7Zxwzcpm9izZkIyx5Z3Xm
+            l11t8C3QPDcJ4lRiTI9jF81lmxKak9eIl2PmnWNg5D19nynsboEUxfkr9IWQDYt/
+            JJ36+LyBi/mRph2c7jG3IE7GqoViW+7zd6ImzoiQZajii5PPo8ZRyvVNAZ44UbsL
+            E5djCSUrPH7slC5Cu+eV3YePq8+izZDSGcfwlzrzWGQRt2+kojpy4bPX/qxWB/sO
+            F9C85rrfrjsWWczag8SZdrvBgXWm1d0gAofhGYUCAwEAAaNTMFEwHQYDVR0OBBYE
+            FKT8KNtbCqB4oRqvV+kmEM1sK0ghMB8GA1UdIwQYMBaAFKT8KNtbCqB4oRqvV+km
+            EM1sK0ghMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAH2nbGzx
+            vLlE1JVO27hw10iq3kC66kTbvwM2I4MIkaPfRQ3unmLr+f0uZ5JMJpDzQU7DyN9P
+            i8zsBRqGcA8cnvIC26SbNTX77RYzzEELsr7hl1N/Gjv+xls4IARMfrSKg5uZfPa0
+            raN7oFbJsbh45Z0296AWQ4o9uh/DmHvEo+d1frE+LbQcV6GHQwMjHlzgSjgieFfR
+            8MgJ9YxUfYnFUSdSRq2v/M2WVut9k5IaDBpFcphwUsqXbzE+maJqjGrn+wHBgqVQ
+            hLPNyiQExu/6xUExTFyz4meSDRCaK6N4DJHqWa0lRPG6dhv9jAyOC7Freh2FshLk
+            5ZvJRuUHdhKSA3VbAhr2grL/9f3z1QshohE13qgn25XIr1Vx88N0jJDcbgumqSWf
+            KBU//gL8IFFFfL15nOhhDkGgzHnV/IKeaMJVBC7D/aW5tRUWWzESBQHJR7lvu+sR
+            2eYyRl07aS451CmcdJNQg+KnIflBiYQFgPh6dAjNm2QAoH5ROQLW7Ah+TA==
+            -----END CERTIFICATE-----
+        run: |
+          python3 -B - <<'PY'
+          import io, json, os, pathlib, stat, subprocess, tarfile
+          from tools.release.private_roots import admit_directory
+          root = pathlib.Path(os.environ['PROOF_ROOT'])
+          admit_directory(root)
+          summary = root/'journey-summary.private.json'
+          try:
+              info = summary.lstat()
+              if not (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 65536):
+                  raise SystemExit(0)
+              with summary.open('rb') as stream:
+                  data = stream.read(65537)
+              if len(data) > 65536:
+                  raise SystemExit(0)
+              value = json.loads(data)
+              counts = json.loads((root/'safe/counts.json').read_bytes())
+              if not (value.get('packageVerified') is True and value.get('schemaVersion') == 1
+                      and value.get('kind') == 'installed-spring-export-journey'
+                      and value.get('sourceSha') == os.environ['SOURCE_SHA']
+                      and value.get('packageSha256') == counts.get('packageSha256')):
+                  raise SystemExit(0)
+          except (OSError, ValueError):
+              raise SystemExit(0)
+          journey = root/'journey'
+          # A missing/refused root is not traversed or archived.
+          if not journey.is_dir() or journey.is_symlink():
+              raise SystemExit(0)
+          admit_directory(journey)
+          browser = journey/'browser'
+          if not browser.is_dir() or browser.is_symlink():
+              raise SystemExit(0)
+          admit_directory(browser)
+          widths = (320,736,1024,1280,1440)
+          names = ('choose.png', 'all-openapi-yaml.png', 'save.png')
+          selected = []
+          for width in widths:
+              for pointer in ('fine', 'coarse'):
+                  directory = browser/f'{width}-{pointer}'
+                  if not directory.is_dir() or directory.is_symlink():
+                      continue
+                  admit_directory(directory)
+                  for name in names:
+                      path = directory/name
+                      if path.is_file() and not path.is_symlink():
+                          assert path.stat().st_size <= 20*1024*1024
+                          data = path.read_bytes()
+                          assert data.startswith(b'\x89PNG\r\n\x1a\n')
+                          selected.append((f'{width}-{pointer}/{name}', data))
+          if not selected:
+              raise SystemExit(0)
+          payload = io.BytesIO()
+          with tarfile.open(fileobj=payload, mode='w:gz') as archive:
+              for name, data in selected:
+                  info = tarfile.TarInfo(name)
+                  info.size, info.mode, info.mtime = len(data), 0o600, 0
+                  archive.addfile(info, io.BytesIO(data))
+          cert = root/'recipient.pem'
+          cert.write_text(os.environ['RECIPIENT_CERT'])
+          encrypted = root/'encrypted'
+          encrypted.mkdir(mode=0o700)
+          with (root/'logs/encryption.stderr').open('xb') as err:
+              result = subprocess.run(['openssl', 'cms', '-encrypt', '-binary', '-aes-256-gcm', '-outform', 'DER', '-out', str(encrypted/'visuals.cms'), str(cert)], input=payload.getvalue(), stdout=subprocess.DEVNULL, stderr=err, check=False, timeout=60)
+          if result.returncode:
+              # Never upload plaintext or a failed/partial encrypted file.
+              (encrypted/'visuals.cms').unlink(missing_ok=True)
+              raise SystemExit(1)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('ready=true\n')
+          print('encryptedVisualCount=' + str(len(selected)))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() && steps.proof.outputs['receipt-ready'] == 'true' }}
+        with:
+          name: installed-export-counts
+          path: ${{ env.PROOF_ROOT }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.visual.outputs.ready == 'true' }}
+        with:
+          name: installed-export-encrypted-visuals
+          path: ${{ env.PROOF_ROOT }}/encrypted/visuals.cms
+          if-no-files-found: ignore
+          retention-days: 1
