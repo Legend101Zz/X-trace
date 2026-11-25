@@ -844,6 +844,15 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
 
 #[test]
 fn focused_spring_viewer_highlights_a_recorded_line_and_local() {
+    run_focused_spring_viewer_journey(false);
+}
+
+#[test]
+fn focused_spring_viewer_loads_earlier_and_later_recorded_events() {
+    run_focused_spring_viewer_journey(true);
+}
+
+fn run_focused_spring_viewer_journey(window_journey: bool) {
     let root = temp_root();
     let repo = root.path().join("focused repository");
     let data_home = root.path().join("focused data");
@@ -911,7 +920,15 @@ fn focused_spring_viewer_highlights_a_recorded_line_and_local() {
         br#"{"description":"focused fixture","bodyCanary":"BODY_CANARY_1D4","errorCanary":""}"#,
     );
     assert!(response.starts_with(b"HTTP/1.1 201"), "focused fixture POST failed");
-    wait_for_terminal_recording(&project_root);
+    wait_for_terminal_recordings(&project_root, 1);
+    if window_journey {
+        let response = post_order_body(
+            port,
+            br#"{"description":"replay-window fixture","bodyCanary":"BODY_CANARY_1D4","errorCanary":""}"#,
+        );
+        assert!(response.starts_with(b"HTTP/1.1 201"), "paging fixture POST failed");
+        wait_for_terminal_recordings(&project_root, 2);
+    }
 
     let pid = rustix::process::Pid::from_raw(process.child.id() as i32).expect("focused CLI PID");
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("stop focused run");
@@ -923,15 +940,44 @@ fn focused_spring_viewer_highlights_a_recorded_line_and_local() {
     assert_canaries_absent(&stdout);
     assert_canaries_absent(&stderr);
 
-    let list = recording_list_page(&repo, &data_home, None);
-    assert!(list.status.success(), "focused recording list failed");
-    let list: Value = serde_json::from_slice(&list.stdout).expect("focused recording list JSON");
-    let recording_id =
-        list["recordings"][0]["recording_id"].as_str().expect("focused recording ID");
+    let (script, receipt, id_key, ids) = if window_journey {
+        let endpoints = endpoint_list_page(&repo, &data_home, None, None);
+        assert!(endpoints.status.success(), "paging fixture endpoint list failed");
+        assert_canaries_absent(&endpoints.stdout);
+        let endpoints: Value =
+            serde_json::from_slice(&endpoints.stdout).expect("fixture endpoints");
+        let operation_id =
+            endpoints["items"][0]["operationId"].as_str().expect("fixture operation");
+        let linked = endpoint_recordings_page(&repo, &data_home, operation_id, 2, None);
+        assert!(linked.status.success(), "paging fixture recording list failed");
+        assert_canaries_absent(&linked.stdout);
+        let linked: Value = serde_json::from_slice(&linked.stdout).expect("fixture recordings");
+        let items = linked["items"].as_array().expect("fixture recording items");
+        assert_eq!(items.len(), 2, "both real Spring requests produced linked recordings");
+        (
+            "real-replay-window-journey.mjs",
+            "real Spring replay windows proof passed",
+            "recordingIds",
+            Value::Array(items.iter().map(|item| item["recordingId"].clone()).collect()),
+        )
+    } else {
+        let list = recording_list_page(&repo, &data_home, None);
+        assert!(list.status.success(), "focused recording list failed");
+        let list: Value =
+            serde_json::from_slice(&list.stdout).expect("focused recording list JSON");
+        let recording_id =
+            list["recordings"][0]["recording_id"].as_str().expect("focused recording ID");
+        (
+            "focused-code-journey.mjs",
+            "focused Code and Values proof passed",
+            "recordingId",
+            serde_json::json!(recording_id),
+        )
+    };
     let (mut readiness, mut viewer) = launch_viewer(&repo, &data_home);
-    readiness["recordingId"] = serde_json::json!(recording_id);
+    readiness[id_key] = ids;
     let mut browser = Command::new("node")
-        .arg(workspace.join("web/app/scripts/focused-code-journey.mjs"))
+        .arg(workspace.join("web/app/scripts").join(script))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -951,25 +997,23 @@ fn focused_spring_viewer_highlights_a_recorded_line_and_local() {
         "focused browser failed: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&result.stdout).contains("focused Code and Values proof passed")
-    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains(receipt));
     println!("{}", String::from_utf8_lossy(&result.stdout).trim());
     stop_viewer(&mut viewer);
 }
 
-fn wait_for_terminal_recording(project_root: &Path) {
+fn wait_for_terminal_recordings(project_root: &Path, expected: u32) {
     let database = Connection::open(project_root.join("metadata.sqlite3")).expect("focused SQLite");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let finished: bool = database
+        let finished: u32 = database
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM recordings WHERE status IN ('complete', 'partial'))",
+                "SELECT COUNT(*) FROM recordings WHERE status IN ('complete', 'partial')",
                 [],
                 |row| row.get(0),
             )
             .expect("focused recording status");
-        if finished {
+        if finished >= expected {
             return;
         }
         assert!(Instant::now() < deadline, "focused recording did not reach a terminal state");

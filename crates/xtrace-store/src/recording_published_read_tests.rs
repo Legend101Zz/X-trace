@@ -29,6 +29,7 @@ mod published_reads {
                             recording_id: recording,
                             limit: 10,
                             after_sequence: None,
+                            before_sequence: None,
                         },
                         None,
                     )
@@ -326,6 +327,7 @@ mod published_reads {
                             recording_id: recording,
                             limit: 10,
                             after_sequence: None,
+                            before_sequence: None,
                         },
                         None,
                     )
@@ -361,6 +363,7 @@ mod published_reads {
                         recording_id: recording,
                         limit: 10,
                         after_sequence: None,
+                        before_sequence: None,
                     },
                     None,
                 )
@@ -429,6 +432,7 @@ mod published_reads {
                         recording_id: anchor.recording_id,
                         limit: 10,
                         after_sequence: None,
+                        before_sequence: None,
                     },
                     None,
                 )
