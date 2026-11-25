@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: f14f42bf1096595ebf2d4c79c9d8849f78f69810
+          ref: 8f45baf26a5c57548b354cda107b97a92092d698
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
@@ -40,7 +40,7 @@ jobs:
           root="$RUNNER_TEMP/x112"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/fragments"
           export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
-          test "$(git rev-parse HEAD)" = f14f42bf1096595ebf2d4c79c9d8849f78f69810
+          test "$(git rev-parse HEAD)" = 8f45baf26a5c57548b354cda107b97a92092d698
           cargo fmt --all --check
           python3 -B -m tools.qa.lane_run run --suite rust --step registered-v11 --min-passed 2 --max-ignored 0 --out "$root/fragments" -- \
             cargo test --locked -p xtrace-store --lib proposed_catalog_link
@@ -84,7 +84,7 @@ jobs:
           from pathlib import Path
           import json, sys
           manifest = json.loads(Path(sys.argv[1]).read_text())
-          if manifest["sourceCommit"] != "f14f42bf1096595ebf2d4c79c9d8849f78f69810" or manifest["packTrust"] != "unsigned":
+          if manifest["sourceCommit"] != "8f45baf26a5c57548b354cda107b97a92092d698" or manifest["packTrust"] != "unsigned":
               raise SystemExit("Unexpected package identity")
           PY
           stage=fixture
