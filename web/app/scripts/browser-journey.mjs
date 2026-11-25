@@ -510,6 +510,19 @@ try {
         await expect(toolsPage.locator('.event[aria-current="true"] .event-seq')).toHaveText(sequence);
         const steps = toolsPage.locator('#events-panel');
         const refresh = steps.getByRole('button', { name: 'Refresh', exact: true });
+        if (toolsPage.viewportSize().width < 700) {
+          const currentTab = tabs.getByRole('tab', { selected: true });
+          await currentTab.focus();
+          await expect(currentTab).toBeFocused();
+          await refresh.scrollIntoViewIfNeeded();
+          const before = await refresh.boundingBox();
+          await refresh.evaluate((button) => button.focus({ preventScroll: true }));
+          await expect(refresh).toBeFocused();
+          const after = await refresh.boundingBox();
+          assert.ok(before && after && before.x === after.x && before.y === after.y,
+            'moving focus out of the recording tabs keeps the phone Refresh target stationary');
+          await currentTab.focus();
+        }
         let refreshRequest;
         const [, refreshResponse] = await Promise.all([
           toolsPage.waitForRequest((request) => {

@@ -200,8 +200,11 @@
   .shell.viewer-shell[data-reading='true']:not([data-pane='recordings']) {
     grid-template-rows: 0 auto auto minmax(0, 1fr) auto 44px;
   }
-  .shell[data-reading='true']:not([data-pane='recordings']) > .topbar,
-  .shell[data-reading='true']:not([data-pane='recordings']) > .recording-tabs:not(:focus-within) { display: none; }
+  .shell[data-reading='true']:not([data-pane='recordings']) > .topbar { display: none; }
+  /* The recording summary stays first. Moving focus off a tab must not move
+     the pointer target between pointerdown and click. */
+  .shell[data-reading='true']:not([data-pane='recordings']) > .replay-context { grid-row: 2; }
+  .shell[data-reading='true']:not([data-pane='recordings']) > .recording-tabs { grid-row: 3; }
   .replay-context-event { margin: 0; }
   .phone-replay-toolbar { position: relative; background: var(--panel); }
   .phone-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; }
