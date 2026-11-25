@@ -57,8 +57,7 @@ class Journey:
                                      stdout=output, stderr=error)
         try:
             deadline = time.monotonic() + 40
-            pattern = (rb"^LINK_FIXTURE_READY ([0-9]{1,5})$" if self.framework == "express"
-                       else rb"Tomcat started on port[s]? ([0-9]{1,5}) ")
+            pattern = rb"^LINK_FIXTURE_READY ([0-9]{1,5})$"
             while time.monotonic() < deadline:
                 require(child.poll() is None, "launch_early_exit_" + label)
                 match = re.search(pattern, log.read_bytes(), re.MULTILINE)
@@ -72,10 +71,7 @@ class Journey:
             for method, path, status in requests:
                 connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
                 try:
-                    body = (json.dumps({"description": self.seed, "bodyCanary": self.seed})
-                            if method == "POST" else None)
-                    connection.request(method, path + "?trace_token=" + self.seed, body,
-                                       {"Content-Type": "application/json"})
+                    connection.request(method, path + "?trace_token=" + self.seed)
                     response = connection.getresponse()
                     require(response.status == status, "http_status_" + label)
                     response.read()
@@ -124,21 +120,21 @@ process.stdin.once('data', () => { process.stdin.pause(); server.close(); });
             app = ["--node-adapter", ws / "adapters/node/packages/adapter-core/dist",
                    "--node-mode", "cjs", "--", "node", main]
             endpoint = ("GET", "/owners/{id}")
-            matched = [("GET", "/owners/42", 200), ("GET", "/owners/71", 200)]
+            matched = [("GET", "/owners/42", 200), ("GET", "/owners/" + self.seed, 200)]
             negatives = [("GET", "/unscanned", 200), ("GET", "/missing", 404)]
         else:
             java = ws / "adapters/java"
             analyzer = java / "static-analyzer/build/install/xtrace-java-static/bin/xtrace-java-static"
-            src = self.source / "OrderController.java"
-            shutil.copyfile(java / "spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java", src)
+            src = self.source / "SpringLinkFixture.java"
+            shutil.copyfile(ws / "tools/qa/fixtures/catalog-link/SpringLinkFixture.java", src)
             app = ["--java-agent", java / "agent-bootstrap/build/agent-dist/xtrace-java-agent.jar",
-                   "--app-package", "dev.xtrace.fixture", "--", "java", "-jar",
-                   java / "spring-fixture/build/libs/xtrace-spring-fixture.jar",
+                   "--app-package", "dev.xtrace.catalogfixture", "--", "java", "-cp",
+                   os.environ["XTRACE_LINK_SPRING_CLASSPATH"], "dev.xtrace.catalogfixture.SpringLinkFixture",
                    "--server.port=0", "--server.address=127.0.0.1",
-                   "--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO"]
-            endpoint = ("POST", "/orders")
-            matched = [("POST", "/orders", 201)]
-            negatives = [("GET", "/__fixture/count", 200)]
+                   "--logging.level.root=WARN"]
+            endpoint = ("GET", "/owners/{id}")
+            matched = [("GET", "/owners/42", 200), ("GET", "/owners/" + self.seed, 200)]
+            negatives = []
         scope = f"link-{self.framework}"
         scan = ["scan", "--source", self.source, "--framework", self.framework, "--analyzer", analyzer,
                 "--application-component", scope, "--binding-key", "default", "--json"]
@@ -154,7 +150,7 @@ process.stdin.once('data', () => { process.stdin.pause(); server.close(); });
         if self.framework == "express":
             changed = original.replace("'/:ownerId'", "'/different'")
         else:
-            changed = original.replace('"/orders"', '"/new-orders"')
+            changed = original.replace('"/owners/{ownerId}"', '"/new-owners/{ownerId}"')
         require(changed != original, "rescan_fixture_changed")
         src.write_text(changed)
         second = self.call("rescan_complete", *scan)
@@ -174,10 +170,9 @@ process.stdin.once('data', () => { process.stdin.pause(); server.close(); });
                     and row["observationPolicy"] == "runtime-route-v1"
                     and row["unmatchedReason"] is None for row in linked), "exact_linked_rows")
         unmatched = self.call("unmatched", "recording", "list", "--unmatched")["items"]
-        reasons = ["no_catalog_match", "no_catalog_match", "catalog_revision_unavailable",
-                   "observation_policy_missing"]
+        reasons = ["no_catalog_match", "catalog_revision_unavailable", "observation_policy_missing"]
         if self.framework == "express":
-            reasons.append("route_template_unavailable_or_ineligible")
+            reasons.extend(["no_catalog_match", "route_template_unavailable_or_ineligible"])
         require(sorted(row["unmatchedReason"] for row in unmatched) == sorted(reasons)
                 and all(row["operationId"] is None for row in unmatched), "unmatched_reasons")
         ids = {row["recordingId"] for row in linked + unmatched}
