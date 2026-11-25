@@ -1,0 +1,40 @@
+name: Persisted Express terminal outcome
+on:
+  push:
+    branches: [codex/express-outcome-6-proof]
+permissions:
+  contents: read
+jobs:
+  outcome:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 83fbfd86b474fdfba6d4d940718ec113672842f6
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Prepare locked real Express adapters
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = 83fbfd86b474fdfba6d4d940718ec113672842f6
+          npm ci --prefix adapters/node > "$RUNNER_TEMP/express-deps.log" 2>&1
+          npm run build:protocol --prefix adapters/node > "$RUNNER_TEMP/express-protocol.log" 2>&1
+          npm run build:core --prefix adapters/node > "$RUNNER_TEMP/express-core.log" 2>&1
+      - name: Verify both real Express CLI journeys
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/fragments"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          cargo fmt --all --check
+          cargo clippy --locked -p xtrace-cli --test node_express_journey -- -D warnings
+          python3 -B -m tools.qa.lane_run run --suite rust --step express-outcome --min-passed 2 --max-ignored 0 --out "$root/fragments" -- cargo test --locked -p xtrace-cli --test node_express_journey
