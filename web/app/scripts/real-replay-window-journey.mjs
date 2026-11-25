@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { chromium, expect } from '@playwright/test';
-import { verifyReplayWindowNavigation } from './replay-window-journey.mjs';
+import { jumpToLoadedSequence, verifyMountedWindow, verifyReplayWindowNavigation } from './replay-window-journey.mjs';
 
 const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
@@ -99,7 +99,7 @@ try {
       }
     }
   };
-  const steps = page.locator('#events-panel .event');
+  const currentStep = page.locator('#events-panel .event[aria-current="true"]');
   const windows = page.getByRole('region', { name: 'Loaded event window' });
   const laterButton = () => windows.getByRole('button', { name: 'Load later', exact: true });
 
@@ -117,19 +117,14 @@ try {
       await switchPane('Requests');
     }
     await row(recordingId).click();
-    await expect(steps).toHaveCount(first.sequences.length);
+    await verifyMountedWindow(page, first.sequences);
     await laterButton().click();
-    await expect(steps).toHaveCount(first.sequences.length + middle.sequences.length);
-    const target = steps.nth(first.sequences.length + selectedIndex);
-    await expect(target.locator('.event-seq')).toHaveText(selected);
-    await target.click();
-    await switchPane('Steps');
-    await expect(target).toHaveAttribute('aria-current', 'true');
+    await verifyMountedWindow(page, [...first.sequences, ...middle.sequences]);
+    await jumpToLoadedSequence(page, selected);
     await tab(otherId).click();
-    await expect(steps).toHaveCount(initials[1 - pagedIndex].sequences.length);
+    await verifyMountedWindow(page, initials[1 - pagedIndex].sequences);
     await tab(recordingId).click();
-    await expect(steps).toHaveCount(middle.sequences.length);
-    await expect(steps.nth(selectedIndex)).toHaveAttribute('aria-current', 'true');
+    await expect(currentStep.locator('.event-seq')).toHaveText(selected);
     stage = `navigate and retain selection at ${width}px`;
     return { earlier: earlier.sequences, current: middle.sequences, later: later.sequences, selected };
   });
@@ -143,6 +138,7 @@ try {
   // Playwright failures can contain rendered trace text or private locators.
   const frames = String(error.stack).match(/(?:real-)?replay-window-journey\.mjs:\d+:\d+/g) ?? [];
   console.error(`Spring replay window failed during ${stage} (${frames.join(', ')})`);
+  if (error.anchorGeometry) console.error(`Steps anchor geometry ${JSON.stringify(error.anchorGeometry)}`);
   process.exitCode = 1;
 } finally {
   await browser.close();
