@@ -1,0 +1,359 @@
+name: Replay loaded Tools source-built Spring diagnosis
+on:
+  push:
+    branches: [codex/proof-replay-tools-diagnosis-113]
+permissions:
+  contents: read
+jobs:
+  viewer-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PRODUCT: 0ea8c8ea1e46310c9a370e0b907b622c829b03e3
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PRODUCT }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Admit fresh private scratch and exact source
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import os, pathlib, re, subprocess
+          from tools.release import ci_floor
+          from tools.release.private_roots import ensure_private_directory
+          sha = os.environ['PRODUCT']
+          assert re.fullmatch('[0-9a-f]{40}', sha)
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == sha
+          assert not subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=all'])
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'xt113'
+          assert len(str(root)) <= 40
+          ci_floor._prepare_private_root(type('Args', (), {'root': str(root)})())
+          for name in ('logs', 'fragments', 'safe', 'shots', 'generated', 'cache', 'receipts'):
+              ensure_private_directory(root / name, must_create=True)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write(f'PROOF_ROOT={root}\nPLAYWRIGHT_BROWSERS_PATH={root}/cache/chromium\nPROOF_RECEIPT_ID={os.urandom(32).hex()}\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('admitted=true\n')
+          PY
+      - name: Rebuild and verify pinned assets and diagnose the genuine Spring browser journey
+        id: proof
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, subprocess, sys
+          from tools.release.private_roots import admit_directory, atomic_write_private
+          root = pathlib.Path(os.environ['PROOF_ROOT'])
+          admit_directory(root)
+          os.umask(0o077)
+          repo = pathlib.Path.cwd()
+          env = dict(os.environ)
+          for key in ('XTRACE_JAVA_ANALYZER', 'XTRACE_NODE_ANALYZER', 'XTRACE_JAVA_PACK', 'XTRACE_JAVA_AGENT', 'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'):
+              env.pop(key, None)
+          env['XTRACE_BROWSER_SCREENSHOT_DIR'] = str(root/'shots')
+          env['XTRACE_REPLAY_TOOLS_REPORT'] = str(root/'receipts/jumps.private.json')
+          env['XTRACE_REPLAY_TOOLS_SOURCE_SHA'] = env['PRODUCT']
+          env['XTRACE_REPLAY_TOOLS_RECEIPT_ID'] = env['PROOF_RECEIPT_ID']
+          env['npm_config_cache'] = str(root/'cache/npm')
+          stages = ('source-check', 'web-install', 'web-api', 'web-types', 'browser-syntax', 'tools-unit', 'contrast', 'web-build', 'web-embed', 'embedded-parity', 'generated-assets', 'java-build', 'adapter-verify', 'chromium-install', 'source-scope', 'spring-browser')
+          report = {'schemaVersion': 1, 'kind': 'source-built-spring-replay-tools-proof', 'sourceSha': os.environ['PRODUCT'], 'releaseAcceptance': False, 'installedPackage': False, 'fullFloor': False, 'status': 'fail', 'stage': 'source-check', 'exitCode': 1, 'countsComplete': False, 'stages': []}
+          atomic_write_private(root/'safe/counts.json', (json.dumps(report, sort_keys=True)+'\n').encode())
+          def checkpoint():
+              atomic_write_private(root/'safe/counts.json', (json.dumps(report, sort_keys=True)+'\n').encode())
+          def command(label, args, cwd=repo, timeout=3000):
+              assert label in stages
+              report.update(stage=label, exitCode=1)
+              checkpoint()
+              number = len(report['stages']) + 1
+              with (root/'logs'/f'{number}.stdout').open('xb') as out, (root/'logs'/f'{number}.stderr').open('xb') as err:
+                  try:
+                      result = subprocess.run(args, cwd=cwd, env=env, stdout=out, stderr=err, timeout=timeout, check=False)
+                      code = result.returncode
+                  except subprocess.TimeoutExpired:
+                      code = 124
+              report['stages'].append({'stage': label, 'exitCode': code, 'timedOut': code == 124})
+              report['exitCode'] = code
+              checkpoint()
+              if code:
+                  raise RuntimeError('stage-failed')
+          def fragment(name, expected, key, stage):
+              # A zero-exit command is not a passing count/schema validation.
+              report.update(stage=stage, exitCode=1)
+              checkpoint()
+              path = root/'fragments'/name
+              assert not path.is_symlink() and path.is_file() and path.stat().st_size <= 65536
+              value = json.loads(path.read_bytes())
+              safe = {key: value.get(key) for key in ('passed', 'failed', 'ignored')}
+              assert all(type(v) is int and 0 <= v <= 100000 for v in safe.values())
+              report[key] = safe
+              checkpoint()
+              assert value.get('status') == 'pass' and value.get('exitCode') == 0
+              assert safe == {'passed': expected, 'failed': 0, 'ignored': 0}
+              report['exitCode'] = 0
+              checkpoint()
+          try:
+              command('source-check', ['git', 'diff', '--exit-code', 'HEAD'])
+              command('web-install', ['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], cwd=repo/'web/app')
+              lane = ['python3', '-B', '-m', 'tools.qa.lane_run', 'run', '--out', str(root/'fragments'), '--private-log-dir', str(root/'logs'), '--max-ignored', '0']
+              command('web-build', ['npm', 'run', 'build'], cwd=repo/'web/app')
+              command('web-embed', ['npm', 'run', 'embed'], cwd=repo/'web/app')
+              command('embedded-parity', ['npm', 'run', 'check:embedded'], cwd=repo/'web/app')
+              command('java-build', ['./gradlew', '--no-daemon', '--dependency-verification', 'strict', 'clean', 'installDist', 'agentDist', 'fixtureBootJar'], cwd=repo/'adapters/java')
+              report.update(stage='adapter-verify', exitCode=1)
+              checkpoint()
+              adapter_paths = ('adapters/java/agent-bootstrap/build/agent-dist/xtrace-java-agent.jar', 'adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar')
+              assert all((repo/name).is_file() and not (repo/name).is_symlink() and (repo/name).stat().st_size > 0 for name in adapter_paths)
+              agent = repo/'adapters/java/agent-bootstrap/build/agent-dist'
+              agent_manifest = agent/'manifest.sha256'
+              assert agent_manifest.is_file() and not agent_manifest.is_symlink() and agent_manifest.stat().st_size <= 65536
+              agent_members = set()
+              for line in agent_manifest.read_text().splitlines():
+                  digest, name = line.split('  ')
+                  parts = pathlib.PurePosixPath(name).parts
+                  assert re.fullmatch('[0-9a-f]{64}', digest) and parts and not name.startswith('/') and all(part not in ('.','..') for part in parts)
+                  assert name not in agent_members and name.endswith('.jar')
+                  member = agent/name
+                  assert member.is_file() and not member.is_symlink() and member.stat().st_size <= 256*1024*1024
+                  assert all(not (agent/pathlib.Path(*parts[:i])).is_symlink() for i in range(1,len(parts)))
+                  with member.open('rb') as stream:
+                      assert hashlib.file_digest(stream, 'sha256').hexdigest() == digest
+                  agent_members.add(name)
+              assert 2 <= len(agent_members) <= 128 and 'xtrace-java-agent.jar' in agent_members and any(name.startswith('runtime/') for name in agent_members)
+              report['adapterArtifactCount'] = len(adapter_paths)
+              report['verifiedAgentJarCount'] = len(agent_members)
+              report['stages'].append({'stage': 'adapter-verify', 'exitCode': 0, 'timedOut': False})
+              checkpoint()
+              # Hosted Ubuntu already supplies Chromium libraries; no privileged dependency installer.
+              command('chromium-install', ['npm', 'exec', '--', 'playwright', 'install', 'chromium'], cwd=repo/'web/app')
+              report.update(stage='source-scope', exitCode=1)
+              checkpoint()
+              dirty = subprocess.check_output(['git', 'diff', '--name-only', 'HEAD'], env=env, text=True).splitlines()
+              assert not dirty
+              assert not subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], env=env)
+              assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], env=env, text=True).strip() == env['PRODUCT']
+              report['stages'].append({'stage': 'source-scope', 'exitCode': 0, 'timedOut': False})
+              checkpoint()
+              # Keep lane_run's existing 3000s command limit, readiness and browser limits unchanged.
+              command('spring-browser', lane + ['--suite', 'rust', '--variant', '17', '--step', 'spring-browser', '--min-passed', '1', '--ci-diagnostics', '--', 'cargo', 'test', '--locked', '--all-features', '--features', 'xtrace-private-storage/ci-diagnostics', '-p', 'xtrace-cli', '--test', 'java_run_spring', 'run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown', '--', '--exact', '--nocapture'], timeout=3060)
+              fragment('rust__17__spring-browser.json', 1, 'spring', 'spring-count-validation')
+              report.update(status='awaiting-browser-receipt', stage='jump-receipt-validation', exitCode=0, countsComplete=False)
+          except Exception:
+              report.update(status='fail', exitCode=report['exitCode'] or 1, countsComplete=False)
+              # Never publish exception text, argv, logs, trace values or diagnostic files.
+          checkpoint()
+          sys.exit(0 if report['status'] == 'awaiting-browser-receipt' else 1)
+          PY
+      - name: Project bounded progress and encrypt allowlisted viewport frames
+        id: visual
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        env:
+          # Public certificate only; supplied from the existing qualified viewer visual recipient.
+          RECIPIENT_CERT: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJgaIGZvHvTO1qz7A91QyCXVCBLwwDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCB2aWV3ZXIgdmlzdWFs
+            IHJldmlldzAeFw0yNjExMjUxNzQ1MjdaFw0yNjEyMDkxNzQ1MjdaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgdmlld2VyIHZpc3VhbCByZXZpZXcwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDUCDMtoLNBiFxpd01HnkpFVMon
+            DCZYbJiETXhyeSC/ecpMarzXEZ4ju0nd4LZwjL/A4Mx9T4JBA4pdFAQDPlnOfG6N
+            J+CQToj6WgpXFWUHpJp3yqfWqRRNj2LC10+slMqtzfcMRORiIYzzco9Uavy4a4zL
+            2jtcP3ShaaD6m/AsBFkCJMmZ94cJUeTgHwdDm9ERrPU0Eo1O31CWp0Oc/lmzvLFe
+            LpjJkdXSGZYrfQfc1n+iSNu1OO2ARxd2gkJPyTSE8dS7Zxwzcpm9izZkIyx5Z3Xm
+            l11t8C3QPDcJ4lRiTI9jF81lmxKak9eIl2PmnWNg5D19nynsboEUxfkr9IWQDYt/
+            JJ36+LyBi/mRph2c7jG3IE7GqoViW+7zd6ImzoiQZajii5PPo8ZRyvVNAZ44UbsL
+            E5djCSUrPH7slC5Cu+eV3YePq8+izZDSGcfwlzrzWGQRt2+kojpy4bPX/qxWB/sO
+            F9C85rrfrjsWWczag8SZdrvBgXWm1d0gAofhGYUCAwEAAaNTMFEwHQYDVR0OBBYE
+            FKT8KNtbCqB4oRqvV+kmEM1sK0ghMB8GA1UdIwQYMBaAFKT8KNtbCqB4oRqvV+km
+            EM1sK0ghMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAH2nbGzx
+            vLlE1JVO27hw10iq3kC66kTbvwM2I4MIkaPfRQ3unmLr+f0uZ5JMJpDzQU7DyN9P
+            i8zsBRqGcA8cnvIC26SbNTX77RYzzEELsr7hl1N/Gjv+xls4IARMfrSKg5uZfPa0
+            raN7oFbJsbh45Z0296AWQ4o9uh/DmHvEo+d1frE+LbQcV6GHQwMjHlzgSjgieFfR
+            8MgJ9YxUfYnFUSdSRq2v/M2WVut9k5IaDBpFcphwUsqXbzE+maJqjGrn+wHBgqVQ
+            hLPNyiQExu/6xUExTFyz4meSDRCaK6N4DJHqWa0lRPG6dhv9jAyOC7Freh2FshLk
+            5ZvJRuUHdhKSA3VbAhr2grL/9f3z1QshohE13qgn25XIr1Vx88N0jJDcbgumqSWf
+            KBU//gL8IFFFfL15nOhhDkGgzHnV/IKeaMJVBC7D/aW5tRUWWzESBQHJR7lvu+sR
+            2eYyRl07aS451CmcdJNQg+KnIflBiYQFgPh6dAjNm2QAoH5ROQLW7Ah+TA==
+            -----END CERTIFICATE-----
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, io, json, os, pathlib, re, stat, struct, subprocess, tarfile
+          from tools.release.private_roots import admit_directory, atomic_write_private, read_private_json
+          root = pathlib.Path(os.environ['PROOF_ROOT'])
+          admit_directory(root)
+          os.umask(0o077)
+          safe = root/'safe/counts.json'
+          if safe.is_symlink() or not safe.is_file() or safe.stat().st_size > 65536:
+              raise SystemExit(1)
+          report = json.loads(safe.read_bytes())
+          assert report.get('sourceSha') == os.environ['PRODUCT']
+          # Only pinned source locations and fixed enums may leave private scratch.
+          # Discard captured error messages, selectors, URLs, log lines and arbitrary filenames.
+          diag = {'locations': [], 'classes': [], 'reached': []}
+          safe_sources = ('browser-journey.mjs', 'replay-tools-journey.mjs', 'replay-tools-report.mjs')
+          private_log = root/'logs/xl/rust-17-spring-browser.log'
+          if private_log.is_file() and not private_log.is_symlink():
+              with private_log.open('rb') as data:
+                  data.seek(max(0, private_log.stat().st_size - 1024*1024))
+                  end = data.read(1024*1024).decode('utf-8', errors='replace')
+              for source in safe_sources:
+                  code = (pathlib.Path('web/app/scripts')/source).read_text().splitlines()
+                  for match in re.finditer(r'(?m)^\s*at [^\r\n]*?/web/app/scripts/'+re.escape(source)+r':(\d{1,5}):(\d{1,5})\)?\s*$', end):
+                      line, col = map(int, match.groups())
+                      loc = {'file':source, 'line':line, 'column':col}
+                      if 1 <= line <= len(code) and 1 <= col <= len(code[line-1].encode('utf-16-le'))//2+1 and loc not in diag['locations'] and len(diag['locations']) < 12:
+                          diag['locations'].append(loc)
+              for label, pattern in [('node-assertion', r'(?m)^AssertionError\b'), ('playwright-timeout', r'(?m)^(?:TimeoutError|(?:locator|page)\.[a-zA-Z]+: Timeout [0-9]+ms exceeded)'), ('playwright-strict-mode', r'strict mode violation:'), ('rust-browser-child-failed', r'(?m)^browser journey failed:')]:
+                  if re.search(pattern, end):
+                      diag['classes'].append(label)
+          milestones = ('viewer-desktop-endpoints','viewer-mobile-endpoints','viewer-mobile-linked-recordings','viewer-desktop-genuine-detail','viewer-mobile-genuine-detail','viewer-mobile-genuine-events')
+          for name in milestones:
+              frame = root/'shots'/(name+'-viewport.png')
+              if frame.is_file() and not frame.is_symlink() and frame.stat().st_size >= 33:
+                  diag['reached'].append(name)
+          report['springDiagnostic'] = diag
+          def project_jumps():
+              value = read_private_json(root/'receipts/jumps.private.json', maximum_bytes=65536, maximum_nodes=4096, maximum_commas=4096)
+              assert set(value) == {'schemaVersion', 'kind', 'sourceSha', 'receiptId', 'status', 'stage', 'failureStage', 'viewports'}
+              assert value['schemaVersion'] == 1 and type(value['schemaVersion']) is int and value['kind'] == 'spring-replay-tools-jumps'
+              assert value['sourceSha'] == os.environ['PRODUCT'] and value['receiptId'] == os.environ['PROOF_RECEIPT_ID']
+              stages = {'before-tools', 'viewport', 'jump-observation', 'jump-activation', 'jump-absence', 'viewport-complete', 'complete'}
+              assert value['status'] in ('running', 'pass', 'fail') and value['stage'] in stages
+              assert value['failureStage'] is None or value['failureStage'] in stages
+              assert (value['status'] == 'fail') == (value['failureStage'] is not None)
+              expected = [(w,h,p) for w,h in ((320,640),(736,900),(1024,768),(1280,900),(1440,900)) for p in ('fine','coarse')]
+              assert isinstance(value['viewports'], list) and len(value['viewports']) == 10
+              kinds = ('gap', 'exception', 'database', 'http')
+              directions = ('next', 'previous')
+              cells, inventory = [], {}
+              summary = {kind: {direction: {'activated': 0, 'absenceReasonChecked': 0} for direction in directions} for kind in kinds}
+              for cell, identity in zip(value['viewports'], expected):
+                  assert isinstance(cell, dict) and set(cell) == {'width','height','pointer','status','jumps'}
+                  assert type(cell['width']) is int and type(cell['height']) is int and (cell['width'],cell['height'],cell['pointer']) == identity
+                  assert cell['status'] in ('not-started','running','pass','fail')
+                  rows = cell['jumps']
+                  assert isinstance(rows, list) and len(rows) <= 4
+                  assert cell['status'] != 'not-started' or not rows
+                  assert cell['status'] != 'pass' or len(rows) == 4
+                  rebuilt = []
+                  for index, row in enumerate(rows):
+                      assert isinstance(row, dict) and set(row) == {'kind','observedCount','next','previous'}
+                      kind, count = row['kind'], row['observedCount']
+                      assert kind == kinds[index] and type(count) is int and 0 <= count <= 100000
+                      checked = {'kind': kind, 'observedCount': count}
+                      for direction in directions:
+                          outcome = row[direction]
+                          assert isinstance(outcome, dict) and set(outcome) == {'targetAvailable','activated','absenceReasonChecked'}
+                          available, activated, absent = (outcome[key] for key in ('targetAvailable','activated','absenceReasonChecked'))
+                          assert type(available) is bool and type(activated) is int and type(absent) is int
+                          assert activated in (0,1) and absent in (0,1) and activated + absent <= 1
+                          assert (not activated or available) and (not absent or not available)
+                          assert cell['status'] != 'pass' or activated + absent == 1
+                          checked[direction] = {'targetAvailable': available, 'activated': activated, 'absenceReasonChecked': absent}
+                          summary[kind][direction]['activated'] += activated
+                          summary[kind][direction]['absenceReasonChecked'] += absent
+                      targets = (checked['next']['targetAvailable'], checked['previous']['targetAvailable'])
+                      assert any(targets) == (count > 0) and (count <= 1 or all(targets))
+                      fact = (count, targets)
+                      assert kind not in inventory or inventory[kind] == fact
+                      inventory[kind] = fact
+                      rebuilt.append(checked)
+                  cells.append({'width': identity[0], 'height': identity[1], 'pointer': identity[2], 'status': cell['status'], 'jumps': rebuilt})
+              complete = value['status'] == 'pass' and value['stage'] == 'complete' and all(cell['status'] == 'pass' for cell in cells)
+              assert value['status'] != 'pass' or complete
+              return {'status': value['status'], 'stage': value['stage'], 'failureStage': value['failureStage'], 'receiptId': os.environ['PROOF_RECEIPT_ID'], 'viewports': cells, 'summary': summary}, complete
+          jump_complete = False
+          try:
+              report['jumpCoverage'], jump_complete = project_jumps()
+              report['jumpReceipt'] = 'validated'
+          except FileNotFoundError:
+              report['jumpReceipt'] = 'unavailable'
+          except Exception:
+              report['jumpReceipt'] = 'invalid-or-unavailable'
+          if report.get('status') == 'awaiting-browser-receipt':
+              if jump_complete:
+                  report.update(status='pass', stage='complete', exitCode=0, countsComplete=True)
+              else:
+                  report.update(status='fail', stage='jump-receipt-validation', exitCode=1, countsComplete=False)
+          shots = root/'shots'
+          admit_directory(shots)
+          widths = ((320,640), (736,900), (1024,768), (1280,900), (1440,900))
+          phases = ('filter', 'goto', 'jump', 'tools')
+          selected, progress = [], []
+          # Exactly forty viewport files can leave this job, only as recipient-encrypted bytes.
+          # A present frame means capture reached, never that later assertions passed.
+          for width, height in widths:
+              for pointer in ('fine', 'coarse'):
+                  captured = 0
+                  for phase in phases:
+                      name = f'viewer-replay-{phase}-{pointer}-{width}-viewport.png'
+                      path = shots/name
+                      try:
+                          info = path.lstat()
+                      except FileNotFoundError:
+                          continue
+                      assert stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and 33 <= info.st_size <= 20*1024*1024
+                      with path.open('rb') as stream:
+                          data = stream.read(20*1024*1024+1)
+                      assert len(data) <= 20*1024*1024 and data[:8] == b'\x89PNG\r\n\x1a\n'
+                      assert data[12:16] == b'IHDR' and struct.unpack('>II', data[16:24]) == (width,height)
+                      selected.append((name,data))
+                      captured += 1
+                  progress.append({'width': width, 'height': height, 'pointer': pointer, 'capturedStages': captured, 'expectedStages': 4, 'assertionsPassed': report.get('status') == 'pass' and captured == 4})
+          assert len(selected) <= 40
+          report['viewports'] = progress
+          report['encryptedViewportCount'] = 0
+          report['jumpCoverageMeaning'] = 'activated counts require selected-target assertions; absenceReasonChecked never credits a matching target'
+          if report.get('status') == 'pass' and len(selected) != 40:
+              report.update(status='fail', stage='viewport-coverage', exitCode=1, countsComplete=False)
+          if selected:
+              payload = io.BytesIO()
+              with tarfile.open(fileobj=payload, mode='w:gz') as archive:
+                  for name,data in selected:
+                      info = tarfile.TarInfo(name)
+                      info.size, info.mode, info.mtime = len(data), 0o600, 0
+                      archive.addfile(info, io.BytesIO(data))
+              cert = root/'recipient.pem'
+              atomic_write_private(cert, os.environ['RECIPIENT_CERT'].encode())
+              encrypted = root/'encrypted'
+              encrypted.mkdir(mode=0o700)
+              with (root/'logs/encryption.stderr').open('xb') as err:
+                  result = subprocess.run(['openssl', 'cms', '-encrypt', '-binary', '-aes-256-gcm', '-outform', 'DER', '-out', str(encrypted/'visuals.cms'), str(cert)], input=payload.getvalue(), stdout=subprocess.DEVNULL, stderr=err, check=False, timeout=60)
+              if result.returncode:
+                  (encrypted/'visuals.cms').unlink(missing_ok=True)
+                  report.update(status='fail', stage='visual-encryption', exitCode=1, countsComplete=False)
+              else:
+                  report['encryptedViewportCount'] = len(selected)
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+                      stream.write('ready=true\n')
+          atomic_write_private(safe, (json.dumps(report, sort_keys=True)+'\n').encode())
+          print(json.dumps(report, sort_keys=True))
+          raise SystemExit(0 if report['status'] == 'pass' else 1)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        with:
+          name: replay-tools-113-counts
+          path: ${{ env.PROOF_ROOT }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.visual.outputs.ready == 'true' }}
+        with:
+          name: replay-tools-113-encrypted-visuals
+          path: ${{ env.PROOF_ROOT }}/encrypted/visuals.cms
+          if-no-files-found: error
+          retention-days: 1
