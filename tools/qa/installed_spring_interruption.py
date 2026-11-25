@@ -111,9 +111,15 @@ def verify_partial(journey, recording, facts):
                     == [(recording, "partial")], "restart_recovered_exact_recording")
         window = journey.call("read_recovered_recording", "recording", "show", recording)
         require(window["recording_id"] == recording and window["status"] == "partial"
-                and window["completion"] == "partial" and window["incomplete_evidence"]
-                and window["outcome"] is None and window["duration_ns"] is None,
-                "partial_became_complete_or_lost_evidence")
+                and window["completion"] == "partial"
+                and "persisted_status:partial" in window["incomplete_evidence"],
+                "partial_seal_evidence_missing")
+        # Local recovery seals the prefix without an adapter finish. The read contract projects
+        # a sealed row with no adapter outcome as explicitly unobserved.
+        require(window["outcome"] == {"kind": "unobserved", "httpStatus": None,
+                                      "exception": None, "thrownFromEventId": None},
+                "partial_seal_invented_an_adapter_outcome")
+        require(window["duration_ns"] is None, "partial_seal_invented_a_duration")
         require(facts <= persistent_frames(window), "acknowledged_frames_lost")
         require(not any(event["kind"] == "recording_event_kind:response"
                         for event in window["events"]), "response_was_invented")
@@ -121,6 +127,7 @@ def verify_partial(journey, recording, facts):
         journey.call("stop_installed", "stop", allow_not_running=started is None)
     reopened = journey.call("reopen_after_stop", "recording", "show", recording)
     require(reopened["completion"] == "partial" and reopened["recording_id"] == recording
+            and reopened["outcome"] == window["outcome"] and reopened["duration_ns"] is None
             and facts <= persistent_frames(reopened), "reopen_lost_partial_evidence")
     print("Installed Spring JVM interruption: one stable partial recording, held frame preserved, no HTTP finish")
 
