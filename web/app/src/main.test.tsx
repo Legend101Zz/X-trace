@@ -104,6 +104,29 @@ describe('endpoint-first recording viewer', () => {
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL).includes(`/${legacyV4}?limit=200`))).toBe(true);
   });
 
+  it.each([
+    ['empty project', [], null, 200, true],
+    ['unmatched-only project', [unmatched.items[0]], null, 200, false],
+    ['unreadable presence page', [], null, 500, false],
+    ['incomplete empty presence page', [], recordingA, 200, false],
+  ] as const)('shows first-run guidance only after a successful empty project read (%s)', async (_name, recordings, nextAfter, status, empty) => {
+    vi.mocked(fetch).mockImplementation((input) => {
+      const path = route(input);
+      if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response({ items: [], nextCursor: null }));
+      if (path === '/api/v1/recordings?limit=1') return Promise.resolve(response({ schemaVersion: 3, recordings, nextAfter }, status));
+      return defaultFetch(input);
+    });
+    render(<App />);
+    if (empty) {
+      expect(await screen.findByRole('region', { name: 'No recordings yet' })).toHaveTextContent('xtrace run --project-dir ./your-project --java-agent ./xtrace-java-agent.jar -- java -jar ./your-app.jar');
+    } else {
+      await waitFor(() => expect(vi.mocked(fetch).mock.calls.map(([input]) => route(input))).toContain('/api/v1/recordings?limit=1'));
+      await waitFor(() => expect(within(screen.getByRole('tabpanel', { name: 'Requests' })).getByRole('button', { name: 'Refresh', exact: true })).toBeEnabled());
+      expect(screen.getByText('No observed endpoints')).toBeInTheDocument();
+      expect(screen.queryByRole('region', { name: 'No recordings yet' })).not.toBeInTheDocument();
+    }
+  });
+
   it('ignores an obsolete linked 401 and clears that lane after returning to endpoints', async () => {
     let resolveFirst: ((response: Response) => void) | undefined;
     vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {

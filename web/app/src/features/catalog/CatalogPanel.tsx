@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { CatalogMode, Endpoint, Recording } from '../../types';
 import { ErrorState } from '../common/ErrorState';
 import { RecordingRows } from './RecordingRows';
+import { FirstRecording } from './FirstRecording';
 
 /** One paged catalog lane as the panel sees it. */
 export interface CatalogLaneView<T> {
@@ -14,6 +15,8 @@ export interface CatalogLaneView<T> {
 
 export interface CatalogPanelProps {
   active: boolean;
+  projectEmpty: boolean;
+  onAnnounce: (message: string) => void;
   catalogMode: CatalogMode;
   endpointLane: CatalogLaneView<Endpoint>;
   linkedLane: CatalogLaneView<Recording>;
@@ -36,7 +39,7 @@ export interface CatalogPanelProps {
 
 export function CatalogPanel(props: CatalogPanelProps) {
   const {
-    active, catalogMode, selectedEndpoint, selectedRecording, arrivals,
+    active, projectEmpty, onAnnounce, catalogMode, selectedEndpoint, selectedRecording, arrivals,
     onRefresh, onRetryEndpoints, onRetryLinked, onRetryUnmatched,
     onNextEndpoints, onNextLinked, onNextUnmatched, onOpenEndpoint, onOpenUnmatched, onBack, onSelectRecording,
   } = props;
@@ -86,7 +89,10 @@ export function CatalogPanel(props: CatalogPanelProps) {
           <div className="policy-note"><strong>Operator-selected policy</strong><span>{endpoints[0]?.observationPolicy ?? 'spring-orders-v1'} does not attest which adapter or application produced the event.</span></div>
           {endpointBusy && endpoints.length === 0 ? <div className="loading">Reading observed endpoints…</div> : null}
           {endpointError ? <ErrorState message={endpointError} onRetry={onRetryEndpoints} /> : null}
-          {!endpointBusy && !endpointError && endpoints.length === 0 ? <div className="empty"><strong>No observed endpoints</strong><p>A persisted capture must include the exact operator-selected policy and approved route.</p></div> : null}
+          {!endpointBusy && !endpointError && endpoints.length === 0 ? projectEmpty
+            ? <FirstRecording onAnnounce={onAnnounce} />
+            : <div className="empty"><strong>No observed endpoints</strong><p>Check Not linked to an endpoint for other recordings.</p></div>
+            : null}
           {query && branches.length === 0 && endpoints.length > 0 ? <p className="context-note">No matching loaded endpoints</p> : null}
           {tree}
           {endpointCursor ? <div className="page-controls"><span className="top-meta">More endpoints</span><button className="button" onClick={onNextEndpoints} disabled={endpointBusy}>Load next page</button></div> : null}
