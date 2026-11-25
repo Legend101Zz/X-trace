@@ -38,3 +38,8 @@ jobs:
           cargo fmt --all --check
           cargo clippy --locked -p xtrace-cli --test node_express_journey -- -D warnings
           python3 -B -m tools.qa.lane_run run --suite rust --step express-outcome --min-passed 2 --max-ignored 0 --out "$root/fragments" -- cargo test --locked -p xtrace-cli --test node_express_journey
+          for major in 4 5; do
+            name="express${major}_requests_persist_route_middleware_handler_and_error_frames"
+            grep -Fxq "test $name ... ok" "$RUNNER_TEMP/xl/rust---express-outcome.log"
+            echo "Verified the named Express $major CLI outcome journey." >> "$GITHUB_STEP_SUMMARY"
+          done
