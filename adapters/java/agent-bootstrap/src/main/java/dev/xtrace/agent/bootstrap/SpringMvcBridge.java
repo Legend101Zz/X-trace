@@ -92,6 +92,7 @@ public final class SpringMvcBridge {
 
   /** sendError may report committed before the container has rendered its error page. */
   public static void servletSendError() {
+    ServletFilterBridge.sendError();
     ServletState state = SERVLET.get();
     if (state != null) state.errorPending = true;
   }
@@ -125,6 +126,7 @@ public final class SpringMvcBridge {
 
   /** Called on entry to each {@code DispatcherServlet#doDispatch} on this thread. */
   public static void dispatchEnter() {
+    ServletFilterBridge.downstreamEnter();
     DispatchState state = DISPATCH.get();
     if (state == null) {
       state = new DispatchState();
@@ -162,6 +164,7 @@ public final class SpringMvcBridge {
    * is already open on this thread (nested or forwarded dispatch).
    */
   public static boolean start(Object request, Object handlerMethod) {
+    ServletFilterBridge.downstreamEnter();
     DispatchState state = DISPATCH.get();
     ServletState servlet = SERVLET.get();
     if (request == null || handlerMethod == null || BootstrapBridge.inRequest()
@@ -267,22 +270,31 @@ public final class SpringMvcBridge {
   }
 
   static boolean asyncStarted(Object request) {
+    return Boolean.TRUE.equals(asyncState(request));
+  }
+
+  static Boolean asyncState(Object request) {
     try {
       Method method = REQUEST_METHODS.get(request.getClass())[2];
-      return method != null && Boolean.TRUE.equals(method.invoke(request));
+      Object value = method == null ? null : method.invoke(request);
+      return value instanceof Boolean started ? started : null;
     } catch (ReflectiveOperationException | RuntimeException ignored) {
-      return false;
+      return null;
     }
   }
 
   static boolean isContinuationDispatch(Object request) {
+    String kind = dispatchType(request);
+    return "ASYNC".equals(kind) || "ERROR".equals(kind);
+  }
+
+  static String dispatchType(Object request) {
     try {
       Method method = REQUEST_METHODS.get(request.getClass())[3];
       Object value = method == null ? null : method.invoke(request);
-      return value instanceof Enum<?> kind
-          && (kind.name().equals("ASYNC") || kind.name().equals("ERROR"));
+      return value instanceof Enum<?> kind ? kind.name() : null;
     } catch (ReflectiveOperationException | RuntimeException ignored) {
-      return false;
+      return null;
     }
   }
 

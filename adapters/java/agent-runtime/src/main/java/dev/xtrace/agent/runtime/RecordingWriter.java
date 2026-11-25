@@ -227,7 +227,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           recording.throwEventIds.add(event.eventId());
           recording.retainedThrowBytes += bytes;
         }
-        recording.batchBytes += toProto(event, 2).getSerializedSize() + 8;
+        recording.batchBytes += toProto(event, 2, recording.start.route().isEmpty()).getSerializedSize() + 8;
         if (recording.events.size() >= MAX_BATCH_EVENTS
             || recording.batchBytes >= MAX_BATCH_BYTES) flush(recording, false);
       } else {
@@ -477,7 +477,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     for (int index = 0; index < count; index++) {
       QueueSignal.Event event = pending.events.get(index);
       long sequence = Math.addExact(pending.sequence, 1);
-      RecordingEvent proto = toProto(event, sequence);
+      RecordingEvent proto = toProto(event, sequence, pending.start.route().isEmpty());
       batch.addEvents(proto);
       if (!fitsBatch(pending, batch)) {
         batch.removeEvents(batch.getEventsCount() - 1);
@@ -694,6 +694,11 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   static RecordingEvent toProto(QueueSignal.Event event, long sequence)
       throws ClientException {
+    return toProto(event, sequence, false);
+  }
+
+  private static RecordingEvent toProto(QueueSignal.Event event, long sequence, boolean filterOnly)
+      throws ClientException {
     RecordingEventKind kind = RecordingEventKind.forNumber(event.kind());
     if (kind == null || kind == RecordingEventKind.RECORDING_EVENT_KIND_UNSPECIFIED) {
       throw new ClientException("XTR-JAVA-EVENT", "recording event kind is invalid");
@@ -755,21 +760,20 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       builder.setException(exception);
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_REQUEST_UPDATE) {
-      // The request event symbol is "http.request <METHOD> <route template>", both validated by
-      // the bridge; nothing about the route is assumed here.
+      // Only a matched handler contributes the third part, a validated route template.
       String[] parts = event.symbol().split(" ", 3);
-      boolean shaped = parts.length == 3 && parts[0].equals("http.request");
+      boolean shaped = parts.length == (filterOnly ? 2 : 3) && parts[0].equals("http.request");
       builder.setInteraction(
           Interaction.newBuilder()
               .setKind(InteractionKind.INTERACTION_KIND_FRAMEWORK)
-              .setDriver("spring-mvc")
+              .setDriver(filterOnly ? "servlet" : "spring-mvc")
               .setMethod(shaped ? parts[1] : "")
-              .setPath(shaped ? parts[2] : ""));
+              .setPath(shaped && !filterOnly ? parts[2] : ""));
     } else if (kind == RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE) {
       builder.setInteraction(
           Interaction.newBuilder()
               .setKind(InteractionKind.INTERACTION_KIND_FRAMEWORK)
-              .setDriver("spring-mvc")
+              .setDriver(filterOnly ? "servlet" : "spring-mvc")
               .setMethod("status")
               .setPath(event.detail() == 0 ? "unavailable" : Long.toString(event.detail())));
     } else if (kind == RecordingEventKind.RECORDING_EVENT_KIND_DATABASE_START
