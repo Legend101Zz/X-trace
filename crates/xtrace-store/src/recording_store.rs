@@ -6795,13 +6795,13 @@ mod tests {
             view.begin_recording(&linked).expect("linked begin");
             let connection = fixture.store.lock().expect("connection");
             connection
-                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
                 .expect("bypass schema checks for fixture");
             connection
                 .execute(statement, [project_id.as_uuid().as_bytes().to_vec()])
                 .expect("corrupt stored operation fixture");
             connection
-                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .execute_batch("PRAGMA ignore_check_constraints = OFF; PRAGMA foreign_keys = ON;")
                 .expect("restore schema checks");
             drop(connection);
             let error = view
@@ -8237,7 +8237,7 @@ mod tests {
         let (endpoints, _) =
             view.list_observed_endpoints(project_id, None, 1).expect("endpoint read");
         let operation_id = endpoints[0].operation_id;
-        fixture.store.lock().expect("connection").execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE recording_endpoint_observations SET method='GET'; PRAGMA ignore_check_constraints=OFF;").expect("corrupt sidecar");
+        fixture.store.lock().expect("connection").execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON; UPDATE recording_endpoint_observations SET method='GET'; PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;").expect("corrupt sidecar");
         let error = view
             .list_operation_recordings(project_id, operation_id, None, 1)
             .expect_err("corrupt sidecar");
@@ -8290,7 +8290,7 @@ mod tests {
             ),
             (
                 "bad-operation-tuple",
-                "PRAGMA ignore_check_constraints=ON; UPDATE operations SET method='PUT'; PRAGMA ignore_check_constraints=OFF;",
+                "PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON; UPDATE operations SET method='PUT'; PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;",
             ),
             (
                 "bad-operation-fingerprint",
