@@ -1,0 +1,69 @@
+name: JHipster installed harness proof
+on:
+  push:
+    branches: [codex/jhipster-105-proof]
+permissions:
+  contents: read
+jobs:
+  campaign-judges:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 81584cfde66d70299d059e827a96f5f4c87170f7
+          persist-credentials: false
+      - name: Check campaign library and JHipster expectations
+        env:
+          PRODUCT_SHA: 81584cfde66d70299d059e827a96f5f4c87170f7
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          root="${RUNNER_TEMP:?}/xf"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/logs" "$root/summary"
+          export XTRACE_PROOF_ROOT="$root"
+          python3 -B - <<'PYTHON'
+          import ast
+          import contextlib
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          import unittest
+
+          root = pathlib.Path(os.environ['XTRACE_PROOF_ROOT'])
+          sys.path.insert(0, str(pathlib.Path('campaigns/lib').resolve()))
+          cases = ast.parse(pathlib.Path('campaigns/lib/test_jhipster_evidence.py').read_bytes())
+          names = {node.name for node in ast.walk(cases) if isinstance(node, ast.FunctionDef) and node.name.startswith('test_')}
+          class Result(unittest.TextTestResult):
+              def startTest(self, test):
+                  super().startTest(test)
+                  self.started.append(test.id())
+          Result.started = []
+          with (root/'logs'/'library.log').open('w') as private, contextlib.redirect_stdout(private), contextlib.redirect_stderr(private):
+              suite = unittest.defaultTestLoader.discover('campaigns/lib')
+              result = unittest.TextTestRunner(stream=private, resultclass=Result, verbosity=2).run(suite)
+          named = {i.split('.')[-1] for i in result.started if i.startswith('test_jhipster_evidence.JHipsterEvidence.')}
+          def safe_name(test):
+              return next((n for n in result.started if test.id() == n or test.id().startswith(n+' ')), 'case-name-unavailable')
+          details = {
+              'productSha': os.environ['PRODUCT_SHA'], 'executed':result.testsRun, 'errors':len(result.errors),
+              'failures':len(result.failures), 'ignored':len(result.skipped)+len(result.expectedFailures),
+              'unexpectedSuccesses':len(result.unexpectedSuccesses),
+              'jhipsterNamed':sorted(named & names),
+              'failedCases':[safe_name(t) for t,_ in result.failures+result.errors],
+          }
+          (root/'summary'/'campaign-judges.json').write_text(json.dumps(details))
+          print(json.dumps(details))
+          raise SystemExit(0 if result.wasSuccessful() and details['ignored']==0 and result.testsRun>=135 and named==names and len(names)==12 else 1)
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
+        with:
+          name: jhipster-harness-judges
+          path: ${{ runner.temp }}/xf/summary/campaign-judges.json
+          retention-days: 14
+          if-no-files-found: error
