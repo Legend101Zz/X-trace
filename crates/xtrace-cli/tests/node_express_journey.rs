@@ -10,6 +10,7 @@
 //! Express 4 and Express 5 journeys: the fixture is started with `xtrace run -- node app.js`, driven
 //! over real HTTP, and read back through the recording read API. The fixtures are npm workspace packages, so `npm ci --prefix adapters/node` provides them.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -45,10 +46,10 @@ impl Drop for RunChild {
 
 /// What one request must leave behind in the persisted recording.
 ///
-/// The route template and response status are asserted in the in-process journey tests
-/// (`express4/5-instrument.test.ts`): the daemon does not yet persist them for Node runs without an
-/// endpoint observation policy (`recording_endpoint_observations` stays `unmatched` with empty route
-/// and the outcome reads `unobserved`), which is request N-003 to the CLI/daemon owners.
+/// The complete recordings are checked for their adapter-observed response status and outcome.
+/// With no endpoint observation policy, the supported queries must leave these recordings
+/// unmatched with a named reason and expose no observed endpoints. Route templates are checked
+/// separately in the in-process journey tests (`express4/5-instrument.test.ts`).
 struct Expected {
     target: &'static str,
     /// HTTP status the real fixture answered, checked on the wire.
@@ -246,10 +247,58 @@ fn journey(fixture: &str) {
     let recordings = list["recordings"].as_array().expect("recordings");
     assert_eq!(recordings.len(), COMMON.len() + 1, "exactly one recording per request: {list}");
 
+    let unmatched = endpoint_projection(&repo, &data_home, &["recording", "list", "--unmatched"]);
+    let unmatched_rows = unmatched["items"].as_array().expect("unmatched recording items");
+    assert!(
+        unmatched.get("nextCursor") == Some(&Value::Null),
+        "unmatched recording page must be complete"
+    );
+    assert!(
+        unmatched_rows.len() == recordings.len(),
+        "every default Node recording must remain unmatched"
+    );
+    let recorded_ids: BTreeSet<_> =
+        recordings.iter().map(|row| row["recording_id"].as_str().expect("recording id")).collect();
+    let unmatched_ids: BTreeSet<_> = unmatched_rows
+        .iter()
+        .map(|row| row["recordingId"].as_str().expect("unmatched recording id"))
+        .collect();
+    assert!(recorded_ids.len() == recordings.len(), "recording list identities must be unique");
+    assert!(
+        unmatched_ids.len() == unmatched_rows.len(),
+        "unmatched recording identities must be unique"
+    );
+    assert!(recorded_ids == unmatched_ids, "unmatched recording identities must match the list");
+    for row in unmatched_rows {
+        assert!(
+            row.get("operationId") == Some(&Value::Null),
+            "default Node recording must not claim an operation"
+        );
+        assert!(
+            row.get("observationPolicy") == Some(&Value::Null),
+            "default Node recording must not claim a policy"
+        );
+        assert!(
+            row["unmatchedReason"] == "observation_policy_missing",
+            "default Node recording must name the missing endpoint policy"
+        );
+    }
+    let endpoints = endpoint_projection(&repo, &data_home, &["endpoint", "list"]);
+    assert!(
+        endpoints["items"].as_array().expect("observed endpoint items").is_empty(),
+        "default Node capture must not claim an observed endpoint"
+    );
+    assert!(
+        endpoints.get("nextCursor") == Some(&Value::Null),
+        "empty observed endpoint page must be complete"
+    );
+
     let mut observed: Vec<(String, Value, Vec<String>)> = Vec::new();
+    let mut outcomes = BTreeMap::new();
     for metadata in recordings {
         let id = metadata["recording_id"].as_str().expect("recording id");
         let detail = show_recording(&repo, &data_home, id);
+        outcomes.insert(id.to_owned(), detail["outcome"].clone());
         let completion = detail["completion"].clone();
         let events = detail["events"].as_array().expect("events");
         let roots = events
@@ -298,7 +347,16 @@ fn journey(fixture: &str) {
                     && frames.iter().map(String::as_str).eq(expected.frames.iter().copied())
             })
             .unwrap_or_else(|| panic!("no recording matches {} in {observed:#?}", expected.target));
-        observed.remove(position);
+        let (id, _, _) = observed.remove(position);
+        let outcome = outcomes.get(&id).expect("recording outcome projection");
+        assert!(
+            outcome["kind"] == "responded",
+            "complete Express response outcome must be observed"
+        );
+        assert!(
+            outcome["httpStatus"].as_u64() == Some(u64::from(expected.status)),
+            "persisted response status must match the fixture response"
+        );
     }
     assert_eq!(observed.len(), 1, "only the shutdown request is left: {observed:#?}");
     assert!(
@@ -353,6 +411,25 @@ fn list_recordings(repo: &Path, data_home: &Path) -> Value {
         .expect("recording list");
     assert!(output.status.success(), "recording list failed: {}", diagnostic(&output));
     serde_json::from_slice(&output.stdout).expect("recording list JSON")
+}
+
+fn endpoint_projection(repo: &Path, data_home: &Path, command: &[&str]) -> Value {
+    let output = cli()
+        .args(command)
+        .arg("--project-dir")
+        .arg(repo)
+        .args(["--limit", "50"])
+        .env("XTRACE_DATA_HOME", data_home)
+        .output()
+        .expect("query endpoint observation projection");
+    assert!(output.status.success(), "endpoint observation query failed");
+    for canary in ["QUERY_CANARY", "SECRET_CANARY", "bearer-PRIVATE"] {
+        assert!(
+            !output.stdout.windows(canary.len()).any(|window| window == canary.as_bytes()),
+            "private canary reached endpoint observation projection"
+        );
+    }
+    serde_json::from_slice(&output.stdout).expect("endpoint observation JSON")
 }
 
 fn temp_root() -> TempDir {
