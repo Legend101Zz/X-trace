@@ -5,6 +5,7 @@ import App from './main';
 
 const operationA = '018f0000-0000-7000-8000-000000000001';
 const recordingA = '018f0000-0000-7000-8000-000000000011';
+const recordingB = '018f0000-0000-7000-8000-000000000012';
 const runtimeSessionId = '018f0000-0000-7000-8000-000000000021';
 const sessionContext = { runtimeSessionId, rejectedRequests: null as string | null };
 
@@ -13,7 +14,7 @@ const linked = { items: [{ recordingId: recordingA, status: 'complete', completi
 
 const none = { state: 'boundary' };
 const nav = (over: Record<string, unknown>) => ({ previous: none, next: none, into: none, over: none, out: none, ...over });
-const ev = (n: number, parent: string | null, symbol: string, navigation: object) => ({ sequence: String(n), frameId: `f${n}`, eventId: `event-${n}`, navigation, monotonicNs: String(n * 10), kind: 'method', symbol, parentFrameId: parent, sourceBinding: 'unspecified', fieldTruncations: [], exception: null as { exceptionType: string | null } | null });
+const ev = (n: number, parent: string | null, symbol: string, navigation: object) => ({ sequence: String(n), frameId: `f${n}` as string | null, eventId: `event-${n}`, navigation, monotonicNs: String(n * 10), kind: 'method', symbol, parentFrameId: parent, sourceBinding: 'unspecified', fieldTruncations: [], exception: null as { exceptionType: string | null } | null });
 
 const events = [
   ev(1, null, 'Controller.create', nav({ next: { state: 'target', frameId: 'f2' }, into: { state: 'target', frameId: 'f2' } })),
@@ -45,14 +46,16 @@ const inspector = () => screen.getByRole('tabpanel', { name: 'evidence', hidden:
 
 describe('replay wiring in the app', () => {
   let responseDetail = detail;
+  let responseLinked = linked;
   beforeEach(() => {
     responseDetail = detail;
+    responseLinked = linked;
     window.history.replaceState(null, '', '/viewer#token=t');
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const path = route(input);
       if (path === '/api/v1/auth/exchange') return json({ authenticated: true });
       if (path.startsWith('/api/v1/endpoints?')) return json(endpoints);
-      if (path.includes('/recordings') && path.includes('/endpoints/')) return json(linked);
+      if (path.includes('/recordings') && path.includes('/endpoints/')) return json(responseLinked);
       if (path.startsWith('/api/v1/recordings/')) return json(responseDetail);
       throw new Error(`Unexpected request ${path}`);
     }));
@@ -180,5 +183,73 @@ describe('replay wiring in the app', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
     fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowRight' });
     await waitFor(() => expect(live()).toHaveTextContent('Selected event 2'));
+  });
+
+  const showEvents = () => fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+  const refreshEvents = () => {
+    showEvents();
+    fireEvent.click(within(screen.getByRole('tabpanel', { name: 'events' })).getByRole('button', { name: 'Refresh' }));
+  };
+
+  it('preserves the exact same-frame event through Canvas, reordering, and a missing window', async () => {
+    const line = { ...ev(5, 'f1', 'Repo.line', nav({})), frameId: 'f2' };
+    responseDetail = { ...detail, events: [...events, line] };
+    await openRecording();
+
+    fireEvent.click(screen.getByRole('button', { name: /Repo\.line/ }));
+    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    showEvents();
+    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    const selectedFrame = screen.getByRole('treeitem', { selected: true });
+    expect(selectedFrame).toHaveTextContent('Repo.save');
+    fireEvent.click(selectedFrame);
+    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Linear' }));
+
+    responseDetail = { ...detail, events: [events[1], line, events[0], ...events.slice(2)] };
+    refreshEvents();
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /Repo\.line|Controller\.create/ })[0]).toHaveTextContent('Repo.line'));
+    expect(screen.getByRole('button', { name: /Repo\.line/ })).toHaveAttribute('aria-current', 'true');
+    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+
+    responseDetail = detail;
+    refreshEvents();
+    expect(await within(inspector()).findByText('Selected event is not in the loaded window.')).toBeInTheDocument();
+    expect(within(inspector()).queryByText('event-2')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Repo\.save/ })).toHaveAttribute('aria-current', 'false');
+    fireEvent.keyDown(window, { altKey: true, key: 'ArrowDown' });
+    expect(within(inspector()).getByText('Selected event is not in the loaded window.')).toBeInTheDocument();
+
+    responseDetail = { ...detail, events: [...events, line] };
+    refreshEvents();
+    expect(await within(inspector()).findByText('event-5')).toBeInTheDocument();
+  });
+
+  it('preserves a frame-less event through Canvas and resets selection on an explicit recording change', async () => {
+    const frameLess = { ...ev(5, null, 'Request boundary', nav({})), frameId: null };
+    responseLinked = { ...linked, items: [...linked.items, { ...linked.items[0], recordingId: recordingB }] };
+    responseDetail = { ...detail, events: [...events, frameLess] };
+    await openRecording();
+
+    fireEvent.click(screen.getByRole('button', { name: /Audit\.write/ }));
+    fireEvent.keyDown(window, { altKey: true, key: 'ArrowDown' });
+    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    expect(live()).toHaveTextContent('Event 5 selected');
+    fireEvent.click(within(inspector()).getByRole('button', { name: 'Previous', exact: true }));
+    expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
+    fireEvent.click(within(inspector()).getByRole('button', { name: 'Next', exact: true }));
+    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    showEvents();
+    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    expect(screen.queryByRole('treeitem', { selected: true })).not.toBeInTheDocument();
+    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Linear' }));
+    expect(screen.getByRole('button', { name: /Request boundary/ })).toHaveAttribute('aria-current', 'true');
+
+    responseDetail = { ...detail, recordingId: recordingB };
+    fireEvent.click(screen.getByRole('tab', { name: 'recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
+    expect(await within(inspector()).findByText('event-1')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Controller\.create/ })).toHaveAttribute('aria-current', 'true');
   });
 });
