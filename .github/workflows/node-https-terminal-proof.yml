@@ -1,0 +1,60 @@
+name: Persisted Node HTTPS outcome
+on:
+  push:
+    branches: [diagnostic/node-https-terminal-20261125]
+permissions:
+  contents: read
+jobs:
+  direct-node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 9277f039e3404db5300acb911c787d9fb2e30d35
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Build the locked Node adapter and check the Rust harness
+        id: adapter
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = 9277f039e3404db5300acb911c787d9fb2e30d35
+          echo "node22=$(dirname "$(command -v node)")" >> "$GITHUB_OUTPUT"
+          npm ci --prefix adapters/node > "$RUNNER_TEMP/node-deps.log" 2>&1
+          npm run build:protocol --prefix adapters/node > "$RUNNER_TEMP/node-protocol.log" 2>&1
+          npm run build:core --prefix adapters/node > "$RUNNER_TEMP/node-core.log" 2>&1
+          cargo fmt --all --check
+          cargo clippy --locked -p xtrace-cli --test node_run_http -- -D warnings
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+      - name: Verify the named HTTPS and existing HTTP journeys on Node 22 and 24
+        env:
+          NODE22_BIN: ${{ steps.adapter.outputs.node22 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          node24="$(dirname "$(command -v node)")"
+          original_path="$PATH"
+          root="$RUNNER_TEMP/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/fragments"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          for major in 22 24; do
+            node_bin="$node24"
+            if [[ "$major" == 22 ]]; then node_bin="$NODE22_BIN"; fi
+            export PATH="$node_bin:$original_path"
+            [[ "$(node --version)" == "v$major."* ]]
+            python3 -B -m tools.qa.lane_run run --suite rust --variant "$major" --step node-http \
+              --min-passed 5 --max-ignored 0 --out "$root/fragments" -- \
+              cargo test --locked -p xtrace-cli --test node_run_http
+            grep -Fxq "test direct_node_https_run_persists_one_private_authenticated_tls_response ... ok" \
+              "$RUNNER_TEMP/xl/rust-$major-node-http.log"
+            echo "Node $(node --version): five passing CLI journeys including authenticated HTTPS." >> "$GITHUB_STEP_SUMMARY"
+          done
