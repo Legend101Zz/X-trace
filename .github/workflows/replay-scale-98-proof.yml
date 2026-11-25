@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 4adee6963c8fd1a7254057d92f8602624c8ea5c7
+          ref: 5cf258d58ad71d9b0d9ddd52e140a47f4e177976
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -24,7 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          test "$(git rev-parse HEAD)" = 4adee6963c8fd1a7254057d92f8602624c8ea5c7
+          test "$(git rev-parse HEAD)" = 5cf258d58ad71d9b0d9ddd52e140a47f4e177976
           node --check ../../tools/qa/replay_scale_browser.mjs
           npm ci >"$RUNNER_TEMP/npm-ci.log" 2>&1
           npm run check:embedded >"$RUNNER_TEMP/embedded.log" 2>&1
@@ -41,7 +41,7 @@ jobs:
             cargo test --locked -p xtrace-cli --test replay_scale synthetic_ten_thousand_frames_are_complete_ordered_and_navigable -- --exact --nocapture
           rc=0
           node tools/qa/replay_scale_browser.mjs --manifest "$XTRACE_SCALE_FIXTURE_MANIFEST" \
-            --xtrace "$PWD/target/debug/xtrace" --source-sha 4adee6963c8fd1a7254057d92f8602624c8ea5c7 --provenance source-built \
+            --xtrace "$PWD/target/debug/xtrace" --source-sha 5cf258d58ad71d9b0d9ddd52e140a47f4e177976 --provenance source-built \
             --later-pages 12 --cdp-heap --out "$root/priv/browser.json" >"$root/priv/driver.log" 2>&1 || rc=$?
           python3 -B - <<'PY'
           import json, os, re
@@ -52,7 +52,7 @@ jobs:
               raise SystemExit("Driver produced no measurement receipt")
           data = json.loads(path.read_bytes())
           assert data["kind"] == "synthetic_replay_scale_browser" and data["synthetic"] is True
-          assert data["provenance"]["declaredSourceSha"] == "4adee6963c8fd1a7254057d92f8602624c8ea5c7"
+          assert data["provenance"]["declaredSourceSha"] == "5cf258d58ad71d9b0d9ddd52e140a47f4e177976"
           assert len(data["samples"]) == 5
           # The reviewed driver emits bounded stage codes and measured numbers. Only this file is retained.
           for sample in data["samples"]:
@@ -60,7 +60,7 @@ jobs:
               assert sample["status"] in ("exercised", "failed")
           (root / "report/browser-metrics.json").write_text(json.dumps(data, indent=2) + "\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              print("Source-built synthetic 10,000-frame viewer. Product 4adee6963c8fd1a7254057d92f8602624c8ea5c7.", file=summary)
+              print("Source-built synthetic 10,000-frame viewer. Product 5cf258d58ad71d9b0d9ddd52e140a47f4e177976.", file=summary)
               print("\n| Sample | Outcome | Last stage | Last substage | Initial ms | Over 1500 ms |", file=summary)
               print("|---|---|---|---|---|---|", file=summary)
               for sample in data["samples"]:
