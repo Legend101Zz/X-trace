@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './main';
 import { retainPage } from './retained-page';
@@ -91,7 +91,7 @@ describe('endpoint-first recording viewer', () => {
   it('keeps unmatched separate and displays a legacy null reason without inventing one', async () => {
     render(<App />);
     await screen.findByText('Operator-selected policy');
-    fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
     const unmatchedRow = await screen.findByRole('button', { name: new RegExp(recordingB) });
     expect(unmatchedRow).toBeInTheDocument();
     expect(unmatchedRow.querySelector('time')).toHaveAttribute('datetime', unmatched.items[0].openedAt);
@@ -139,7 +139,7 @@ describe('endpoint-first recording viewer', () => {
     });
     render(<App />);
     await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ });
-    fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
     await waitFor(() => expect(resolveUnmatched).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: 'Observed endpoints' }));
     await act(async () => { resolveUnmatched?.(response(body, status)); });
@@ -167,7 +167,7 @@ describe('endpoint-first recording viewer', () => {
     await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ });
     fireEvent.click(screen.getAllByRole('button', { name: 'Refresh' })[0]);
     await waitFor(() => expect(endpointRequests).toBe(2));
-    fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
     expect(await screen.findByRole('button', { name: new RegExp(recordingB) })).toBeInTheDocument();
     await act(async () => { resolveOld?.(response({ detail: 'stale endpoint error' }, 422)); });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
@@ -186,7 +186,7 @@ describe('endpoint-first recording viewer', () => {
     });
     render(<App />);
     await screen.findByText('Operator-selected policy');
-    fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
     await screen.findByRole('button', { name: new RegExp(recordingB) });
     fireEvent.click(screen.getByRole('button', { name: 'Load next page' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Request failed with status 422.');
@@ -226,6 +226,43 @@ describe('endpoint-first recording viewer', () => {
     expect(screen.queryByText('stale-recording-detail')).not.toBeInTheDocument();
   });
 
+
+  it('checks for arrivals while replaying if the Requests sidebar is visible', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    const now = vi.spyOn(window, 'setInterval');
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
+    await screen.findByText('fixture.Service.call');
+
+    const search = screen.getByRole('searchbox', { name: 'Search loaded requests' });
+    const layout = vi.spyOn(search, 'getClientRects').mockReturnValue({ length: 0 } as DOMRectList);
+    const callback = now.mock.calls.filter(([, delay]) => delay === 15_000).at(-1)?.[0];
+    if (typeof callback !== 'function') throw new Error('Missing Requests timer');
+    const linkedCalls = () => vi.mocked(fetch).mock.calls.filter(([input]) => route(input).includes(`/endpoints/${operationA}/recordings`));
+    try {
+      await act(async () => { callback(); });
+      expect(linkedCalls()).toHaveLength(1);
+
+      layout.mockReturnValue({ length: 1 } as DOMRectList);
+      await act(async () => { callback(); });
+      expect(linkedCalls()).toHaveLength(2);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Not linked to an endpoint' }));
+      await screen.findByRole('button', { name: new RegExp(recordingB) });
+      const stale = now.mock.calls.filter(([, delay]) => delay === 15_000).at(-1)?.[0];
+      if (typeof stale !== 'function') throw new Error('Missing unlinked Requests timer');
+      fireEvent.click(screen.getByRole('button', { name: 'Observed endpoints' }));
+      await act(async () => { stale(); });
+      const unmatchedCalls = vi.mocked(fetch).mock.calls.filter(([input]) => route(input).includes('/recordings?unmatched=true'));
+      expect(unmatchedCalls).toHaveLength(1);
+    } finally {
+      layout.mockRestore();
+      now.mockRestore();
+      visibility.mockRestore();
+    }
+  });
+
   it('expires the current viewer session after an authenticated endpoint request returns 401', async () => {
     vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => route(input) === '/api/v1/auth/exchange'
       ? Promise.resolve(response({ authenticated: true }))
@@ -246,7 +283,7 @@ describe('endpoint-first recording viewer', () => {
       if (path === '/api/v1/auth/exchange') return Promise.resolve(response({ authenticated: true }));
       if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response(endpoints));
       if (path.includes(`/endpoints/${operationA}/recordings`)) return Promise.resolve(response({ ...linked, items: [linked.items[0], { ...linked.items[0], recordingId: recordingB }] }));
-      if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200&cursor=`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: null, events: [{ sequence: '3', frameId: null, navigation: navigationUnavailable, monotonicNs: '30', kind: 'method', symbol: 'fixture.Service.call', sourceBinding: 'unspecified', fieldTruncations: [] }] }));
+      if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200&cursor=`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: null, events: [{ sequence: '300', frameId: null, navigation: navigationUnavailable, monotonicNs: '30', kind: 'method', symbol: 'fixture.Service.call', sourceBinding: 'unspecified', fieldTruncations: [] }] }));
       if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: 'recording-a-next', events: firstEvents }));
       if (path.startsWith(`/api/v1/recordings/${recordingB}?limit=200`)) return Promise.resolve(response(detail(recordingB, 'recording-b-only')));
       throw new Error(`Unexpected request ${path}`);
@@ -266,12 +303,23 @@ describe('endpoint-first recording viewer', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'events' }));
     fireEvent.click(screen.getByRole('button', { name: 'Load next window' }));
     expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /fixture\.Service\.call/ }));
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL) === `/api/v1/recordings/${recordingA}?limit=200&cursor=recording-a-next`)).toBe(true);
     fireEvent.click(screen.getByRole('tab', { name: 'recordings' }));
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
     expect(await screen.findByText('recording-b-only')).toBeInTheDocument();
     expect(screen.queryByText('fixture.Service.call')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Load next window' })).not.toBeInTheDocument();
+
+    const tabs = screen.getByRole('tablist', { name: 'Open recordings' });
+    fireEvent.keyDown(within(tabs).getByRole('tab', { name: new RegExp(recordingB) }), { key: 'ArrowLeft' });
+    const restored = await screen.findByRole('button', { name: /fixture\.Service\.call/ });
+    expect(restored).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByLabelText('Recording summary')).toHaveTextContent('Event sequence 300');
+    expect(screen.queryByText('fixture.Controller.handle')).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.filter(([input]) =>
+      route(input as RequestInfo | URL) === `/api/v1/recordings/${recordingA}?limit=200&cursor=recording-a-next`,
+    )).toHaveLength(2);
   });
 
   it('shows only matched bounded source returned for a compile-attested frame', async () => {

@@ -15,6 +15,12 @@ import { MAX_RETAINED_EVENTS, MAX_RETAINED_ROWS } from './types';
 import type { AuthState, CatalogMode, Detail, Endpoint, Pane, Recording, ReplayEvent } from './types';
 import './style.css';
 
+interface TabSelection {
+  frameId: string | null;
+  sequence: string | null;
+  cursor: string | null;
+}
+
 /** Read-only local browser for bounded observed endpoints and persisted recordings. */
 export default function App() {
   const [auth, setAuth] = useState<AuthState>('checking');
@@ -22,7 +28,10 @@ export default function App() {
   const [replay, dispatchReplay] = useReducer(replayReducer, initialReplayState);
   const selectedRecording = replay.recordingId;
   const [openRecordings, setOpenRecordings] = useState<OpenRecording[]>([]);
-  const tabSelections = useRef(new Map<string, Pick<typeof replay, 'frameId' | 'sequence'>>());
+  const tabSelections = useRef(new Map<string, TabSelection>());
+  // Only the active retained window is indexed. Inactive tabs hold one cursor and event identity each.
+  const eventPageCursors = useRef(new Map<string, string | null>());
+  const eventWindowStartCursor = useRef<string | null>(null);
   const [arrivals, setArrivals] = useState<ReadonlySet<string>>(new Set());
   const [selectedOperation, setSelectedOperation] = useState('');
   const [catalogMode, setCatalogMode] = useState<CatalogMode>('endpoints');
@@ -136,13 +145,14 @@ export default function App() {
   }, []);
 
   const loadUnmatched = useCallback(async (cursor: string | null = null, append = false) => {
+    if (catalogModeRef.current !== 'unmatched') return;
     const { generation, signal } = unmatchedLane.begin();
     setUnmatchedBusy(true);
     setUnmatchedError('');
     try {
       const query = cursor ? `?unmatched=true&limit=50&cursor=${encodeURIComponent(cursor)}` : '?unmatched=true&limit=50';
       const page = await api<components['schemas']['ObservedRecordingPage']>(`/api/v1/recordings${query}`, signal);
-      if (!unmatchedLane.isCurrent(generation)) return;
+      if (!unmatchedLane.isCurrent(generation) || catalogModeRef.current !== 'unmatched') return;
       if (!append && unmatchedFirstPage.current) {
         const observed = recentlyObserved(unmatchedRef.current, page.items);
         setArrivals((current) => new Set(page.items.filter((item) => current.has(item.recordingId) || observed.has(item.recordingId)).map((item) => item.recordingId)));
@@ -155,11 +165,11 @@ export default function App() {
       setOlderUnmatchedReleased(result.released > 0);
       if (catalogModeRef.current === 'unmatched') setAnnouncement(`${page.items.length} unmatched recordings loaded`);
     } catch (error) {
-      if (!unmatchedLane.isCurrent(generation)) return;
+      if (!unmatchedLane.isCurrent(generation) || catalogModeRef.current !== 'unmatched') return;
       markExpired(error);
       setUnmatchedError(failureMessage(error));
     } finally {
-      if (unmatchedLane.isCurrent(generation)) {
+      if (unmatchedLane.isCurrent(generation) && catalogModeRef.current === 'unmatched') {
         setUnmatchedBusy(false);
       }
     }
@@ -168,6 +178,7 @@ export default function App() {
   const loadDetail = useCallback(async (recordingId: string, cursor: string | null = null, append = false) => {
     if (!recordingId || selectedRecordingRef.current !== recordingId) return;
     const { generation, signal } = detailLane.begin();
+    if (!append) eventWindowStartCursor.current = cursor;
     setDetailBusy(true);
     setDetailError('');
     try {
@@ -177,6 +188,11 @@ export default function App() {
       if (next.recordingId !== recordingId) throw new Error('Recording detail identity mismatch');
       const previous = append ? detailRef.current : null;
       const result = retainPage(previous?.events ?? [], next.events, MAX_RETAINED_EVENTS, next.nextCursor ?? null);
+      const incomingSequences = new Set(next.events.map((item) => item.sequence));
+      const priorCursors = eventPageCursors.current;
+      eventPageCursors.current = new Map(result.items.map((item) => [
+        item.sequence, incomingSequences.has(item.sequence) ? cursor : priorCursors.get(item.sequence) ?? null,
+      ]));
       const updated = { ...next, events: result.items, nextCursor: result.nextCursor };
       detailRef.current = updated;
       setDetail(updated);
@@ -199,19 +215,26 @@ export default function App() {
     const previous = selectedRecordingRef.current;
     const changed = previous !== recordingId;
     if (changed && preserveOutgoing && previous) {
-      tabSelections.current.set(previous, { frameId: replay.frameId, sequence: replay.sequence });
+      const prior = tabSelections.current.get(previous);
+      const cursor = replay.sequence !== null && eventPageCursors.current.has(replay.sequence)
+        ? eventPageCursors.current.get(replay.sequence) ?? null
+        : prior && prior.sequence === replay.sequence ? prior.cursor : null;
+      tabSelections.current.set(previous, { frameId: replay.frameId, sequence: replay.sequence, cursor });
     }
     selectedRecordingRef.current = recordingId;
-    dispatchReplay({ type: 'select-recording', recordingId, restore: tabSelections.current.get(recordingId) });
+    const restore = tabSelections.current.get(recordingId);
+    dispatchReplay({ type: 'select-recording', recordingId,
+      restore: restore ? { frameId: restore.frameId, sequence: restore.sequence } : undefined });
     setActivePane(recordingId ? 'events' : 'recordings');
     if (changed) {
       detailLane.invalidate();
+      eventPageCursors.current.clear();
       detailRef.current = null;
       setDetail(null);
       setDetailError('');
       setDetailBusy(false);
       setOlderEventsReleased(false);
-      void loadDetail(recordingId);
+      void loadDetail(recordingId, restore?.cursor);
     }
     setAnnouncement(recordingId ? `Recording ${recordingId} selected` : 'Recording tab closed');
   }
@@ -234,7 +257,11 @@ export default function App() {
     if (recordingId === selectedRecording) activateRecording(next, false);
     requestAnimationFrame(() => {
       if (next) document.getElementById(`open-recording-${next}`)?.focus();
-      else document.getElementById('request-search')?.focus();
+      else {
+        const search = document.getElementById('request-search');
+        search?.focus();
+        if (document.activeElement !== search) document.querySelector<HTMLElement>('.collapsed-panel--requests')?.focus();
+      }
     });
   }
 
@@ -281,13 +308,20 @@ export default function App() {
     ? 'Selected event is not in the loaded window.'
     : null;
 
+  const selectEvent = useCallback((recordingId: string, item: ReplayEvent) => {
+    const frameId = item.frameId ?? null;
+    tabSelections.current.set(recordingId, { frameId, sequence: item.sequence,
+      cursor: eventPageCursors.current.get(item.sequence) ?? null });
+    dispatchReplay({ type: 'select-frame', frameId, sequence: item.sequence });
+  }, []);
+
   const moveEvent = useCallback((delta: number) => {
     if (!detail || selectedEvent < 0) return;
     const next = detail.events[selectedEvent + delta];
     if (!next) return;
-    dispatchReplay({ type: 'select-frame', frameId: next.frameId ?? null, sequence: next.sequence });
+    selectEvent(detail.recordingId, next);
     setAnnouncement(`Event ${next.sequence} selected`);
-  }, [detail, selectedEvent]);
+  }, [detail, selectEvent, selectedEvent]);
 
   useEffect(() => {
     const onKeyDown = (keyboard: KeyboardEvent) => {
@@ -300,14 +334,15 @@ export default function App() {
   }, [moveEvent]);
 
   useEffect(() => {
-    if (auth !== 'ready' || activePane !== 'recordings' || catalogMode === 'endpoints') return;
+    if (auth !== 'ready' || catalogMode === 'endpoints') return;
     const timer = window.setInterval(() => {
-      if (document.visibilityState !== 'visible') return;
+      if (document.visibilityState !== 'visible' || catalogModeRef.current !== catalogMode) return;
+      if (!document.getElementById('request-search')?.getClientRects().length) return;
       if (catalogMode === 'linked' && linkedFirstPage.current && !linkedBusy) void loadLinked(selectedOperation);
       if (catalogMode === 'unmatched' && unmatchedFirstPage.current && !unmatchedBusy) void loadUnmatched();
     }, 15_000);
     return () => window.clearInterval(timer);
-  }, [activePane, auth, catalogMode, linkedBusy, loadLinked, loadUnmatched, selectedOperation, unmatchedBusy]);
+  }, [auth, catalogMode, linkedBusy, loadLinked, loadUnmatched, selectedOperation, unmatchedBusy]);
 
   function openEndpoint(endpoint: Endpoint) {
     endpointLane.invalidate(); setEndpointBusy(false);
@@ -356,9 +391,9 @@ export default function App() {
   const nextDetail = () => detail?.nextCursor && selectedRecording && void loadDetail(selectedRecording, detail.nextCursor, true);
 
   const refreshCatalog = () => catalogMode === 'endpoints' ? void loadEndpoints() : catalogMode === 'linked' ? void loadLinked(selectedOperation) : void loadUnmatched();
-  const refreshDetail = () => selectedRecording && void loadDetail(selectedRecording);
+  const refreshDetail = () => selectedRecording && void loadDetail(selectedRecording, eventWindowStartCursor.current);
   const pickEvent = (item: ReplayEvent) => {
-    dispatchReplay({ type: 'select-frame', frameId: item.frameId ?? null, sequence: item.sequence });
+    selectEvent(selectedRecording, item);
     setActivePane('evidence');
     setAnnouncement(`Event ${item.sequence} selected`);
   };
@@ -369,7 +404,7 @@ export default function App() {
       setAnnouncement(`${action}: the target frame is outside the loaded window. Load more events to reach it; paging backward is not available yet.`);
       return;
     }
-    dispatchReplay({ type: 'select-frame', frameId, sequence: target.sequence });
+    selectEvent(selectedRecording, target);
     setAnnouncement(`Selected event ${target.sequence}`);
   };
 

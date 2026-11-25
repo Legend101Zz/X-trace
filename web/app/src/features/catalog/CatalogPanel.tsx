@@ -80,9 +80,9 @@ export function CatalogPanel(props: CatalogPanelProps) {
         <label className="request-search" id="request-search-label" htmlFor="request-search">Search loaded requests</label>
         <input type="search" id="request-search" className="request-search-input" aria-labelledby="request-search-label"
           value={search} onChange={(event) => setSearch(event.currentTarget.value)} />
-        {catalogMode === 'linked' ? <div className="catalog-back"><div className="catalog-actions"><button className="button" onClick={onBack}>← Observed endpoints</button><button className="button" aria-label="Unmatched recordings" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button></div><span>{selectedEndpoint?.method} {selectedEndpoint?.routeTemplate}</span><small>Component: {selectedEndpoint?.applicationComponent} · Binding: {selectedEndpoint?.binding}</small></div> : null}
+        {catalogMode === 'linked' ? <div className="catalog-back"><div className="catalog-actions"><button className="button" onClick={onBack}>← Observed endpoints</button><button className="button" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button></div><span>{selectedEndpoint?.method} {selectedEndpoint?.routeTemplate}</span><small>Component: {selectedEndpoint?.applicationComponent} · Binding: {selectedEndpoint?.binding}</small></div> : null}
         {catalogMode === 'endpoints' ? <>
-          <div className="catalog-switch"><button className="button" aria-current="page">Observed endpoints</button><button className="button" aria-label="Unmatched recordings" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button></div>
+          <div className="catalog-switch"><button className="button" aria-current="page">Observed endpoints</button><button className="button" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button></div>
           <div className="policy-note"><strong>Operator-selected policy</strong><span>{endpoints[0]?.observationPolicy ?? 'spring-orders-v1'} does not attest which adapter or application produced the event.</span></div>
           {endpointBusy && endpoints.length === 0 ? <div className="loading">Reading observed endpoints…</div> : null}
           {endpointError ? <ErrorState message={endpointError} onRetry={onRetryEndpoints} /> : null}
@@ -96,7 +96,7 @@ export function CatalogPanel(props: CatalogPanelProps) {
           {tree}
         </> : null}
         {catalogMode === 'unmatched' ? <>
-          <div className="catalog-switch"><button className="button" onClick={onBack}>Observed endpoints</button><button className="button" aria-label="Unmatched recordings" aria-expanded="true" onClick={onBack}>Not linked to an endpoint</button></div>
+          <div className="catalog-switch"><button className="button" onClick={onBack}>Observed endpoints</button><button className="button" aria-expanded="true" onClick={onBack}>Not linked to an endpoint</button></div>
           {tree}
           <div className="context-note unmatched-note">These recordings have no observed endpoint association. A historical recording may have no reason code.</div>
           {unmatchedBusy && unmatched.length === 0 ? <div className="loading">Reading unmatched recordings…</div> : null}

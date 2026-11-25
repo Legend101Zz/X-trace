@@ -210,15 +210,15 @@ try {
   await page.locator('.event').nth(1).click();
   await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
   await page.getByRole('status').filter({ hasText: /Event .* selected/ }).waitFor();
-  const backToStep = page.getByRole('button', { name: /Back to step/ });
-  assert.ok((await backToStep.boundingBox())?.height >= 44, 'phone Back to step meets its touch target');
+  const backToStep = page.getByRole('button', { name: /Back to event/ });
+  assert.ok((await backToStep.boundingBox())?.height >= 44, 'phone Back to event meets its touch target');
   await backToStep.press('Enter');
   const currentEvent = page.locator('.event[aria-current="true"]');
   await expect(currentEvent).toBeFocused();
   const priorSequence = await currentEvent.locator('.event-seq').textContent();
   await page.getByRole('tab', { name: 'recordings' }).click();
   await page.getByRole('tabpanel', { name: 'recordings' }).waitFor({ state: 'visible' });
-  await page.getByRole('button', { name: 'Unmatched recordings' }).click();
+  await page.getByRole('button', { name: 'Not linked to an endpoint' }).click();
   const historicalRow = page.getByRole('button', { name: new RegExp(legacyV4Id) });
   await historicalRow.waitFor();
   await historicalRow.getByText('No historical reason recorded').waitFor();
@@ -388,6 +388,27 @@ try {
   await page.getByRole('button', { name: 'Reset panels' }).click();
   const requestsSplitter = page.getByRole('separator', { name: 'Resize Requests' });
   const codeSplitter = page.getByRole('separator', { name: 'Resize Code' });
+  for (const width of [861, 1024]) {
+    await page.setViewportSize({ width, height: 900 });
+    await requestsSplitter.press('End');
+    await inspectorSplitter.press('End');
+    await codeSplitter.press('End');
+    await expect(codeSplitter).toBeFocused();
+    await expect(codeSplitter).toHaveCSS('outline-style', 'solid');
+    const modeFits = await page.locator('.mode-switch').evaluate((mode) => {
+      const pane = mode.closest('.pane').getBoundingClientRect();
+      return [...mode.querySelectorAll('button')].every((button) => {
+        const box = button.getBoundingClientRect();
+        return box.left >= pane.left && box.right <= pane.right && box.width >= 44;
+      });
+    });
+    assert.ok(modeFits, `replay mode controls remain within Steps at maximum panel preferences and ${width}px`);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
+      `maximum panel preferences do not overflow the page at ${width}px`);
+    await saveScreenshot(`viewer-shell-extreme-${width}.png`, 'splitter-extremes-and-visible-keyboard-focus', width, 900);
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.getByRole('button', { name: 'Reset panels' }).click();
   await requestsSplitter.press('Home');
   await expect(requestsSplitter).toHaveAttribute('aria-valuenow', '16');
   await expect(requestsSplitter).toBeFocused();
@@ -417,6 +438,11 @@ try {
   await saveScreenshot('viewer-shell-desktop-1440.png', 'active-recording-tab-and-resized-panels', 1440, 900);
   assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('xtrace.viewer.panels'))),
     { requests: 22, code: 28, inspector: 26, lastOpen: { requests: 22, code: 28, inspector: 26 } });
+  await requestsSplitter.press('Enter');
+  await expect(requestsSplitter).toHaveAttribute('aria-valuenow', '0');
+  await originalRecordingTab.press('Delete');
+  await expect(originalRecordingTab).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Requests', exact: true })).toBeFocused();
   // Reloading the spent link exercises startup and persisted appearance without exchanging another token.
   await page.reload({ waitUntil: 'domcontentloaded' });
   await expect(theme).toHaveValue('hc');

@@ -28,7 +28,7 @@ export function EvidencePanel({ active, currentStatus, detail, event, selectionU
   const loadedFrameIds = new Set((detail?.events ?? []).flatMap((item) => item.frameId ? [item.frameId] : []));
   return <section className="pane" role="tabpanel" id="evidence-panel" aria-labelledby="evidence-tab" data-active={active} aria-label="Evidence inspector">
         <div className="pane-head"><div><div className="eyebrow">Persisted facts</div><h1>Evidence inspector</h1></div><span className="top-meta">{currentStatus}</span></div>
-        {event ? <button type="button" className="button button-primary phone-back-to-step" onClick={onBackToEvent}>Back to step {event.sequence}</button> : null}
+        {event ? <button type="button" className="button button-primary phone-back-to-step" onClick={onBackToEvent}>Back to event {event.sequence}</button> : null}
         <div className="inspector">
           {detail?.sessionContext ? <div className="inspector-section"><div className="inspector-label">Session context</div><div className="inspector-value">{sessionContextText(detail.sessionContext)}</div></div> : null}
           {event ? <>

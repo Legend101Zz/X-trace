@@ -67,7 +67,7 @@ function Splitter({ panel, value, lastOpen, onResize, onCommit }: {
   return <div role="separator" tabIndex={0} className={`panel-splitter panel-splitter--${panel}`}
     aria-label={`Resize ${LABELS[panel]}`} aria-controls={IDS[panel]} aria-orientation={stacked ? 'horizontal' : 'vertical'}
     aria-valuenow={value} aria-valuemin={0} aria-valuemax={max}
-    aria-valuetext={value ? `${LABELS[panel]} ${value}%` : `${LABELS[panel]} collapsed`}
+    aria-valuetext={value ? `${LABELS[panel]} size preference ${value}%` : `${LABELS[panel]} collapsed`}
     onKeyDown={resizeByKey} onPointerDown={startDrag} onPointerMove={(event) => {
       const next = dragValue(event);
       if (next !== undefined) onResize(next);

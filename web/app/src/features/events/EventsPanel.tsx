@@ -37,7 +37,7 @@ export function EventsPanel({ active, selectedRecording, endpoint, detail, detai
             <span>{detail.completion === 'unavailable' ? 'Completion unavailable' : `Recording ${detail.completion}`}</span>
             <span>{detail.durationNs == null ? 'Duration unavailable' : `Duration ${nsToLabel(detail.durationNs)}`}</span>
             <span>Capture mode not reported</span>
-            {selectedEvent ? <span className="recording-bar-field">Step {selectedEvent.sequence}{selectedEvent.symbol ? ` · ${selectedEvent.symbol}` : ''}</span> : null}
+            {selectedEvent ? <span className="recording-bar-field">Event sequence {selectedEvent.sequence}{selectedEvent.symbol ? ` · ${selectedEvent.symbol}` : ''}</span> : null}
           </div>
           <OutcomeBanner detail={detail} />
         </> : null}
