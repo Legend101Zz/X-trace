@@ -4,9 +4,13 @@ import { expect } from '@playwright/test';
 const viewports = [[320, 640], [736, 900], [1024, 768], [1440, 900]];
 
 export async function jumpToLoadedSequence(page, sequence) {
-  const controls = page.getByRole('region', { name: 'Loaded event window' });
-  await controls.getByRole('textbox', { name: 'Loaded event sequence', exact: true }).fill(sequence);
-  await controls.getByRole('button', { name: 'Go to event', exact: true }).press('Enter');
+  await page.locator('#events-panel .event[aria-current="true"]').focus();
+  await page.keyboard.press('Alt+j');
+  const controls = page.getByRole('dialog', { name: 'Go to step', exact: true });
+  const input = controls.getByRole('textbox', { name: 'Go to step number', exact: true });
+  await expect(input).toBeFocused();
+  await input.fill(sequence);
+  await input.press('Enter');
   const current = page.locator('#events-panel .event[aria-current="true"]');
   await expect(current).toBeFocused();
   await expect(current.locator('.event-seq')).toHaveText(sequence);

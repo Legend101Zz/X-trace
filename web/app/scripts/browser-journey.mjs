@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium, expect } from '@playwright/test';
+import { verifyLoadedReplayTools } from './replay-tools-journey.mjs';
+import { createReplayToolsReport } from './replay-tools-report.mjs';
 
 const [recordingId, encodedSequences, operationId, legacyV4Id] = process.argv.slice(2);
 assert.ok(recordingId && encodedSequences && operationId && legacyV4Id, 'recording, endpoint, and expected event data are required');
@@ -21,6 +23,7 @@ assert.ok(Array.isArray(expectedLinkedIds) && expectedLinkedIds.includes(recordi
 assert.ok(Array.isArray(expectedGenuineLinkedIds) && expectedGenuineLinkedIds.includes(recordingId), 'selected recording must be a genuine pre-enrichment capture');
 assert.ok(syntheticUnmatchedId && expectedUnmatchedIds.includes(syntheticUnmatchedId), 'synthetic unmatched fixture must be present');
 
+const jumpReport = createReplayToolsReport();
 const browser = await chromium.launch({ headless: true });
 try {
   const context = await browser.newContext({ timezoneId: 'America/New_York' });
@@ -50,12 +53,12 @@ try {
   assert.equal(await page.locator('.endpoint-card').count(), 1, 'the finite fixture policy shows its persisted endpoint');
   const screenshotDirectory = process.env.XTRACE_BROWSER_SCREENSHOT_DIR;
   const screenshotViews = [];
-  const saveScreenshot = async (name, view, width, height) => {
+  const saveScreenshot = async (name, view, width, height, target = page) => {
     if (!screenshotDirectory) return;
-    await page.screenshot({ path: join(screenshotDirectory, name), fullPage: true });
+    await target.screenshot({ path: join(screenshotDirectory, name), fullPage: true });
     screenshotViews.push({ file: name, viewport: { width, height }, view });
     const viewportName = name.replace(/\.png$/, '-viewport.png');
-    await page.screenshot({ path: join(screenshotDirectory, viewportName) });
+    await target.screenshot({ path: join(screenshotDirectory, viewportName) });
     screenshotViews.push({ file: viewportName, viewport: { width, height }, view: `${view}-viewport` });
   };
   if (screenshotDirectory) {
@@ -150,13 +153,13 @@ try {
   const eventLayout = await page.locator('.event').first().evaluate((row) => {
     const kind = row.querySelector('.event-kind');
     const time = row.querySelector('.event-time');
-    if (!kind || !time) throw new Error('event row is missing kind or timestamp');
+    if (!kind || !time) throw new Error('event row is missing kind or timing slot');
     const kindBounds = kind.getBoundingClientRect();
     const timeBounds = time.getBoundingClientRect();
     return {
       kindFits: kind.scrollWidth <= kind.clientWidth,
       timeFits: time.scrollWidth <= time.clientWidth,
-      overlaps: kindBounds.right > timeBounds.left,
+      overlaps: getComputedStyle(time).display !== 'none' && kindBounds.right > timeBounds.left,
     };
   });
   assert.deepEqual(eventLayout, { kindFits: true, timeFits: true, overlaps: false }, 'mobile event data must wrap without clipping or overlap');
@@ -433,7 +436,62 @@ try {
   assert.deepEqual(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length })), { local: 0, session: 0 });
   assert.deepEqual(await page.evaluate(() => indexedDB.databases()), []);
   assert.equal(await page.evaluate(() => document.referrer), '');
-  // Exercise appearance only after verifying that normal replay has not written to browser storage.
+  // Tools write appearance preferences. Give each pointer journey its own session clone so the
+  // original replay's storage/privacy assertions below remain independent and unchanged.
+  const replayStorage = await context.storageState();
+  for (const pointer of ['fine', 'coarse']) {
+    const toolsContext = await browser.newContext({ storageState: replayStorage, hasTouch: pointer === 'coarse', timezoneId: 'America/New_York' });
+    try {
+      const toolsPage = await toolsContext.newPage();
+      toolsPage.setDefaultTimeout(8000);
+      toolsPage.setDefaultNavigationTimeout(10000);
+      let toolsErrors = 0;
+      const activate = (control) => pointer === 'coarse' ? control.tap() : control.click();
+      toolsPage.on('pageerror', () => { toolsErrors += 1; });
+      toolsPage.on('console', (message) => { if (message.type() === 'error') toolsErrors += 1; });
+      toolsPage.on('request', (request) => {
+        assert.equal(new URL(request.url()).origin, new URL(startUrl).origin, `${pointer} tools journey stays on the local origin`);
+        assert.ok(!request.url().includes(bootstrapToken), 'bootstrap token appeared in a tools request URL');
+        assert.ok(!request.headers().referer?.includes(bootstrapToken), 'bootstrap token appeared in a tools referrer');
+      });
+      const openCapture = async () => {
+        await activate(toolsPage.getByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
+        await activate(toolsPage.getByRole('button', { name: new RegExp(recordingId) }));
+        await expect(toolsPage.locator('.event[aria-current="true"]')).toBeVisible();
+      };
+      await toolsPage.goto(page.url(), { waitUntil: 'domcontentloaded' });
+      await openCapture();
+      const verifyRecordingSelection = async ({ sequence }) => {
+        const tabs = toolsPage.getByRole('tablist', { name: 'Open recordings' });
+        const historical = tabs.getByRole('tab', { name: new RegExp(legacyV4Id) });
+        if (await historical.count() === 0) {
+          await activate(toolsPage.getByRole('tab', { name: 'Requests', exact: true }));
+          await activate(toolsPage.getByRole('button', { name: 'Not linked to an endpoint', exact: true }));
+          await activate(toolsPage.getByRole('button', { name: new RegExp(legacyV4Id) }));
+        } else await activate(historical);
+        await expect(toolsPage.getByText('No projected events', { exact: true })).toBeVisible();
+        await activate(tabs.getByRole('tab', { name: new RegExp(recordingId) }));
+        await expect(toolsPage.locator('.event[aria-current="true"] .event-seq')).toHaveText(sequence);
+        await activate(toolsPage.getByRole('tabpanel', { name: 'Steps' }).getByRole('button', { name: 'Refresh', exact: true }));
+        await expect(toolsPage.getByRole('region', { name: 'Loaded event window' }).getByText('Loading event window…', { exact: true })).not.toBeVisible();
+        await expect(toolsPage.locator('.event[aria-current="true"] .event-seq')).toHaveText(sequence);
+      };
+      await verifyLoadedReplayTools(toolsPage, { events: verifiedEvents, pointer, saveScreenshot, verifyRecordingSelection, jumpReport });
+      const timingButton = toolsPage.locator('.replay-tools').getByRole('button', { name: 'Show timing', exact: true });
+      await activate(timingButton);
+      await expect(timingButton).toHaveAttribute('aria-pressed', 'true');
+      assert.equal(await toolsPage.evaluate(() => JSON.parse(localStorage.getItem('xtrace.viewer.appearance')).timing), 'on');
+      await toolsPage.reload({ waitUntil: 'domcontentloaded' });
+      await openCapture();
+      await expect(timingButton).toHaveAttribute('aria-pressed', 'true');
+      await expect(toolsPage.locator('.event[aria-current="true"] .event-time')).toHaveText('+0 ns');
+      assert.equal(toolsErrors, 0, `${pointer} tools journey has no console or page errors`);
+    } finally {
+      await toolsContext.close();
+    }
+  }
+  assert.deepEqual(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length })), { local: 0, session: 0 });
+  await page.setViewportSize({ width: 390, height: 844 });
   const settingsButton = page.getByRole('button', { name: 'Settings', exact: true });
   const helpButton = page.getByRole('button', { name: 'Help', exact: true });
   const settings = page.getByRole('dialog', { name: 'Settings' });
@@ -640,6 +698,10 @@ try {
   if (screenshotDirectory) {
     await writeFile(join(screenshotDirectory, 'metadata.json'), `${JSON.stringify({ screenshots: screenshotViews, sanitized: true }, null, 2)}\n`, { mode: 0o600 });
   }
+  jumpReport.complete();
+} catch (error) {
+  jumpReport.fail();
+  throw error;
 } finally {
   await browser.close();
 }

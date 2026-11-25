@@ -1,4 +1,5 @@
 import { useId, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { NavAction, NavControl } from '../../replay/navigation';
 
 const FRAME_STEPS = [
@@ -7,12 +8,13 @@ const FRAME_STEPS = [
   { action: 'out', label: 'Step out' },
 ] as const;
 
-export function ReplayToolbar({ backReason, nextReason, frameControls, onMove, onNavigate }: {
+export function ReplayToolbar({ backReason, nextReason, frameControls, onMove, onNavigate, tools }: {
   backReason: string | null;
   nextReason: string | null;
   frameControls: readonly NavControl[];
   onMove: (direction: -1 | 1) => void;
   onNavigate: (action: NavAction) => void;
+  tools?: ReactNode;
 }) {
   const id = useId();
   const [focusedAction, setFocusedAction] = useState<string | null>(null);
@@ -33,6 +35,7 @@ export function ReplayToolbar({ backReason, nextReason, frameControls, onMove, o
         onFocus={() => setFocusedAction(action)} onBlur={() => setFocusedAction(null)}
         onMouseEnter={() => setPointedAction(action)} onMouseLeave={() => setPointedAction(null)}
         onClick={() => { setPointedAction(action); run(); }}>{label}</button>)}
+      {tools}
     </div>
     {controls.map(({ action, label, reason }) => reason
       ? <p key={action} id={`${id}-${action}`} className={action === visibleReason ? "replay-reason" : "sr-only"}>{label} · {reason}</p> : null)}

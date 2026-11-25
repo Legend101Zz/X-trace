@@ -7,6 +7,7 @@ const defaults = {
   density: 'comfortable' as 'comfortable' | 'compact',
   time: 'local' as 'local' | 'utc',
   inline: 'on' as 'on' | 'off',
+  timing: 'off' as 'on' | 'off',
   motion: 'system' as 'system' | 'reduce',
 };
 
@@ -16,12 +17,14 @@ const choices = {
   density: ['comfortable', 'compact'],
   time: ['local', 'utc'],
   inline: ['on', 'off'],
+  timing: ['on', 'off'],
   motion: ['system', 'reduce'],
 } as const;
 
 const KEY = 'xtrace.viewer.appearance';
 export const ViewerPreferencesContext = createContext<ViewerPreferences>(defaults);
 export const useViewerPreferences = () => useContext(ViewerPreferencesContext);
+export const ViewerPreferencesUpdateContext = createContext<ReturnType<typeof useAppearancePreferences>['update'] | null>(null);
 
 function read(): ViewerPreferences {
   try {

@@ -1,4 +1,4 @@
-/** Replay-core reducer for event selection and view mode. Filter and playback are reserved for later wiring. */
+/** Replay-core reducer for exact event selection, view mode and loaded-step filtering. */
 
 export type ReplayMode = 'linear' | 'canvas';
 export type PlaybackSpeed = 0.5 | 1 | 2 | 4;

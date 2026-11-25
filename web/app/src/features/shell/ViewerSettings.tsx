@@ -31,6 +31,13 @@ export function ViewerSettings({ appearance, theme, dock, onDock }: {
       <p>Compact shortens rows on a desktop with a fine pointer. Touch targets stay at least 44 px.</p>
     </section>
     <section><h3>Replay</h3>
+      <label>Show timing
+        <select className="theme-select" value={preferences.timing}
+          onChange={(event) => update('timing', event.currentTarget.value === 'on' ? 'on' : 'off')}>
+          <option value="on">On</option><option value="off">Off</option>
+        </select>
+      </label>
+      <p>Time since the first loaded step, from recorded monotonic timestamps. This is not a step duration.</p>
       <label>Inline values in code
         <select className="theme-select" value={preferences.inline}
           onChange={(event) => update('inline', event.currentTarget.value === 'off' ? 'off' : 'on')}>

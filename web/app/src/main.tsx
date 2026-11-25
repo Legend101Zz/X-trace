@@ -13,6 +13,7 @@ import { retainPage } from './retained-page';
 import { replayPage, retainReplayWindow } from './replay/window';
 import type { ReplayPage, WindowDirection } from './replay/window';
 import { initialReplayState, replayReducer } from './replay/state';
+import { filteredSteps } from './replay/loaded-tools';
 import type { MissingTarget } from './replay/missing';
 import { navigationControls } from './replay/navigation';
 import type { NavAction, NavFrameNavigation } from './replay/navigation';
@@ -307,6 +308,9 @@ export default function App() {
     ? detail.events.findIndex((item) => item.sequence === replay.sequence && (item.frameId ?? null) === replay.frameId)
     : -1;
   const event = detail?.events[selectedEvent];
+  const navigableEvents = useMemo(() => replay.mode === 'linear'
+    ? filteredSteps(detail?.events ?? [], replay.filter, event) : detail?.events ?? [], [detail, event, replay.filter, replay.mode]);
+  const navigableIndex = event ? navigableEvents.indexOf(event) : -1;
   const selectionUnavailable = detail && replay.sequence !== null && selectedEvent < 0
     ? 'Selected event is not in the loaded window.'
     : null;
@@ -317,9 +321,11 @@ export default function App() {
     [event, loadedFrameIds],
   );
   const missingSelection = selectionUnavailable ?? 'Select an event first.';
-  const backReason = selectedEvent < 0 ? missingSelection : selectedEvent === 0 ? 'No earlier event in the loaded window.' : null;
-  const nextReason = selectedEvent < 0 ? missingSelection : selectedEvent === eventCount - 1
-    ? detail?.nextCursor ? 'Load the next window to reach more events.' : 'No later event in the loaded window.'
+  const filterActive = replay.mode === 'linear' && replay.filter.kinds.length > 0;
+  const backReason = selectedEvent < 0 ? missingSelection : navigableIndex === 0
+    ? filterActive ? 'No earlier matching step in the loaded window.' : 'No earlier event in the loaded window.' : null;
+  const nextReason = selectedEvent < 0 ? missingSelection : navigableIndex === navigableEvents.length - 1
+    ? detail?.nextCursor ? 'Load the next window to reach more events.' : filterActive ? 'No later matching step in the loaded window.' : 'No later event in the loaded window.'
     : null;
 
   const selectEvent = useCallback((recordingId: string, item: ReplayEvent) => {
@@ -336,11 +342,11 @@ export default function App() {
       return;
     }
     if (!detail) return;
-    const next = detail.events[selectedEvent + delta];
+    const next = navigableEvents[navigableIndex + delta];
     if (!next) return;
     selectEvent(detail.recordingId, next);
     setAnnouncement(`Event ${next.sequence} selected`);
-  }, [backReason, detail, nextReason, selectEvent, selectedEvent]);
+  }, [backReason, detail, navigableEvents, navigableIndex, nextReason, selectEvent]);
 
   useEffect(() => {
     if (auth !== 'ready' || catalogMode === 'endpoints') return;
@@ -421,7 +427,15 @@ export default function App() {
       setAnnouncement('Event sequence is not in the loaded window.');
       return;
     }
-    goToMissing({ recordingId: selectedRecording, sequence, frameId: target.frameId ?? null });
+    selectEvent(selectedRecording, target);
+    setActivePane('events');
+    setAnnouncement(`Event ${sequence} selected`);
+    requestAnimationFrame(() => {
+      if (selectedRecordingRef.current !== selectedRecording) return;
+      const current = document.querySelector<HTMLElement>(replay.mode === 'linear' ? '.event[aria-current="true"]' : '.canvas-tree [aria-selected="true"]');
+      if (current) focusStepControl(current);
+      else document.querySelector<HTMLElement>('.replay-tools > button')?.focus({ preventScroll: true });
+    });
   };
   const pickEvent = (item: ReplayEvent) => {
     selectEvent(selectedRecording, item);
@@ -536,6 +550,13 @@ export default function App() {
       onPickEvent={pickEvent}
       onChangeWindow={changeWindow}
       onJumpToSequence={jumpToSequence}
+      filter={replay.filter}
+      onFilter={(kinds) => {
+        dispatchReplay({ type: 'set-filter', kinds });
+        setAnnouncement(kinds.length ? 'Step filter changed. The selected step stays listed.' : 'Showing all loaded steps.');
+      }}
+      onActivate={() => setActivePane('events')}
+      onAnnounce={setAnnouncement}
       onFocusedRowReleased={() => setAnnouncement('The focused event was released from the loaded window.')}
       mode={replay.mode}
       onMode={(mode) => dispatchReplay({ type: 'set-mode', mode })}

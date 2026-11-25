@@ -75,7 +75,65 @@ describe('replay wiring in the app', () => {
       throw new Error(`Unexpected request ${path}`);
     }));
   });
-  afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+  afterEach(() => { cleanup(); vi.unstubAllGlobals(); localStorage.removeItem('xtrace.viewer.appearance'); });
+
+  it('keeps a filtered shared-frame selection through Map, refresh and recording tab restoration', async () => {
+    responseDetail = { ...detail, events: [
+      { ...events[0], kind: 'recording_event_kind:frame_enter' },
+      { ...events[1], kind: 'recording_event_kind:line_cursor', frameId: events[0].frameId },
+      { ...events[2], kind: 'recording_event_kind:frame_exit' },
+      { ...events[3], kind: 'recording_event_kind:gap', frameId: null },
+    ] };
+    responseLinked = { ...linked, items: [linked.items[0], { ...linked.items[0], recordingId: recordingB }] };
+    secondDetail = { ...detail, recordingId: recordingB };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
+    await screen.findByRole('button', { name: /Called Controller\.create/ });
+    fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
+    fireEvent.keyDown(document.body, { altKey: true, code: 'KeyJ' });
+    const sequence = screen.getByRole('textbox', { name: 'Go to step number' });
+    fireEvent.change(sequence, { target: { value: '2' } });
+    fireEvent.submit(sequence.closest('form')!);
+    const exactSelected = () => document.querySelector('.event[aria-current="true"] .event-seq');
+    expect(exactSelected()).toHaveTextContent('2');
+
+    fireEvent.keyDown(document.body, { altKey: true, code: 'KeyQ' });
+    fireEvent.click(screen.getByRole('button', { name: 'Not recorded' }));
+    const steps = screen.getByRole('list', { name: 'Loaded replay steps' });
+    expect(steps.querySelectorAll('.event')).toHaveLength(2);
+    expect(exactSelected()).toHaveTextContent('2');
+    expect(screen.getByText(/showing 2 of 4 loaded steps/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
+    expect(screen.getByRole('region', { name: 'Recording summary' })).toHaveTextContent('Event sequence 2');
+    fireEvent.click(screen.getByRole('button', { name: 'Steps' }));
+    expect(exactSelected()).toHaveTextContent('2');
+    fireEvent.click(within(screen.getByRole('tabpanel', { name: 'Steps' })).getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(exactSelected()).toHaveTextContent('2'));
+    expect(screen.getByText(/showing 2 of 4 loaded steps/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Recording summary' })).toHaveTextContent('Event sequence 1'));
+    fireEvent.click(screen.getByRole('tab', { name: new RegExp(recordingA) }));
+    await waitFor(() => expect(exactSelected()).toHaveTextContent('2'));
+    expect(screen.getByText(/showing 2 of 4 loaded steps/)).toBeInTheDocument();
+  });
+
+  it('returns focus to persistent Tools when clearing the filter removes Show all steps', async () => {
+    await openRecording();
+    const tools = screen.getByRole('button', { name: 'Tools' });
+    tools.focus();
+    fireEvent.keyDown(tools, { altKey: true, code: 'KeyQ' });
+    fireEvent.click(screen.getByRole('button', { name: 'Not recorded' }));
+    const selected = () => document.querySelector('.event[aria-current="true"] .event-seq');
+    const sequence = selected()?.textContent;
+    const clear = screen.getByRole('button', { name: 'Show all steps' });
+    clear.focus();
+    fireEvent.click(clear);
+    expect(screen.queryByRole('button', { name: 'Show all steps' })).not.toBeInTheDocument();
+    expect(tools).toHaveFocus();
+    expect(selected()?.textContent).toBe(sequence);
+  });
 
   it.each([
     [null, 'agent capacity rejections not observed'],
@@ -503,20 +561,22 @@ describe('replay wiring in the app', () => {
     expect(within(controls).getByText('No later events available from this window.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Audit\.log/ })).toHaveAttribute('aria-current', 'true');
 
-    const typedSequence = within(controls).getByRole('textbox', { name: 'Loaded event sequence' });
+    fireEvent.keyDown(document.body, { altKey: true, code: 'KeyJ' });
+    const goPanel = screen.getByRole('dialog', { name: 'Go to step' });
+    const typedSequence = within(goPanel).getByRole('textbox', { name: 'Go to step number' });
     fireEvent.change(typedSequence, { target: { value: '99' } });
     const requestCount = vi.mocked(fetch).mock.calls.length;
-    fireEvent.click(within(controls).getByRole('button', { name: 'Go to event' }));
+    fireEvent.submit(typedSequence.closest('form')!);
     expect(live()).toHaveTextContent('Event sequence is not in the loaded window.');
     expect(vi.mocked(fetch).mock.calls).toHaveLength(requestCount);
     fireEvent.change(typedSequence, { target: { value: '4' } });
-    fireEvent.click(within(controls).getByRole('button', { name: 'Go to event' }));
+    fireEvent.submit(typedSequence.closest('form')!);
     const selected = screen.getByRole('button', { name: /Audit\.write/ });
     expect(selected).toHaveAttribute('aria-current', 'true');
     await waitFor(() => expect(selected).toHaveFocus());
   });
 
-  it('moves focus to loaded-sequence search and announces when paging releases a browsed row', async () => {
+  it('moves focus to window tools and announces when paging releases a browsed row', async () => {
     const middle = Array.from({ length: 1_999 }, (_, index) => ev(index + 2, null, `Synthetic ${index + 2}`, nav({})));
     responseDetail = { ...detail, events: [events[0]], nextCursor: 'middle-page' };
     continuationPages.set('middle-page', { ...detail, events: middle, nextCursor: 'end-page' });
@@ -527,9 +587,11 @@ describe('replay wiring in the app', () => {
     fireEvent.click(later);
     await within(controls).findByText('2000 loaded events');
 
-    const search = within(controls).getByRole('textbox', { name: 'Loaded event sequence' });
+    fireEvent.keyDown(document.body, { altKey: true, code: 'KeyJ' });
+    const search = screen.getByRole('textbox', { name: 'Go to step number' });
     fireEvent.change(search, { target: { value: '2' } });
-    fireEvent.click(within(controls).getByRole('button', { name: 'Go to event' }));
+    fireEvent.submit(search.closest('form')!);
+    const windowTools = screen.getByRole('button', { name: 'Tools' });
     const kept = screen.getByRole('button', { name: /Synthetic 2(?:\s|$)/ });
     await waitFor(() => expect(kept).toHaveFocus());
     const browsed = within(screen.getByRole('tabpanel', { name: 'Steps' })).getByRole('button', { name: /Controller\.create/ });
@@ -537,7 +599,7 @@ describe('replay wiring in the app', () => {
     expect(browsed).toHaveFocus();
 
     fireEvent.click(later);
-    await waitFor(() => expect(search).toHaveFocus());
+    await waitFor(() => expect(windowTools).toHaveFocus());
     expect(live()).toHaveTextContent('The focused event was released from the loaded window.');
     expect(browsed).not.toBeInTheDocument();
     expect(kept).toHaveAttribute('aria-current', 'true');

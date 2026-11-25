@@ -2,8 +2,35 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, expect, it, vi } from 'vitest';
 import type { ReplayEvent } from '../../types';
 import { StepsList } from './StepsList';
+import { filteredSteps, loadedTiming, STEP_FILTERS } from '../../replay/loaded-tools';
 
 afterEach(cleanup);
+
+it('keeps the mounted row bound and exact selected event when filters shrink a full retained window', () => {
+  const events = Array.from({ length: 2_000 }, (_, index) => ({
+    sequence: String((index + 1) * 2), frameId: index === 1_999 ? null : 'shared-frame',
+    kind: `recording_event_kind:${index % 2 === 0 ? 'line_cursor' : 'frame_enter'}`,
+    monotonicNs: String(index + 10), symbol: 'Synthetic.method', line: index + 1,
+  })) as ReplayEvent[];
+  const selected = events[1_999];
+  const renderFiltered = (kinds: readonly string[]) => <section id="events-panel">
+    <StepsList events={filteredSteps(events, { kinds }, selected)} selected={selected} timing={loadedTiming(events)}
+      onMove={() => undefined} onPick={() => undefined} />
+  </section>;
+  const { rerender } = render(renderFiltered(STEP_FILTERS[2].kinds));
+  const list = screen.getByRole('list', { name: 'Loaded replay steps' });
+  const selection = () => list.querySelector<HTMLElement>('[data-step-sequence="4000"]');
+  expect(list.querySelectorAll('.step-row').length).toBeLessThanOrEqual(80);
+  expect(selection()).toHaveAttribute('aria-posinset', '1001');
+  expect(selection()).toHaveAttribute('aria-setsize', '1001');
+  expect(selection()?.querySelector('.event')).toHaveAttribute('aria-current', 'true');
+  expect(selection()).toHaveTextContent('+1999 ns');
+  rerender(renderFiltered(STEP_FILTERS[4].kinds));
+  expect(list.querySelectorAll('.step-row')).toHaveLength(1);
+  expect(selection()?.querySelector('.event')).toHaveAttribute('aria-current', 'true');
+  expect(selection()).toHaveTextContent('Frame ID unavailable');
+  expect(selection()).toHaveTextContent('+1999 ns');
+});
 
 it('bounds a retained window, pins exact selection and restores a virtualized Why disclosure', () => {
   const events = Array.from({ length: 160 }, (_, index) => ({

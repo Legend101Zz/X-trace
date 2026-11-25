@@ -7,12 +7,13 @@ import { revealWithin } from '../common/reveal-within';
 import { stepScrollOwner, useStepWindow } from './useStepWindow';
 import './steps.css';
 
-export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleased }: {
+export function StepsList({ events, selected, timing, onPick, onMove, onFocusedRowReleased }: {
   events: readonly ReplayEvent[];
   selected: ReplayEvent | undefined;
+  timing?: ReadonlyMap<string, string>;
   onPick: (event: ReplayEvent) => void;
   onMove: (direction: -1 | 1) => void;
-  onFocusedRowReleased?: () => void;
+  onFocusedRowReleased?: (sequence: string) => void;
 }) {
   const rail = useRef<HTMLDivElement>(null);
   const selectedRow = useRef<HTMLButtonElement>(null);
@@ -23,7 +24,7 @@ export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleas
   useLayoutEffect(() => {
     if (focused === undefined || events.some(({ sequence }) => sequence === focused)) return;
     setFocused(undefined);
-    if (document.activeElement === document.body) onFocusedRowReleased?.();
+    if (document.activeElement === document.body) onFocusedRowReleased?.(focused);
   }, [events, focused, onFocusedRowReleased, setFocused]);
 
   useLayoutEffect(() => {
@@ -72,7 +73,7 @@ export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleas
       onFocus={() => setFocused(item.sequence)} onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) setFocused(undefined);
       }}>
-      <button className={`event${step.gap ? ' gap-event' : ''}`} ref={active ? selectedRow : undefined}
+      <button className={`event${step.gap ? ' gap-event' : ''}${timing ? ' event-with-timing' : ''}`} ref={active ? selectedRow : undefined}
         data-event-kind={item.kind} aria-current={active} tabIndex={active || (!selected && index === 0) ? 0 : -1}
         onKeyDown={(key) => {
           if (key.altKey || key.ctrlKey || key.metaKey || (key.key !== 'ArrowUp' && key.key !== 'ArrowDown')) return;
@@ -88,7 +89,7 @@ export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleas
           {symbol && !step.text.includes(symbol) ? <span className="event-symbol">{symbol}</span> : null}
           {item.frameId == null ? <span className="event-symbol">Frame ID unavailable</span> : null}
         </span>
-        <span className="event-time">{item.monotonicNs} ns</span>
+        <span className="event-time">{timing?.get(item.sequence)}</span>
       </button>
       {step.gap ? <details className="step-why" open={disclosures.has(item.sequence)} onToggle={(event) => {
         const open = event.currentTarget.open;

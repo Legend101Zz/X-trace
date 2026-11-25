@@ -11,7 +11,7 @@ import { RecordingContext } from './features/shell/RecordingContext';
 import { ViewerDialog } from './features/shell/ViewerDialog';
 import { ViewerHelp } from './features/shell/ViewerHelp';
 import { ViewerSettings } from './features/shell/ViewerSettings';
-import { useAppearancePreferences, ViewerPreferencesContext } from './features/shell/viewer-preferences';
+import { useAppearancePreferences, ViewerPreferencesContext, ViewerPreferencesUpdateContext } from './features/shell/viewer-preferences';
 import './features/shell/viewer-dialog.css';
 
 const INSPECTOR_DOCK_KEY = 'xtrace.viewer.inspector-dock';
@@ -73,6 +73,7 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
     document.getElementById('header-requests')?.focus();
   };
   return <ViewerPreferencesContext.Provider value={appearance.preferences}>
+    <ViewerPreferencesUpdateContext.Provider value={appearance.update}>
     <div className="shell viewer-shell" data-pane={activePane} data-reading={detail !== null && sourceEvent !== undefined}
       data-density={appearance.preferences.density} data-motion={appearance.preferences.motion}
       style={{ '--viewer-code-size': `${appearance.preferences.codeSize}px` } as CSSProperties}
@@ -124,5 +125,6 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
       {modal.title === 'Settings' ? <ViewerSettings appearance={appearance} theme={theme} dock={dock} onDock={changeDock} />
         : <ViewerHelp />}
     </ViewerDialog> : null}
+    </ViewerPreferencesUpdateContext.Provider>
   </ViewerPreferencesContext.Provider>;
 }

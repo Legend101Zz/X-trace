@@ -20,18 +20,21 @@ afterEach(() => {
 });
 
 it('validates stored choices independently and restores valid updates after remount', () => {
-  localStorage.setItem(key, JSON.stringify({ codeSize: '99', density: 'compact', time: 'utc', inline: 'off', motion: 'force' }));
+  localStorage.setItem(key, JSON.stringify({ codeSize: '99', density: 'compact', time: 'utc', inline: 'off', timing: 'invalid', motion: 'force' }));
   const mounted = render(<SettingsHarness />);
   expect(screen.getByLabelText('Code font size')).toHaveValue('12');
   expect(screen.getByLabelText('Density')).toHaveValue('compact');
   expect(screen.getByLabelText('Recording times')).toHaveValue('utc');
   expect(screen.getByLabelText('Inline values in code')).toHaveValue('off');
+  expect(screen.getByLabelText('Show timing')).toHaveValue('off');
   expect(screen.getByLabelText('Animations')).toHaveValue('system');
   fireEvent.change(screen.getByLabelText('Code font size'), { target: { value: '16' } });
+  fireEvent.change(screen.getByLabelText('Show timing'), { target: { value: 'on' } });
   mounted.unmount();
   render(<SettingsHarness />);
   expect(screen.getByLabelText('Code font size')).toHaveValue('16');
   expect(screen.getByLabelText('Recording times')).toHaveValue('utc');
+  expect(screen.getByLabelText('Show timing')).toHaveValue('on');
 });
 
 it('keeps appearance usable for the session when storage reads and writes are blocked', () => {
