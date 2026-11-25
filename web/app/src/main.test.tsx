@@ -121,7 +121,7 @@ describe('endpoint-first recording viewer', () => {
       expect(await screen.findByRole('region', { name: 'No recordings yet' })).toHaveTextContent('xtrace run --project-dir ./your-project --java-agent ./xtrace-java-agent.jar -- java -jar ./your-app.jar');
     } else {
       await waitFor(() => expect(vi.mocked(fetch).mock.calls.map(([input]) => route(input))).toContain('/api/v1/recordings?limit=1'));
-      await waitFor(() => expect(within(screen.getByRole('tabpanel', { name: 'Requests' })).getByRole('button', { name: 'Refresh', exact: true })).toBeEnabled());
+      await waitFor(() => expect(within(screen.getByRole('tabpanel', { name: 'Requests' })).getByRole('button', { name: /^Refresh$/ })).toBeEnabled());
       expect(screen.getByText('No observed endpoints')).toBeInTheDocument();
       expect(screen.queryByRole('region', { name: 'No recordings yet' })).not.toBeInTheDocument();
     }
