@@ -32,7 +32,7 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
   const list = useRef<HTMLOListElement>(null);
   const heights = useRef(new Map<string, number>());
   const measuredWidth = useRef(0);
-  const anchor = useRef<{ sequence: string; displacement: number } | null>(null);
+  const anchor = useRef<{ sequence: string; offset: number } | null>(null);
   const [revision, measure] = useState(0);
   const [viewport, setViewport] = useState({ top: 0, height: 800 });
   const [focused, setFocused] = useState<string>();
@@ -47,42 +47,58 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
   const last = firstVisible(offsets, Math.max(0, viewport.top + viewport.height));
   const start = events.length <= STEP_ROW_LIMIT ? 0 : Math.max(0, first - OVERSCAN);
   const end = events.length <= STEP_ROW_LIMIT ? events.length
-    : Math.min(events.length, last + OVERSCAN + 1, start + STEP_ROW_LIMIT - 2);
+    : Math.min(events.length, last + OVERSCAN + 1, start + STEP_ROW_LIMIT - 3);
   const indices = new Set(Array.from({ length: end - start }, (_, offset) => start + offset));
-  for (const sequence of [selected ?? events[0]?.sequence, focused]) {
+  for (const sequence of [selected ?? events[0]?.sequence, focused, anchor.current?.sequence]) {
     const index = sequence === undefined ? undefined : indexes.get(sequence);
     if (index !== undefined) indices.add(index);
+  }
+
+  function updateViewport(element: HTMLElement, owner: HTMLElement, viewportTop: number) {
+    const top = viewportTop - element.getBoundingClientRect().top;
+    setViewport((current) => current.top === top && current.height === owner.clientHeight
+      ? current : { top, height: owner.clientHeight });
   }
 
   function captureViewport() {
     const element = list.current;
     const owner = element && stepScrollOwner(element);
     if (!element || !owner || !owner.clientHeight) return;
-    const top = owner.getBoundingClientRect().top - element.getBoundingClientRect().top;
-    const index = firstVisible(offsets, Math.max(0, top));
-    anchor.current = top + owner.clientHeight <= 0 || !events[index] ? null : {
-      sequence: events[index].sequence, displacement: top - offsets[index],
-    };
-    setViewport((current) => current.top === top && current.height === owner.clientHeight
-      ? current : { top, height: owner.clientHeight });
-  }
-
-  useLayoutEffect(() => {
-    const element = list.current;
-    const owner = element && stepScrollOwner(element);
-    if (!element || !owner) return;
-    for (const sequence of heights.current.keys()) if (!indexes.has(sequence)) heights.current.delete(sequence);
-    const kept = anchor.current;
-    const index = kept ? indexes.get(kept.sequence) : undefined;
-    if (kept && index !== undefined && owner.clientHeight) {
-      const actual = owner.getBoundingClientRect().top - element.getBoundingClientRect().top;
-      owner.scrollTop += offsets[index] + kept.displacement - actual;
+    const viewportTop = owner.getBoundingClientRect().top + owner.clientTop;
+    const viewportBottom = viewportTop + owner.clientHeight;
+    anchor.current = null;
+    for (const row of element.querySelectorAll<HTMLElement>('[data-step-sequence]')) {
+      const box = row.getBoundingClientRect();
+      if (box.bottom > viewportTop && box.top < viewportBottom) {
+        anchor.current = { sequence: row.dataset.stepSequence!, offset: box.top - viewportTop };
+        break;
+      }
     }
-    captureViewport();
-  }, [events, offsets]);
+    updateViewport(element, owner, viewportTop);
+  }
 
   const mounted = [...indices].sort((left, right) => left - right);
   const mountedKey = mounted.join(',');
+  useLayoutEffect(() => {
+    const element = list.current;
+    const owner = element && stepScrollOwner(element);
+    if (!element || !owner || !owner.clientHeight) return;
+    for (const sequence of heights.current.keys()) if (!indexes.has(sequence)) heights.current.delete(sequence);
+    const kept = anchor.current;
+    const row = kept && [...element.querySelectorAll<HTMLElement>('[data-step-sequence]')]
+      .find(({ dataset }) => dataset.stepSequence === kept.sequence);
+    if (!row || !kept) {
+      captureViewport();
+      return;
+    }
+
+    // Mounted rows have real heights before ResizeObserver reports them. Restore from the
+    // keyed row's live geometry, including header movement and any newly measured spacers.
+    const viewportTop = owner.getBoundingClientRect().top + owner.clientTop;
+    owner.scrollTop += row.getBoundingClientRect().top - viewportTop - kept.offset;
+    updateViewport(element, owner, viewportTop);
+  }, [events, offsets, mountedKey]);
+
   useLayoutEffect(() => {
     const element = list.current;
     const owner = element && stepScrollOwner(element);
