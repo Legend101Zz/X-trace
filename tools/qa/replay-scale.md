@@ -73,3 +73,84 @@ Optionally set `XTRACE_SCALE_XTRACE` to an absolute path to a supported, install
 binary before running the test. Both initialization and every cursor-page read then use that
 binary, while writes still use this checkout's persistence implementation. This requires
 matching schema/package compatibility. It is not, by itself, an installed-viewer journey.
+
+## Embedded browser measurement (#98)
+
+`tools/qa/replay_scale_browser.mjs` consumes that retained private manifest and starts the
+normal foreground `xtrace open --viewer --no-browser` with its project directory and data
+home. It uses the existing `web/app/node_modules/@playwright/test` installation and its
+Chromium browser. Run on Linux GitHub Actions after the focused #94 verification, a build of
+the intended embedded viewer (or a supported package installation), and browser prerequisites.
+No Vite server, request mocking, direct database reads or production instrumentation is used.
+
+```bash
+source tools/dev/env.sh
+node tools/qa/replay_scale_browser.mjs \
+  --manifest "$XTRACE_SCALE_FIXTURE_MANIFEST" \
+  --xtrace "$XTRACE_MEASUREMENT_BINARY" \
+  --out "$XTRACE_TEST_PRIVATE_SCRATCH/replay-browser.json" \
+  --source-sha "$XTRACE_MEASUREMENT_SOURCE_SHA" \
+  --provenance source-built \
+  --later-pages 12 --cdp-heap
+```
+
+All three input/output paths stay private. `--out` must be a new file; output is mode 0600.
+`--source-sha` is the coordinator's declared 40-character product-source revision; it is not
+inferred from this script's checkout. The driver computes the actual executable SHA-256.
+For an installed product, use `--provenance installed --package-sha256 "$XTRACE_PACKAGE_SHA256"`;
+the package hash is declared by the caller and must come from independently verified package
+bytes. The report distinguishes declarations from the measured binary hash. No path, token,
+URL, trace body, screenshot or raw error text is emitted. Do not upload the manifest/store.
+
+Flags: `--manifest`, `--xtrace`, `--out`, `--source-sha` and `--provenance` are required.
+`--package-sha256` is required for installed provenance; `--cdp-heap` is optional.
+`--later-pages` accepts 1–49 additional pages and defaults to 12. Twelve crosses the current
+2,000-event retained-window cap with 200-event responses; the report records actual returned
+and mounted counts rather than assuming those widths. Every requested later load must execute.
+There are always five attempts, each with a new foreground viewer, browser process, context
+and page. Failures are retained; attempts are never repeated. An unreached action fails its
+journey rather than becoming a timing sample. Exit 0 means all functional journeys were
+exercised, 1 means at least one failed, and 2 means setup or output failed. Timing overruns are
+reported individually; these exit codes do not decide the unsettled performance aggregation.
+
+The fixed baseline is headless Chromium, 1440×900 CSS pixels, scale factor 1, en-US, UTC,
+light color scheme, normal motion and no CPU/network throttling. Browser processes and caches
+are fresh per sample; OS/filesystem caches are uncontrolled and may be warm. Catalog loading,
+fixture generation and viewer startup precede timing. A synchronous capture listener records
+`performance.now()` on the actual trusted recording click. The end uses that same clock,
+after the selected first step remains visible with the correct recording and inspector event
+identity across two requestAnimationFrame callbacks. This observes an intervening rendering opportunity,
+not physical display completion. No scroll, forced click, CSS alteration or DOM replacement is
+used to make the initial row visible. A layout that hides it fails; #97 may need integration.
+
+The exact successful detail response is checked against the manifest project/recording,
+cursor, completion, capacity and synthetic event identities. The visible selected sequence
+and inspector identity match its first event; the Map's selected frame subsequently matches
+that same response frame. Identity digests bind private events without serializing their IDs.
+After the initial measurement, actual Steps/Map buttons and Next/Back navigation must work
+in both modes. Later pages are loaded through the real button and each newly returned window
+is selected through an actual row click, then navigation and both mode switches are repeated.
+Playwright may scroll normal controls into view for these untimed actions. No API fixture or
+fallback to another recording replaces an unreachable action.
+
+The mode-0600 JSON file and stdout contain the same sanitized schema-version-1 report:
+
+- `provenance`: declared source/package and computed executable hashes.
+- `conditions`: browser/viewport/runner CPU, timing, cache and DOM measurement scopes.
+- `samples`: all five attempts, bounded stage/failure codes, validated initial milliseconds,
+  relation to 1,500 ms, API first-window count and selected-identity digest; successful actions
+  and DOM snapshots for initial/later Steps, Map and return to Steps. `initial` is null when
+  initial measurement was not established. A later failure retains valid initial timing.
+- Each DOM snapshot separates cumulative API events and the last API window from the loaded
+  rail label, mounted rail rows, viewport-hit-tested visible rows, SVG graph nodes, accessible
+  tree rows, visible tree rows and all document elements. Counts cover the current DOM and
+  mode, not the whole recording or React heap. Optional CDP `Runtime.getHeapUsage` reports
+  this page target's JS heap separately; it is not browser RSS, a forced-GC result or a budget.
+  Unsupported heap measurement has an explicit status.
+- `summary`: valid initial and complete-journey counts, functional failure count, descriptive
+  median/max initial milliseconds and count over 1,500 ms. Failed initial attempts remain
+  visible and contribute no invented time. Aggregation and memory thresholds stay unsettled.
+
+A synthetic baseline does not establish real-framework stress performance, installed-package
+behavior unless installed provenance was exercised, or release acceptance. Those journeys
+remain separate evidence under #7.
