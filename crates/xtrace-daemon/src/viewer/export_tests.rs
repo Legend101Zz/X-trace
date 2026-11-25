@@ -601,8 +601,8 @@ with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as z:
     async fn observed_scope_echoes_original_selector_and_exposes_only_resolved_catalog_id() {
         let original = snapshot();
         let catalog_id = original.operations[0].operation_id;
-        let observed_id = OperationId::new();
-        assert_ne!(observed_id, catalog_id);
+        let observed_id = catalog_id;
+        // Production finite aliases share UUID bytes; selector kinds still bind approval separately.
         let viewer = start_exports(move |_, _, scope, _| {
             let mut selected = original.clone();
             match scope {
@@ -638,6 +638,14 @@ with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as z:
         assert!(post(&viewer, &cookie, "save", &body).await.0.starts_with("HTTP/1.1 200"));
         body["scope"] = catalog_id.to_string().into();
         assert!(post(&viewer, &cookie, "save", &body).await.0.starts_with("HTTP/1.1 409"));
+        let mut direct = selection("bundle");
+        direct["scope"] = catalog_id.to_string().into();
+        let (headers, bytes) = post(&viewer, &cookie, "preview", &direct).await;
+        assert!(headers.starts_with("HTTP/1.1 200"));
+        let direct_preview: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        direct["approval"] = direct_preview["approval"].clone();
+        direct["scope"] = format!("observed:{observed_id}").into();
+        assert!(post(&viewer, &cookie, "save", &direct).await.0.starts_with("HTTP/1.1 409"));
         let mut missing = selection("bundle");
         missing["scope"] = format!("observed:{}", OperationId::new()).into();
         assert!(post(&viewer, &cookie, "preview", &missing).await.0.starts_with("HTTP/1.1 404"));

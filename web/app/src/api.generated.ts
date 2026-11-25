@@ -212,7 +212,7 @@ export interface components {
             yaml: boolean;
             /** @description The last catalog publication for this project or one explicit revision UUID. */
             revision: "latest" | string;
-            /** @description Every eligible operation of the revision, a catalog operation UUID or an observed endpoint UUID prefixed with observed:. The observed selector is resolved within this project and revision using its recorded component, binding, HTTP method and declared route. A missing or ambiguous match is unavailable. */
+            /** @description Every eligible operation of the revision, a catalog operation UUID or an observed endpoint UUID prefixed with observed:. The observed selector is resolved within this project and revision using its recorded component, binding, HTTP method and declared route. The supported finite observed alias shares its catalog UUID, but the selector kind remains distinct for approval. Divergent stored aliases are corrupt. A missing or ambiguous match is unavailable. */
             scope: "all" | string;
         };
         ExportApproval: {
@@ -226,7 +226,7 @@ export interface components {
             yaml: boolean;
             /** @description The last catalog publication for this project or one explicit revision UUID. */
             revision: "latest" | string;
-            /** @description Every eligible operation of the revision, a catalog operation UUID or an observed endpoint UUID prefixed with observed:. The observed selector is resolved within this project and revision using its recorded component, binding, HTTP method and declared route. A missing or ambiguous match is unavailable. */
+            /** @description Every eligible operation of the revision, a catalog operation UUID or an observed endpoint UUID prefixed with observed:. The observed selector is resolved within this project and revision using its recorded component, binding, HTTP method and declared route. The supported finite observed alias shares its catalog UUID, but the selector kind remains distinct for approval. Divergent stored aliases are corrupt. A missing or ambiguous match is unavailable. */
             scope: "all" | string;
             approval: components["schemas"]["ExportApproval"];
         };

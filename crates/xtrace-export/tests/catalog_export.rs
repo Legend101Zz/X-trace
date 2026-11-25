@@ -575,6 +575,8 @@ fn root_recipe_preview_names_require_source_root_without_literal_slug_collisions
 fn observed_scope_approval_binds_original_selector_and_resolved_catalog_identity() {
     let selected = operation(3, "/orders");
     let observed_id = xtrace_domain::OperationId::new();
+    // Synthetic projection-boundary fixture: no SQLite store is involved. Production's
+    // finite observed alias shares the catalog UUID; this probes caller-supplied metadata.
     assert_ne!(observed_id, selected.operation_id);
     let mut fixture = snapshot(
         std::slice::from_ref(&selected),

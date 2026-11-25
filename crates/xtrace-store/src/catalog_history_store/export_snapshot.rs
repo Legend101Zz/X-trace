@@ -167,6 +167,11 @@ fn read_snapshot(
         &mut budget,
         is_cancelled,
     )?;
+    if let CatalogExportScope::ObservedOperation(id) = scope {
+        if selected.first().ok_or(ReadError::OperationNotFound)?.id != id {
+            return Err(ReadError::Corrupt);
+        }
+    }
     let catalog_scope = match scope {
         CatalogExportScope::ObservedOperation(_) => {
             CatalogExportScope::Operation(selected.first().ok_or(ReadError::OperationNotFound)?.id)
@@ -188,7 +193,7 @@ fn read_snapshot(
     let mut observation = connection.prepare(OBSERVATION_SQL).map_err(sql_error)?;
     for op in selected {
         check_cancelled(is_cancelled)?;
-        if has_linked_observation(&mut observation, &op.identity, None, &mut budget)? {
+        if has_linked_observation(&mut observation, &op.identity, op.id, &mut budget)? {
             linked_operation_ids.insert(op.id);
         }
         let claims = claims.remove(&op.id).unwrap_or_default().claims;
@@ -535,7 +540,7 @@ fn read_observed_identity(
         return Err(ReadError::Corrupt);
     }
     let mut observation = connection.prepare(OBSERVATION_SQL).map_err(sql_error)?;
-    if !has_linked_observation(&mut observation, &identity, Some(operation_id), budget)? {
+    if !has_linked_observation(&mut observation, &identity, operation_id, budget)? {
         return Err(ReadError::OperationNotFound);
     }
     Ok(identity)
@@ -547,45 +552,49 @@ const OBSERVATION_SQL: &str = "
            CASE WHEN octet_length(e.binding_key) BETWEEN 1 AND 128 THEN e.binding_key END,
            CASE WHEN octet_length(e.method) BETWEEN 1 AND 16 THEN e.method END,
            CASE WHEN octet_length(e.route_template) BETWEEN 1 AND 1024 THEN e.route_template END,
-           r.recording_id IS NOT NULL
+           r.recording_id IS NOT NULL,
+           CASE WHEN length(o.operation_id) = 16 THEN o.operation_id END,
+           CASE WHEN length(o.endpoint_fingerprint) = 32 THEN o.endpoint_fingerprint END,
+           o.fingerprint_format_version
     FROM operations o
     CROSS JOIN recording_endpoint_observations e INDEXED BY endpoint_observations_operation_recording
          ON e.project_id = o.project_id AND e.operation_id = o.operation_id
     LEFT JOIN recordings r ON r.project_id = e.project_id AND r.recording_id = e.recording_id
     WHERE o.project_id = ?1 AND o.application_component = ?2 AND o.binding_key = ?3
       AND o.transport = 'http' AND o.method = ?4 AND o.route_template = ?5
-      AND (?6 IS NULL OR o.operation_id = ?6)
     LIMIT 1";
 
 fn has_linked_observation(
     statement: &mut rusqlite::Statement<'_>,
     identity: &EndpointIdentity,
-    observed_operation_id: Option<OperationId>,
+    observed_operation_id: OperationId,
     budget: &mut InputBudget,
 ) -> Result<bool, ReadError> {
-    let observed_uuid = observed_operation_id.map(|id| id.as_uuid());
     let mut rows = statement
         .query(params![
             identity.project_id.as_uuid().as_bytes(),
             identity.application_component,
             identity.binding_key,
             identity.method.as_str(),
-            identity.route_template,
-            observed_uuid.as_ref().map(|id| id.as_bytes().as_slice())
+            identity.route_template
         ])
         .map_err(sql_error)?;
     let Some(row) = rows.next().map_err(sql_error)? else {
         return Ok(false);
     };
     // The operation index identifies the endpoint and the observation index yields one
-    // proof. The sidecar schema binds the tuple and forbids an operation ID on unmatched rows.
-    budget.admit(row, 6)?;
+    // proof. Compare UUIDs after lookup: filtering by UUID would disguise a divergent alias
+    // as absent evidence. The sidecar schema forbids an operation ID on unmatched rows.
+    budget.admit(row, 9)?;
     if text(row, 0)? != "linked"
         || text(row, 1)? != identity.application_component
         || text(row, 2)? != identity.binding_key
         || text(row, 3)? != identity.method.as_str()
         || text(row, 4)? != identity.route_template
         || !row.get::<_, bool>(5).map_err(corrupt)?
+        || blob(row, 6)? != observed_operation_id.as_uuid().as_bytes()
+        || identity.fingerprint().map_err(corrupt)?.as_bytes() != blob(row, 7)?
+        || row.get::<_, i64>(8).map_err(corrupt)? != 1
     {
         return Err(ReadError::Corrupt);
     }

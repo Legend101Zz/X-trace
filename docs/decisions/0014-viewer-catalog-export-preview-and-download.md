@@ -56,8 +56,8 @@ The OpenAPI contract documents both routes and their generated browser types.
 2. Request one format and either all operations of the selected project revision or one stable operation ID in
    that revision. The visible scope label names the revision; "all" does not promise every recording or the latest
    revision of every catalog scope. An unmatched recording or runtime-only endpoint without revision membership
-   has an explicit unavailable reason. The persisted observed endpoint ID and catalog operation ID have separate
-   allocation histories. The browser supplies the observed selector. The store resolves its exact project, component,
+   has an explicit unavailable reason. The supported finite observed endpoint alias shares the catalog operation
+   UUID; observed and catalog selectors remain distinct choices. The browser supplies the observed selector. The store resolves its exact project, component,
    binding, HTTP transport, method and declared route to one member of the requested revision within the same read
    transaction. Missing or ambiguous membership stops the export. Preview echoes the requested selector and returns
    the resolved catalog operation ID for CLI parity. Direct catalog UUID selection remains supported.
@@ -154,3 +154,8 @@ the browser download on Save file. The browser reports when the download starts.
 terminal Postman connections remain outside the viewer's observations. A file-text or request-body preview
 would require a separately bounded redaction contract. Release acceptance requires the installed catalog journey,
 including real keyboard, pointer and responsive behavior at the approved widths.
+
+Observed selectors and direct catalog selectors remain distinct request and approval choices even when their UUID
+bytes match. The supported v0003 finite `spring-fixture/default/POST /orders` observed alias shares its UUID
+with the catalog operation. Export reads reject divergent persisted aliases as corruption, validate the backing
+fingerprint and observation, and never repair storage. No migration or broader observation policy is introduced.
