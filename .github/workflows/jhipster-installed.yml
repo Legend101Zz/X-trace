@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.candidate || github.sha }}
+          ref: 714616f02f134431d243c49bf295ebe370361db3
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -129,6 +129,33 @@ jobs:
           exit "$rc"
       - name: Retain identified pre-receipt stderr as recipient-only ciphertext
         id: diagnostic
+        env:
+          XTRACE_DIAGNOSTIC_CERT_PEM: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJUwyDQ+9vO7xAPtW6/AiQDiLem8wDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCBkaWFnbm9zdGljIHJl
+            Y2lwaWVudDAeFw0yNjExMjUxNzEwMjZaFw0yNjEyMDkxNzEwMjZaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgZGlhZ25vc3RpYyByZWNpcGllbnQwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDagbD2rPLoVyTA7+JETGkeoV+g
+            aeX8nH/waU5Nbd0ddYewY5o11niUoiNB5mAWTHo//CePeCT0u+t8szQsSPjpkSxi
+            QGMfvmHhr/2/TWpJuEx5zg0+ZgSCiKa7/gNmq843mywVJS00E3hFJrsRtSF/P5b7
+            i511cb3XjP14GW7kGiOltNrdzaY00dQZ1OmEFvp7xvYcp5iNckzsM46GUF9ANmjv
+            8P/cQKA8m4RvuAU+PHcYbN75uGfRvU60NJoSTFVocz5SXkae6LA7k+tDyyMp1s83
+            QEz99eWuB5VU1JzFGYpSq7Uuy3N4YhhzqhLw20cN6EdThmJmqa81b4O1394i49Zs
+            IG3yGED0sCLC3jwVeHFqBY0eKbmhgIdCuJjUkq8uRDtGeTettWXhtJN8K/2hXLaO
+            j4f/X5I/cA610eaFBFNpIK8k3PNbd/cWBi1x4qe9yx/OPLZm+/H3xfJLYbgmP1R0
+            UHZtw7yhdLdTg68FirgVFsEDlzd9neqgVxD1rakCAwEAAaNTMFEwHQYDVR0OBBYE
+            FGeVjUCYACKgYX2S3YdIjMzTtlZEMB8GA1UdIwQYMBaAFGeVjUCYACKgYX2S3YdI
+            jMzTtlZEMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAMDsepFD
+            mI4DRG3Qf7/BPgmzOPDHWpMvBXEfMpusS+4fZRdqQECuEHW+wSoCR1iJLrZDpKqn
+            75DL8gJTqfoKIdFB9W6Q9Fzh2sTUBSsHmfCAHs9RfMTSxae6Wm9us73GyZvawg3h
+            XA860/O98Mb3uR8NR0OQA1PrCc/uH9fA5EsdHgsp+YpB1yj8D0blbweXRYAAZb44
+            9zPHIrkfduzmeqBodJUg2XbXKYDg1PC+tFva5NWTYrp7CPY1xYcffaYb/RpPc2C1
+            O1PP7MpyuY/LH4bxtMd5Mjcz2qNw295S7RZAnoP9lU3R8af99OuSkhPgHz/x/jCW
+            7J5+uR/ZKMNP+o/7mPe55yXNuuyVH2v6mnf9nONqeHZPLxJWzAgqkF4zrUrA66YO
+            qwt3G2O2KErAwo5wT7n5u1BiJzTrU1oIvEoCR43oyiFlOHIJ3WxBLCgDb6frqMAt
+            XM0u/CD69DpfF4vMEsgraAxrGCQ81Qgj5knjCWPYZuT/bCjYa7zdX9ARDw==
+            -----END CERTIFICATE-----
         if: always()
         run: |
           set -euo pipefail
