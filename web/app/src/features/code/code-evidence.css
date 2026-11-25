@@ -1,0 +1,6 @@
+.source-excerpt.source-rows { list-style: none; padding: 0; white-space: normal; }
+.source-row { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 8px; min-height: 1.6em; padding: 2px 6px; }
+.source-row[aria-current='location'] { border-inline-start: 2px solid var(--amber); background: var(--select); }
+.source-number { color: var(--quiet); font-variant-numeric: tabular-nums; }
+.source-text { white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
+.source-inline { grid-column: 2; margin-block: 4px; min-width: 0; color: var(--muted); overflow-wrap: anywhere; }

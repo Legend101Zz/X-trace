@@ -17,7 +17,9 @@ public class OrderService {
     if (errorCanary != null && !errorCanary.isBlank()) {
       throw new FixtureRequestedException(errorCanary);
     }
-    repository.save(description);
+    int descriptionPresent = description == null ? 0 : 1;
+
+    repository.save(descriptionPresent == 0 ? null : description);
   }
 }
 

@@ -343,4 +343,55 @@ describe('replay wiring in the app', () => {
     expect(second).toHaveAttribute('aria-selected', 'true');
     await waitFor(() => expect(second).toHaveFocus());
   });
+  it('numbers matched blank lines and shows private binding states without leaking payloads', async () => {
+    const match = { path: 'Example.java', status: 'matched', startLine: 7, endLine: 9, excerpt: '\n  body();\n}', truncated: false };
+    const bindings = [
+      { name: 'safeLocal', role: 'local', nameOrigin: 'declared', value: { state: 'captured', preview: '<span>observed</span>' } },
+      { name: 'arg0', role: 'argument', nameOrigin: 'synthesized', value: { state: 'truncated', preview: 'prefix' } },
+      { name: 'hidden', role: 'local', nameOrigin: 'declared', value: { state: 'redacted', preview: 'PRIVATE-HIDDEN' } },
+      { name: 'missing', role: 'local', nameOrigin: 'declared', value: { state: 'unavailable', reason: 'focused_capture_not_armed', preview: 'PRIVATE-MISSING' } },
+      { name: 'dropped', role: 'return', nameOrigin: 'declared', value: { state: 'dropped', reason: 'value_budget', preview: 'PRIVATE-DROPPED' } },
+    ];
+    const range = { ...events[0], source: match, kind: 'recording_event_kind:frame_enter', sourceBinding: 'verified' };
+    const cursor = {
+      ...events[1], source: { ...match, truncated: true }, kind: 'recording_event_kind:line_cursor',
+      sourceBinding: 'observed_unattested', line: 8, bindings,
+    };
+    const mismatch = {
+      ...events[2], source: { ...match, status: 'mismatch', excerpt: 'PRIVATE-SOURCE' },
+      kind: 'recording_event_kind:line_cursor', sourceBinding: 'verified', line: 8,
+    };
+    responseDetail = { ...detail, events: [range, cursor, mismatch] };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
+    fireEvent.click(await screen.findByRole('button', { name: /Called Controller\.create/ }));
+    const code = () => within(inspector()).getByRole('region', { name: 'Code', hidden: true });
+    const rows = () => [...code().querySelectorAll('.source-row')];
+    expect(rows().map((row) => row.getAttribute('data-source-line'))).toEqual(['7', '8', '9']);
+    expect(rows()[0].querySelector('.source-text')?.textContent).toBe('');
+    expect(code().querySelector('[aria-current="location"]')).toBeNull();
+
+    fireEvent.keyDown(window, { key: 'ArrowDown', altKey: true });
+    const active = code().querySelector('[aria-current="location"]');
+    expect(active).toHaveAttribute('data-source-line', '8');
+    expect(active?.querySelector('.source-inline')).toHaveTextContent('Local bindings at the recorded line cursor');
+    expect(active?.querySelector('.source-inline')).toHaveTextContent('<span>observed</span>');
+    expect(active?.querySelector('.source-inline')).not.toHaveTextContent('arg0');
+    expect(active?.querySelector('.source-inline')).not.toHaveTextContent('before it ran');
+    expect(within(code()).getByText('Source excerpt is bounded')).toBeInTheDocument();
+
+    const values = within(inspector()).getByRole('region', { name: 'Values', hidden: true });
+    expect([...values.querySelectorAll('[data-value-state]')].map((row) => row.getAttribute('data-value-state')))
+      .toEqual(['captured', 'truncated', 'redacted', 'unavailable', 'dropped']);
+    expect(values.querySelector('[data-value-state="redacted"] details')).toHaveTextContent('Value withheld by a redaction rule.');
+    expect(values.querySelector('[data-value-state="truncated"]')).toHaveTextContent('prefix');
+    expect(values.querySelector('img, script')).toBeNull();
+    expect(inspector()).not.toHaveTextContent(/PRIVATE-/);
+
+    fireEvent.keyDown(window, { key: 'ArrowDown', altKey: true });
+    expect(rows()).toHaveLength(0);
+    expect(within(code()).getByText('Recorded line cursor L8. No matching source row is available.')).toBeInTheDocument();
+    expect(inspector()).not.toHaveTextContent('PRIVATE-SOURCE');
+  });
 });
