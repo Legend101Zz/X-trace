@@ -1,0 +1,127 @@
+name: Installed Fineract campaign
+on:
+  push:
+    branches: [codex/proof-fineract-tagged-installed-117]
+permissions:
+  contents: read
+jobs:
+  fineract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      PRODUCT: a692dae048b85cb1c1276ff9a92d95414cc52e84
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Verify the checkout and reserve private working directories
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/fineract-proof"
+          mkdir -m 700 "$root" "$root/driver" "$root/logs" "$root/checks"
+          echo "PROOF=$root" >> "$GITHUB_ENV"
+      - name: Run all Fineract regressions and existing campaign tests
+        run: |
+          set -euo pipefail
+          umask 077
+          command -v zstd >/dev/null
+          for group in named library; do
+            if [ "$group" = named ]; then
+              set -- test_fineract_installed test_fineract_privacy test_fineract_sink_coverage
+            else
+              set -- discover -s campaigns/lib -p 'test_*.py'
+            fi
+            rc=0
+            PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$PROOF/checks/$group.json" "$@" > "$PROOF/logs/$group.stdout" 2> "$PROOF/logs/$group.stderr" || rc=$?
+            python3 -B -m tools.qa.unittest_summary "$PROOF/checks/$group.json"
+            python3 -B - "$PROOF/checks/$group.json" "$group" <<'PY'
+          import json,sys
+          counts=json.load(open(sys.argv[1]))['counts']
+          if (counts['testsRun'] != (56 if sys.argv[2]=='named' else 260)
+                  or any(n for k,n in counts.items() if k != 'testsRun')):
+              raise SystemExit(1)
+          PY
+            test "$rc" -eq 0
+          done
+      - name: Build the unsigned Linux package and bind its digest
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B packaging/build.py --platform linux-x86_64 --out "$PROOF/dist" --work "$PROOF/package-work" > "$PROOF/logs/package.stdout" 2> "$PROOF/logs/package.stderr"
+          python3 -B - <<'PY'
+          import hashlib,os,pathlib
+          root=pathlib.Path(os.environ['PROOF'])
+          archive=root/'dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz'
+          with archive.open('rb') as f: digest=hashlib.file_digest(f,'sha256').hexdigest()
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write(f'ARCHIVE={archive}\nPACKAGE_SHA256={digest}\n')
+          print('Development package SHA-256',digest)
+          PY
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Verify and install the pinned package and run the original two workload legs
+        id: campaign
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          python3 -B campaigns/java/fineract/harness/installed.py \
+            --private-root "$PROOF/run" --archive "$ARCHIVE" --package-sha256 "$PACKAGE_SHA256" \
+            --source-sha "$PRODUCT" --java "$JAVA_HOME/bin/java" \
+            > "$PROOF/driver/stdout" 2> "$PROOF/driver/stderr" || rc=$?
+          python3 -B - "$rc" <<'PY'
+          import json,os,pathlib,sys
+          p=pathlib.Path(os.environ['PROOF'])/'driver/status.json'
+          with p.open('x') as f: json.dump({'schema':'xtrace-fineract-driver/1','exitCode':int(sys.argv[1])},f)
+          PY
+          echo "Installed Fineract driver exit $rc"
+          exit "$rc"
+      - name: Verify actual dependency members with the Fineract campaign checker
+        if: ${{ !cancelled() && (steps.campaign.outcome == 'success' || steps.campaign.outcome == 'failure') }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export XTRACE_CAMPAIGN_ROOT="$PROOF/run/campaign"
+          python3 -B - <<'INVENTORY'
+          import json, os
+          from pathlib import Path
+          from campaigns.java.fineract.harness import privacy
+          root=Path(os.environ['PROOF'])/'run'
+          if not privacy.admitted(root): raise SystemExit('dependency-inventory-root-unavailable')
+          phases=json.loads((root/'phases.json').read_bytes())
+          if phases.get('upstreamBuild',{}).get('status')!='artifact-present': raise SystemExit('dependency-inventory-unreached')
+          try:
+              from campaigns.java.fineract.harness import run
+              members=run.runtime_dependencies()
+              if set(members)!={'jersey-server','jersey-common','tomcat-embed-core','postgresql','spring-boot'}: raise ValueError
+          except Exception: raise SystemExit('dependency-inventory-failed') from None
+          print('Verified five pinned runtime dependencies in the built Fineract JAR')
+          INVENTORY
+      - name: Finalize the bounded summary after driver streams have closed
+        if: ${{ !cancelled() && (steps.campaign.outcome == 'success' || steps.campaign.outcome == 'failure') }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B campaigns/java/fineract/harness/privacy.py \
+            --private-root "$PROOF/run" --public-out "$PROOF/public" > "$PROOF/logs/finalize.stdout" 2> "$PROOF/logs/finalize.stderr"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() && (steps.campaign.outcome == 'success' || steps.campaign.outcome == 'failure') }}
+        with:
+          name: fineract-installed-public-result
+          path: ${{ env.PROOF }}/public/summary.json
+          if-no-files-found: error
+          retention-days: 14
