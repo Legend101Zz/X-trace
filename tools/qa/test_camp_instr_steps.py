@@ -22,12 +22,13 @@ def by(steps):
     return {n: (st, note) for n, st, note in steps}
 
 
-def browser_png(width: int, gray: int = 0) -> bytes:
+def browser_png(width: int, gray: int = 0, *, height: int = 1) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, 1, 8, 0, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(b"\0" + bytes([gray]) * width)) + chunk(b"IEND", b""))
+    scanline = b"\0" + bytes([gray]) * width
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(scanline * height)) + chunk(b"IEND", b""))
 
 
 class T(unittest.TestCase):
@@ -220,6 +221,7 @@ class T(unittest.TestCase):
 
         self.assertEqual(diagnostic(j), ("reported", "reported"))
         self.assertIn("320,736,1280", by(s.browser_steps(j))["browser-journeys-linear"][1])
+        self.assertIn("viewport proof", by(s.browser_steps(j))["browser-journeys-linear"][1])
         self.assertEqual(diagnostic(dict(j, overflowAt=[320])), ("fail", "fail"))
         self.assertEqual(diagnostic(dict(j, linear="fail")), ("fail", "reported"))
 
@@ -253,7 +255,7 @@ class T(unittest.TestCase):
 
     def test_packaged_browser_evidence(self):
         source_sha, package_sha = "1" * 40, "2" * 64
-        j = {"schemaVersion": 2, "kind": "browser_journeys", "sourceSha": source_sha, "packageSha256": package_sha,
+        j = {"schemaVersion": 3, "kind": "browser_journeys", "sourceSha": source_sha, "packageSha256": package_sha,
              "linear": "pass", "canvas": "pass", "overflowAt": [], "widths": []}
         with tempfile.TemporaryDirectory() as tmp:
             frames = pathlib.Path(tmp)
@@ -261,17 +263,35 @@ class T(unittest.TestCase):
                 steps = {}
                 for name in ("list", "recordings", "linear", "canvas", "returnToSteps"):
                     frame = f"{name}-{w}.png"
-                    image = browser_png(w)
+                    image = browser_png(w, height=1200)
                     (frames / frame).write_bytes(image)
                     steps[name] = {"status": "pass", "screenshot": frame, "horizontalOverflow": False,
                                    "screenshotSha256": hashlib.sha256(image).hexdigest()}
+                    if name in ("linear", "canvas", "returnToSteps"):
+                        viewport = f"viewport-{frame}"
+                        viewport_image = browser_png(w, height=900)
+                        (frames / viewport).write_bytes(viewport_image)
+                        steps[name]["viewport"] = {"width": w, "height": 900, "deviceScaleFactor": 1,
+                                                   "screenshot": viewport,
+                                                   "screenshotSha256": hashlib.sha256(viewport_image).hexdigest()}
                 j["widths"].append({"width": w, "steps": steps, "pageErrors": 0, "selectionContinuous": True})
 
-            def verdict(report, expected_source=source_sha):
-                checked = by(s.browser_steps(report, frame_dir=frames, source_sha=expected_source, package_sha256=package_sha))
+            def verdict(report, expected_source=source_sha, *, require_current=True):
+                checked = by(s.browser_steps(report, frame_dir=frames, source_sha=expected_source,
+                                             package_sha256=package_sha, require_current=require_current))
                 return checked["browser-journeys-linear"][0], checked["browser-journeys-canvas"][0]
 
             self.assertEqual(verdict(j), ("pass", "pass"))
+            legacy = copy.deepcopy(j)
+            legacy["schemaVersion"] = 2
+            for row in legacy["widths"]:
+                for step in row["steps"].values():
+                    step.pop("viewport", None)
+            self.assertEqual(verdict(legacy, require_current=False), ("reported", "reported"))
+            self.assertEqual(verdict(legacy), ("fail", "fail"))
+            legacy_current = s.browser_steps(legacy, frame_dir=frames, source_sha=source_sha,
+                                             package_sha256=package_sha, require_current=True)
+            self.assertTrue(all("without viewport proof" in note for _, _, note in legacy_current))
             self.assertEqual(verdict(j, "3" * 40), ("fail", "fail"))
             for width_change in (j["widths"][:-1], j["widths"][:-1] + j["widths"][:1]):
                 self.assertEqual(verdict(dict(j, widths=width_change)), ("fail", "fail"))
@@ -304,6 +324,35 @@ class T(unittest.TestCase):
                 del row["steps"]["returnToSteps"]
                 row["selectionContinuous"] = False
             self.assertEqual(verdict(unavailable), ("pass", "not-implemented"))
+
+            for phase, expected in (("linear", ("fail", "fail")), ("canvas", ("pass", "fail")),
+                                    ("returnToSteps", ("pass", "fail"))):
+                with self.subTest(missing_viewport=phase):
+                    changed = copy.deepcopy(j)
+                    del changed["widths"][0]["steps"][phase]["viewport"]
+                    self.assertEqual(verdict(changed), expected)
+
+            for key, value in (("width", 1024), ("height", 899), ("deviceScaleFactor", 2),
+                               ("deviceScaleFactor", True), ("screenshotSha256", "0" * 64),
+                               ("screenshot", "viewport-linear-736.png"), ("screenshot", "canvas-736.png")):
+                with self.subTest(viewport_field=key, value=value):
+                    changed = copy.deepcopy(j)
+                    changed["widths"][1]["steps"]["canvas"]["viewport"][key] = value
+                    self.assertEqual(verdict(changed), ("pass", "fail"))
+
+            viewport = frames / "viewport-canvas-736.png"
+            original = viewport.read_bytes()
+            for width, height in ((737, 900), (736, 899), (736, 901)):
+                with self.subTest(viewport_png_dimensions=(width, height)):
+                    changed = copy.deepcopy(j)
+                    image = browser_png(width, height=height)
+                    viewport.write_bytes(image)
+                    changed["widths"][1]["steps"]["canvas"]["viewport"]["screenshotSha256"] = hashlib.sha256(image).hexdigest()
+                    self.assertEqual(verdict(changed), ("pass", "fail"))
+            viewport.unlink()
+            self.assertEqual(verdict(j), ("pass", "fail"))
+            viewport.write_bytes(original)
+
             screenshot = frames / "canvas-736.png"
             for malformed in (browser_png(320), browser_png(736)[:-4], b"\x89PNG\r\n\x1a\n"):
                 screenshot.write_bytes(malformed)

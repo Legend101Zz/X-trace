@@ -133,20 +133,36 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
 
 BROWSER_WIDTHS = (320, 736, 1024, 1280, 1440)
 BROWSER_PHASES = ("list", "recordings", "linear", "canvas", "returnToSteps")
+BROWSER_VIEWPORT_PHASES = ("linear", "canvas", "returnToSteps")
+BROWSER_VIEWPORT_HEIGHT = 900
+BROWSER_DEVICE_SCALE_FACTOR = 1
 
 
-def _browser_screenshot(path: pathlib.Path, width: int, digest: object) -> bool:
+def _browser_screenshot(path: pathlib.Path, width: int, digest: object, *, height: int | None = None) -> bool:
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         return False
     try:
         image = path.read_bytes()
     except OSError:
         return False
-    return (len(image) > 45 and image.startswith(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
-            and width <= int.from_bytes(image[16:20], "big") <= width + 1
-            and int.from_bytes(image[20:24], "big") > 0
-            and image.endswith(b"\0\0\0\0IEND\xaeB`\x82")
-            and hashlib.sha256(image).hexdigest() == digest)
+    if not (len(image) > 45 and image.startswith(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
+            and image.endswith(b"\0\0\0\0IEND\xaeB`\x82")):
+        return False
+    image_width = int.from_bytes(image[16:20], "big")
+    image_height = int.from_bytes(image[20:24], "big")
+    dimensions_match = (width <= image_width <= width + 1 and image_height > 0 if height is None
+                        else (image_width, image_height) == (width, height))
+    return dimensions_match and hashlib.sha256(image).hexdigest() == digest
+
+
+def _browser_viewport_screenshot(frame_dir: pathlib.Path | None, phase: str, width: int, viewport: object) -> bool:
+    geometry = {"width": width, "height": BROWSER_VIEWPORT_HEIGHT, "deviceScaleFactor": BROWSER_DEVICE_SCALE_FACTOR}
+    if (frame_dir is None or not isinstance(viewport, dict)
+            or any(type(viewport.get(key)) is not int or viewport[key] != value for key, value in geometry.items())):
+        return False
+    filename = f"viewport-{phase}-{width}.png"
+    return viewport.get("screenshot") == filename and _browser_screenshot(
+        frame_dir / filename, width, viewport.get("screenshotSha256"), height=BROWSER_VIEWPORT_HEIGHT)
 
 
 def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
@@ -157,14 +173,17 @@ def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
 
     if not isinstance(j, dict):
         return results("fail", "fail", "browser report missing or unreadable")
+    version = j.get("schemaVersion")
+    if j.get("kind") != "browser_journeys" or type(version) is not int or version not in (1, 2, 3):
+        return results("fail", "fail", "unsupported browser report schema")
     rows = j.get("widths")
     if not isinstance(rows, list) or any(not isinstance(row, dict) or type(row.get("width")) is not int
                                         or not 0 < row["width"] <= 2**53 - 1 for row in rows):
         return results("fail", "fail", "invalid viewport rows")
     observed = [row["width"] for row in rows]
     width_note = f"observed widths {','.join(map(str, observed)) or 'none'}"
-    if j.get("schemaVersion") == 1 and j.get("kind") == "browser_journeys":
-        note = f"legacy evidence without selection proof; {width_note}"
+    if version == 1:
+        note = f"legacy evidence without selection or viewport proof; {width_note}"
         if require_current:
             return results("fail", "fail", note)
         if not rows or len(set(observed)) != len(observed) or j.get("overflowAt") != []:
@@ -188,8 +207,10 @@ def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
                     break
             legacy.append("reported" if earned and declared == "pass" else "not-implemented" if earned else "fail")
         return results(*legacy, note)
-    if j.get("schemaVersion") != 2 or j.get("kind") != "browser_journeys":
-        return results("fail", "fail", "unsupported browser report schema")
+    if version == 2:
+        width_note = f"legacy full-page evidence without viewport proof; {width_note}"
+        if require_current:
+            return results("fail", "fail", width_note)
     if len(set(observed)) != len(observed) or set(observed) != set(widths):
         return results("fail", "fail", f"incomplete, duplicate or unexpected viewports; {width_note}")
     if (not source_sha or j.get("sourceSha") != source_sha
@@ -240,6 +261,10 @@ def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
                           and _browser_screenshot(frame_dir / screenshot, w, step.get("screenshotSha256")))
                 if not earned:
                     issues.append(f"{phase} screenshot missing or invalid")
+                if (version == 3 and phase in BROWSER_VIEWPORT_PHASES
+                        and not _browser_viewport_screenshot(frame_dir, phase, w, step.get("viewport"))):
+                    issues.append(f"{phase} viewport screenshot missing or invalid")
+                    earned = False
             if not earned:
                 canvas_failed = True
                 if phase in ("list", "recordings", "linear"):
@@ -271,7 +296,7 @@ def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
         elif any(failures[mode]) or (mode == "linear" and aggregate != "pass"):
             rollups[mode] = "fail"
         else:
-            rollups[mode] = aggregate
+            rollups[mode] = "reported" if version == 2 and aggregate == "pass" else aggregate
     note = "; ".join([width_note, *notes])
     return results(rollups["linear"], rollups["canvas"], note)
 
