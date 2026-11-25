@@ -107,6 +107,14 @@
   .export-sheet > section { overflow: visible; }
 }
 
+@media (min-width: 40.01rem) and (max-height: 17rem) {
+  /* Keep the landscape action row fully visible while the preview body scrolls.
+     Give the explanation the remaining width so the buttons stay together. */
+  .export-footer { position: sticky; bottom: 0; z-index: 1; }
+  .export-footer > span { flex: 1 1 10rem; min-width: 0; }
+  .viewer-dialog:has(.export-sheet) .viewer-dialog-body { scroll-padding-block-end: 4.5rem; }
+}
+
 .request-branch > .export-trigger, #recordings-panel > .export-trigger { margin: .25rem .65rem; }
 .export-trigger, .recording-more summary { min-height: 44px; min-width: 44px; }
 .recording-more { flex-shrink: 0; margin-inline-start: auto; }

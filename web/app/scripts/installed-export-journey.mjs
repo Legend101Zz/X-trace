@@ -189,6 +189,12 @@ async function shortPreviewProbes(page, dialog, row, out) {
       check = 'keyboardAction';
       await dialog.getByRole('button', { name: 'Close', exact: true }).focus();
       const action = dialog.getByRole('button', { name: 'Save file', exact: true });
+      if (row.width === 736 && height === 260) {
+        // At this width all three actions fit alongside the wrapped explanation.
+        for (const name of ['Back', 'Copy terminal command', 'Save file']) {
+          await primaryActionVisible(dialog, name);
+        }
+      }
       const stops = await dialog.locator('button, select, input, textarea, a[href], summary, [tabindex]').count();
       let reached = false;
       for (let index = 0; index <= stops; index += 1) {
