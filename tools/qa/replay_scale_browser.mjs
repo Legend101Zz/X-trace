@@ -10,9 +10,19 @@ import { parseArgs } from 'node:util';
 const SAMPLES = 5;
 const VIEWPORT = { width: 1440, height: 900 };
 const ACTION_TIMEOUT = 10_000;
+const DIAGNOSTIC_TIMEOUT = 2_000;
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const check = (condition) => { if (!condition) throw new Error('measurement condition failed'); };
 const identity = (event) => sha256(JSON.stringify([event.sequence, event.eventId, event.frameId]));
+
+async function boundedDiagnostic(observe) {
+  let timer;
+  try {
+    return await Promise.race([Promise.resolve().then(observe), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('diagnostic unavailable')), DIAGNOSTIC_TIMEOUT);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 
 function startViewer(binary, manifest) {
   const child = spawn(binary, ['open', '--project-dir', manifest.project_dir, '--viewer', '--no-browser'], {
@@ -131,12 +141,14 @@ async function domSample(page, phase, apiState, heap) {
     };
     const steps = [...document.querySelectorAll('.event-rail .event')];
     const tree = [...document.querySelectorAll('.canvas-tree [role="treeitem"]')];
+    const svg = [...document.querySelectorAll('.canvas-svg .canvas-node')];
     const note = document.querySelector('.event-rail .window-note span')?.textContent ?? '';
     return {
       mountedStepRows: steps.length,
       visibleStepRows: steps.filter(visible).length,
       loadedRailLabelCount: /^\d+ ordered events$/.test(note) ? Number.parseInt(note, 10) : null,
-      mapSvgNodes: document.querySelectorAll('.canvas-svg .canvas-node').length,
+      mapSvgNodes: svg.length,
+      visibleMapSvgNodes: svg.filter(visible).length,
       mapTreeRows: tree.length,
       visibleMapTreeRows: tree.filter(visible).length,
       documentElements: document.querySelectorAll('*').length,
@@ -154,6 +166,87 @@ async function domSample(page, phase, apiState, heap) {
     finally { if (cdp) await cdp.detach().catch(() => {}); }
   }
   return { phase, ...apiState, ...dom, browserHeap };
+}
+
+// Failure-only observation: fixed surface names and boolean/numeric facts, never DOM content.
+// Do not scroll, focus, click or otherwise change the state whose failure is being diagnosed.
+async function selectionDiagnostic(page, mode, event, recordingId) {
+  return page.evaluate(({ mode, sequence, frameId, eventId, recordingId }) => {
+    const steps = [...document.querySelectorAll('.event-rail .event[aria-current="true"]')];
+    const tree = [...document.querySelectorAll('.canvas-tree [role="treeitem"][aria-selected="true"]')];
+    const matchingTree = [...document.querySelectorAll('.canvas-tree [role="treeitem"]')]
+      .filter((node) => node.getAttribute('data-key') === frameId);
+    const svg = [...document.querySelectorAll('.canvas-svg .canvas-node[data-selected="true"]')];
+    const sections = [...document.querySelectorAll('.inspector-section')].filter((node) =>
+      node.querySelector('.inspector-label')?.textContent === 'Event identity');
+    const ancestors = {
+      documentRoot: document.documentElement, body: document.body,
+      shell: document.querySelector('.shell'), workspace: document.querySelector('.viewer-workspace'),
+      stepsAndCode: document.querySelector('.steps-and-code'), codePanel: document.querySelector('#code-panel'),
+      eventsPanel: document.querySelector('#events-panel'), eventRail: document.querySelector('.event-rail'),
+      mapView: document.querySelector('.canvas-view'), mapScroll: document.querySelector('.canvas-scroll'),
+      mapSvg: document.querySelector('.canvas-svg'), mapTree: document.querySelector('.canvas-tree'),
+      inspector: document.querySelector('.inspector'), inspectorWorkspace: document.querySelector('.workspace-inspector'),
+      evidencePanel: document.querySelector('#evidence-panel'), documentScroller: document.scrollingElement,
+    };
+    const geometry = (node) => {
+      if (!node) return { present: false };
+      const rect = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      const x = (Math.max(rect.left, 0) + Math.min(rect.right, innerWidth)) / 2;
+      const y = (Math.max(rect.top, 0) + Math.min(rect.bottom, innerHeight)) / 2;
+      const hitPointInViewport = x >= 0 && x < innerWidth && y >= 0 && y < innerHeight;
+      const hit = hitPointInViewport ? document.elementFromPoint(x, y) : null;
+      const positiveArea = rect.width > 0 && rect.height > 0;
+      const checkVisibility = node.checkVisibility();
+      return {
+        present: true, connected: node.isConnected, checkVisibility,
+        left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom,
+        width: rect.width, height: rect.height, clientWidth: node.clientWidth, clientHeight: node.clientHeight,
+        scrollWidth: node.scrollWidth, scrollHeight: node.scrollHeight,
+        scrollLeft: node.scrollLeft ?? null, scrollTop: node.scrollTop ?? null,
+        displayNone: style.display === 'none', visibilityHidden: style.visibility === 'hidden',
+        opacityZero: Number(style.opacity) === 0,
+        overflowXClips: ['hidden', 'clip', 'auto', 'scroll'].includes(style.overflowX),
+        overflowYClips: ['hidden', 'clip', 'auto', 'scroll'].includes(style.overflowY),
+        viewportIntersects: positiveArea && rect.right > 0 && rect.bottom > 0 && rect.left < innerWidth && rect.top < innerHeight,
+        hitPointX: x, hitPointY: y, hitPointInViewport, hitFound: hit !== null,
+        hitInsideSurface: hit !== null && node.contains(hit),
+        selectionWaitVisibilityPass: checkVisibility && positiveArea && hitPointInViewport && hit !== null && node.contains(hit),
+        ancestors: Object.fromEntries(Object.entries(ancestors).map(([key, ancestor]) =>
+          [key, ancestor !== null && ancestor !== node && ancestor.contains(node)])),
+        hitInside: Object.fromEntries(Object.entries(ancestors).map(([key, ancestor]) =>
+          [key, ancestor !== null && hit !== null && ancestor.contains(hit)])),
+      };
+    };
+    const modeButtons = [...document.querySelectorAll('.mode-switch button')];
+    const buttons = (label) => modeButtons.filter((node) => node.textContent === label);
+    const stepsButtons = buttons('Steps');
+    const mapButtons = buttons('Map');
+    const selectedStepMatches = steps.filter((node) => node.querySelector('.event-seq')?.textContent === sequence);
+    const selectedTreeMatches = tree.filter((node) => node.getAttribute('data-key') === frameId);
+    return {
+      requestedMap: mode === 'map', viewportWidth: innerWidth, viewportHeight: innerHeight,
+      recordingHeaderMatches: document.querySelector('#events-panel h1')?.textContent === recordingId,
+      recordingCatalogMatches: document.querySelector('.recording[aria-current="true"] .recording-title')?.textContent === recordingId,
+      inspectorIdentitySectionCount: sections.length,
+      inspectorIdentityMatchCount: sections.filter((node) => node.querySelector('.inspector-value.mono')?.textContent === eventId).length,
+      selectedStepRowCount: steps.length, selectedStepSequenceMatchCount: selectedStepMatches.length,
+      selectedTreeRowCount: tree.length, selectedTreeKeyMatchCount: selectedTreeMatches.length,
+      expectedTreeKeyMatchCount: matchingTree.length, selectedSvgNodeCount: svg.length,
+      // SVG exposes selection only, with no frame-key attribute. Do not infer identity from it.
+      svgFrameIdentityComparable: false,
+      stepsButtonCount: stepsButtons.length, mapButtonCount: mapButtons.length,
+      stepsPressedCount: stepsButtons.filter((node) => node.getAttribute('aria-pressed') === 'true').length,
+      mapPressedCount: mapButtons.filter((node) => node.getAttribute('aria-pressed') === 'true').length,
+      surfaces: {
+        stepsButton: geometry(stepsButtons[0]), mapButton: geometry(mapButtons[0]),
+        selectedStep: geometry(steps[0]), selectedTree: geometry(tree[0]), expectedTree: geometry(matchingTree[0]),
+        selectedSvg: geometry(svg[0]), inspectorIdentity: geometry(sections[0]),
+        ...Object.fromEntries(Object.entries(ancestors).map(([key, node]) => [key, geometry(node)])),
+      },
+    };
+  }, { mode, sequence: event.sequence, frameId: event.frameId, eventId: event.eventId, recordingId });
 }
 
 async function detailFromAction(page, manifest, expectedCursor, action) {
@@ -187,38 +280,50 @@ async function detailFromAction(page, manifest, expectedCursor, action) {
 }
 
 async function measureSample(index, options, manifest, chromium) {
-  const result = { sample: index, status: 'failed', stage: 'viewer_start', initial: null, dom: [], actions: [], failures: [] };
+  const result = { sample: index, status: 'failed', stage: 'viewer_start', substage: null,
+    initial: null, dom: [], actions: [], modeTransitions: [], failures: [] };
+  const setStage = (stage, substage = null) => { result.stage = stage; result.substage = substage; };
   let viewer;
   let browser;
   let context;
+  let page;
+  let pageErrors = null;
+  let externalRequests = null;
+  let expectedMode = 'steps';
+  let expectedSelection;
+  let detail;
+  let cumulative = 0;
+  const apiState = () => ({ apiLastPageEvents: detail?.events.length ?? null, apiEventsReturnedCumulative: cumulative });
   try {
     viewer = startViewer(options.xtrace, manifest);
     const url = await viewer.ready;
-    result.stage = 'browser_start';
+    setStage('browser_start');
     browser = await chromium.launch({ headless: true });
     result.browserVersion = browser.version();
     context = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: 1, locale: 'en-US',
       timezoneId: 'UTC', colorScheme: 'light', reducedMotion: 'no-preference' });
-    const page = await context.newPage();
+    page = await context.newPage();
     page.setDefaultTimeout(ACTION_TIMEOUT);
     page.setDefaultNavigationTimeout(30_000);
-    let pageErrors = 0;
-    let externalRequests = 0;
+    pageErrors = 0;
+    externalRequests = 0;
     page.on('pageerror', () => { pageErrors += 1; });
     page.on('request', (request) => { if (new URL(request.url()).origin !== new URL(url).origin) externalRequests += 1; });
     await page.addInitScript(installClickClock, { recordingId: manifest.recording_id });
-    result.stage = 'catalog';
+    setStage('catalog');
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.getByRole('button', { name: 'Not linked to an endpoint', exact: true }).click();
     const recording = page.locator('.recording').filter({ has: page.locator('.recording-title', { hasText: manifest.recording_id }) });
     await recording.waitFor({ state: 'visible' });
     check(await recording.count() === 1);
 
-    result.stage = 'initial_click_response';
-    let detail = await detailFromAction(page, manifest, null, () => recording.click());
+    setStage('initial_click_response');
+    detail = await detailFromAction(page, manifest, null, () => recording.click());
     check(detail.events[0].sequence === '2');
     let selected = detail.events[0];
-    result.stage = 'initial_visible_paint_opportunity';
+    expectedSelection = selected;
+    cumulative = detail.events.length;
+    setStage('initial_visible_paint_opportunity');
     await page.waitForFunction(() => window.__xtraceScale?.completed === true);
     const clock = await page.evaluate(() => ({ ...window.__xtraceScale }));
     check(clock.trusted && clock.sequence === selected.sequence && Number.isFinite(clock.elapsedMs));
@@ -226,31 +331,49 @@ async function measureSample(index, options, manifest, chromium) {
     result.initial = { elapsedMs: clock.elapsedMs, over1500Ms: clock.elapsedMs > 1500,
       apiFirstPageEvents: detail.events.length, selectedIdentitySha256: identity(selected),
       responseAndUiIdentityMatched: true, trustedClickCaptured: true, paintOpportunityObserved: true };
-    let cumulative = detail.events.length;
     let lastSequence = BigInt(detail.events.at(-1).sequence);
-    const apiState = () => ({ apiLastPageEvents: detail.events.length, apiEventsReturnedCumulative: cumulative });
+    setStage('initial_steps', 'dom_snapshot');
     result.dom.push(await domSample(page, 'initial_steps', apiState(), options['cdp-heap']));
     const mode = page.getByRole('group', { name: 'Replay view', exact: true });
     const navigation = page.getByRole('group', { name: 'Replay navigation', exact: true });
     const switchMode = async (target, phase) => {
-      result.stage = phase;
+      setStage(phase, 'mode_click');
+      expectedMode = target;
+      expectedSelection = selected;
       const button = mode.getByRole('button', { name: target === 'map' ? 'Map' : 'Steps', exact: true });
+      const transition = { phase, requestedMap: target === 'map', clickCompleted: false,
+        pressedObserved: null, selectionMatched: false };
+      result.modeTransitions.push(transition);
       await button.click();
-      check(await button.getAttribute('aria-pressed') === 'true');
+      transition.clickCompleted = true;
+      result.substage = 'mode_pressed';
+      transition.pressedObserved = await button.getAttribute('aria-pressed') === 'true';
+      check(transition.pressedObserved);
+      result.substage = 'selection_wait';
       await waitSelection(page, target, selected, manifest.recording_id);
+      transition.selectionMatched = true;
       result.actions.push(phase);
+      result.substage = 'dom_snapshot';
       const snapshot = await domSample(page, phase, apiState(), options['cdp-heap']);
-      check(target === 'map' ? snapshot.mapSvgNodes > 0 && snapshot.mapTreeRows > 0 : snapshot.mountedStepRows > 0);
+      result.substage = 'dom_assertions';
       result.dom.push(snapshot);
+      check(target === 'map' ? snapshot.mapSvgNodes > 0 && snapshot.mapTreeRows > 0 : snapshot.mountedStepRows > 0);
     };
     const navigateBoth = async (target, events, phase) => {
-      result.stage = phase;
+      setStage(phase, 'next_event_lookup');
+      expectedMode = target;
       const original = selected;
       const next = events[events.findIndex((event) => event.frameId === original.frameId) + 1];
       check(next && next.frameId !== original.frameId);
+      result.substage = 'next_click';
+      expectedSelection = next;
       await navigation.getByRole('button', { name: 'Next', exact: true }).click();
+      result.substage = 'next_selection_wait';
       await waitSelection(page, target, next, manifest.recording_id);
+      result.substage = 'back_click';
+      expectedSelection = original;
       await navigation.getByRole('button', { name: 'Back', exact: true }).click();
+      result.substage = 'back_selection_wait';
       await waitSelection(page, target, original, manifest.recording_id);
       result.actions.push(`${phase}_next`, `${phase}_back`);
     };
@@ -260,34 +383,54 @@ async function measureSample(index, options, manifest, chromium) {
     await switchMode('steps', 'initial_steps_return');
 
     for (let later = 1; later <= options['later-pages']; later += 1) {
-      result.stage = `load_later_${later}`;
+      setStage(`load_later_${later}`, 'detail_response');
       check(typeof detail.nextCursor === 'string');
       detail = await detailFromAction(page, manifest, detail.nextCursor,
         () => page.getByRole('button', { name: 'Load next window', exact: true }).click());
       for (const event of detail.events) { check(BigInt(event.sequence) === lastSequence + 1n); lastSequence += 1n; }
       cumulative += detail.events.length;
       selected = detail.events[0];
+      expectedSelection = selected;
       const row = page.locator('.event-rail .event').filter({
         has: page.locator('.event-seq').filter({ hasText: new RegExp(`^${selected.sequence}$`) }),
       });
+      result.substage = 'row_click';
       await row.click();
+      result.substage = 'selection_wait';
       await waitSelection(page, 'steps', selected, manifest.recording_id);
       result.actions.push(`load_later_${later}`);
     }
+    setStage('later_steps', 'dom_snapshot');
     result.dom.push(await domSample(page, 'later_steps', apiState(), options['cdp-heap']));
     await navigateBoth('steps', detail.events, 'later_steps_navigation');
     await switchMode('map', 'later_map');
     await navigateBoth('map', detail.events, 'later_map_navigation');
     await switchMode('steps', 'later_steps_return');
-    result.pageErrors = pageErrors;
-    result.externalRequests = externalRequests;
+    setStage('page_observations');
     check(pageErrors === 0 && externalRequests === 0);
     result.status = 'exercised';
-    result.stage = 'complete';
+    setStage('complete');
   } catch {
     // Never serialize exception messages, URLs, response bodies, DOM text or Playwright traces.
-    result.failures.push({ stage: result.stage, code: 'journey_failed_or_unreached' });
+    result.failures.push({ stage: result.stage, substage: result.substage, code: 'journey_failed_or_unreached' });
+    if (page) {
+      // Preserve the functional failure first; either diagnostic may itself be unavailable.
+      const observation = { stage: result.stage, substage: result.substage,
+        selection: { status: 'unavailable' }, dom: { status: 'unavailable' } };
+      result.failureObservation = observation;
+      try {
+        if (expectedSelection) observation.selection = { status: 'observed',
+          ...await boundedDiagnostic(() => selectionDiagnostic(page, expectedMode, expectedSelection, manifest.recording_id)) };
+      } catch { /* Bounded status only; diagnostic errors must not replace the journey failure. */ }
+      try {
+        const snapshot = await boundedDiagnostic(() => domSample(page, `failed_${result.stage}`, apiState(), options['cdp-heap']));
+        result.dom.push(snapshot);
+        observation.dom = { status: 'observed', phase: snapshot.phase };
+      } catch { /* A closed page still retains the original failure and unavailable status. */ }
+    }
   } finally {
+    result.pageErrors = pageErrors;
+    result.externalRequests = externalRequests;
     try { if (context) await context.close(); if (browser) await browser.close(); }
     catch { result.failures.push({ stage: 'browser_cleanup', code: 'cleanup_failed' }); }
     try { if (viewer) await stopViewer(viewer.child); }

@@ -141,9 +141,23 @@ The mode-0600 JSON file and stdout contain the same sanitized schema-version-1 r
   relation to 1,500 ms, API first-window count and selected-identity digest; successful actions
   and DOM snapshots for initial/later Steps, Map and return to Steps. `initial` is null when
   initial measurement was not established. A later failure retains valid initial timing.
+- `substage` distinguishes mode click, pressed-state check, selection wait, DOM capture and
+  DOM assertions. `modeTransitions` retains whether each requested mode click completed,
+  its pressed-state observation and whether selection matched. Failures retain that substage,
+  an additional current-mode DOM/heap snapshot when available, and `failureObservation`.
+  The latter compares the expected recording, sequence, tree key and inspector event only as
+  booleans/counts. It reports selected/expected tree row counts, mode button counts, and geometry,
+  viewport intersection, the existing selection wait's hit-test result, scroll metrics and
+  clipping booleans for fixed named surfaces and their relevant ancestors. The SVG exposes no
+  frame identity, so its selected-node count/geometry is explicitly not an identity comparison.
+  Diagnostics do not scroll, focus or alter the page. Each failure diagnostic has a separate
+  two-second observation cap; unavailable diagnostics never replace the original failure or
+  extend/retry its action. These later observations do not describe the initial timed paint.
+  `pageErrors` and `externalRequests` retain counts even on failure, or null if no page existed;
+  error messages, DOM text, raw keys and URLs are never serialized.
 - Each DOM snapshot separates cumulative API events and the last API window from the loaded
   rail label, mounted rail rows, viewport-hit-tested visible rows, SVG graph nodes, accessible
-  tree rows, visible tree rows and all document elements. Counts cover the current DOM and
+  tree rows, visible SVG nodes/tree rows and all document elements. Counts cover the current DOM and
   mode, not the whole recording or React heap. Optional CDP `Runtime.getHeapUsage` reports
   this page target's JS heap separately; it is not browser RSS, a forced-GC result or a budget.
   Unsupported heap measurement has an explicit status.
