@@ -1,0 +1,49 @@
+name: catalog-export-alias-proof
+on:
+  push:
+    branches: [codex/proof-distinct-hints-102]
+permissions:
+  contents: read
+jobs:
+  http:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PROBE_SOURCE: 01b5583916d1f7cab232557cd66f4d5151a58138
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Admit private test scratch
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          root="${RUNNER_TEMP:?}/xh"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/frag"
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+          echo "PROBE_ADMITTED=true" >> "$GITHUB_ENV"
+          printf '{"sourceSha":"%s","releaseAcceptance":false}\n' "$PROBE_SOURCE" > "$root/frag/source.json"
+      - name: Project, tuple, revision and read snapshot
+        if: ${{ !cancelled() && env.PROBE_ADMITTED == 'true' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step observed-store \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 11 --max-ignored 0 -- cargo test --locked -p xtrace-store --lib viewer_export
+          for name in viewer_export_observed_ids_resolve_only_exact_backed_project_revision_members viewer_export_observed_resolution_keeps_revision_and_backing_proof_in_one_snapshot viewer_export_rejects_divergent_finite_alias_for_every_scope; do
+            grep -Fq "::$name ... ok" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---observed-store.log" || exit 1
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && env.PROBE_ADMITTED == 'true' }}
+        with:
+          name: catalog-export-alias-proof
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
+          if-no-files-found: error
+          retention-days: 14
