@@ -54,6 +54,9 @@ try {
     if (!screenshotDirectory) return;
     await page.screenshot({ path: join(screenshotDirectory, name), fullPage: true });
     screenshotViews.push({ file: name, viewport: { width, height }, view });
+    const viewportName = name.replace(/\.png$/, '-viewport.png');
+    await page.screenshot({ path: join(screenshotDirectory, viewportName) });
+    screenshotViews.push({ file: viewportName, viewport: { width, height }, view: `${view}-viewport` });
   };
   if (screenshotDirectory) {
     await mkdir(screenshotDirectory, { recursive: true });

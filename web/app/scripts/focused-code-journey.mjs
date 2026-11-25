@@ -76,7 +76,10 @@ try {
       `focused source and values fit at ${width}px`);
     const rendered = await page.locator('body').textContent();
     assert.ok(canaries.every((canary) => !rendered.includes(canary)), 'private limits hold in the focused rendered UI');
-    if (screenshotDirectory) await page.screenshot({ path: join(screenshotDirectory, `focused-code-${width}.png`), fullPage: true });
+    if (screenshotDirectory) {
+      await page.screenshot({ path: join(screenshotDirectory, `focused-code-${width}.png`), fullPage: true });
+      await page.screenshot({ path: join(screenshotDirectory, `focused-code-${width}-viewport.png`) });
+    }
   }
   assert.equal(externalRequests, 0, 'focused viewer made a request outside loopback');
   assert.equal(browserErrors, 0, 'focused browser reported an error');
