@@ -156,9 +156,10 @@ try {
   await eventKind.evaluate((node, text) => { node.textContent = text; }, originalKind);
   await saveScreenshot('viewer-mobile-genuine-events.png', 'genuine-event-window', 390, 844);
 
-  // Linear and Canvas on the real recording at 320, 736 and 1024 px: no horizontal page scroll,
+  // Steps and Map on the real recording at 320, 736, 1024 and 1440 px: no horizontal page scroll,
   // one shared selection, a single roving tab stop in the tree, keyboard stepping, screenshots.
-  for (const [width, height] of [[320, 640], [736, 900], [1024, 768]]) {
+  let renderedStepKinds;
+  for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1440, 900]]) {
     await page.setViewportSize({ width, height });
     const eventsTab = page.getByRole('tab', { name: 'events' });
     if (await eventsTab.isVisible()) await eventsTab.click();
@@ -167,13 +168,30 @@ try {
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
       assert.ok(overflow <= 0, `${view} view scrolls the page horizontally by ${overflow}px at ${width}px`);
     };
-    await page.getByRole('button', { name: 'Linear', exact: true }).click();
+    await page.getByRole('button', { name: 'Steps', exact: true }).click();
     await page.locator('.event').first().waitFor();
-    await noHorizontalScroll('linear');
+    await noHorizontalScroll('steps');
+    const observedRows = page.locator('.event');
+    const toolbar = page.getByRole('group', { name: 'Replay navigation' });
+    const methods = observedRows.locator('.event-kind');
+    assert.ok((await methods.allTextContents()).some((text) => /^Called .+/.test(text)), 'the Spring recording displays an observed call sentence');
+    const kinds = await observedRows.evaluateAll((rows) => rows.map((row) => row.dataset.eventKind));
+    if (renderedStepKinds) assert.deepEqual(kinds, renderedStepKinds, 'Steps retains observed kinds and order across viewport changes');
+    renderedStepKinds = kinds;
+    const currentRow = page.locator('.event[aria-current="true"]');
+    const originalSequence = await currentRow.locator('.event-seq').textContent();
+    const next = toolbar.getByRole('button', { name: 'Next', exact: true });
+    const forward = await next.getAttribute('aria-disabled') !== 'true';
+    await (forward ? next : toolbar.getByRole('button', { name: 'Back', exact: true })).click();
+    await expect(currentRow.locator('.event-seq')).not.toHaveText(originalSequence);
+    await currentRow.focus();
+    await currentRow.press(forward ? 'ArrowUp' : 'ArrowDown');
+    await expect(currentRow.locator('.event-seq')).toHaveText(originalSequence);
+    await expect(currentRow).toBeFocused();
     await saveScreenshot(`viewer-replay-linear-${width}.png`, 'linear-real-recording', width, height);
     const selectedLinear = async () => page.locator('.event').evaluateAll((rows) => rows.findIndex((row) => row.getAttribute('aria-current') === 'true'));
     const startIndex = await selectedLinear();
-    await page.getByRole('button', { name: 'Canvas', exact: true }).click();
+    await page.getByRole('button', { name: 'Map', exact: true }).click();
     await page.getByRole('tree').waitFor();
     const items = page.getByRole('treeitem');
     const itemCount = await items.count();
@@ -185,11 +203,11 @@ try {
     if (itemCount > 1) {
       await page.locator('.canvas-tree [role="treeitem"][tabindex="0"]').focus();
       await page.keyboard.press('ArrowDown');
-      await page.getByRole('button', { name: 'Linear', exact: true }).click();
+      await page.getByRole('button', { name: 'Steps', exact: true }).click();
       await page.locator('.event').first().waitFor();
       assert.notEqual(await selectedLinear(), startIndex, `ArrowDown in Canvas moved the selection Linear shows at ${width}px`);
     } else {
-      await page.getByRole('button', { name: 'Linear', exact: true }).click();
+      await page.getByRole('button', { name: 'Steps', exact: true }).click();
     }
     assert.equal(await page.locator('.event[aria-current="true"]').count(), 1, 'exactly one selected event in Linear');
   }
@@ -311,7 +329,30 @@ try {
       assert.ok(!body.includes(canary), `API response included privacy canary ${canary}`);
     }
   }
-  assert.deepEqual(JSON.parse(apiPayloads.detailBody).events.map((event) => event.sequence), expectedSequences);
+  const verifiedEvents = JSON.parse(apiPayloads.detailBody).events;
+  assert.deepEqual(verifiedEvents.map((event) => event.sequence), expectedSequences);
+  assert.deepEqual(renderedStepKinds, verifiedEvents.map((event) => event.kind), 'Steps only renders kinds returned by the real recording read API');
+  const knownKinds = new Set(['unspecified', 'request_update', 'frame_enter', 'frame_exit', 'frame_throw', 'line_cursor',
+    'value_snapshot', 'database_start', 'database_end', 'outbound_http_start', 'outbound_http_end',
+    'async_link', 'exception', 'response', 'gap']);
+  const observedKindReceipt = [...new Set(verifiedEvents.map(({ kind }) => {
+    const name = kind.startsWith('recording_event_kind:') ? kind.slice('recording_event_kind:'.length) : '';
+    return knownKinds.has(name) ? name : 'other';
+  }))].sort();
+  process.stdout.write(`packaged Steps observed event kinds: ${observedKindReceipt.join(', ')}\n`);
+  const intoIndex = verifiedEvents.findIndex((event) => event.navigation?.into?.state === 'target'
+    && verifiedEvents.some(({ frameId }) => frameId === event.navigation.into.frameId));
+  if (intoIndex >= 0) {
+    const expectedTarget = verifiedEvents.find(({ frameId }) => frameId === verifiedEvents[intoIndex].navigation.into.frameId);
+    await page.locator('.event').nth(intoIndex).click();
+    const eventsTab = page.getByRole('tab', { name: 'events' });
+    if (await eventsTab.isVisible()) await eventsTab.click();
+    const stepIn = page.getByRole('group', { name: 'Replay navigation' }).getByRole('button', { name: 'Step in', exact: true });
+    await expect(stepIn).toHaveAttribute('aria-disabled', 'false');
+    await stepIn.click();
+    await expect(page.locator('.event[aria-current="true"] .event-seq')).toHaveText(expectedTarget.sequence);
+    process.stdout.write('packaged Steps navigation: exercised a server-resolved in-window Step in target\n');
+  }
   assert.equal(new URL(page.url()).hash, '', 'bootstrap fragment must be removed before exchange');
   const cookies = await context.cookies();
   assert.equal(cookies.length, 1, 'one browser-session cookie should be issued');

@@ -131,7 +131,7 @@ describe('replay wiring in the app', () => {
     fireEvent.click(screen.getByRole('button', { name: /Repo\.save/ }));
     expect(within(inspector()).getByText('event-2')).toBeInTheDocument();
     // Switch to Canvas: the same frame is the selected tree item.
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     const selected = () => screen.getAllByRole('treeitem').filter((item) => item.getAttribute('aria-selected') === 'true');
     expect(selected()).toHaveLength(1);
     expect(selected()[0]).toHaveTextContent('Repo.save');
@@ -142,16 +142,17 @@ describe('replay wiring in the app', () => {
     fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowDown' });
     expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
     // Back to Linear keeps that selection.
-    fireEvent.click(screen.getByRole('button', { name: 'Linear' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Steps' }));
     expect(screen.getByRole('button', { name: /Audit\.write/ })).toHaveAttribute('aria-current', 'true');
   });
 
   it('navigation buttons select the server-resolved target frame', async () => {
     await openRecording();
     fireEvent.click(screen.getByRole('button', { name: /Controller\.create/ }));
-    fireEvent.click(within(inspector()).getByRole('button', { name: 'Step into' }));
+    const toolbar = screen.getByRole('group', { name: 'Replay navigation' });
+    fireEvent.click(within(toolbar).getByRole('button', { name: 'Step in' }));
     expect(within(inspector()).getByText('event-2')).toBeInTheDocument();
-    fireEvent.click(within(inspector()).getByRole('button', { name: 'Step out' }));
+    fireEvent.click(within(toolbar).getByRole('button', { name: 'Step out' }));
     expect(within(inspector()).getByText('event-1')).toBeInTheDocument();
   });
 
@@ -164,10 +165,57 @@ describe('replay wiring in the app', () => {
 
   const live = () => screen.getByRole('status', { hidden: true });
 
+  it('keeps one Steps tab stop and moves focus with adjacent-event keyboard navigation', async () => {
+    await openRecording();
+    const first = screen.getByRole('button', { name: /Controller\.create/ });
+    const second = screen.getByRole('button', { name: /Repo\.save/ });
+    expect(first).toHaveAttribute('tabindex', '0');
+    expect(second).toHaveAttribute('tabindex', '-1');
+    first.focus();
+    fireEvent.keyDown(first, { key: 'ArrowDown' });
+    expect(second).toHaveFocus();
+    expect(second).toHaveAttribute('aria-current', 'true');
+    expect(first).toHaveAttribute('tabindex', '-1');
+    expect(live()).toHaveTextContent('Event 2 selected');
+  });
+
+  it('matches physical Option shortcuts while preserving native search editing', async () => {
+    await openRecording();
+    const search = screen.getByRole('searchbox', { name: 'Search loaded requests' });
+    expect(fireEvent.keyDown(search, { key: 'ˆ', code: 'KeyI', altKey: true })).toBe(true);
+    expect(screen.getByRole('button', { name: /Controller\.create/ })).toHaveAttribute('aria-current', 'true');
+
+    fireEvent.keyDown(window, { key: 'ˆ', code: 'KeyI', altKey: true });
+    expect(within(inspector()).getByText('event-2')).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 'µ', code: 'KeyM', altKey: true });
+    const selection = screen.getByRole('treeitem', { selected: true });
+    expect(selection).toHaveTextContent('Repo.save');
+    await waitFor(() => expect(selection).toHaveFocus());
+    fireEvent.keyDown(selection, { key: 'µ', code: 'KeyM', altKey: true });
+    const row = screen.getByRole('button', { name: /Repo\.save/ });
+    expect(row).toHaveAttribute('aria-current', 'true');
+    await waitFor(() => expect(row).toHaveFocus());
+  });
+
+  it('shows and announces an unloaded frame target once without moving Steps selection', async () => {
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Audit\.write/ }));
+    const toolbar = screen.getByRole('group', { name: 'Replay navigation' });
+    const into = within(toolbar).getByRole('button', { name: 'Step in' });
+    expect(into).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.focus(into);
+    fireEvent.mouseEnter(within(toolbar).getByRole('button', { name: /^Next$/ }));
+    expect(toolbar.querySelector('.replay-reason')).toHaveTextContent(/outside the loaded window/);
+    fireEvent.keyDown(into, { key: 'i', altKey: true });
+    expect(live()).toHaveTextContent(/outside the loaded window/);
+    expect(document.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
+    expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
+  });
+
   it('announces an out-of-window Canvas key target in the live region', async () => {
     await openRecording();
     fireEvent.click(screen.getByRole('button', { name: /Audit\.write/ }));
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowRight' });
     await waitFor(() => expect(live()).toHaveTextContent(/outside the loaded window/));
   });
@@ -175,15 +223,15 @@ describe('replay wiring in the app', () => {
   it('announces a boundary in the live region', async () => {
     await openRecording();
     fireEvent.click(screen.getByRole('button', { name: /Audit\.log/ }));
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowRight' });
-    await waitFor(() => expect(live()).toHaveTextContent(/boundary, no further frame in this direction/));
+    await waitFor(() => expect(live()).toHaveTextContent(/Boundary: no further frame in this direction/));
   });
 
   it('announces Selected event N after an in-window Canvas key step', async () => {
     await openRecording();
     fireEvent.click(screen.getByRole('button', { name: /Controller\.create/ }));
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowRight' });
     await waitFor(() => expect(live()).toHaveTextContent('Selected event 2'));
   });
@@ -202,12 +250,12 @@ describe('replay wiring in the app', () => {
     fireEvent.click(screen.getByRole('button', { name: /Repo\.line/ }));
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
     showEvents();
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     const selectedFrame = screen.getByRole('treeitem', { selected: true });
     expect(selectedFrame).toHaveTextContent('Repo.save');
     fireEvent.click(selectedFrame);
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Linear' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Steps' }));
 
     responseDetail = { ...detail, events: [events[1], line, events[0], ...events.slice(2)] };
     refreshEvents();
@@ -238,13 +286,15 @@ describe('replay wiring in the app', () => {
     fireEvent.keyDown(window, { altKey: true, key: 'ArrowDown' });
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
     expect(live()).toHaveTextContent('Event 5 selected');
-    fireEvent.click(within(inspector()).getByRole('button', { name: /^Previous$/ }));
+    const toolbar = screen.getByRole('group', { name: 'Replay navigation' });
+    fireEvent.click(within(toolbar).getByRole('button', { name: 'Back' }));
     expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
-    fireEvent.click(within(inspector()).getByRole('button', { name: /^Next$/ }));
+    fireEvent.click(within(toolbar).getByRole('button', { name: /^Next$/ }));
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
     showEvents();
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
     expect(screen.queryByRole('treeitem', { selected: true })).not.toBeInTheDocument();
+    expect(screen.getByText('Frame ID unavailable for the selected event.')).toBeInTheDocument();
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
     const initialTreeItem = screen.getAllByRole('treeitem')[0];
     initialTreeItem.focus();
@@ -259,7 +309,7 @@ describe('replay wiring in the app', () => {
     expect(selectedTreeItem).toHaveFocus();
     fireEvent.keyDown(selectedTreeItem, { altKey: true, key: 'ArrowDown' });
     expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Linear' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Steps' }));
     expect(screen.getByRole('button', { name: /Request boundary/ })).toHaveAttribute('aria-current', 'true');
 
     responseDetail = { ...detail, recordingId: recordingB };
