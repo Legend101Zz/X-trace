@@ -46,27 +46,67 @@ async function pageWithoutMovingAnchor(page, button, expectedCount) {
   const current = page.locator('#events-panel .event[aria-current="true"]');
   await current.scrollIntoViewIfNeeded();
   const list = page.getByRole('list', { name: 'Loaded replay steps' });
-  const anchor = () => list.evaluate((element) => {
+  const anchor = (originalSequence = null) => list.evaluate((element, originalSequence) => {
     const body = element.closest('.steps-content');
     const owner = body && getComputedStyle(body).overflowY === 'auto' ? body : element.closest('#events-panel');
     const viewport = owner.getBoundingClientRect();
-    for (const row of element.querySelectorAll('[data-step-sequence]')) {
-      const box = row.getBoundingClientRect();
-      if (box.bottom > viewport.top && box.top < viewport.bottom) {
-        return { sequence: row.dataset.stepSequence, offset: box.top - viewport.top };
-      }
-    }
-    return null;
-  });
-  const original = await anchor();
-  assert.ok(original, 'the loaded list has a visible scroll anchor');
-  await button.evaluate((node) => node.focus({ preventScroll: true }));
-  await page.keyboard.press('Enter');
-  await expect(page.getByText(`${expectedCount} ordered events`, { exact: true })).toBeVisible();
-  await expect.poll(async () => {
-    const now = await anchor();
-    return now?.sequence === original.sequence && Math.abs(now.offset - original.offset) <= 2;
-  }).toBe(true);
+    const rows = [...element.querySelectorAll('[data-step-sequence]')];
+    const intersectsViewport = (node) => {
+      const box = node.getBoundingClientRect();
+      return box.height > 0 && box.bottom > viewport.top && box.top < viewport.bottom;
+    };
+    const first = rows.find(intersectsViewport);
+    const placeholderVisible = [...element.querySelectorAll('.steps-spacer')].some(intersectsViewport);
+    const original = originalSequence === null ? first : rows.find((row) => row.dataset.stepSequence === originalSequence);
+    const offset = (row) => row ? Math.round((row.getBoundingClientRect().top - viewport.top) * 10) / 10 : null;
+    return {
+      sequence: first?.dataset.stepSequence ?? null,
+      exactOffset: first ? first.getBoundingClientRect().top - viewport.top : null,
+      geometry: {
+        sameFirst: first != null && first === original,
+        originalMounted: original != null,
+        sameSelection: original?.querySelector('.event[aria-current="true"]') != null,
+        firstOffset: offset(first),
+        originalOffset: offset(original),
+        ownerTop: Math.round(viewport.top),
+        ownerHeight: owner.clientHeight,
+        ownerBorderTop: owner.clientTop,
+        scrollTop: Math.round(owner.scrollTop),
+        scrollHeight: owner.scrollHeight,
+        pageScrollTop: Math.round(window.scrollY),
+        listTop: Math.round(element.getBoundingClientRect().top - viewport.top),
+        mountedRows: rows.length,
+        placeholderVisible,
+        desktopScrollOwner: owner === body,
+      },
+    };
+  }, originalSequence);
+  const samples = {};
+  try {
+    // A scroll can reveal an overscan placeholder before React mounts the actual rows.
+    // Sample only once the viewport intersects a real row and no virtual spacer.
+    let original;
+    await expect.poll(async () => {
+      original = await anchor();
+      samples.lastReadiness = original.geometry;
+      return original.sequence !== null && !original.geometry.placeholderVisible;
+    }).toBe(true);
+    samples.beforeFocus = original.geometry;
+    await button.evaluate((node) => node.focus({ preventScroll: true }));
+    samples.afterFocus = (await anchor(original.sequence)).geometry;
+    await page.keyboard.press('Enter');
+    samples.afterPagingKey = (await anchor(original.sequence)).geometry;
+    await expect(page.getByText(`${expectedCount} ordered events`, { exact: true })).toBeVisible();
+    await expect.poll(async () => {
+      const now = await anchor(original.sequence);
+      samples.final = now.geometry;
+      return !now.geometry.placeholderVisible && now.sequence === original.sequence
+        && Math.abs(now.exactOffset - original.exactOffset) <= 2;
+    }).toBe(true);
+  } catch (error) {
+    error.anchorGeometry = samples;
+    throw error;
+  }
 }
 
 /**

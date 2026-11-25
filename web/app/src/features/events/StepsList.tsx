@@ -17,7 +17,6 @@ export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleas
   const rail = useRef<HTMLDivElement>(null);
   const selectedRow = useRef<HTMLButtonElement>(null);
   const pendingFocus = useRef<string | undefined>(undefined);
-  const [browseSequence, setBrowseSequence] = useState<string>();
   const [disclosures, setDisclosures] = useState<ReadonlySet<string>>(new Set());
   const { list, mounted, offsets, first, focused, setFocused, revealIndex, groupSize } = useStepWindow(events, selected?.sequence);
 
@@ -53,11 +52,8 @@ export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleas
     });
   }, [events]);
 
-  const browseIndex = browseSequence === undefined ? -1 : events.findIndex(({ sequence }) => sequence === browseSequence);
-  const groupIndex = browseIndex < 0 ? first : browseIndex;
   const browseTo = (index: number) => {
     pendingFocus.current = revealIndex(index);
-    setBrowseSequence(pendingFocus.current);
   };
 
   const rows: ReactNode[] = [];
@@ -82,7 +78,7 @@ export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleas
           if (key.altKey || key.ctrlKey || key.metaKey || (key.key !== 'ArrowUp' && key.key !== 'ArrowDown')) return;
           key.preventDefault();
           const direction = key.key === 'ArrowDown' ? 1 : -1;
-          if (active || !selected) onMove(direction);
+          if (active) onMove(direction);
           else browseTo(index + direction);
         }}
         onClick={() => onPick(item)}>
@@ -117,8 +113,8 @@ export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleas
   return <div className="event-rail" ref={rail}>
     <div className="window-note"><span>{events.length} ordered events</span><span>ALT + ↑ / ↓ to step</span></div>
     <div className="step-groups" role="group" aria-label="Browse loaded Steps">
-      <button className="button" disabled={groupIndex <= 0} onClick={() => browseTo(groupIndex - groupSize)}>Earlier loaded rows</button>
-      <button className="button" disabled={groupIndex >= events.length - 1} onClick={() => browseTo(groupIndex + groupSize)}>Later loaded rows</button>
+      <button className="button" disabled={first <= 0} onClick={() => browseTo(first - groupSize)}>Earlier loaded rows</button>
+      <button className="button" disabled={first >= events.length - 1} onClick={() => browseTo(first + groupSize)}>Later loaded rows</button>
       <span>Loaded position {first + 1} of {events.length}</span>
     </div>
     <ol className="steps-list" role="list" aria-label="Loaded replay steps" ref={list}>{rows}</ol>

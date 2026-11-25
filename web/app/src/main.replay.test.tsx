@@ -561,8 +561,16 @@ describe('replay wiring in the app', () => {
     let finish: ((value: Response) => void) | undefined;
     heldContinuations.set(token, new Promise<Response>((resolve) => { finish = resolve; }));
     await openRecording();
+    const count = screen.getByText('4 loaded events', { exact: true });
+    const loading = screen.getByText('Loading event window…', { exact: true });
+    expect(count).toHaveAttribute('aria-hidden', 'false');
+    expect(loading).toHaveAttribute('aria-hidden', 'true');
+    expect(loading.parentElement).toBe(count.parentElement);
     fireEvent.click(screen.getByRole('button', { name: 'Load later' }));
-    expect(screen.getByText('Loading event window…')).toBeInTheDocument();
+    expect(loading).toBeInTheDocument();
+    expect(loading).toHaveAttribute('aria-hidden', 'false');
+    expect(count).toHaveAttribute('aria-hidden', 'true');
+    expect(loading.parentElement).toBe(count.parentElement);
     secondDetail = { ...detail, recordingId: recordingB, events: [{ ...events[0], symbol: 'Other.recording' }] };
     fireEvent.click(screen.getByRole('tab', { name: 'Requests' }));
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));

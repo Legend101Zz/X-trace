@@ -138,6 +138,7 @@ try {
   // Playwright failures can contain rendered trace text or private locators.
   const frames = String(error.stack).match(/(?:real-)?replay-window-journey\.mjs:\d+:\d+/g) ?? [];
   console.error(`Spring replay window failed during ${stage} (${frames.join(', ')})`);
+  if (error.anchorGeometry) console.error(`Steps anchor geometry ${JSON.stringify(error.anchorGeometry)}`);
   process.exitCode = 1;
 } finally {
   await browser.close();
