@@ -1,7 +1,8 @@
 import { useViewport } from '../shell/viewport';
 import { NavigationControls } from './NavigationControls';
 import type { NavAction, NavFrameNavigation } from '../../replay/navigation';
-import { sourceStateText } from '../../replay/source-states';
+import { CodeEvidence } from '../code/CodeEvidence';
+import { Values } from './Values';
 import { sessionContextText } from '../../replay/outcome';
 import type { Detail, ReplayEvent } from '../../types';
 
@@ -13,11 +14,6 @@ export interface EvidencePanelProps {
   selectionUnavailable: string | null;
   onBackToEvent: () => void;
   onNavigate: (action: NavAction, frameId: string) => void;
-}
-
-function valuesText(event: { bindings?: unknown[] }): string {
-  const count = event.bindings?.length ?? 0;
-  return count > 0 ? `${count} value binding${count === 1 ? '' : 's'} recorded; value display is not implemented in this build` : 'No value bindings were recorded for this event';
 }
 
 export function EvidencePanel({ active, currentStatus, detail, event, selectionUnavailable, onBackToEvent, onNavigate }: EvidencePanelProps) {
@@ -38,7 +34,12 @@ export function EvidencePanel({ active, currentStatus, detail, event, selectionU
             <div className="inspector-section"><div className="inspector-label">Persisted interaction</div>{event.interaction ? Object.entries(event.interaction).filter(([, value]) => value).map(([key, value]) => <div className="inspector-value" key={key}>{key}: <span className="mono">{value}</span></div>) : <div className="inspector-value">No interaction fields persisted</div>}</div>
             {event.fieldTruncations.map((item) => <div key={item.field} className="evidence-state">{item.field} {item.representation} · {item.originalBytes} bytes</div>)}
             {detail?.incompleteEvidence.map((item, index) => <div key={`${item}-${index}`} className="evidence-state">Persisted incomplete evidence: {item}</div>)}
-            <div className="inspector-section"><div className="inspector-label">Recorded source evidence</div>{event.source ? <><div className="inspector-value">{event.source.path} · debug range L{event.source.startLine}{event.source.endLine && event.source.endLine !== event.source.startLine ? `–L${event.source.endLine}` : ''}</div><div className="evidence-state">{sourceStateText(event.sourceBinding, event.source)}</div>{!hasCodePane && event.source.status === 'matched' && event.source.excerpt ? <pre className="source-excerpt">{event.source.excerpt}</pre> : null}{event.source.truncated ? <div className="evidence-state">Source excerpt is bounded</div> : null}</> : <div className="evidence-state">{sourceStateText(event.sourceBinding, null)}</div>}<div className="evidence-state">{valuesText(event)} · response outcome is not event-verified</div></div>
+            {!hasCodePane ? <section className="inspector-section" aria-label="Code">
+              <h2 className="inspector-label">Recorded source evidence</h2>
+              <CodeEvidence event={event} />
+            </section> : null}
+            <Values bindings={event.bindings ?? []} />
+            <p className="evidence-state">response outcome is not event-verified</p>
             <div className="inspector-section"><div className="inspector-label">Timing</div><div className="inspector-value">Monotonic timestamp: <span className="mono">{event.monotonicNs} ns</span></div><div className="evidence-state">Per-event duration is not recorded</div></div>
             <NavigationControls navigation={event.navigation as NavFrameNavigation} loadedFrameIds={loadedFrameIds} actions={['previous', 'next']} onNavigate={onNavigate} />
           </> : <div className="empty"><strong>Select an event</strong><p>{selectionUnavailable ?? "Event selection synchronizes this evidence inspector."}</p></div>}

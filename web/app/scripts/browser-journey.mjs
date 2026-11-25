@@ -353,6 +353,35 @@ try {
     await expect(page.locator('.event[aria-current="true"] .event-seq')).toHaveText(expectedTarget.sequence);
     process.stdout.write('packaged Steps navigation: exercised a server-resolved in-window Step in target\n');
   }
+
+  const methodIndex = verifiedEvents.findIndex(({ kind, source }) => kind === 'recording_event_kind:frame_enter'
+    && source?.status === 'matched' && typeof source.excerpt === 'string' && source.excerpt.length > 0);
+  assert.ok(methodIndex >= 0, 'the standard Spring fixture returned a hash-matched method extent');
+  const methodEvent = verifiedEvents[methodIndex];
+  const expectedLines = methodEvent.source.excerpt.split('\n');
+  for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1440, 900]]) {
+    await page.setViewportSize({ width, height });
+    const eventsTab = page.getByRole('tab', { name: 'events' });
+    if (await eventsTab.isVisible()) await eventsTab.click();
+    await page.locator('.event').nth(methodIndex).click();
+    const code = page.getByRole('region', { name: 'Code', exact: true });
+    await expect(code).toBeVisible();
+    await expect(code.locator('.source-row')).toHaveCount(expectedLines.length);
+    const actualLines = await code.locator('.source-row').evaluateAll((rows) =>
+      rows.map((row) => ({ number: Number(row.dataset.sourceLine), text: row.querySelector('.source-text').textContent })));
+    assert.ok(actualLines.every(({ number, text }, index) => number === methodEvent.source.startLine + index && text === expectedLines[index]),
+      `Code numbers and preserves the real source rows at ${width}px`);
+    assert.equal(await code.locator('[aria-current="location"], .source-inline').count(), 0,
+      `an observed method extent alone must not highlight a line or place inline bindings at ${width}px`);
+    const values = page.getByRole('region', { name: 'Values', exact: true });
+    await expect(values.getByRole('heading')).toHaveText(`Values (${methodEvent.bindings.length})`);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
+      `Code and Values fit on the page at ${width}px`);
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('tab', { name: 'events' }).click();
+  process.stdout.write('packaged Code and Values: hash-matched method extent, source numbering, no active line based on method range, and binding count at 320/736/1024/1440\n');
+  process.stdout.write('focused Code proof: not exercised by the standard fixture browser journey\n');
   assert.equal(new URL(page.url()).hash, '', 'bootstrap fragment must be removed before exchange');
   const cookies = await context.cookies();
   assert.equal(cookies.length, 1, 'one browser-session cookie should be issued');

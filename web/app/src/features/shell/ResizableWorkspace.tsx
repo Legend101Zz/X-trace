@@ -3,7 +3,7 @@ import type { CSSProperties, KeyboardEvent, PointerEvent, ReactNode } from 'reac
 import { clampPanel, DEFAULT_LAYOUT, PANEL_LIMITS, readPanelLayout, savePanelLayout } from './panel-layout';
 import type { Panel, PanelLayout } from './panel-layout';
 import { useViewport } from './viewport';
-import { sourceStateText } from '../../replay/source-states';
+import { CodeEvidence } from '../code/CodeEvidence';
 import type { Pane, ReplayEvent } from '../../types';
 import './workspace.css';
 
@@ -120,7 +120,6 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
     '--code-size': sizes.code ? `${sizes.code}%` : '44px',
     '--inspector-size': sizes.inspector ? `${sizes.inspector}%` : '44px',
   } as CSSProperties;
-  const source = sourceEvent?.source;
   const showSourcePane = useViewport('(min-width: 861px)');
 
   return <main className="workspace viewer-workspace" data-pane={activePane} style={style}>
@@ -134,11 +133,7 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
       <section id="code-panel" className="workspace-code" aria-label="Code">
         {sizes.code === 0 ? restore('code') : <div className="workspace-code-body">
           <h2>Code</h2>
-          {showSourcePane && sourceEvent ? <>
-            {source ? <p>{source.path}</p> : null}
-            <p className="evidence-state">{sourceStateText(sourceEvent.sourceBinding, source)}</p>
-            {source?.status === 'matched' && source.excerpt ? <pre className="source-excerpt">{source.excerpt}</pre> : null}
-          </> : <p>Select an event</p>}
+          {showSourcePane && sourceEvent ? <CodeEvidence event={sourceEvent} /> : <p>Select an event</p>}
         </div>}
       </section>
     </div>
