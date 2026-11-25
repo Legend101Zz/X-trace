@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 9f6313a944da8d5f41fd4e1f7858a0d9d84d8535
+          ref: 3d49d29fb5c1a53946823e4e49ec706311540f56
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
@@ -37,7 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          test "$(git rev-parse HEAD)" = 9f6313a944da8d5f41fd4e1f7858a0d9d84d8535
+          test "$(git rev-parse HEAD)" = 3d49d29fb5c1a53946823e4e49ec706311540f56
           root="$RUNNER_TEMP/xt"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/fragments"
           export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
@@ -76,5 +76,13 @@ jobs:
           umask 077
           root="$RUNNER_TEMP/xt"
           export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          mkdir -m 700 "$root/spring-lib" "$root/spring-classes"
+          (
+            cd "$root/spring-lib"
+            jar -xf "$GITHUB_WORKSPACE/adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar" BOOT-INF/lib
+          )
+          javac --release 17 -cp "$root/spring-lib/BOOT-INF/lib/*" -d "$root/spring-classes" \
+            tools/qa/fixtures/catalog-link/SpringLinkFixture.java
+          export XTRACE_LINK_SPRING_CLASSPATH="$root/spring-classes:$root/spring-lib/BOOT-INF/lib/*"
           python3 -B tools/qa/catalog_link_journey.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/target/debug/xtrace" "$root/journeys" \
             | tee -a "$GITHUB_STEP_SUMMARY"
