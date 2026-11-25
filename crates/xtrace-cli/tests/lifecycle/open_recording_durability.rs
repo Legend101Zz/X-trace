@@ -107,6 +107,7 @@ fn assert_readable(fx: &Fixture, recording_id: RecordingId, recovered: bool) {
             recording_id,
             limit: 10,
             after_sequence: None,
+            before_sequence: None,
         })
         .expect("read API opens the unfinished batch");
     assert_eq!(
