@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Apache Fineract campaign harness (PREPARATION, uninstrumented baseline). See petclinic/harness/run.py for usage."""
+"""Pinned Apache Fineract baseline and private installed development instrumentation."""
 import base64
 import concurrent.futures
 import json
+import os
 import pathlib
+import re
 import sys
+import zipfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
 import xcamp  # noqa: E402
+import xinstr  # noqa: E402
+import installed_java  # noqa: E402
+import recording_evidence  # noqa: E402
 
 CAMP, PROJ, SRC = xcamp.load_campaign(__file__)
 HERE = pathlib.Path(__file__).resolve()
 JAR = SRC / CAMP["build"]["artifact"]
 IMAGE = CAMP["runtime"]["buildImage"]
+POSTGRES_IMAGE = CAMP["runtime"]["databaseImage"]
+POSTGRES_DIGEST = POSTGRES_IMAGE.split("@", 1)[1]
 BASE = "/fineract-provider/api/v1"
 TENANT = {"Fineract-Platform-TenantId": "default"}
 # Fineract's documented demo credentials (upstream seed). The Authorization header is redacted in receipts.
@@ -37,10 +45,11 @@ def build() -> int:
     return rc
 
 
-def make_stack(run_id: str) -> xcamp.Stack:
+def make_stack(run_id: str, launch_prefix: tuple[str, ...] = ()) -> xcamp.Stack:
     return xcamp.Stack(
         project="fineract", jdk_image=IMAGE, jar=JAR, run_id=run_id, app_port=8080, app_mem="3g",
-        app_args=["--server.address={BINDADDR}"],
+        app_args=["--server.address={BINDADDR}", "--server.port={APPPORT}",
+                  "--logging.level.org.springframework.boot.web.embedded.tomcat.TomcatWebServer=INFO"],
         env={"FINERACT_SERVER_PORT": "{APPPORT}", "FINERACT_SERVER_SSL_ENABLED": "false",
              "FINERACT_HIKARI_JDBC_URL": "jdbc:postgresql://{DBHOST}:{DBPORT}/fineract_tenants",
              "FINERACT_HIKARI_USERNAME": "root", "FINERACT_HIKARI_PASSWORD": "postgres",
@@ -49,6 +58,7 @@ def make_stack(run_id: str) -> xcamp.Stack:
              "FINERACT_DEFAULT_TENANTDB_UID": "root", "FINERACT_DEFAULT_TENANTDB_PWD": "postgres"},
         java_opts=["-Xmx2g"], db_name="fineract_tenants", effect_db="fineract_default", db_user="root", db_password="postgres",
         extra_db_init=["CREATE DATABASE fineract_default"], ready_timeout=900,
+        db_image=POSTGRES_IMAGE, launch_prefix=launch_prefix,
         ready_path="/fineract-provider/actuator/health", ready_ok=lambda st, body: st == 200 and '"UP"' in body)
 
 
@@ -203,13 +213,100 @@ SCENARIOS = [
 ]
 
 
+def runtime_dependencies():
+    """Observe the pinned framework/driver artifacts in the actual built boot JAR."""
+    expected = {"jersey-server": CAMP["runtime"]["jersey"].split(" ", 1)[0],
+                "jersey-common": CAMP["runtime"]["jersey"].split(" ", 1)[0],
+                "tomcat-embed-core": CAMP["runtime"]["tomcat"], "postgresql": CAMP["runtime"]["pgjdbc"],
+                "spring-boot": CAMP["runtime"]["springBoot"]}
+    observed = {}
+    with zipfile.ZipFile(JAR) as jar:
+        for name, version in expected.items():
+            entries = [entry for entry in jar.infolist() if re.fullmatch(
+                r"BOOT-INF/lib/" + re.escape(name) + r"-([0-9][^/]*)\.jar", entry.filename)]
+            if len(entries) != 1 or entries[0].filename != f"BOOT-INF/lib/{name}-{version}.jar" or entries[0].file_size > 64 << 20:
+                raise ValueError("built framework dependency differs from development pin")
+            observed[name] = {"version": version, "sha256": xcamp.sha256_bytes(jar.read(entries[0]))}
+    return observed
+
+
+def source_pin():
+    pin = {**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR),
+           "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
+           "postgresImageDigest": POSTGRES_DIGEST, "jdkImage": IMAGE,
+           "license": CAMP["license"], "developmentPin": True, "runtimeDependencies": runtime_dependencies(),
+           "historicalPlatform": CAMP["runtime"]["platform"], "actualPlatform": xcamp.PLATFORM}
+    if os.environ.get("XCAMP_APP_MODE") == "host":
+        installed_java.clean_checkout(HERE.parents[4], os.environ["XCAMP_PRODUCT_SHA"])
+        pin["hostJava"] = installed_java.java_identity(pathlib.Path(os.environ["XCAMP_JAVA"]), CAMP["runtime"]["jdk"])
+        pin["hostRunBindingSha256"] = installed_java.host_binding()
+        pin["runtimeDatabaseImageId"] = xcamp.image_id(POSTGRES_IMAGE)
+        pin["databaseRepoDigest"] = xcamp.image_digest(POSTGRES_IMAGE)
+        archive = installed_java.private_file(pathlib.Path(os.environ["XCAMP_PACKAGE_ARCHIVE"]))
+        pin["packageArchiveSha256"] = xcamp.sha256_file(archive)
+        if pin["packageArchiveSha256"] != os.environ["XCAMP_PACKAGE_SHA256"]:
+            raise ValueError("baseline archive identity differs")
+    return pin
+
+
 def baseline(out):
-    return xcamp.run_baseline(project="fineract", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR),
-                              "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
-                              "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
-                              make_stack=make_stack, scenarios=SCENARIOS, out_dir=out, norm_extra=NORM,
+    if os.environ.get("XCAMP_LAUNCH_PREFIX") or xcamp.REQUEST_HOOK is not None:
+        raise ValueError("baseline requires an uninstrumented, unmodified workload")
+    STATE.clear()
+    return xcamp.run_baseline(project="fineract", pin=source_pin(), make_stack=make_stack,
+                              scenarios=SCENARIOS, out_dir=out, norm_extra=NORM,
                               adaptations=CAMP["configAdaptations"], harness_files=[HERE])
 
 
+def instrumented():
+    required = ("XCAMP_INSTALL_PREFIX", "XCAMP_PACKAGE_ARCHIVE", "XCAMP_PACKAGE_SHA256", "XCAMP_PRODUCT_SHA",
+                "XCAMP_JAVA", "XCAMP_DATA_HOME", "XCAMP_BASELINE_RECEIPT", "XCAMP_CANARY_FILE", "TMPDIR")
+    if (any(not os.environ.get(key) for key in required) or os.environ.get("XCAMP_APP_MODE") != "host"
+            or xcamp.PLATFORM != "linux/amd64" or os.environ.get("XCAMP_LAUNCH_PREFIX")):
+        raise ValueError("installed hosted campaign environment unavailable")
+    root = installed_java.private_dir(pathlib.Path(os.environ["XTRACE_CAMPAIGN_ROOT"]))
+    project = installed_java.private_dir(PROJ)
+    if not project.is_relative_to(root) or SRC.resolve(strict=True).parent != project:
+        raise ValueError("source and receipts escaped the private campaign root")
+    installed_java.private_dir(pathlib.Path(os.environ["TMPDIR"]))
+    data = installed_java.private_dir(pathlib.Path(os.environ["XCAMP_DATA_HOME"]))
+    prefix = installed_java.private_dir(pathlib.Path(os.environ["XCAMP_INSTALL_PREFIX"]))
+    archive = installed_java.private_file(pathlib.Path(os.environ["XCAMP_PACKAGE_ARCHIVE"]))
+    out = project / "instrumented-1"
+    # A single fresh attempt: rerunning an unexplained red cannot replace its receipt.
+    out.mkdir(mode=0o700, exist_ok=False)
+    cli, agent, package = installed_java.installed_package(prefix, archive, os.environ["XCAMP_PACKAGE_SHA256"],
+                                                         os.environ["XCAMP_PRODUCT_SHA"], out / "verified-package")
+    pin = source_pin()
+    tracked = json.loads((HERE.parents[1] / "baseline-summary.json").read_text())
+    fingerprints, historic, baseline_digest = installed_java.checked_baseline(
+        pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]), pin, tracked, [sc.id for sc in SCENARIOS], "fineract")
+    canaries = json.loads(installed_java.private_file(pathlib.Path(os.environ["XCAMP_CANARY_FILE"])).read_text())
+    keys = ("authorization-header", "cookie-header", "query-token", "json-body-password", "env-var")
+    if (not isinstance(canaries, dict) or any(not isinstance(canaries.get(k), str) or not canaries[k] for k in keys)
+            or len({canaries[k] for k in keys}) != len(keys)):
+        raise ValueError("distinct private canaries unavailable")
+    launch = (cli, "run", "--project-dir", str(SRC), "--java-agent", agent,
+              "--app-package", recording_evidence.APP_PACKAGE, "--source-root", recording_evidence.SOURCE_ROOT,
+              "--capture-depth", "standard", "--")
+    STATE.clear()
+    receipt = xinstr.run_instrumented(
+        project="fineract", pin={**pin, "installedPackage": package, "trackedBaselineMatches": historic,
+                                 "runBoundBaselineReceiptSha256": baseline_digest},
+        make_stack=lambda run_id: make_stack(run_id, launch), scenarios=SCENARIOS, out_dir=out / "capture",
+        norm_extra=NORM, expectations=recording_evidence.EXPECT, xtrace=cli, project_dir=SRC, data_home=data,
+        adaptations=CAMP["configAdaptations"], canaries=canaries, baseline_receipt=None, extra_canary_paths=[],
+        baseline_fingerprints=fingerprints,
+        harness_files=[HERE, pathlib.Path(recording_evidence.__file__), pathlib.Path(installed_java.__file__),
+                       pathlib.Path(xinstr.__file__), pathlib.Path(xcamp.__file__)],
+        ordered_campaign=xinstr.OrderedCampaign(recording_evidence.PRE_DISPATCH, recording_evidence.inject_probes,
+                                                recording_evidence.judge))
+    # Final sink scans are performed after this process closes all capture outputs.
+    return 0 if receipt["result"] == "recorded" and all(historic.values()) else 1
+
+
 if __name__ == "__main__":
+    os.umask(0o077)
+    if sys.argv[1:] == ["instrumented"]:
+        sys.exit(instrumented())
     sys.exit(xcamp.main_cli("fineract", build, baseline, PROJ))

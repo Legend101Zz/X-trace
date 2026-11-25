@@ -1128,7 +1128,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "correlationGap": REQUEST_CORRELATION_GAP,
     }}
     init_args = [xtrace, "init", "--project-dir", str(project_dir), "--display-name", "campaign"]
-    if project == "jhipster" and ordered_campaign is not None:
+    if ordered_campaign is not None:
         init = private_diagnostic.run_captured(init_args, env=env, text=True, timeout=120, label="init")
     else:
         init = subprocess.run(init_args, env=env, capture_output=True, text=True, timeout=120)
@@ -1253,7 +1253,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
 
     # product lifecycle commands that exist in the CLI surface: exit code 9 means "not implemented yet"
     stop_args = [xtrace, "stop", "--project-dir", str(project_dir)]
-    if project == "jhipster" and ordered_campaign is not None:
+    if ordered_campaign is not None:
         stop = private_diagnostic.run_captured(stop_args, env=env, text=True, timeout=60, label="stop")
     else:
         stop = subprocess.run(stop_args, env=env, capture_output=True, text=True, timeout=60)
