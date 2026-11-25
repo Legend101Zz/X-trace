@@ -192,7 +192,35 @@ class FineractPrivacy(unittest.TestCase):
         status = json.loads((self.root / "sinks/cli-status.json").read_text())
         self.assertFalse(status["complete"])
         self.assertEqual(status["commandExits"], [23])
+        detail = privacy.receipt_diagnostics.cli_diagnostics(status)
+        self.assertEqual(detail["firstFailure"], {"stage": "list", "reason": "nonzero-exit", "exitCode": 23})
+        self.assertNotIn("private CLI refusal", json.dumps(detail))
         self.assertEqual((self.root / "sinks/cli/list-00.stderr").read_bytes(), b"private CLI refusal")
+
+    def test_cli_first_incomplete_marker_keeps_only_validated_categories(self):
+        capture = self.root / "campaign/java/fineract/instrumented-1/capture"
+        self.file(str(capture.relative_to(self.root)) + "/api/page.json", '{"recordings":[]}')
+        private = self.values["query-token"]
+        replies = iter([{"recordings": [{"recording_id": "recording-a"}], "next_after": None},
+                        {"recording_id": "recording-a", "events": [], "next_cursor": None,
+                         "incomplete_evidence": ["durable_tail_pending:2..5", "gap_event_sequence:3", private]}])
+        def run(args, **kwargs):
+            kwargs["stdout"].write(json.dumps(next(replies)).encode())
+            return subprocess.CompletedProcess(args, 0)
+        with mock.patch.object(subprocess, "run", side_effect=run):
+            self.assertFalse(installed_sinks.collect(self.root, "fineract", capture))
+        status = json.loads((self.root / "sinks/cli-status.json").read_text())
+        self.assertTrue(status["artifactComplete"])
+        projected = privacy.receipt_diagnostics.cli_diagnostics(status)
+        self.assertEqual(projected["firstFailure"], {"stage": "detail", "reason": "incomplete-evidence", "exitCode": None})
+        self.assertEqual((projected["listCommands"], projected["detailCommands"], projected["completedDetails"]), (1, 1, 0))
+        self.assertEqual({key: value for key, value in projected["evidenceClasses"].items() if value},
+                         {"pending-tail": 1, "gap-event": 1, "other": 1})
+        for value in (private, "2..5", "recording-a"):
+            self.assertNotIn(value, json.dumps(projected))
+        self.assertIsNone(privacy.receipt_diagnostics.cli_diagnostics(dict(status, commandExits=[0, 12])))
+        status["firstEvidenceClasses"][private] = 1
+        self.assertIsNone(privacy.receipt_diagnostics.cli_diagnostics(status))
 
     def test_complete_actual_sink_corpus_can_pass_scan_without_accepting_missing_workloads(self):
         evidence, phases, _ = self.complete_sinks()

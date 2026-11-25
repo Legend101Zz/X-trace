@@ -298,7 +298,8 @@ def instrumented():
         adaptations=CAMP["configAdaptations"], canaries=canaries, baseline_receipt=None, extra_canary_paths=[],
         baseline_fingerprints=fingerprints,
         harness_files=[HERE, pathlib.Path(recording_evidence.__file__), pathlib.Path(installed_java.__file__),
-                       pathlib.Path(xinstr.__file__), pathlib.Path(xcamp.__file__)],
+                       pathlib.Path(xinstr.__file__), pathlib.Path(xinstr.boundary_diagnostics.__file__),
+                       pathlib.Path(xcamp.__file__)],
         ordered_campaign=xinstr.OrderedCampaign(recording_evidence.PRE_DISPATCH, recording_evidence.inject_probes,
                                                 recording_evidence.judge))
     # Final sink scans are performed after this process closes all capture outputs.

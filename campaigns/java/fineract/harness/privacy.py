@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO / "campaigns/lib"))
 import installed_java  # noqa: E402
 from private_sinks import AdmittedSinks, STATUSES, valid_canaries  # noqa: E402
 from tools.qa import canary  # noqa: E402
+from campaigns.java.fineract.harness import receipt_diagnostics
 from campaigns.java.fineract.harness.recording_evidence import PROBES, PROBE_STATUSES, RECORDABLE_PROBES  # noqa: E402
 
 PHASES = ("prerequisite", "archive-verify", "candidate-install", "checkout-upstream", "source-verify",
@@ -252,7 +253,7 @@ class PrivacyEvidence:
         cli = maybe_read(root / "sinks/cli-status.json")
         complete_api = (isinstance(api, dict) and api.get("ok") is True and type(api.get("incompleteDetails")) is int and api["incompleteDetails"] == 0
                         and "listReadGap" in api and api["listReadGap"] is None and type(api.get("recordings")) is int and api["recordings"] > 0)
-        valid_cli = (isinstance(cli, dict) and cli.get("schema") == "xtrace-fineract-cli-sinks/1"
+        valid_cli = (isinstance(cli, dict) and cli.get("schema") in ("xtrace-fineract-cli-sinks/1", "xtrace-fineract-cli-sinks/2")
                      and type(cli.get("recordings")) is int and cli["recordings"] > 0
                      and isinstance(cli.get("commandExits"), list) and bool(cli["commandExits"])
                      and all(type(code) is int and code == 0 for code in cli["commandExits"]))
@@ -364,6 +365,9 @@ def finalize(root, public):
                    releaseAcceptance=False, publication="passed", sourceIdentity=verdict(source),
                    phases=observed_phases, upstreamBuild=upstream_build_summary(phases, observed_phases),
                    baseline=workload(baseline, False), instrumented=workload(receipt, True),
+                   boundaryDiagnostics=receipt_diagnostics.boundary_manifest(receipt),
+                   cliDiagnostics=receipt_diagnostics.cli_diagnostics(maybe_read(root / "sinks/cli-status.json")),
+                   observationChecks=receipt_diagnostics.observations(receipt),
                    privacy=dict(status=verdict(report["clean"]), sinks=report["sinks"], collection=report["collection"],
                                 canaryInjection=report["canaryInjection"], scannerScope=report["scannerScope"],
                                 scopeComplete=report["scopeComplete"], scopeGaps=report["scopeGaps"],

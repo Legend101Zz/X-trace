@@ -125,6 +125,27 @@ def enters_from(events):
     return [e for e in events if str(e.get("kind", "")).endswith("frame_enter")]
 
 
+def required_observations(rule):
+    """Failure labels emitted by inspect for this rule, excluding unreadable details."""
+    labels = ["exact-route-root-unobserved", "servlet-invocation-seam-unobserved",
+              "terminal-http-status-unobserved", "recording-incomplete"]
+    if rule["handler"]:
+        labels.extend(("jersey-resource-method-unobserved", "jersey-invocation-seam-unobserved", "resource-source-unobserved"))
+    if rule["preDispatch"]:
+        labels.append("unexpected-resource-on-denial")
+    if rule["command"]:
+        labels.append("command-pipeline-unobserved")
+        if rule["handler"] == CLIENT_RESOURCE + "create":
+            labels.append("client-write-service-unobserved")
+    if rule["mapper"]:
+        labels.append("jersey-exception-mapper-unobserved")
+    if rule["exception"]:
+        labels.append("exception-type-unobserved")
+    if rule["jdbc"]:
+        labels.extend(("pgjdbc-boundary-unobserved", "required-sql-operation-unobserved"))
+    return labels
+
+
 def inspect(detail, rule, status):
     if xinstr.detail_read_incomplete(detail):
         return ["recording-detail-incomplete"], False, False
@@ -238,15 +259,22 @@ def judge(details, expectations, phases, probes):
                         problems.append("burst-boundary-unverified")
                     if len(ids) != rule["minCount"]:
                         problems.append("burst-route-count-mismatch")
+                inspected = 0
+                failed_checks = {label: 0 for label in required_observations(rule)}
                 for rid in ids:
                     wanted = sent[0][1]["response"]["status"] if phase.kind == "serial" and sent else rule["statuses"][0]
                     found, status, source = inspect(details[rid], rule, wanted)
                     problems.extend(found)
+                    if "recording-detail-incomplete" not in found:
+                        inspected += 1
+                        for label in failed_checks:
+                            failed_checks[label] += label in found
                     if status:
                         statuses.add(rid)
                     if source:
                         sources.add(rid)
                 item = {"label": rule["label"], "method": rule["method"], "route": rule["route"],
+                        "inspectedDetails": inspected, "failedObservations": failed_checks,
                         "recordingsMatchingRoute": len(ids), "recordingsWithStatus": len(set(ids) & statuses),
                         "recordingsWithSource": len(set(ids) & sources), "problems": sorted(set(problems)),
                         "passed": bool(ids) and not problems}
