@@ -1986,10 +1986,7 @@ mod tests {
                 .expect("observed UUID");
             OperationId::from_uuid(uuid::Uuid::from_slice(&bytes).expect("UUID"))
         };
-        assert_ne!(
-            observed_id, catalog_id,
-            "recording and catalog UUID namespaces are independently allocated"
-        );
+        assert_eq!(observed_id, catalog_id, "finite observed alias shares the catalog UUID");
         let resolved = history
             .read_export_snapshot(
                 project,
@@ -2003,10 +2000,11 @@ mod tests {
         assert_eq!(resolved.operations[0].operation_id, catalog_id);
         assert!(resolved.linked_operation_ids.contains(&catalog_id));
         assert_eq!(resolved.catalog_identities, full.catalog_identities);
-        assert_eq!(
-            history.read_export_snapshot(project, Latest, Operation(observed_id), || false),
-            Err(CatalogExportReadError::OperationNotFound)
-        );
+        let direct = history
+            .read_export_snapshot(project, Latest, Operation(observed_id), || false)
+            .expect("shared UUID also resolves as direct catalog selector");
+        assert_eq!(direct.operations[0].operation_id, catalog_id);
+        assert!(direct.observed_operation_id.is_none());
         assert!(
             history
                 .read_export_snapshot(project, Latest, Operation(catalog_id), || false)
@@ -2116,16 +2114,67 @@ mod tests {
                 params![observed_id.as_uuid().as_bytes()],
             )
             .expect("tamper fingerprint");
-        let error = SqliteCatalogHistoryStore::new(shared)
+        let history = SqliteCatalogHistoryStore::new(shared);
+        for scope in [
+            CatalogExportScope::All,
+            CatalogExportScope::Operation(observed_id),
+            CatalogExportScope::ObservedOperation(observed_id),
+        ] {
+            let error = history
+                .read_export_snapshot(project, CatalogExportRevision::Latest, scope, || false)
+                .expect_err("unverified tuple refused");
+            assert_eq!(error, CatalogExportReadError::Corrupt);
+            assert!(!error.to_string().contains(&observed_id.to_string()));
+        }
+    }
+
+    #[test]
+    fn viewer_export_rejects_divergent_finite_alias_for_every_scope() {
+        let shared = SqliteStore::open_in_memory(OpenOptions::default()).expect("store");
+        let owner =
+            test_selection(test_scope("spring-fixture"), CatalogRunNamespace::RuntimeProducer);
+        seed_authority(&shared, &owner);
+        let project = owner.project_id();
+        let claim = test_claim(project, "spring-fixture", "orders");
+        publish_fixture_catalog(&shared, &owner, "divergent-alias", std::slice::from_ref(&claim));
+        let history = SqliteCatalogHistoryStore::new(shared.clone());
+        let catalog_id = history
             .read_export_snapshot(
                 project,
                 CatalogExportRevision::Latest,
-                CatalogExportScope::ObservedOperation(observed_id),
+                CatalogExportScope::All,
                 || false,
             )
-            .expect_err("unverified tuple refused");
-        assert_eq!(error, CatalogExportReadError::Corrupt);
-        assert!(!error.to_string().contains(&observed_id.to_string()));
+            .expect("catalog")
+            .operations[0]
+            .operation_id;
+        let divergent = OperationId::new();
+        {
+            let connection = shared.lock().expect("connection");
+            seed_export_recording(&connection, claim.operation(), true);
+            let transaction = connection.unchecked_transaction().expect("transaction");
+            transaction.pragma_update(None, "defer_foreign_keys", true).expect("defer references");
+            transaction
+                .execute(
+                    "UPDATE operations SET operation_id=?1 WHERE project_id=?2",
+                    params![divergent.as_uuid().as_bytes(), project.as_uuid().as_bytes()],
+                )
+                .expect("tamper alias");
+            transaction.execute("UPDATE recording_endpoint_observations SET operation_id=?1 WHERE project_id=?2",
+                params![divergent.as_uuid().as_bytes(), project.as_uuid().as_bytes()]).expect("retain backing references");
+            transaction.commit().expect("commit semantic corruption");
+        }
+        for scope in [
+            CatalogExportScope::All,
+            CatalogExportScope::Operation(catalog_id),
+            CatalogExportScope::ObservedOperation(divergent),
+        ] {
+            assert_eq!(
+                history
+                    .read_export_snapshot(project, CatalogExportRevision::Latest, scope, || false),
+                Err(CatalogExportReadError::Corrupt)
+            );
+        }
     }
 
     #[test]
@@ -2198,7 +2247,7 @@ mod tests {
             )
             .expect("next snapshot sees proof");
         assert_eq!(after.observed_operation_id, Some(observed_id));
-        assert_ne!(after.operations[0].operation_id, observed_id);
+        assert_eq!(after.operations[0].operation_id, observed_id);
         assert!(after.linked_operation_ids.contains(&after.operations[0].operation_id));
         drop(history);
         drop(shared);
