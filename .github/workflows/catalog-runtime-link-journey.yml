@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 55779297fd2df67b9085339af59dfbb36dfd6a8d
+          ref: 8d3be1544eb658389aef5748f6141051f617713d
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
@@ -37,7 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          test "$(git rev-parse HEAD)" = 55779297fd2df67b9085339af59dfbb36dfd6a8d
+          test "$(git rev-parse HEAD)" = 8d3be1544eb658389aef5748f6141051f617713d
           root="$RUNNER_TEMP/xt"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/fragments"
           export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
