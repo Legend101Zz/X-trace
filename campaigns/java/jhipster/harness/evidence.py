@@ -34,6 +34,10 @@ ACCOUNT_HANDLER = "AccountResource.getAccount"
 BANK_CREATE = "BankAccountResource.createBankAccount"
 BANK_READ = "BankAccountResource.getBankAccount"
 BANK_UPDATE = "BankAccountResource.updateBankAccount"
+# BankAccountResource.java at the campaign's pinned upstream commit imports this exact type.
+BANK_ALERT = REST_PACKAGE + "errors.BadRequestAlertException"
+EXCEPTION_TYPE_UNOBSERVED = "controller-exception-type-unobserved"
+EXCEPTION_LINK_UNOBSERVED = "controller-exception-link-unobserved"
 USER_REPO = (REPOSITORY_PACKAGE + "UserRepository.findOneWithAuthoritiesByLogin",)
 BANK_REPO = (REPOSITORY_PACKAGE + "BankAccountRepository.findOneWithEagerRelationships",)
 OP_REPO = (REPOSITORY_PACKAGE + "OperationRepository.findOneWithEagerRelationships",)
@@ -80,7 +84,7 @@ EXPECT = {
     "account-validation-errors": [
         login(),
         expect("account without name", "POST", BANK, (400,), refused_handler=BANK_CREATE),
-        expect("account with preset id", "POST", BANK, (400,), BANK_CREATE, exception="BadRequestAlertException"),
+        expect("account with preset id", "POST", BANK, (400,), BANK_CREATE, exception=BANK_ALERT),
         expect("malformed json", "POST", BANK, tuple(range(400, 500)), refused_handler=BANK_CREATE),
     ],
     "account-update-and-missing": [
@@ -90,7 +94,7 @@ EXPECT = {
                jdbc=(("update", "bank_account"),)),
         expect("get updated", "GET", BANK_ID, (200,), BANK_READ, repository=BANK_REPO, jdbc=BANK_SELECT),
         expect("update missing", "PUT", BANK_ID, (400, 404), BANK_UPDATE,
-               repository=(CRUD + "existsById",), jdbc=BANK_SELECT, exception="BadRequestAlertException"),
+               repository=(CRUD + "existsById",), jdbc=BANK_SELECT, exception=BANK_ALERT),
     ],
     "operation-with-relations": [
         login(),
@@ -168,9 +172,57 @@ def postgres_boundary(ev):
     return None
 
 
-def inspect(detail, rule, status):
+def controller_exception_problem(detail, handler, anchors, exception_type, exact_root):
+    events = detail.get("events", [])
+    throws = [ev for ev in events if ev.get("kind") == "recording_event_kind:frame_throw"]
+    typed = [ev for ev in throws if isinstance(ev.get("exception"), dict)
+             and ev["exception"].get("exceptionType") == exception_type]
+    if not typed:
+        return EXCEPTION_TYPE_UNOBSERVED
+    if (not exact_root or detail.get("nextCursor") is not None
+            or detail.get("completion") != "complete" or detail.get("incompleteEvidence")
+            or any(ev.get("kind") == "recording_event_kind:gap" or ev.get("gap") is not None for ev in events)
+            or len(anchors) != 1):
+        return EXCEPTION_LINK_UNOBSERVED
+
+    anchor, = anchors
+    event_id = anchor.get("eventId")
+    roots = [index for index, ev in enumerate(events) if ev.get("kind") == "recording_event_kind:request_update"]
+    anchor_index = next(index for index, ev in enumerate(events) if ev is anchor)
+    event_counts = Counter(ev["eventId"] for ev in events if isinstance(ev.get("eventId"), str))
+    if (not isinstance(event_id, str) or not event_id or event_counts[event_id] != 1
+            or len(roots) != 1 or roots[0] >= anchor_index
+            or not xinstr.REQUEST_SYMBOL.fullmatch(events[roots[0]].get("symbol") or "")
+            or anchor.get("fieldTruncations")):
+        return EXCEPTION_LINK_UNOBSERVED
+
+    # FRAME_THROW has its own event/frame identity. The adapter links it directly to the
+    # throwing method's entry event, so a matching display symbol or a frame ID alone is insufficient.
+    linked = [ev for ev in throws if ev.get("parentEventId") == event_id]
+    if len(linked) != 1:
+        return EXCEPTION_LINK_UNOBSERVED
+    throwing, = linked
+    throw_id = throwing.get("eventId")
+    throw_frame = throwing.get("frameId")
+    parent_frame = throwing.get("parentFrameId")
+    anchor_frame = anchor.get("frameId")
+    if (not any(ev is throwing for ev in typed)
+            or not any(ev is throwing for ev in events[anchor_index + 1:])
+            or not isinstance(throw_id, str) or not throw_id or event_counts[throw_id] != 1
+            or throwing.get("symbol") not in (handler, simple_symbol(handler))
+            or (throwing.get("source") is not None and not matches_source(throwing, handler))
+            or (throw_frame is not None and throw_frame == anchor_frame)
+            or (parent_frame is not None and parent_frame != anchor_frame)
+            or throwing.get("asyncParentEventId") or throwing.get("asyncParentFrameId")
+            or throwing.get("fieldTruncations")):
+        return EXCEPTION_LINK_UNOBSERVED
+    return None
+
+
+def inspect(detail, rule, status, *, recording_id=None):
     """Evaluate only persisted evidence from the same recording as the route."""
-    if xinstr.detail_read_incomplete(detail):
+    if (xinstr.detail_read_incomplete(detail)
+            or (rule["exception"] and recording_id is not None and detail.get("recordingId") != recording_id)):
         return ["recording-detail-incomplete"], False, False
     problems = []
     request_roots = sum(bool(xinstr.REQUEST_SYMBOL.fullmatch(ev.get("symbol") or ""))
@@ -203,12 +255,10 @@ def inspect(detail, rule, status):
         elif any(ev.get("symbol") == simple_symbol(refused) for ev in enters):
             problems.append("refused-controller-identity-unresolved")
     if rule["exception"]:
-        frame_ids = {ev["frameId"] for ev in anchors if ev.get("frameId")}
-        if not any(str(ev.get("kind", "")).endswith("frame_throw")
-                   and (app_frame(ev, handler) or ev.get("frameId") in frame_ids)
-                   and ((ev.get("exception") or {}).get("exceptionType") or "").rsplit(".", 1)[-1] == rule["exception"]
-                   for ev in detail.get("events", [])):
-            problems.append("controller-exception-type-unobserved")
+        problem = controller_exception_problem(
+            detail, handler, anchors, rule["exception"], exact_root)
+        if problem:
+            problems.append(problem)
     if rule["repository"]:
         scoped = descendants(enters, anchors)
         if repository_anchor := rule["repositoryAnchor"]:
@@ -286,7 +336,7 @@ def judge(details, expectations, phases, probes):
     verdicts, groups = {}, []
 
     def observed(rid, rule, status):
-        problems, has_status, has_source = inspect(details[rid], rule, status)
+        problems, has_status, has_source = inspect(details[rid], rule, status, recording_id=rid)
         if has_status:
             status_ids.add(rid)
         if has_source:

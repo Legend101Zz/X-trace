@@ -59,9 +59,18 @@ Launch: `xtrace run -- java -Xmx1g -jar target/jhipster-sample-application-0.0.1
 Seams: `AuthenticateController.authorize` `POST /api/authenticate`; `AccountResource.getAccount`; `UserResource.getAllUsers`;
 `BankAccountResource.{createBankAccount,getBankAccount,updateBankAccount}`, `LabelResource.*`, `OperationResource.*`; intermediate
 `BankAccountService`/`*Repository` methods; JDBC on `bank_account`, `operation`, `label`, `rel_operation__label`, `jhi_user*`.
-Auth scenarios: 401 from the Spring Security filter chain happens BEFORE any controller: the recording must show a servlet root
-with outcome 401 and `handler_unresolved`/no handler (not a wrongly attributed handler). The JWT bearer value must never appear in
-any captured surface (privacy canary: use the JWT and the synthetic passwords).
+Auth scenarios require the refusal recording for the declared route, a terminal 401/403 as expected,
+and evidence consistent with no controller entry. The HTTP workload separately observes the client's response.
+A route-less filter recording (#114) can be inventoried as a captured method and servlet-boundary outcome.
+It carries no matched template or per-request identity that can tie it to a declared route. The strict #105
+judge gives it no route credit, even when the method and HTTP status agree with the workload.
+The JWT bearer value must stay out of every captured surface.
+
+For the account create and update error paths, the pinned controller imports
+`io.github.jhipster.sample.web.rest.errors.BadRequestAlertException`. Its exact type must appear on a
+throw linked directly to the sourced controller entry by `parentEventId`. The method symbol must agree,
+and the throw has its own event identity. The public receipt distinguishes missing qualified type from
+unproven linkage using fixed problem names.
 
 ### apache/fineract 1.15.0 (JDK 21, Spring Boot 3.5.15, servlet root + Jersey, pgjdbc)
 Launch: `xtrace run -- java -Xmx2g -jar fineract-provider/build/libs/fineract-provider-1.15.0.jar --server.address=127.0.0.1` with the

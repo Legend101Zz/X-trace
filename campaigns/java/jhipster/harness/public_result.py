@@ -50,7 +50,7 @@ CHILD_STDERR_LABELS = ("host-java", "installed-payload-verify", "init", "recordi
 RECORDING_PROBLEMS = frozenset("""
 recording-detail-incomplete exact-route-root-unobserved terminal-http-status-unobserved recording-incomplete
 controller-frame-unobserved controller-source-unobserved unexpected-controller-frame
-refused-controller-identity-unresolved controller-exception-type-unobserved
+refused-controller-identity-unresolved controller-exception-type-unobserved controller-exception-link-unobserved
 repository-declaration-unobserved-in-handler repository-source-unobserved postgresql-boundary-unobserved
 jdbc-operation-unobserved unexpected-bank-account-write-frame-or-interaction workload-request-count-mismatch
 workload-http-status-mismatch burst-boundary-unverified burst-route-count-mismatch burst-capacity-drops
@@ -63,7 +63,8 @@ SEAM_PROBLEMS = {
     "outcome": ("exact-route-root-unobserved", "terminal-http-status-unobserved"),
     "completion": ("recording-incomplete",),
     "controller": ("controller-frame-unobserved", "unexpected-controller-frame",
-                   "refused-controller-identity-unresolved", "controller-exception-type-unobserved"),
+                   "refused-controller-identity-unresolved", "controller-exception-type-unobserved",
+                   "controller-exception-link-unobserved"),
     "source": ("exact-route-root-unobserved", "controller-source-unobserved"),
     "repository": ("repository-declaration-unobserved-in-handler", "repository-source-unobserved"),
     "postgresql": ("postgresql-boundary-unobserved", "jdbc-operation-unobserved"),
@@ -230,7 +231,7 @@ def inspect_problem_names(rule):
     if rule["refusedHandler"]:
         names.update(("unexpected-controller-frame", "refused-controller-identity-unresolved"))
     if rule["exception"]:
-        names.add("controller-exception-type-unobserved")
+        names.update(("controller-exception-type-unobserved", "controller-exception-link-unobserved"))
     names.update(f"repository-declaration-unobserved-in-handler({symbol})" for symbol in rule["repository"])
     names.update(f"repository-source-unobserved({symbol})" for symbol in rule["repository"]
                  if symbol.startswith("io.github.jhipster.sample.repository."))
@@ -293,6 +294,9 @@ def inspected_item(row, rule, statuses_sent, *, burst=False):
     if unread > matched or max(statuses, sources) > checked:
         return None
     if any(value > checked for key, value in histogram.items() if key != "recording-detail-incomplete"):
+        return None
+    if sum(histogram.get(name, 0) for name in (
+            "controller-exception-type-unobserved", "controller-exception-link-unobserved")) > checked:
         return None
     missing_pg = histogram.get("postgresql-boundary-unobserved", 0)
     if any(histogram.get(f"jdbc-operation-unobserved({verb} {table})", 0) < missing_pg for verb, table in rule["jdbc"]):

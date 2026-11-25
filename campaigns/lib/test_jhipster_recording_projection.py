@@ -146,6 +146,23 @@ class RecordingProjection(unittest.TestCase):
         self.assertEqual(controller["satisfiedRecordings"], 3)  # Both failures concern one serial recording.
 
 
+    def test_controller_exception_public_counts_distinguish_type_and_linkage(self):
+        for token in (evidence.EXCEPTION_TYPE_UNOBSERVED, evidence.EXCEPTION_LINK_UNOBSERVED):
+            with self.subTest(token=token):
+                doc = self.document()
+                verdict = doc["scenarios"][3]["recordingVerdict"]
+                item = verdict["expectations"][2]
+                item.update(passed=False, problems=[token])
+                verdict["passed"] = False
+                projected = self.scenario(public.recording_evidence_summary(doc), "account-validation-errors")
+                self.assertEqual(projected["failureClasses"], {token: 1})
+                self.assertEqual(projected["seams"]["controller"]["failureClasses"], {token: 1})
+                self.assertNotIn(evidence.BANK_ALERT, json.dumps(projected))
+
+                item["problems"] = [evidence.EXCEPTION_TYPE_UNOBSERVED, evidence.EXCEPTION_LINK_UNOBSERVED]
+                rule = evidence.EXPECT["account-validation-errors"][2]
+                self.assertIsNone(public.inspected_item(item, rule, [400]))
+
     def test_envelope_missing_scenario_and_wrong_or_duplicate_identity_cannot_credit_burst(self):
         for field, value in (("project", "other"), ("instrumented", False), ("instrumented", 1),
                              ("releaseAcceptance", True), ("releaseAcceptance", 0)):
