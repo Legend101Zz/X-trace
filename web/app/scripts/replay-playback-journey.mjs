@@ -16,13 +16,16 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
   const pause = () => playback.getByRole('button', { name: 'Pause', exact: true });
   const selection = page.locator('#evidence-panel > button');
   const mode = (name) => page.getByRole('tablist', { name: 'Replay view', exact: true }).getByRole('tab', { name, exact: true });
-  const go = async (sequence) => {
+  const submitGo = async (sequence) => {
     await selected.focus();
     await selected.press('Alt+j');
     const input = page.getByRole('dialog', { name: 'Go to step', exact: true }).getByRole('textbox', { name: 'Go to step number' });
     await input.fill(sequence);
     await input.press('Enter');
     await expect(selected.locator('.event-seq')).toHaveText(sequence);
+  };
+  const go = async (sequence) => {
+    await submitGo(sequence);
     // Go restores row focus on the next animation frame. Under the controlled clock,
     // complete that interaction before moving focus to an unrelated playback control.
     await page.clock.runFor(17);
@@ -44,6 +47,25 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
       if (await tab.isVisible()) await activate(tab);
       await activate(page.getByRole('tablist', { name: 'Replay view' }).getByRole('tab', { name: 'Steps', exact: true }));
       await go(events[start].sequence);
+      if (width === 320) {
+        // Both actions occur while the Go focus frame is still queued.
+        await submitGo(events[start].sequence);
+        await activate(mode('Map'));
+        await page.clock.runFor(17);
+        await expect(page.locator('.canvas-tree [aria-selected="true"]')).toBeFocused();
+        await activate(mode('Steps'));
+        await submitGo(events[start + 1].sequence);
+        const speedButton = playback.getByRole('button', { name: /^Replay speed,/ });
+        await activate(speedButton);
+        const speedDialog = page.getByRole('dialog', { name: 'Replay speed', exact: true });
+        const selectedSpeed = speedDialog.locator('button[aria-pressed="true"]');
+        await expect(selectedSpeed).toBeFocused();
+        await page.clock.runFor(17);
+        await expect(selectedSpeed).toBeFocused();
+        await selectedSpeed.press('Escape');
+        await expect(speedButton).toBeFocused();
+        await go(events[start].sequence);
+      }
       await speed(1);
       await activate(replay());
       await expect(pause()).toHaveAttribute('aria-pressed', 'true');
@@ -169,9 +191,26 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
       }
       await go(events[start].sequence);
       await activate(playback.getByRole('button', { name: /^Replay speed,/ }));
-      await expect(page.getByRole('dialog', { name: 'Replay speed' })).toContainText('display pacing, not a step duration');
+      const speedChoices = page.getByRole('dialog', { name: 'Replay speed', exact: true });
+      await expect(speedChoices).toContainText('display pacing, not a step duration');
+      const chosen = speedChoices.getByRole('button', { name: '2×', exact: true });
+      const other = speedChoices.getByRole('button', { name: '4×', exact: true });
+      await expect(speedChoices.locator('.replay-speed-options [aria-pressed="true"]')).toHaveCount(1);
+      await expect(chosen).toHaveAttribute('aria-pressed', 'true');
+      await expect(chosen).toBeFocused();
+      await chosen.press('Tab');
+      await expect(other).toBeFocused();
+      await expect(other).toHaveAttribute('aria-pressed', 'false');
+      const appearance = (button) => button.evaluate((node) => {
+        const { backgroundColor, color, fontWeight } = getComputedStyle(node);
+        return { backgroundColor, color, weight: Number(fontWeight) };
+      });
+      const [chosenStyle, otherStyle] = await Promise.all([appearance(chosen), appearance(other)]);
+      assert.notEqual(chosenStyle.backgroundColor, otherStyle.backgroundColor, 'selected speed stays visibly filled away from focus');
+      assert.notEqual(chosenStyle.color, otherStyle.color, 'selected speed uses the accent foreground');
+      assert.ok(chosenStyle.weight > otherStyle.weight, 'selected speed has a second visible distinction besides color');
       await saveScreenshot(`viewer-replay-speed-${pointer}-${width}.png`, `real-Spring-replay-speed-${pointer}`, width, height, page);
-      await page.getByRole('dialog', { name: 'Replay speed' }).getByRole('button', { name: 'Close', exact: true }).press('Escape');
+      await speedChoices.getByRole('button', { name: 'Close', exact: true }).press('Escape');
       if (width === 1280) {
         await activate(page.getByRole('button', { name: 'Settings', exact: true }));
         await page.getByRole('combobox', { name: 'Default speed', exact: true }).selectOption('0.5');

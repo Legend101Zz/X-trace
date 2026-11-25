@@ -106,6 +106,30 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     await expect(selected.locator('.event-seq')).toHaveText(sequence);
     await expect(selected).toBeFocused();
   };
+  const verifyCompactJumpClose = async () => {
+    const opener = page.locator('.replay-tools').getByRole('button', { name: 'Tools', exact: true });
+    await openPanel('jump');
+    const dialog = panel('Jump to');
+    const close = dialog.getByRole('button', { name: 'Close', exact: true });
+    const hitTest = () => close.evaluate((button) => {
+      const box = button.getBoundingClientRect();
+      const dialogBox = button.closest('[role="dialog"]').getBoundingClientRect();
+      const inside = box.width >= 44 && box.height >= 44
+        && box.left >= Math.max(0, dialogBox.left) && box.top >= Math.max(0, dialogBox.top)
+        && box.right <= Math.min(innerWidth, dialogBox.right) && box.bottom <= Math.min(innerHeight, dialogBox.bottom);
+      return inside && [[box.left + 4, box.top + 4], [box.right - 4, box.bottom - 4],
+        [(box.left + box.right) / 2, (box.top + box.bottom) / 2]]
+        .every(([x, y]) => button.contains(document.elementFromPoint(x, y)));
+    });
+    // Inspect before an automation action can scroll Close into view.
+    assert.ok(await hitTest(), 'compact Jump Close starts fully within the dialog and hit-testable');
+    await dialog.getByRole('button', { name: 'Next http call', exact: true }).press('Tab');
+    await expect(close).toBeFocused();
+    assert.ok(await hitTest(), 'compact Jump Close stays fully hit-testable with keyboard focus');
+    await activate(close);
+    await expect(dialog).toHaveCount(0);
+    await expect(opener).toBeFocused();
+  };
 
   for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1280, 900], [1440, 900]]) {
     jumpReport.beginViewport(width, height, pointer);
@@ -129,6 +153,7 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     await activate(panel('Go to step').getByRole('button', { name: 'Go', exact: true }));
     await expect(selected.locator('.event-seq')).toHaveText(events[1].sequence);
     await expect(selected).toBeFocused();
+    if (width === 320) await verifyCompactJumpClose();
     for (const [label, kinds] of categories) {
       const sequence = await selected.locator('.event-seq').textContent();
       if (pointer === 'coarse') await openPanel('filter');
@@ -255,7 +280,35 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       await verifyRows(page, events.map(({ sequence }) => sequence), timingBySequence);
     }
     await saveScreenshot(`viewer-replay-tools-${pointer}-${width}.png`, `loaded-tools-real-Spring-${pointer}`, width, height, page);
-    if (width < 1280) await activate(tools.getByRole('button', { name: 'Tools', exact: true }));
+    if (width < 1280) {
+      await activate(tools.getByRole('button', { name: 'Tools', exact: true }));
+      const menu = panel('Tools');
+      for (const name of ['Filter steps', 'Go to step', 'Jump to…', 'Show timing', 'Close']) {
+        await expect(menu.getByRole('button', { name, exact: true })).toBeVisible();
+      }
+      await expect(menu.getByRole('button', { name: 'Filter steps', exact: true })).toBeFocused();
+      await touchTargets(menu);
+      assert.ok(await menu.locator('button').evaluateAll((buttons) => buttons.length === 5 && buttons.every((button) => {
+        const box = button.getBoundingClientRect();
+        const panel = button.closest('[role="dialog"]').getBoundingClientRect();
+        return box.left >= Math.max(0, panel.left) && box.right <= Math.min(innerWidth, panel.right)
+          && box.top >= Math.max(0, panel.top) && box.bottom <= Math.min(innerHeight, panel.bottom)
+          && button.contains(document.elementFromPoint((box.left + box.right) / 2, (box.top + box.bottom) / 2));
+      })), 'compact Tools displays every action fully inside the open panel and viewport');
+      await saveScreenshot(`viewer-replay-compact-tools-open-${pointer}-${width}.png`, `open-compact-tools-real-Spring-${pointer}`, width, height, page);
+    } else {
+      // Desktop has inline controls, not a Tools dialog. Capture the real equivalent.
+      for (const name of ['Filter', 'Go to step', 'Show timing', 'Jump']) {
+        const button = tools.getByRole('button', { name, exact: true });
+        await expect(button).toBeVisible();
+        assert.ok(await button.evaluate((element) => {
+          const box = element.getBoundingClientRect();
+          return box.left >= 0 && box.right <= innerWidth && box.top >= 0 && box.bottom <= innerHeight
+            && element.contains(document.elementFromPoint((box.left + box.right) / 2, (box.top + box.bottom) / 2));
+        }), 'desktop inline tool must be fully visible and hittable');
+      }
+      await saveScreenshot(`viewer-replay-desktop-tools-inline-${pointer}-${width}.png`, `inline-desktop-tools-real-Spring-${pointer}`, width, height, page);
+    }
     await activate((width < 1280 ? panel('Tools') : tools).getByRole('button', { name: 'Show timing', exact: true }));
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), `tools fit at ${width}px ${pointer}`);
     await touchTargets(tools);

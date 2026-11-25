@@ -139,6 +139,43 @@ describe('replay wiring in the app', () => {
     expect(steps).toHaveAttribute('aria-selected', 'true');
   });
 
+  it('leaves focus with a later view change or manual focus move while Go is queued', async () => {
+    await openRecording();
+    const callbacks: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => callbacks.push(callback));
+    const cancel = vi.fn();
+    vi.stubGlobal('cancelAnimationFrame', cancel);
+    const views = screen.getByRole('tablist', { name: 'Replay view' });
+    const queueGo = (sequence: string) => {
+      const count = callbacks.length;
+      fireEvent.keyDown(document.activeElement!, { altKey: true, code: 'KeyJ' });
+      const input = screen.getByRole('textbox', { name: 'Go to step number' });
+      fireEvent.change(input, { target: { value: sequence } });
+      fireEvent.submit(input.closest('form')!);
+      expect(callbacks).toHaveLength(count + 1);
+      expect(document.querySelector('.event[aria-current="true"] .event-seq')).toHaveTextContent(sequence);
+      return { frame: callbacks[count], handle: count + 1 };
+    };
+
+    const first = queueGo('2');
+    fireEvent.click(within(views).getByRole('tab', { name: 'Map' }));
+    const selectedFrame = screen.getByRole('treeitem', { selected: true });
+    expect(selectedFrame).toHaveFocus();
+    expect(cancel).toHaveBeenCalledWith(first.handle);
+    act(() => first.frame(0));
+    expect(selectedFrame).toHaveFocus();
+
+    fireEvent.click(within(views).getByRole('tab', { name: 'Steps' }));
+    const next = queueGo('3');
+    const replay = screen.getByRole('button', { name: 'Replay' });
+    act(() => replay.focus());
+    expect(replay).toHaveFocus();
+    expect(cancel).toHaveBeenCalledWith(next.handle);
+    act(() => next.frame(0));
+    expect(replay).toHaveFocus();
+    expect(document.querySelector('.event[aria-current="true"] .event-seq')).toHaveTextContent('3');
+  });
+
   it('keeps current speed separate from persisted defaults and applies the default on a new recording', async () => {
     localStorage.setItem('xtrace.viewer.appearance', JSON.stringify({ defaultSpeed: '2' }));
     responseLinked = { ...linked, items: [linked.items[0], { ...linked.items[0], recordingId: recordingB }] };

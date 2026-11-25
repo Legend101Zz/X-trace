@@ -107,6 +107,8 @@ export function ReplayTools({ events, selected, filter, busy, onFilter, onGo, on
   const trigger = (target: Panel, label: string, ref?: RefObject<HTMLButtonElement | null>) => <button type="button" className="button"
     ref={ref} aria-expanded={panel === target || (target === 'tools' && panel !== null)} aria-controls={panel ? id : undefined}
     onClick={(event) => panel === target ? close() : open(target, event.currentTarget)}>{label}{filtered && (target === 'filter' || target === 'tools') ? ' · 1' : ''}</button>;
+  const searchLimit = <p>Only the {events.length} loaded steps ({events[0]?.sequence}–{events.at(-1)?.sequence}) are searched. Use Load earlier or Load later for other windows. No match here does not mean no match in the recording.</p>;
+  const status = <p className="replay-tool-message" id={`${id}-message`}>{message}</p>;
 
   return <div className="replay-tools" ref={root} onKeyDown={(event) => {
     if (event.key === 'Escape' && panel) { event.preventDefault(); event.stopPropagation(); close(); }
@@ -116,7 +118,8 @@ export function ReplayTools({ events, selected, filter, busy, onFilter, onGo, on
     {wide ? <>{trigger('filter', 'Filter')}{trigger('goto', 'Go to step', controlRef)}
       <button className="button" type="button" aria-pressed={preferences.timing === 'on'} disabled={!update} onClick={(event) => toggleTiming(event.currentTarget)}>Show timing</button>
       {trigger('jump', 'Jump')}</> : trigger('tools', 'Tools', controlRef)}
-    {panel ? createPortal(<div className="replay-tool-panel" ref={body} role="dialog" aria-label={{ tools: 'Tools', filter: 'Filter steps', goto: 'Go to step', jump: 'Jump to' }[panel]} id={id}>
+    {panel ? createPortal(<div className={panel === 'jump' ? 'replay-tool-panel replay-tool-panel--jump' : 'replay-tool-panel'}
+      ref={body} role="dialog" aria-label={{ tools: 'Tools', filter: 'Filter steps', goto: 'Go to step', jump: 'Jump to' }[panel]} id={id}>
       {panel === 'tools' ? <div className="replay-tool-options">
         <button className="button" type="button" onClick={() => open('filter')}>Filter steps{filtered ? ' · 1' : ''}</button>
         <button className="button" type="button" onClick={() => open('goto')}>Go to step</button>
@@ -151,7 +154,7 @@ export function ReplayTools({ events, selected, filter, busy, onFilter, onGo, on
         </form>
         <button className="link-button" type="button" onClick={() => open('jump')}>Jump to the next not-recorded stretch, exception or call…</button>
       </> : null}
-      {panel === 'jump' ? <>
+      {panel === 'jump' ? <div className="replay-jump-content">
         <h3>Jump to the previous or next</h3>
         {JUMP_KINDS.map(({ id: kind, label }) => <div className="replay-jump-row" key={kind}>
           <span>{label} · {events.filter((event) => matchesJump(event, kind)).length}</span>
@@ -174,9 +177,11 @@ export function ReplayTools({ events, selected, filter, busy, onFilter, onGo, on
               {unavailable ? <span className="sr-only" id={reasonId}>{unavailable}</span> : null}</Fragment>;
           })}
         </div>)}
-      </> : null}
-      {panel === 'goto' || panel === 'jump' ? <p>Only the {events.length} loaded steps ({events[0]?.sequence}–{events.at(-1)?.sequence}) are searched. Use Load earlier or Load later for other windows. No match here does not mean no match in the recording.</p> : null}
-      <p className="replay-tool-message" id={`${id}-message`}>{message}</p>
+        {searchLimit}
+        {status}
+      </div> : null}
+      {panel === 'goto' ? searchLimit : null}
+      {panel !== 'jump' ? status : null}
       <button className="button" type="button" onClick={() => close()}>Close</button>
     </div>, document.body) : null}
   </div>;

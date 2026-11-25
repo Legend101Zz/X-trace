@@ -87,6 +87,14 @@ export default function App() {
   const unmatchedLane = useLane();
   const detailLane = useLane();
   const authLane = useLane();
+  const goFocus = useRef<{ recordingId: string; mode: typeof replay.mode; sequence: string; frameId: string | null; cancel: () => void } | null>(null);
+
+  useLayoutEffect(() => {
+    const pending = goFocus.current;
+    if (pending && (activePane !== 'events' || selectedRecording !== pending.recordingId || replay.mode !== pending.mode
+      || replay.sequence !== pending.sequence || replay.frameId !== pending.frameId)) pending.cancel();
+  }, [activePane, replay.mode, replay.sequence, replay.frameId, selectedRecording]);
+  useLayoutEffect(() => () => goFocus.current?.cancel(), []);
 
   useEffect(() => { endpointsRef.current = endpoints; }, [endpoints]);
   useEffect(() => { linkedRef.current = linked; }, [linked]);
@@ -384,6 +392,7 @@ export default function App() {
 
   const [modeFocus, setModeFocus] = useState<{ mode: 'linear' | 'canvas'; owner: Element | null; recordingId: string } | null>(null);
   const changeReplayMode = useCallback((mode: 'linear' | 'canvas', focusSelection: boolean) => {
+    goFocus.current?.cancel();
     dispatchReplay({ type: 'set-mode', mode });
     setModeFocus(focusSelection ? { mode, owner: document.activeElement, recordingId: selectedRecording } : null);
     if (focusSelection) setActivePane('events');
@@ -492,12 +501,29 @@ export default function App() {
     selectEvent(selectedRecording, target);
     setActivePane('events');
     setAnnouncement(`Event ${sequence} selected`);
-    requestAnimationFrame(() => {
-      if (selectedRecordingRef.current !== selectedRecording) return;
-      const current = document.querySelector<HTMLElement>(replay.mode === 'linear' ? '.event[aria-current="true"]' : '.canvas-tree [aria-selected="true"]');
+    goFocus.current?.cancel();
+    const owner = document.activeElement;
+    const mode = replay.mode;
+    const cancel = () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener('focusin', cancel, true);
+      document.removeEventListener('pointerdown', cancel, true);
+      if (goFocus.current?.cancel === cancel) goFocus.current = null;
+    };
+    const frame = requestAnimationFrame(() => {
+      if (goFocus.current?.cancel !== cancel) return;
+      cancel();
+      if (selectedRecordingRef.current !== selectedRecording
+        || (document.activeElement !== owner && document.activeElement !== document.body)) return;
+      const current = document.querySelector<HTMLElement>(mode === 'linear'
+        ? '#replay-view-steps-panel .event[aria-current="true"]' : '#replay-view-map-panel .canvas-tree [aria-selected="true"]');
       if (current) focusStepControl(current);
       else document.querySelector<HTMLElement>('.replay-tools > button')?.focus({ preventScroll: true });
     });
+    // Removing the dialog can leave focus on body. An intervening focus or pointer action owns it instead.
+    goFocus.current = { recordingId: selectedRecording, mode, sequence, frameId: target.frameId ?? null, cancel };
+    document.addEventListener('focusin', cancel, true);
+    document.addEventListener('pointerdown', cancel, true);
   };
   const pickEvent = (item: ReplayEvent) => {
     selectEvent(selectedRecording, item);
