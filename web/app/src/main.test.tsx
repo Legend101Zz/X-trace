@@ -76,8 +76,8 @@ describe('endpoint-first recording viewer', () => {
     expect(document.querySelectorAll('.recording-date-heading')).toHaveLength(1);
     expect(screen.queryByText(recordingB)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingA) }));
-    expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
     fireEvent.keyDown(window, { key: 'ArrowDown', altKey: true });
     expect(window.location.hash).toBe('');
     for (const [input, init] of vi.mocked(fetch).mock.calls) {
@@ -100,7 +100,7 @@ describe('endpoint-first recording viewer', () => {
     expect(legacyRow).toHaveTextContent('No historical reason recorded');
     expect(legacyRow).not.toHaveTextContent('route_unapproved');
     fireEvent.click(legacyRow);
-    expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call')).toBeInTheDocument();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL).includes(`/${legacyV4}?limit=200`))).toBe(true);
   });
 
@@ -220,7 +220,7 @@ describe('endpoint-first recording viewer', () => {
     await waitFor(() => expect(resolveFirst).toBeDefined());
     expect(screen.queryByLabelText('Recording summary')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
-    expect(await screen.findByText('newer-recording-detail')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('newer-recording-detail')).toBeInTheDocument();
     await act(async () => { resolveFirst?.(response(detail(recordingA, 'stale-recording-detail'))); });
     expect(screen.getByRole('heading', { name: recordingB })).toBeInTheDocument();
     expect(screen.queryByText('stale-recording-detail')).not.toBeInTheDocument();
@@ -233,7 +233,7 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
-    await screen.findByText('fixture.Service.call');
+    await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call');
 
     const search = screen.getByRole('searchbox', { name: 'Search loaded requests' });
     const layout = vi.spyOn(search, 'getClientRects').mockReturnValue({ length: 0 } as DOMRectList);
@@ -270,7 +270,7 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     expect(await screen.findByText('Viewer session expired')).toBeInTheDocument();
     expect(screen.queryByText('sensitive server wording')).not.toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: 'recordings' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Requests' })).toBeInTheDocument();
   });
 
   it('keeps event stepping, truncation, unavailable evidence, and recording-scoped cursors', async () => {
@@ -291,9 +291,9 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
-    await screen.findByText('fixture.Controller.handle');
+    await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Controller.handle');
     fireEvent.keyDown(window, { key: 'ArrowDown', altKey: true });
-    expect(await screen.findByText('Events were not recorded here')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('Events were not recorded here')).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('Event 2 selected');
     fireEvent.click(screen.getByRole('button', { name: /Events were not recorded here/ }));
     expect(screen.getByText('recording_event_kind:gap')).toBeInTheDocument();
@@ -302,14 +302,14 @@ describe('endpoint-first recording viewer', () => {
     expect(screen.getByText('Per-event duration is not recorded')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: /^Values/ }));
     expect(screen.getByText(/No value bindings were recorded for this event/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
     fireEvent.click(screen.getByRole('button', { name: 'Load next window' }));
-    expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('fixture.Service.call')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /fixture\.Service\.call/ }));
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL) === `/api/v1/recordings/${recordingA}?limit=200&cursor=recording-a-next`)).toBe(true);
-    fireEvent.click(screen.getByRole('tab', { name: 'recordings' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Requests' }));
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
-    expect(await screen.findByText('recording-b-only')).toBeInTheDocument();
+    expect(await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('recording-b-only')).toBeInTheDocument();
     expect(screen.queryByText('fixture.Service.call')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Load next window' })).not.toBeInTheDocument();
 

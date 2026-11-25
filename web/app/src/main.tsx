@@ -476,7 +476,7 @@ export default function App() {
 
   return <AppShell activePane={activePane} onPane={setActivePane} announcement={announcement} auth={auth} authError={authError}
     openRecordings={openRecordings} selectedRecording={selectedRecording} onSelectRecording={activateRecording} onCloseRecording={closeRecording}
-    sourceEvent={event}>
+    sourceEvent={event} detail={detail} endpoint={activeRecordingTab?.endpoint ?? null}>
     <CatalogPanel
       active={activePane === 'recordings'}
       catalogMode={catalogMode}
@@ -501,7 +501,6 @@ export default function App() {
     <EventsPanel
       active={activePane === 'events'}
       selectedRecording={selectedRecording}
-      endpoint={activeRecordingTab?.endpoint ?? null}
       detail={detail}
       detailBusy={detailBusy}
       detailError={detailError}

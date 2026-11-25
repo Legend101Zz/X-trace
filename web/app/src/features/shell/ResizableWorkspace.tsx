@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, PointerEvent, ReactNode } from 'react';
 import { clampPanel, DEFAULT_LAYOUT, PANEL_LIMITS, readPanelLayout, savePanelLayout } from './panel-layout';
 import type { Panel, PanelLayout } from './panel-layout';
@@ -9,19 +9,21 @@ import './workspace.css';
 
 const LABELS = { requests: 'Requests', code: 'Code', inspector: 'Inspector' } as const;
 const IDS = { requests: 'recordings-panel', code: 'code-panel', inspector: 'evidence-panel' } as const;
-const STACKED = '(min-width: 700px) and (max-width: 860px)';
+const TABLET = '(min-width: 700px) and (max-width: 860px)';
+const DESKTOP = '(min-width: 861px)';
 
-function Splitter({ panel, value, lastOpen, onResize, onCommit }: {
+export type InspectorDock = 'bottom' | 'right';
+
+function Splitter({ panel, value, lastOpen, stacked, onResize, onCommit }: {
   panel: Panel;
   value: number;
   lastOpen: number;
+  stacked: boolean;
   onResize: (value: number) => void;
   onCommit: (value: number) => void;
 }) {
   const drag = useRef<{ pointer: number; from: number; startSize: number; originalSize: number; extent: number; stacked: boolean; moved: boolean } | null>(null);
   const [min, max] = PANEL_LIMITS[panel];
-  const stackedInspector = useViewport(STACKED);
-  const stacked = panel === 'inspector' && stackedInspector;
   const axis = (event: PointerEvent, stacked: boolean) => stacked ? event.clientY : event.clientX;
   function resizeByKey(event: KeyboardEvent<HTMLDivElement>) {
     const direction = stacked ? { decrease: 'ArrowDown', increase: 'ArrowUp' }
@@ -82,12 +84,13 @@ function Splitter({ panel, value, lastOpen, onResize, onCommit }: {
     onDoubleClick={() => onCommit(value ? 0 : lastOpen)} />;
 }
 
-export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, activePane }: {
+export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, activePane, dock }: {
   requests: ReactNode;
   steps: ReactNode;
   inspector: ReactNode;
   sourceEvent: ReplayEvent | undefined;
   activePane: Pane;
+  dock: InspectorDock;
 }) {
   const [layout, setLayout] = useState(readPanelLayout);
   const layoutRef = useRef(layout);
@@ -108,7 +111,10 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
     setLayout(DEFAULT_LAYOUT);
     savePanelLayout(DEFAULT_LAYOUT);
   }
-  const splitter = (panel: Panel) => <Splitter panel={panel} value={sizes[panel]} lastOpen={lastOpen[panel]}
+  const showSourcePane = useViewport(DESKTOP);
+  const tablet = useViewport(TABLET);
+  const inspectorStacked = tablet || (showSourcePane && dock === 'bottom');
+  const splitter = (panel: Panel) => <Splitter panel={panel} value={sizes[panel]} lastOpen={lastOpen[panel]} stacked={panel === 'inspector' && inspectorStacked}
     onResize={(value) => resize(panel, value)} onCommit={(value) => resize(panel, value, true)} />;
   const restore = (panel: Panel) => <button className={`button collapsed-panel collapsed-panel--${panel}`}
     type="button" onClick={() => {
@@ -120,9 +126,10 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
     '--code-size': sizes.code ? `${sizes.code}%` : '44px',
     '--inspector-size': sizes.inspector ? `${sizes.inspector}%` : '44px',
   } as CSSProperties;
-  const showSourcePane = useViewport('(min-width: 861px)');
+  const codePane = useRef<HTMLElement>(null);
+  useLayoutEffect(() => { if (codePane.current) codePane.current.scrollTop = 0; }, [sourceEvent, showSourcePane]);
 
-  return <main className="workspace viewer-workspace" data-pane={activePane} style={style}>
+  return <main className="workspace viewer-workspace" data-pane={activePane} data-dock={dock} style={style}>
     <div className="workspace-requests" data-collapsed={sizes.requests === 0}>
       {requests}{sizes.requests === 0 ? restore('requests') : null}
     </div>
@@ -130,7 +137,7 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
     <div className="steps-and-code" data-code-collapsed={sizes.code === 0}>
       {steps}
       {splitter('code')}
-      <section id="code-panel" className="workspace-code" aria-label="Code">
+      <section id="code-panel" ref={codePane} className="workspace-code" aria-label="Code">
         {sizes.code === 0 ? restore('code') : <div className="workspace-code-body">
           <h2>Code</h2>
           {showSourcePane && sourceEvent ? <CodeEvidence event={sourceEvent} /> : <p>Select an event</p>}

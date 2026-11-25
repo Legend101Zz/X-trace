@@ -3,7 +3,7 @@
 // rules over the rendered DOM): accessible names, unique ids, valid references, roving tabindex,
 // landmarks, hidden decoration, and the keyboard-only focus order. They do not replace a manual
 // screen-reader pass (UX-ACCESSIBILITY stays partial until the owner does one).
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './main';
@@ -75,8 +75,8 @@ async function openRecording() {
   render(<App />);
   fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
-  await screen.findByText('Controller.create');
-  fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+  await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('Controller.create');
+  fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
 }
 
 describe('accessibility rules over the rendered viewer', () => {
@@ -126,8 +126,9 @@ describe('accessibility rules over the rendered viewer', () => {
       order.push(`${role}:${accessibleName(active).slice(0, 40)}`);
       if (active === document.body) break;
     }
-    // The first stop is the single active tab, never an inactive one.
-    expect(order[0]).toBe('tab:events');
+    // The header request shortcut precedes the one active viewer-pane tab.
+    expect(order[0]).toBe('button:Requests');
+    expect(order.filter((entry) => ['tab:Requests', 'tab:Steps', 'tab:Inspector'].includes(entry))).toEqual(['tab:Steps']);
     expect(order.filter((entry) => entry.startsWith('treeitem:'))).toHaveLength(1);
     // Expand buttons inside the tree are reachable by pointer, not by Tab (roving tabindex).
     expect(order.some((entry) => entry.startsWith('button:Expand') || entry.startsWith('button:Collapse'))).toBe(false);
