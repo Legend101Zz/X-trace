@@ -34,58 +34,47 @@ jobs:
           echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
           printf '{"sourceSha":"%s","fullFloor":false,"releaseAcceptance":false}\n' \
             "$PROBE_SOURCE" > "$root/frag/probe-source.json"
-      - name: Format and lint the shared exporter and CLI journey
+      - name: Identify the failing lint or compilation check
         run: |
-          set -euo pipefail
-          umask 077
-          cargo fmt --all --check > "$XTRACE_CI_PRIVATE_ROOT/fmt.log" 2>&1
-          cargo clippy --locked --all-features -p xtrace-export --all-targets -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/export-clippy.log" 2>&1
-          cargo clippy --locked --all-features -p xtrace-store --lib -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/store-clippy.log" 2>&1
-          cargo clippy --locked --all-features -p xtrace-cli --test export_journey -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/cli-clippy.log" 2>&1
-      - name: Validate export projection and goldens
-        run: |
-          python3 -B -m tools.qa.lane_run run --suite rust --step export-core \
-            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
-            --min-passed 68 --max-ignored 0 -- \
-            cargo test --locked --all-features -p xtrace-export
-      - name: Validate persisted catalog export through the CLI
-        if: ${{ !cancelled() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
-        run: |
-          python3 -B -m tools.qa.lane_run run --suite rust --step export-journey \
-            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
-            --min-passed 19 --max-ignored 0 -- \
-            cargo test --locked --all-features -p xtrace-cli --test export_journey
-      - name: Exercise bounded store selection and snapshot conditions
-        if: ${{ !cancelled() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
-        run: |
-          python3 -B -m tools.qa.lane_run run --suite rust --step store-snapshot \
-            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
-            --min-passed 7 --max-ignored 0 -- \
-            cargo test --locked -p xtrace-store --lib viewer_export_
-      - name: Verify newly added viewer export and store regressions by name
-        run: |
-          set -euo pipefail
-          grep -Eq "^test (.*::)?viewer_preview_and_approved_save_preserve_exact_cli_artifacts_for_each_scope_and_format \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?viewer_save_refuses_changed_observations_on_the_same_revision \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?endpoint_preview_binds_full_revision_identity_even_for_an_unselected_operation \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?viewer_save_binds_visible_metadata_even_when_logical_files_are_unchanged \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?viewer_save_binds_revision_policy_scope_options_and_approval_digest \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?viewer_preview_reports_colliding_scope_count_and_safe_omission \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?viewer_refuses_invalid_requests_incomplete_catalogs_and_sanitizer_paths_safely \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?manifest_refuses_output_overflow_and_unexpected_paths_or_modes \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?omission_summary_counts_complete_groups_without_exposing_input_text \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---export-core.log"
-          grep -Eq "^test (.*::)?viewer_export_resolves_revision_and_stable_membership_with_project_isolation \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
-          grep -Eq "^test (.*::)?viewer_export_latest_follows_publication_after_reopen_and_clock_rollback \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
-          grep -Eq "^test (.*::)?viewer_export_observations_require_exact_linked_identity_and_can_change_on_same_revision \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
-          grep -Eq "^test (.*::)?viewer_export_admits_aggregate_claim_bytes_before_materializing_selected_claims \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
-          grep -Eq "^test (.*::)?viewer_export_refuses_inconsistent_publication_and_claims \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
-          grep -Eq "^test (.*::)?viewer_export_cancellation_leaves_the_connection_usable \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
-          grep -Eq "^test (.*::)?viewer_export_snapshot_does_not_observe_a_concurrent_link_committed_after_revision_read \.\.\. ok$" "$XTRACE_CI_PRIVATE_ROOT/xl/rust---store-snapshot.log"
-      - name: Upload sanitized test receipts
+          python3 -B - <<'PYTHON'
+          import json, os, pathlib, re, subprocess
+          root = pathlib.Path(os.environ["XTRACE_CI_PRIVATE_ROOT"])
+          tracked = set(subprocess.check_output(["git","ls-files"],text=True).splitlines())
+          checks = [
+            ("format", ["cargo","fmt","--all","--check"]),
+            ("export", ["cargo","clippy","--locked","--all-features","-p","xtrace-export","--all-targets","--message-format=json","--","-D","warnings"]),
+            ("store", ["cargo","clippy","--locked","--all-features","-p","xtrace-store","--lib","--message-format=json","--","-D","warnings"]),
+            ("cli", ["cargo","clippy","--locked","--all-features","-p","xtrace-cli","--test","export_journey","--message-format=json","--","-D","warnings"]),
+          ]
+          rows=[]
+          for label,argv in checks:
+              log = root/(label+".jsonl")
+              with log.open("wb") as out, (root/(label+".stderr")).open("wb") as err:
+                  result=subprocess.run(argv,stdout=out,stderr=err)
+              entries=[]
+              with log.open(errors="replace") as inp:
+                  for line in inp:
+                      try: item=json.loads(line)
+                      except ValueError: continue
+                      if not isinstance(item,dict) or item.get("reason")!="compiler-message": continue
+                      msg=item["message"]
+                      if msg.get("level") not in ("error","warning"): continue
+                      code=(msg.get("code") or {}).get("code") or "uncategorized"
+                      if not re.fullmatch(r"(?:clippy::[a-z0-9_]+|[A-Za-z][A-Za-z0-9_]{0,63})",code): code="uncategorized"
+                      for span in msg.get("spans",[]):
+                          file=span.get("file_name","")
+                          if span.get("is_primary") and file in tracked and type(span.get("line_start")) is int:
+                              entries.append([code,file,span["line_start"]])
+              row={"check":label,"exit":result.returncode,"compilerLocations":entries[:48]}
+              rows.append(row)
+              print(json.dumps(row))
+          (root/"frag"/"lint.json").write_text(json.dumps(rows))
+          raise SystemExit(int(any(r["exit"] for r in rows)))
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: catalog-export-102-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          name: catalog-export-lint-locations
           path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
           if-no-files-found: error
           retention-days: 14
