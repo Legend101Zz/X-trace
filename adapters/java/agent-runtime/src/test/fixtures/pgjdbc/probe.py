@@ -67,7 +67,9 @@ def check_recording(detail):
     jdbc = [event for event in events
             if event["kind"] in {"recording_event_kind:database_start",
                                  "recording_event_kind:database_end"}]
-    require(len(jdbc) == 2 * len(EXPECTED[route]), "jdbc_boundary_count")
+    expected_count = 2 * len(EXPECTED[route])
+    require(len(jdbc) == expected_count,
+            f"jdbc_boundary_count {route}: expected {expected_count}, observed {len(jdbc)}")
     for index, outcome in enumerate(EXPECTED[route]):
         method = outcome.removesuffix(".failed")
         start, end = jdbc[2 * index:2 * index + 2]
@@ -80,6 +82,7 @@ def check_recording(detail):
         for event in (start, end):
             metadata = event["interaction"]
             require(metadata is not None and metadata["driver"] == "pgjdbc"
+                    and metadata["kind"] == "interaction_kind:database"
                     and metadata["method"] == method
                     and all(not metadata[field] for field in ("schema", "table", "host"))
                     and event["exception"] is None, "jdbc_privacy_metadata")
