@@ -1,10 +1,23 @@
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ThemePreference } from './theme-preference';
 import type { AuthState, Detail, Endpoint, Pane, ReplayEvent } from './types';
 import { RecordingTabs } from './features/shell/RecordingTabs';
 import type { OpenRecording } from './features/shell/RecordingTabs';
+import type { InspectorDock } from './features/shell/ResizableWorkspace';
+import { useViewport } from './features/shell/viewport';
 import { ResizableWorkspace } from './features/shell/ResizableWorkspace';
 import { RecordingContext } from './features/shell/RecordingContext';
+
+const INSPECTOR_DOCK_KEY = 'xtrace.viewer.inspector-dock';
+
+function readInspectorDock(): InspectorDock {
+  try {
+    return window.localStorage.getItem(INSPECTOR_DOCK_KEY) === 'right' ? 'right' : 'bottom';
+  } catch {
+    return 'bottom';
+  }
+}
 
 const PANES = ['recordings', 'events', 'evidence'] as const;
 const PANE_LABELS = { recordings: 'Requests', events: 'Steps', evidence: 'Inspector' } as const;
@@ -27,9 +40,38 @@ export interface AppShellProps {
 
 /** Page chrome: header, pane tabs, live region and authentication overlays. */
 export function AppShell({ activePane, onPane, announcement, auth, authError, openRecordings, selectedRecording, onSelectRecording, onCloseRecording, sourceEvent, detail, endpoint, children }: AppShellProps) {
-  return <div className="shell viewer-shell" data-pane={activePane} data-reading={detail !== null && sourceEvent !== undefined}>
+  const [dock, setDock] = useState(readInspectorDock);
+  const requestsDrawer = useViewport('(min-width: 861px) and (max-width: 1199px)');
+  const previousPane = useRef(activePane);
+  useLayoutEffect(() => {
+    const wasOpen = previousPane.current === 'recordings';
+    previousPane.current = activePane;
+    if (!requestsDrawer || !wasOpen || activePane === 'recordings') return;
+    const focus = document.activeElement;
+    if (focus === document.body || focus?.closest('#recordings-panel')) {
+      const tab = document.getElementById(`open-recording-${selectedRecording}`);
+      (tab ?? document.getElementById('header-requests'))?.focus();
+    }
+  }, [activePane, requestsDrawer, selectedRecording]);
+
+  const closeRequests = () => {
+    onPane('events');
+    document.getElementById('header-requests')?.focus();
+  };
+  return <div className="shell viewer-shell" data-pane={activePane} data-reading={detail !== null && sourceEvent !== undefined}
+    onKeyDown={(event) => {
+      if (requestsDrawer && activePane === 'recordings' && event.key === 'Escape') {
+        event.preventDefault();
+        closeRequests();
+      }
+    }}>
     <header className="topbar">
-      <button type="button" className="button header-requests" onClick={() => {
+      <button type="button" id="header-requests" className="button header-requests"
+        aria-controls="recordings-panel" aria-expanded={activePane === 'recordings'} onClick={() => {
+        if (requestsDrawer && activePane === 'recordings') {
+          closeRequests();
+          return;
+        }
         onPane('recordings');
         requestAnimationFrame(() => document.getElementById('request-search')?.focus());
       }}>Requests</button>
@@ -48,9 +90,23 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
     </nav>
     <RecordingTabs recordings={openRecordings} selected={selectedRecording} onSelect={onSelectRecording} onClose={onCloseRecording} />
     {detail ? <RecordingContext key={detail.recordingId} detail={detail} endpoint={endpoint} event={sourceEvent} /> : null}
-    <ResizableWorkspace requests={children[0]} steps={children[1]} inspector={children[2]} sourceEvent={sourceEvent} activePane={activePane} />
+    <ResizableWorkspace requests={children[0]} steps={children[1]} inspector={children[2]} sourceEvent={sourceEvent} activePane={activePane} dock={dock} />
     <footer className="viewer-preferences">
       <span>{auth === 'ready' ? 'Local viewer connected' : auth === 'checking' ? 'Connecting to local viewer' : 'Local viewer unavailable'}</span>
+      <label className="dock-preference">Inspector dock
+        <select className="theme-select" value={dock} onChange={(event) => {
+          const next = event.currentTarget.value === 'right' ? 'right' : 'bottom';
+          setDock(next);
+          try {
+            window.localStorage.setItem(INSPECTOR_DOCK_KEY, next);
+          } catch {
+            // The preference still applies to the current viewer.
+          }
+        }}>
+          <option value="bottom">Bottom</option>
+          <option value="right">Right</option>
+        </select>
+      </label>
       <ThemePreference />
     </footer>
     <div className="sr-only" role="status" aria-live="polite">{announcement}</div>

@@ -5,7 +5,7 @@ export const STEP_ROW_LIMIT = 80;
 const ESTIMATED_ROW_HEIGHT = 60;
 const OVERSCAN = 8;
 
-function scrollOwner(list: HTMLElement) {
+export function stepScrollOwner(list: HTMLElement) {
   const content = list.closest<HTMLElement>('.steps-content');
   if (content && getComputedStyle(content).overflowY === 'auto') return content;
   return list.closest<HTMLElement>('#events-panel');
@@ -50,7 +50,7 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
 
   function captureViewport() {
     const element = list.current;
-    const owner = element && scrollOwner(element);
+    const owner = element && stepScrollOwner(element);
     if (!element || !owner || !owner.clientHeight) return;
     const top = owner.getBoundingClientRect().top - element.getBoundingClientRect().top;
     const index = firstVisible(offsets, Math.max(0, top));
@@ -63,7 +63,7 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
 
   useLayoutEffect(() => {
     const element = list.current;
-    const owner = element && scrollOwner(element);
+    const owner = element && stepScrollOwner(element);
     if (!element || !owner) return;
     for (const sequence of heights.current.keys()) if (!indexes.has(sequence)) heights.current.delete(sequence);
     const kept = anchor.current;
@@ -79,7 +79,7 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
   const mountedKey = mounted.join(',');
   useLayoutEffect(() => {
     const element = list.current;
-    const owner = element && scrollOwner(element);
+    const owner = element && stepScrollOwner(element);
     if (!element || !owner) return;
     const scrollports = new Set([
       owner,
@@ -121,7 +121,7 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
   function revealIndex(index: number) {
     const target = Math.max(0, Math.min(events.length - 1, index));
     const element = list.current;
-    const owner = element && scrollOwner(element);
+    const owner = element && stepScrollOwner(element);
     const sequence = events[target]?.sequence;
     if (!element || !owner || sequence === undefined) return;
     setFocused(sequence);

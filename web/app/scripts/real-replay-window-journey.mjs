@@ -89,10 +89,14 @@ try {
   const tab = (id) => page.getByRole('tablist', { name: 'Open recordings' }).getByRole('tab', { name: new RegExp(id) });
   const switchPane = async (name) => {
     const pane = page.getByRole('tab', { name, exact: true });
-    if (await pane.isVisible()) await pane.click();
-    else if (name === 'Requests') {
+    if (await pane.isVisible()) {
+      await pane.click();
+    } else if (name === 'Requests') {
       const drawer = page.locator('#header-requests');
-      if (await drawer.isVisible() && await drawer.getAttribute('aria-expanded') === 'false') await drawer.click();
+      if (await drawer.isVisible() && await drawer.getAttribute('aria-expanded') === 'false') {
+        await drawer.click();
+        await expect(drawer).toHaveAttribute('aria-expanded', 'true');
+      }
     }
   };
   const currentStep = page.locator('#events-panel .event[aria-current="true"]');

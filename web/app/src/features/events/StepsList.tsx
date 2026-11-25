@@ -3,7 +3,8 @@ import type { CSSProperties, ReactNode } from 'react';
 import { displaySymbol } from '../../replay/display-symbol';
 import { stepSentence } from '../../replay/step-sentence';
 import type { ReplayEvent } from '../../types';
-import { useStepWindow } from './useStepWindow';
+import { revealWithin } from '../common/reveal-within';
+import { stepScrollOwner, useStepWindow } from './useStepWindow';
 import './steps.css';
 
 export function StepsList({ events, selected, onPick, onMove }: {
@@ -20,7 +21,12 @@ export function StepsList({ events, selected, onPick, onMove }: {
   const { list, mounted, offsets, first, setFocused, revealIndex, groupSize } = useStepWindow(events, selected?.sequence);
 
   useLayoutEffect(() => {
-    if (rail.current?.contains(document.activeElement)) selectedRow.current?.focus();
+    const row = selectedRow.current;
+    const element = list.current;
+    if (!row || !element) return;
+    // A mode switch remounts Steps. Reveal the pinned selection in its own scrollport.
+    revealWithin(stepScrollOwner(element), row, 'vertical');
+    if (rail.current?.contains(document.activeElement)) row.focus({ preventScroll: true });
   }, [selected?.sequence]);
 
   useLayoutEffect(() => {
@@ -28,7 +34,7 @@ export function StepsList({ events, selected, onPick, onMove }: {
     const row = Array.from(list.current?.querySelectorAll<HTMLElement>('[data-step-sequence]') ?? [])
       .find((item) => item.dataset.stepSequence === pendingFocus.current);
     if (row) {
-      row.querySelector<HTMLButtonElement>('.event')?.focus();
+      row.querySelector<HTMLButtonElement>('.event')?.focus({ preventScroll: true });
       pendingFocus.current = undefined;
     }
   });

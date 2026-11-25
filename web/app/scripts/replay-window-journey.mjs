@@ -17,6 +17,7 @@ export async function verifyMountedWindow(page, expected) {
   const list = page.getByRole('list', { name: 'Loaded replay steps' });
   await expect(page.getByText(`${expected.length} ordered events`, { exact: true })).toBeVisible();
   const covered = new Set();
+  let peakMountedRows = 0;
   for (let sweep = 0; sweep <= expected.length && covered.size < expected.length; sweep += 1) {
     const mounted = await list.evaluate(async (element, reset) => {
       const body = element.closest('.steps-content');
@@ -31,12 +32,14 @@ export async function verifyMountedWindow(page, expected) {
       }));
     }, sweep === 0);
     assert.ok(mounted.length > 0 && mounted.length <= 80, 'Steps obeys the mounted row cap');
+    peakMountedRows = Math.max(peakMountedRows, mounted.length);
     for (const { sequence, position, count } of mounted) {
       assert.ok(count === expected.length && expected[position - 1] === sequence, 'mounted position and sequence match the read API');
       covered.add(position);
     }
   }
   assert.equal(covered.size, expected.length, 'scrolling exposes every API event in the loaded window');
+  return peakMountedRows;
 }
 
 async function pageWithoutMovingAnchor(page, button, expectedCount) {
