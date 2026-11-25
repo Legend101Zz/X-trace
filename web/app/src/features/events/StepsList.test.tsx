@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { ReplayEvent } from '../../types';
 import { StepsList } from './StepsList';
@@ -36,4 +36,23 @@ it('bounds a retained window, pins exact selection and restores a virtualized Wh
   rerender(renderList(events[159]));
   expect(tail()?.querySelector('details')).toHaveAttribute('open');
   expect(tail()?.querySelector('.event')).toHaveAttribute('aria-current', 'true');
+});
+
+it('notifies the pane when the focused nonselected row is released, without changing selection', () => {
+  const events = ['2', '4', '6'].map((sequence) => ({
+    sequence, kind: 'recording_event_kind:frame_enter', frameId: 'shared-frame', monotonicNs: '1',
+    symbol: `Synthetic ${sequence}`,
+  })) as unknown as ReplayEvent[];
+  const release = vi.fn();
+  const renderList = (window: ReplayEvent[]) => <section id="events-panel">
+    <StepsList events={window} selected={events[1]} onMove={() => undefined} onPick={() => undefined}
+      onFocusedRowReleased={release} />
+  </section>;
+  const { rerender } = render(renderList(events));
+  const discarded = screen.getByRole('button', { name: /Called Synthetic 2/ });
+  act(() => discarded.focus());
+  expect(discarded).toHaveFocus();
+  rerender(renderList(events.slice(1)));
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole('button', { name: /Called Synthetic 4/ })).toHaveAttribute('aria-current', 'true');
 });

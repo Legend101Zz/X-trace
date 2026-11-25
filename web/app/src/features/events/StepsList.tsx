@@ -7,18 +7,25 @@ import { revealWithin } from '../common/reveal-within';
 import { stepScrollOwner, useStepWindow } from './useStepWindow';
 import './steps.css';
 
-export function StepsList({ events, selected, onPick, onMove }: {
+export function StepsList({ events, selected, onPick, onMove, onFocusedRowReleased }: {
   events: readonly ReplayEvent[];
   selected: ReplayEvent | undefined;
   onPick: (event: ReplayEvent) => void;
   onMove: (direction: -1 | 1) => void;
+  onFocusedRowReleased?: () => void;
 }) {
   const rail = useRef<HTMLDivElement>(null);
   const selectedRow = useRef<HTMLButtonElement>(null);
   const pendingFocus = useRef<string | undefined>(undefined);
   const [browseSequence, setBrowseSequence] = useState<string>();
   const [disclosures, setDisclosures] = useState<ReadonlySet<string>>(new Set());
-  const { list, mounted, offsets, first, setFocused, revealIndex, groupSize } = useStepWindow(events, selected?.sequence);
+  const { list, mounted, offsets, first, focused, setFocused, revealIndex, groupSize } = useStepWindow(events, selected?.sequence);
+
+  useLayoutEffect(() => {
+    if (focused === undefined || events.some(({ sequence }) => sequence === focused)) return;
+    setFocused(undefined);
+    if (document.activeElement === document.body) onFocusedRowReleased?.();
+  }, [events, focused, onFocusedRowReleased, setFocused]);
 
   useLayoutEffect(() => {
     const row = selectedRow.current;

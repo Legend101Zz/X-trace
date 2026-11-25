@@ -1,6 +1,7 @@
 import { useState } from 'react';
+import type { Ref } from 'react';
 
-export function ReplayWindows({ prevCursor, nextCursor, count, busy, startKnown, released, onChange, onJump }: {
+export function ReplayWindows({ prevCursor, nextCursor, count, busy, startKnown, released, onChange, onJump, searchRef }: {
   prevCursor: string | null;
   nextCursor: string | null;
   count: number;
@@ -9,6 +10,7 @@ export function ReplayWindows({ prevCursor, nextCursor, count, busy, startKnown,
   released: 'earlier' | 'later' | null;
   onChange: (direction: 'earlier' | 'later') => void;
   onJump: (sequence: string) => void;
+  searchRef: Ref<HTMLInputElement>;
 }) {
   const [sequence, setSequence] = useState('');
   return <section className="replay-windows" aria-label="Loaded event window">
@@ -26,7 +28,7 @@ export function ReplayWindows({ prevCursor, nextCursor, count, busy, startKnown,
       if (/^\d+$/.test(sequence.trim())) onJump(sequence.trim());
     }}>
       <label htmlFor="jump-event-sequence" id="jump-event-sequence-label">Loaded event sequence</label>
-      <input type="text" id="jump-event-sequence" aria-labelledby="jump-event-sequence-label" inputMode="numeric"
+      <input ref={searchRef} type="text" id="jump-event-sequence" aria-labelledby="jump-event-sequence-label" inputMode="numeric"
         pattern="[0-9]+" required value={sequence} onChange={(event) => setSequence(event.currentTarget.value)} />
       <button className="button" type="submit" disabled={busy}>Go to event</button>
     </form> : null}

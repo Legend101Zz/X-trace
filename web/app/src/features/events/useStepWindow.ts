@@ -1,4 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { revealWithin } from '../common/reveal-within';
 import type { ReplayEvent } from '../../types';
 
 export const STEP_ROW_LIMIT = 80;
@@ -8,7 +9,12 @@ const OVERSCAN = 8;
 export function stepScrollOwner(list: HTMLElement) {
   const content = list.closest<HTMLElement>('.steps-content');
   if (content && getComputedStyle(content).overflowY === 'auto') return content;
-  return list.closest<HTMLElement>('#events-panel');
+  return list.closest<HTMLElement>('#events-panel') ?? list.closest<HTMLElement>('.event-rail');
+}
+
+export function focusStepControl(control: HTMLElement) {
+  revealWithin(stepScrollOwner(control), control, 'vertical');
+  control.focus({ preventScroll: true });
 }
 
 function firstVisible(offsets: readonly number[], top: number) {
@@ -131,5 +137,5 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
     return sequence;
   }
 
-  return { list, mounted, offsets, first, setFocused, revealIndex, groupSize: OVERSCAN + 1 };
+  return { list, mounted, offsets, first, focused, setFocused, revealIndex, groupSize: OVERSCAN + 1 };
 }

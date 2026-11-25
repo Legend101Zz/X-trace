@@ -433,10 +433,31 @@ describe('replay wiring in the app', () => {
     expect(reports).toHaveTextContent('future_persisted_code');
     expect(within(reports).queryByRole('button', { name: /Go to event/ })).not.toBeInTheDocument();
 
-    fireEvent.click(within(loaded).getByRole('button', { name: 'Go to event 2' }));
-    const gapRow = screen.getByRole('button', { name: /9007199254740993 events were not recorded here/ });
+    const go = within(loaded).getByRole('button', { name: 'Go to event 2' });
+    const gapRow = document.querySelector<HTMLButtonElement>('#events-panel [data-step-sequence="2"] .event')!;
+    expect(gapRow).toHaveTextContent('9007199254740993 events were not recorded here');
+    const focus = vi.spyOn(gapRow, 'focus');
+    fireEvent.click(go);
     expect(gapRow).toHaveAttribute('aria-current', 'true');
     await waitFor(() => expect(gapRow).toHaveFocus());
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+
+    // The same exact jump still focuses the row when the selection is already unchanged.
+    fireEvent.click(screen.getByRole('tab', { name: 'Inspector' }));
+    const sameTarget = within(inspector()).getByRole('button', { name: 'Go to event 2', hidden: true });
+    sameTarget.focus();
+    focus.mockClear();
+    fireEvent.click(sameTarget);
+    await waitFor(() => expect(gapRow).toHaveFocus());
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Inspector' }));
+    const back = within(inspector()).getByRole('button', { name: /(?:Back to|Focus) event 2/, hidden: true });
+    back.focus();
+    focus.mockClear();
+    fireEvent.click(back);
+    await waitFor(() => expect(gapRow).toHaveFocus());
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
   });
   it('shows observed zero capacity separately from a withheld adapter summary', async () => {
     responseDetail = { ...detail, capacity: { eventCap: 16, eventCount: 4, capacityDroppedEvents: '0', dropsByPriority: {} },
@@ -493,6 +514,33 @@ describe('replay wiring in the app', () => {
     const selected = screen.getByRole('button', { name: /Audit\.write/ });
     expect(selected).toHaveAttribute('aria-current', 'true');
     await waitFor(() => expect(selected).toHaveFocus());
+  });
+
+  it('moves focus to loaded-sequence search and announces when paging releases a browsed row', async () => {
+    const middle = Array.from({ length: 1_999 }, (_, index) => ev(index + 2, null, `Synthetic ${index + 2}`, nav({})));
+    responseDetail = { ...detail, events: [events[0]], nextCursor: 'middle-page' };
+    continuationPages.set('middle-page', { ...detail, events: middle, nextCursor: 'end-page' });
+    continuationPages.set('end-page', { ...detail, events: [ev(2_001, null, 'Synthetic end', nav({}))] });
+    await openRecording();
+    const controls = screen.getByRole('region', { name: 'Loaded event window' });
+    const later = within(controls).getByRole('button', { name: 'Load later' });
+    fireEvent.click(later);
+    await within(controls).findByText('2000 loaded events');
+
+    const search = within(controls).getByRole('textbox', { name: 'Loaded event sequence' });
+    fireEvent.change(search, { target: { value: '2' } });
+    fireEvent.click(within(controls).getByRole('button', { name: 'Go to event' }));
+    const kept = screen.getByRole('button', { name: /Synthetic 2(?:\s|$)/ });
+    await waitFor(() => expect(kept).toHaveFocus());
+    const browsed = within(screen.getByRole('tabpanel', { name: 'Steps' })).getByRole('button', { name: /Controller\.create/ });
+    act(() => browsed.focus());
+    expect(browsed).toHaveFocus();
+
+    fireEvent.click(later);
+    await waitFor(() => expect(search).toHaveFocus());
+    expect(live()).toHaveTextContent('The focused event was released from the loaded window.');
+    expect(browsed).not.toBeInTheDocument();
+    expect(kept).toHaveAttribute('aria-current', 'true');
   });
 
   it('rejects a continuation response for another recording without replacing the current window', async () => {

@@ -6,6 +6,8 @@ import { recentlyObserved } from './features/catalog/recording-arrivals';
 import { CatalogPanel } from './features/catalog/CatalogPanel';
 import type { OpenRecording } from './features/shell/RecordingTabs';
 import { EventsPanel } from './features/events/EventsPanel';
+import { focusStepControl, stepScrollOwner } from './features/events/useStepWindow';
+import { revealWithin } from './features/common/reveal-within';
 import { EvidencePanel } from './features/evidence/EvidencePanel';
 import { retainPage } from './retained-page';
 import { replayPage, retainReplayWindow } from './replay/window';
@@ -441,7 +443,7 @@ export default function App() {
     requestAnimationFrame(() => {
       if (selectedRecordingRef.current !== recordingId) return;
       const current = document.querySelector<HTMLElement>('.event[aria-current="true"]');
-      if (current?.querySelector('.event-seq')?.textContent === sequence) current.focus();
+      if (current && current.querySelector('.event-seq')?.textContent === sequence) focusStepControl(current);
     });
   };
 
@@ -534,6 +536,7 @@ export default function App() {
       onPickEvent={pickEvent}
       onChangeWindow={changeWindow}
       onJumpToSequence={jumpToSequence}
+      onFocusedRowReleased={() => setAnnouncement('The focused event was released from the loaded window.')}
       mode={replay.mode}
       onMode={(mode) => dispatchReplay({ type: 'set-mode', mode })}
       onSelectFrame={selectFrame}
@@ -545,9 +548,23 @@ export default function App() {
     />
     <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectionUnavailable={selectionUnavailable} onGoToMissing={goToMissing} onBackToEvent={() => {
       setActivePane('events');
+      const recordingId = selectedRecording;
       requestAnimationFrame(() => {
-        const row = document.querySelector<HTMLElement>('.event[aria-current="true"], .canvas-tree [aria-selected="true"]');
-        (row ?? document.getElementById('events-tab'))?.focus();
+        if (selectedRecordingRef.current !== recordingId) return;
+        const step = document.querySelector<HTMLElement>('#events-panel .event[aria-current="true"]');
+        if (step) {
+          focusStepControl(step);
+          return;
+        }
+        const row = document.querySelector<HTMLElement>('#events-panel .canvas-tree [aria-selected="true"]');
+        const tree = row?.closest<HTMLElement>('.canvas-tree');
+        if (row && tree) {
+          revealWithin(tree, row, 'vertical');
+          revealWithin(stepScrollOwner(tree), tree, 'vertical');
+          row.focus({ preventScroll: true });
+        } else {
+          document.getElementById('events-tab')?.focus({ preventScroll: true });
+        }
       });
     }} onNavigate={navigateToFrame} />
   </AppShell>;
