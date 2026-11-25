@@ -41,23 +41,48 @@ try {
     return result;
   };
 
+  const verifyOrderedPage = ({ sequences }, after = null) => {
+    assert.ok(sequences.length > 0, 'read API returned an empty replay page');
+    for (const sequence of sequences) {
+      assert.ok(after === null || BigInt(sequence) > BigInt(after), 'replay sequences must increase across page boundaries');
+      after = sequence;
+    }
+  };
+
   stage = 'find three real server pages';
   const initials = await Promise.all(recordingIds.map((id) => read(id)));
   const pagedIndex = initials.findIndex(({ next }) => next != null);
-  assert.ok(pagedIndex >= 0, 'bounded Spring workload must produce more than 200 persisted events');
+  assert.ok(pagedIndex >= 0, 'bounded Spring workload has a real successor');
   const recordingId = recordingIds[pagedIndex];
   const otherId = recordingIds[1 - pagedIndex];
   const first = initials[pagedIndex];
-  assert.equal(first.sequences.length, 200);
-  assert.ok(first.hasLine && initials[1 - pagedIndex].next == null);
+  verifyOrderedPage(first);
+  assert.ok(first.previous == null && initials[1 - pagedIndex].next == null);
   const middle = await read(recordingId, first.next);
+  verifyOrderedPage(middle, first.sequences.at(-1));
   assert.ok(middle.previous != null && middle.next != null, 'a real interior page must have both server-issued continuations');
   const earlier = await read(recordingId, middle.previous);
+  verifyOrderedPage(earlier);
+  assert.ok(BigInt(earlier.sequences.at(-1)) < BigInt(middle.sequences[0]));
+  assert.deepEqual(earlier.sequences, first.sequences.slice(-earlier.sequences.length),
+    'backward projection returns the budgeted suffix ending at the first forward boundary');
   const later = await read(recordingId, middle.next);
-  assert.deepEqual(earlier.sequences, first.sequences);
-  assert.equal(middle.sequences.length, 200);
-  assert.ok(later.sequences.length > 0);
-  const selectedIndex = 5;
+  verifyOrderedPage(later, middle.sequences.at(-1));
+
+  stage = 'verify more than 200 actual persisted events';
+  let observed = first.sequences.length + middle.sequences.length + later.sequences.length;
+  let hasLine = first.hasLine || middle.hasLine || later.hasLine;
+  let tail = later;
+  // Count only actual ordered events, even if byte or verified-input limits shorten each page.
+  for (let additional = 0; (observed <= 200 || !hasLine) && tail.next != null && additional < 200; additional += 1) {
+    const next = await read(recordingId, tail.next);
+    verifyOrderedPage(next, tail.sequences.at(-1));
+    observed += next.sequences.length;
+    hasLine ||= next.hasLine;
+    tail = next;
+  }
+  assert.ok(observed > 200 && hasLine, 'paged Spring recording has more than 200 persisted events including line evidence');
+  const selectedIndex = Math.min(5, middle.sequences.length - 1);
   const selected = middle.sequences[selectedIndex];
 
   const row = (id) => page.locator('.recording-list .recording').filter({ hasText: id });
