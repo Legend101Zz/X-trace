@@ -16,7 +16,7 @@ xtrace-domain = { path = "../xtrace-domain" }
 xtrace-application = { path = "../xtrace-application" }
 xtrace-protocol = { path = "../xtrace-protocol" }
 xtrace-private-storage = { path = "../xtrace-private-storage" }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["hooks"] }
 prost = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

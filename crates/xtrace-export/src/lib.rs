@@ -22,6 +22,7 @@
 
 pub mod bundle;
 pub mod canonical;
+pub mod catalog;
 pub mod curl;
 pub mod input_json;
 pub mod openapi;
@@ -30,6 +31,7 @@ pub mod projection;
 pub mod request;
 pub mod sanitize;
 pub mod validate;
+pub mod viewer;
 
 pub use request::{
     CatalogSummaryInput, ClaimInput, EffectiveState, ExampleInput, ExampleOrigin, ExportError,

@@ -148,6 +148,84 @@ pub struct ObservedOperation {
     pub recording_count: usize,
 }
 
+/// Revision selection for a viewer catalog export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogExportRevision {
+    /// The last successfully published revision of the admitted project, across scopes.
+    ///
+    /// The store resolves this again at Save. Publication order follows the committed
+    /// catalog writes, independent of revision UUID sort order or wall-clock timestamps.
+    Latest,
+    /// Exactly this published revision of the admitted project.
+    Historical(CatalogRevisionId),
+}
+
+/// Stable operation selection within the resolved revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogExportScope {
+    /// All members of the revision, including entries with unknown evidence.
+    All,
+    /// Exactly this operation, when it belongs to the revision.
+    Operation(OperationId),
+}
+
+/// Lightweight identity of one revision member used in export metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogExportOperationIdentity {
+    /// Application component in the identity.
+    pub application_component: String,
+    /// Binding key in the identity.
+    pub binding_key: String,
+    /// Canonical HTTP method.
+    pub method: String,
+    /// Normalized route template.
+    pub route_template: String,
+    /// Canonical version UUID string for this revision member.
+    pub operation_version_id: String,
+}
+
+/// Catalog export evidence read together for one admitted project.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogExportSnapshot {
+    /// Resolved revision, with the count of all of its members.
+    pub revision: RevisionEntry,
+    /// Full revision identities for the shared CLI/viewer catalog digest and application name.
+    pub catalog_identities: Vec<CatalogExportOperationIdentity>,
+    /// Selected operation views, in history order, with only their linked claim evidence.
+    pub operations: Vec<OperationView>,
+    /// Selected operation IDs that have a linked recording matching their exact endpoint tuple.
+    pub linked_operation_ids: BTreeSet<OperationId>,
+}
+
+/// Safe catalog export read outcomes. No error carries input, SQL, or host paths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CatalogExportReadError {
+    /// The admitted project has no published catalog.
+    #[error("no catalog revision is available")]
+    NoCatalog,
+    /// The historical revision does not exist in this project.
+    #[error("catalog revision was not found")]
+    RevisionNotFound,
+    /// The requested operation is not a member of the resolved revision.
+    #[error("catalog operation was not found in the revision")]
+    OperationNotFound,
+    /// The selected projection exceeds a catalog export read budget.
+    #[error("catalog export input exceeds its resource limit")]
+    LimitExceeded,
+    /// Persisted evidence needed by the projection is inconsistent.
+    #[error("catalog export evidence is inconsistent")]
+    Corrupt,
+    /// The store is temporarily locked.
+    #[error("catalog store is busy")]
+    Busy,
+    /// The caller cancelled the read.
+    #[error("catalog export read was cancelled")]
+    Cancelled,
+    /// The catalog store could not serve the read.
+    #[error("catalog store is unavailable")]
+    Unavailable,
+}
+
 /// Read port the store implements.
 pub trait CatalogHistoryPort: Send + Sync {
     /// Revisions of a project, newest first, at most `limit`.
