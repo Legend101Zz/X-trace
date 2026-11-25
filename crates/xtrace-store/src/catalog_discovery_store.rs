@@ -20,7 +20,7 @@ use xtrace_application::{
 use xtrace_domain::catalog_discovery::{
     ClaimProvenance, ClaimSourceEvidence, DiscoveryChunk, DiscoveryCompletion, DiscoveryProofError,
     DiscoveryRunFinish, DiscoveryRunGrant, DiscoveryRunStartRequest, DiscoveryScope,
-    DiscoveryScopeKind,
+    DiscoveryScopeKind, MAX_DISCOVERY_CLAIM_BYTES, ValidatedEndpointClaim,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
@@ -189,6 +189,42 @@ impl StoredClaim {
             self.source_evidence,
         )
     }
+}
+
+pub(crate) const MAX_STORED_CLAIM_JSON_BYTES: usize = 16 * 1024;
+
+fn rebuild_stored_claim(
+    digest: &[u8],
+    canonical: &[u8],
+    json: &str,
+) -> Result<ValidatedEndpointClaim, PortError> {
+    if digest.len() != 32
+        || !(1..=MAX_DISCOVERY_CLAIM_BYTES).contains(&canonical.len())
+        || !(1..=MAX_STORED_CLAIM_JSON_BYTES).contains(&json.len())
+    {
+        return Err(corruption_error());
+    }
+    let stored: StoredClaim = serde_json::from_str(json).map_err(|_| corruption_error())?;
+    let claim = stored.rebuild().map_err(|_| corruption_error())?;
+    if claim.canonical_bytes() != canonical
+        || !claim.digest().is_some_and(|hash| hash.as_bytes() == digest)
+    {
+        return Err(corruption_error());
+    }
+    Ok(claim)
+}
+
+pub(crate) fn rebuild_revision_claim(
+    digest: &[u8],
+    canonical: &[u8],
+    json: &str,
+    operation: &EndpointIdentity,
+) -> Result<ValidatedEndpointClaim, PortError> {
+    let claim = rebuild_stored_claim(digest, canonical, json)?;
+    if claim.operation() != operation {
+        return Err(corruption_error());
+    }
+    Ok(claim)
 }
 
 struct RunRow {
@@ -887,6 +923,7 @@ impl CatalogReadPort for SqliteCatalogDiscoveryStore {
             };
             if identity.fingerprint().ok().map(|hash| hash.as_bytes().to_vec())
                 != Some(stored_fingerprint)
+                || identity.method.as_str() != method
             {
                 return Err(corruption_error());
             }
@@ -946,22 +983,8 @@ impl CatalogReadPort for SqliteCatalogDiscoveryStore {
                 return Err(corruption_error());
             }
             for (claim_digest, canonical_bytes, json) in claims {
-                if canonical_bytes.len() > 8192 || json.len() > 16 * 1024 {
-                    return Err(corruption_error());
-                }
-                let stored: StoredClaim =
-                    serde_json::from_str(&json).map_err(|_| corruption_error())?;
-                let claim = stored.rebuild().map_err(|_| corruption_error())?;
-                if claim.canonical_bytes() != canonical_bytes
-                    || claim.digest().map(|digest| digest.as_bytes().to_vec()) != Some(claim_digest)
-                    || claim.operation().project_id != project_id
-                    || claim.operation().application_component != component
-                    || claim.operation().binding_key != binding
-                    || claim.operation().method.as_str() != method
-                    || claim.operation().route_template != route
-                {
-                    return Err(corruption_error());
-                }
+                let claim =
+                    rebuild_revision_claim(&claim_digest, &canonical_bytes, &json, &identity)?;
                 let claim_provenance = claim.provenance();
                 if !provenance.contains(&claim_provenance) {
                     provenance.push(claim_provenance);
@@ -1227,12 +1250,8 @@ fn load_and_verify_chunks(
         }
         let mut claims = Vec::with_capacity(claim_rows.len());
         for (digest_bytes, canonical, json) in claim_rows {
-            let stored: StoredClaim =
-                serde_json::from_str(&json).map_err(|_| corruption_error())?;
-            let claim = stored.rebuild().map_err(|_| corruption_error())?;
-            if claim.canonical_bytes() != canonical
-                || claim.digest().map(|hash| hash.as_bytes().to_vec()) != Some(digest_bytes)
-                || claim.operation().application_component != scope.application_component
+            let claim = rebuild_stored_claim(&digest_bytes, &canonical, &json)?;
+            if claim.operation().application_component != scope.application_component
                 || claim.operation().binding_key != scope.binding_key
                 || !provenance_matches_scope(claim.provenance(), scope)
             {

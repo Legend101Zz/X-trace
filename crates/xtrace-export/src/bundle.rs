@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::projection::Prepared;
+use crate::projection::{POLICY_DIGEST_FIELD, Prepared};
 use crate::{ExportError, ExportFile, ExportOutput, Omission, canonical, sanitize};
 
 fn omissions_json(omissions: &[Omission]) -> Vec<Value> {
@@ -30,7 +30,7 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
         ("curl", crate::curl::render(prepared)?),
     ];
     let mut files = Vec::new();
-    let mut omissions = Vec::new();
+    let mut omissions: Vec<_> = prepared.policy_digest_omission().into_iter().cloned().collect();
     let mut formats = Vec::new();
     for (format, output) in outputs {
         formats.push(json!({
@@ -39,11 +39,12 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
             "omissions": omissions_json(&output.omissions),
         }));
         // An OpenAPI duplicate may still be present in the other formats.
-        // Qualify omissions so a bundle never claims it dropped that operation everywhere.
+        // Keep format-specific omissions qualified. The policy digest applies to the whole bundle.
         omissions.extend(
             output
                 .omissions
                 .into_iter()
+                .filter(|o| o.what != POLICY_DIGEST_FIELD)
                 .map(|o| Omission { what: format!("{format}:{}", o.what), ..o }),
         );
         files.extend(output.files.into_iter().map(|mut file| {
@@ -55,13 +56,6 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
     }
     let policy_digest = (!prepared.revision.policy_digest.is_empty())
         .then_some(prepared.revision.policy_digest.as_str());
-    if policy_digest.is_none() {
-        omissions.push(Omission {
-            operation_id: String::new(),
-            what: "policy_digest".to_owned(),
-            reason: "not_available_in_catalog_view".to_owned(),
-        });
-    }
     omissions.sort();
     omissions.dedup();
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -88,11 +82,13 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
          openapi.yaml declares routes and required path parameters.\n\
          collection.postman.json contains requests with an empty baseUrl variable.\n\
          curl/ contains private shell recipes; all.sh only prints commands.\n\n\
-         Catalog state identifies declarations and linked observations. Handler conflicts\n\
-         and unavailable claim details are explicit. Single-claim handlers retain their\n\
-         source start line; end lines and multi-claim locations are unavailable. No request or\n\
-         response bodies were observed or retained. No trace objects or source snapshots\n\
-         are included. Nothing was sent or executed. Review recipes before running them.\n\n\
+         Catalog state identifies declarations and linked observations. Per-claim metadata\n\
+         retains recorded handler symbols, confidence, limitations and source evidence,\n\
+         including available end lines and locations from conflicting claims. Unknown fields\n\
+         and unavailable claim details are explicit. Source evidence reports unverified\n\
+         producer assertions. No request or response bodies were observed or retained.\n\
+         No trace objects or source snapshots are included. Nothing was sent or executed.\n\
+         Review recipes before running them.\n\n\
          manifest.json records revision, catalog hash, policy digest (null when unavailable),\n\
          file hashes, counts per format and omissions. OpenAPI can represent only one\n\
          operation per method and path; other scopes remain in Postman and cURL.\n\n\

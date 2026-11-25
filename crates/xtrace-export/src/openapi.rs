@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value, json};
 
 use crate::canonical;
-use crate::projection::{Conflict, Prepared, PreparedOp};
+use crate::projection::{Prepared, PreparedOp};
 use crate::request::{EffectiveState, ExportError, ExportFile, ExportOutput, Omission};
 use crate::{sanitize, validate};
 
@@ -67,14 +67,6 @@ fn operation_ids(ops: &[&PreparedOp]) -> Vec<String> {
         .collect()
 }
 
-fn conflict_json(c: &Conflict) -> Value {
-    json!({
-        "kind": c.kind,
-        "subject": c.subject,
-        "claims": c.values.iter().map(|(id, v)| json!({"claim_id": id, "value": v})).collect::<Vec<_>>(),
-    })
-}
-
 fn example_value(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
 }
@@ -118,63 +110,25 @@ fn operation_json(op: &PreparedOp, operation_id: &str) -> Value {
     }
     out.insert("responses".into(), Value::Object(responses));
 
-    let mut x = Map::new();
-    if let Some(Value::Object(metadata)) = crate::projection::catalog_metadata(op) {
-        x.extend(metadata);
-    }
-    x.insert("operation_id".into(), json!(op.operation_id));
-    x.insert("effective_state".into(), json!(op.state.name()));
-    if !op.binding_key.is_empty() {
-        x.insert("binding_key".into(), json!(op.binding_key));
-    }
-    if !op.component.is_empty() {
-        x.insert("application_component".into(), json!(op.component));
-    }
-    if !op.provenance.is_empty() {
-        x.insert("provenance".into(), json!(op.provenance));
-    }
-    if let Some(bp) = op.confidence_bp {
-        x.insert("confidence_basis_points".into(), json!(bp));
-    }
-    if !op.limitation_codes.is_empty() {
-        x.insert("limitation_codes".into(), json!(op.limitation_codes));
-    }
-    if !op.claims_available {
-        x.insert("claims_projection".into(), json!("unavailable"));
-    }
-    if !op.conflicts.is_empty() {
-        x.insert(
-            "conflicts".into(),
-            Value::Array(op.conflicts.iter().map(conflict_json).collect()),
-        );
-    }
-    if !op.handlers.is_empty() {
-        x.insert(
-            "handlers".into(),
-            Value::Array(op.handlers.iter().map(crate::projection::handler_json).collect()),
-        );
-    }
+    let mut x = crate::projection::catalog_metadata(op);
     if !op.examples.is_empty() {
-        x.insert(
-            "examples".into(),
-            Value::Array(
-                op.examples
-                    .iter()
-                    .map(|e| {
-                        // Examples never come from observed bodies (none are retained).
-                        json!({"target": e.target, "label": e.label, "origin": e.origin,
-                               "x-xtrace-observation": "inferred",
-                               "value": example_value(&e.value)})
-                    })
-                    .collect(),
-            ),
+        x["examples"] = Value::Array(
+            op.examples
+                .iter()
+                .map(|e| {
+                    // Examples never come from observed bodies (none are retained).
+                    json!({"target": e.target, "label": e.label, "origin": e.origin,
+                           "x-xtrace-observation": "inferred",
+                           "value": example_value(&e.value)})
+                })
+                .collect(),
         );
     }
     // CONTRACTS 9.1 export marker: only an Observed operation is `observed`;
     // static, registered, conflicted and unknown ones are `inferred`.
     let observation = if op.state == EffectiveState::Observed { "observed" } else { "inferred" };
     out.insert("x-xtrace-observation".into(), json!(observation));
-    out.insert("x-xtrace".into(), Value::Object(x));
+    out.insert("x-xtrace".into(), x);
     Value::Object(out)
 }
 
@@ -203,9 +157,10 @@ pub fn document(prepared: &Prepared) -> (Value, Vec<Omission>) {
             .or_default()
             .insert(op.method.to_ascii_lowercase(), operation_json(op, id));
     }
+    let rev = &prepared.revision;
+    let policy_digest = (!rev.policy_digest.is_empty()).then_some(rev.policy_digest.as_str());
     omissions.sort();
     omissions.dedup();
-    let rev = &prepared.revision;
     let title = if rev.application_name.is_empty() {
         "X-trace catalog export".to_owned()
     } else {
@@ -219,7 +174,7 @@ pub fn document(prepared: &Prepared) -> (Value, Vec<Omission>) {
             "x-xtrace": {
                 "revision_id": rev.revision_id,
                 "catalog_hash": rev.catalog_hash,
-                "policy_digest": rev.policy_digest,
+                "policy_digest": policy_digest,
                 "notice": "Generated from the X-trace catalog. effective_state says how each operation was learned; no request or response bodies were observed or retained.",
                 "omissions": omissions.iter().map(|o| json!({
                     "operation_id": o.operation_id, "what": o.what, "reason": o.reason,
