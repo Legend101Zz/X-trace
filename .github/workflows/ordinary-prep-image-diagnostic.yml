@@ -1,0 +1,102 @@
+name: Inspect pinned preparation image build
+on:
+  push:
+    branches: [codex/proof-directus-prep-image-119]
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      PRODUCT: 07927522b741afb9d82f4fc32647dbb09ea1e9f2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT }}
+          persist-credentials: false
+      - name: Check image recipe and admit private runner root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          file=campaigns/node/directus/ordinary/installed-ordinary-runtime.Dockerfile
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = e172b267641967c4440fa7e2d083e09ea1f0d812
+          test "$(git hash-object "$file")" = a2fb744b1a1082e9f31e82ec590d97a5feb04c02
+          root="$RUNNER_TEMP/xd119img"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/empty" "$root/tails"
+          echo "ROOT=$root" >> "$GITHUB_ENV"
+      - name: Build only the unchanged preparation image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          docker build --progress=plain --platform linux/amd64 --iidfile "$ROOT/image-id" --tag xtrace-camp-node:22.23.0-amd64 \
+            --file campaigns/node/directus/ordinary/installed-ordinary-runtime.Dockerfile "$ROOT/empty" \
+            >"$ROOT/image.stdout" 2>"$ROOT/image.stderr" || rc=$?
+          printf 'Pinned preparation image build exit %d\n' "$rc"
+          if (( rc )); then
+            echo 'failed=true' >> "$GITHUB_OUTPUT"
+            exit "$rc"
+          fi
+          image="$(<"$ROOT/image-id")"
+          [[ "$image" =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$(docker image inspect --format '{{.Id}}' xtrace-camp-node:22.23.0-amd64)" = "$image"
+      - name: Encrypt two bounded build-stream tails
+        if: ${{ failure() && steps.image.outputs.failed == 'true' }}
+        id: diagnostic
+        env:
+          PUBLIC_CERT: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJgaIGZvHvTO1qz7A91QyCXVCBLwwDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCB2aWV3ZXIgdmlzdWFs
+            IHJldmlldzAeFw0yNjExMjUxNzQ1MjdaFw0yNjEyMDkxNzQ1MjdaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgdmlld2VyIHZpc3VhbCByZXZpZXcwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDUCDMtoLNBiFxpd01HnkpFVMon
+            DCZYbJiETXhyeSC/ecpMarzXEZ4ju0nd4LZwjL/A4Mx9T4JBA4pdFAQDPlnOfG6N
+            J+CQToj6WgpXFWUHpJp3yqfWqRRNj2LC10+slMqtzfcMRORiIYzzco9Uavy4a4zL
+            2jtcP3ShaaD6m/AsBFkCJMmZ94cJUeTgHwdDm9ERrPU0Eo1O31CWp0Oc/lmzvLFe
+            LpjJkdXSGZYrfQfc1n+iSNu1OO2ARxd2gkJPyTSE8dS7Zxwzcpm9izZkIyx5Z3Xm
+            l11t8C3QPDcJ4lRiTI9jF81lmxKak9eIl2PmnWNg5D19nynsboEUxfkr9IWQDYt/
+            JJ36+LyBi/mRph2c7jG3IE7GqoViW+7zd6ImzoiQZajii5PPo8ZRyvVNAZ44UbsL
+            E5djCSUrPH7slC5Cu+eV3YePq8+izZDSGcfwlzrzWGQRt2+kojpy4bPX/qxWB/sO
+            F9C85rrfrjsWWczag8SZdrvBgXWm1d0gAofhGYUCAwEAAaNTMFEwHQYDVR0OBBYE
+            FKT8KNtbCqB4oRqvV+kmEM1sK0ghMB8GA1UdIwQYMBaAFKT8KNtbCqB4oRqvV+km
+            EM1sK0ghMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAH2nbGzx
+            vLlE1JVO27hw10iq3kC66kTbvwM2I4MIkaPfRQ3unmLr+f0uZ5JMJpDzQU7DyN9P
+            i8zsBRqGcA8cnvIC26SbNTX77RYzzEELsr7hl1N/Gjv+xls4IARMfrSKg5uZfPa0
+            raN7oFbJsbh45Z0296AWQ4o9uh/DmHvEo+d1frE+LbQcV6GHQwMjHlzgSjgieFfR
+            8MgJ9YxUfYnFUSdSRq2v/M2WVut9k5IaDBpFcphwUsqXbzE+maJqjGrn+wHBgqVQ
+            hLPNyiQExu/6xUExTFyz4meSDRCaK6N4DJHqWa0lRPG6dhv9jAyOC7Freh2FshLk
+            5ZvJRuUHdhKSA3VbAhr2grL/9f3z1QshohE13qgn25XIr1Vx88N0jJDcbgumqSWf
+            KBU//gL8IFFFfL15nOhhDkGgzHnV/IKeaMJVBC7D/aW5tRUWWzESBQHJR7lvu+sR
+            2eYyRl07aS451CmcdJNQg+KnIflBiYQFgPh6dAjNm2QAoH5ROQLW7Ah+TA==
+            -----END CERTIFICATE-----
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$PUBLIC_CERT" > "$ROOT/recipient.pem"
+          openssl x509 -in "$ROOT/recipient.pem" -outform DER -out "$ROOT/recipient.der"
+          echo "931ca5323fd14a29782acb5f1e52225f5dc5a94f4d680958de3e685514839dc4  $ROOT/recipient.der" | sha256sum --status -c
+          for file in image.stdout image.stderr; do
+            test ! -L "$ROOT/$file" && test -f "$ROOT/$file"
+            test "$(stat -c '%a:%h:%u' "$ROOT/$file")" = "600:1:$(id -u)"
+            tail -c 131072 "$ROOT/$file" > "$ROOT/tails/$file.tail"
+          done
+          tar -C "$ROOT/tails" -czf - image.stdout.tail image.stderr.tail | \
+            openssl cms -encrypt -binary -aes-256-gcm -outform DER -out "$ROOT/image-tails.cms" "$ROOT/recipient.pem"
+          test -s "$ROOT/image-tails.cms"
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.diagnostic.outputs.ready == 'true' }}
+        with:
+          name: pinned-image-build-encrypted-diagnostic
+          path: ${{ env.ROOT }}/image-tails.cms
+          if-no-files-found: error
+          retention-days: 3
