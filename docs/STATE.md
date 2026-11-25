@@ -83,6 +83,15 @@ do not establish a full CI pass on the combined change. See #69 handoff comments
 [7139591259](https://github.com/Legend101Zz/X-trace/issues/69#issuecomment-7139591259) and
 [7140221334](https://github.com/Legend101Zz/X-trace/issues/69#issuecomment-7140221334).
 
+The next integrated head, `32322b6445067c7a3b07c0998c622703be497b54`, passed both 23-gate floors in the
+[PR check](https://github.com/Legend101Zz/X-trace/actions/runs/45544558827) and
+[first repeat](https://github.com/Legend101Zz/X-trace/actions/runs/45544552783). Its
+[second repeat](https://github.com/Legend101Zz/X-trace/actions/runs/45544610800) failed at the JDK 17 /
+Node 22 `rust-workspace` gate after 17 passed. The long-path CLI test failed at its final open. The same test
+thread observed a ctime-only change at the shared scratch ancestor during SQLite admission. The diagnostic's
+connection to the returned failure remains unproven. The fixture now uses its own precreated private scratch
+parent on the Linux runners, retaining the real path length and init, replay and open assertions.
+
 Earlier [main CI 43214553598](https://github.com/Legend101Zz/X-trace/actions/runs/43214553598) after PR #70
 had separate private-storage admission and Java recording failures; their historical causes were not all established.
 #71 closed on evidence from PR #73's exact reviewed head and both full floors; the subsequent main run above failed

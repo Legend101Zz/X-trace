@@ -1405,13 +1405,17 @@ mod tests {
     #[test]
     fn init_with_200_plus_char_repo_path_succeeds_and_replays() {
         // End to end with a repository whose canonical path exceeds 200 characters.
-        let base = tempdir("long-path-repo");
-        let mut repo = base.clone();
+        // SQLite re-admits the data home's ancestors during open. Other command tests
+        // create siblings directly under general scratch, so CI reserves a separate parent.
+        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_IO_ROOT")
+            .map(|root| PathBuf::from(root).join("long-path-init"))
+            .unwrap_or_else(private_scratch);
+        let mut repo = tempdir_in("long-path-repo", &scratch);
         while repo.to_str().map_or(0, str::len) <= 210 {
             repo = repo.join("d".repeat(60));
         }
         std::fs::create_dir_all(&repo).expect("create long repository directory");
-        let home = tempdir("long-path-home");
+        let home = tempdir_in("long-path-home", &scratch);
         let env_reader = move |name: &str| (name == USER_DATA_HOME_ENV).then(|| home.clone());
         let canonical = resolve_repo(&repo).expect("canonical");
         assert!(canonical.to_str().expect("UTF-8").len() > 200);
@@ -1516,18 +1520,25 @@ mod tests {
         assert!(validate_safe_run_identity(Some(&"a".repeat(65)), Some("default")).is_err());
     }
 
+    fn private_scratch() -> PathBuf {
+        PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        )
+    }
+
     fn tempdir(label: &str) -> PathBuf {
+        tempdir_in(label, &private_scratch())
+    }
+
+    fn tempdir_in(label: &str, scratch: &Path) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
         // macOS clocks tick in microseconds: add a process-wide sequence so parallel tests never
         // collide on the directory name.
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let scratch = PathBuf::from(
-            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
-        );
-        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        let root = AdmittedPrivateRoot::open(scratch).expect("admitted private test scratch");
         root.create_private_child(&format!(
             "xtrace-cli-commands-{label}-{}-{sequence}-{nanos}",
             std::process::id()
