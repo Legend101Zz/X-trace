@@ -1,8 +1,16 @@
+import { Fragment } from 'react';
 import type { Recording } from '../../types';
+import { formatRecordingDates } from './recording-dates';
+import './recording-rows.css';
 
 export function RecordingRows({ items, selected, onSelect }: { items: Recording[]; selected: string; onSelect: (id: string) => void }) {
-  return <div className="recording-list">{items.map((recording) => <button className="recording" key={recording.recordingId} aria-current={selected === recording.recordingId} onClick={() => onSelect(recording.recordingId)}>
-    <span className={`status-mark status-mark--${recording.status}`} aria-hidden="true" />
-    <span><span className="recording-title">{recording.recordingId}</span><span className="recording-sub">{recording.eventCount} persisted events · {recording.openedAt}</span><span className="recording-status">{recording.status}</span>{recording.unmatchedReason ? <span className="recording-reason">{recording.unmatchedReason}</span> : recording.operationId === null ? <span className="recording-reason">No historical reason recorded</span> : null}</span>
-  </button>)}</div>;
+  const formatDate = formatRecordingDates(new Date());
+  const rows = items.map((recording) => ({ recording, date: formatDate(recording.openedAt) }));
+  return <div className="recording-list">{rows.map(({ recording, date }, index) => <Fragment key={recording.recordingId}>
+    {rows[index - 1]?.date.key !== date.key ? <h2 className="recording-date-heading">{date.day}</h2> : null}
+    <button className="recording" aria-current={selected === recording.recordingId} onClick={() => onSelect(recording.recordingId)}>
+      <span className={`status-mark status-mark--${recording.status}`} aria-hidden="true" />
+      <span><span className="recording-title">{recording.recordingId}</span><span className="recording-sub">{recording.eventCount} persisted events · {date.time === null ? 'Time unavailable' : <time dateTime={recording.openedAt}>{date.time}</time>}</span><span className="recording-status">{recording.status}</span>{recording.unmatchedReason ? <span className="recording-reason">{recording.unmatchedReason}</span> : recording.operationId === null ? <span className="recording-reason">No historical reason recorded</span> : null}</span>
+    </button>
+  </Fragment>)}</div>;
 }

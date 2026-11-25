@@ -70,7 +70,10 @@ describe('endpoint-first recording viewer', () => {
     const calls = vi.mocked(fetch).mock.calls.map(([input]) => route(input as RequestInfo | URL));
     expect(calls.some((url) => url.startsWith('/api/v1/recordings?'))).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
-    expect(await screen.findByRole('button', { name: new RegExp(recordingA) })).toBeInTheDocument();
+    const linkedRow = await screen.findByRole('button', { name: new RegExp(recordingA) });
+    expect(linkedRow).toBeInTheDocument();
+    expect(linkedRow.querySelector('time')).toHaveAttribute('datetime', linked.items[0].openedAt);
+    expect(document.querySelectorAll('.recording-date-heading')).toHaveLength(1);
     expect(screen.queryByText(recordingB)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingA) }));
     expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
@@ -89,7 +92,10 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     await screen.findByText('Operator-selected policy');
     fireEvent.click(screen.getByRole('button', { name: 'Unmatched recordings' }));
-    expect(await screen.findByRole('button', { name: new RegExp(recordingB) })).toBeInTheDocument();
+    const unmatchedRow = await screen.findByRole('button', { name: new RegExp(recordingB) });
+    expect(unmatchedRow).toBeInTheDocument();
+    expect(unmatchedRow.querySelector('time')).toHaveAttribute('datetime', unmatched.items[0].openedAt);
+    expect(document.querySelectorAll('.recording-date-heading')).toHaveLength(2);
     const legacyRow = screen.getByRole('button', { name: new RegExp(legacyV4) });
     expect(legacyRow).toHaveTextContent('No historical reason recorded');
     expect(legacyRow).not.toHaveTextContent('route_unapproved');
