@@ -12,9 +12,13 @@ READ_REASONS = ("deadline", "transport", "http-status", "schema", "duplicate-ide
                 "cursor", "page-limit", "recording-limit", "io-error", "unavailable")
 INITIAL_STATES = ("not-reached", "verified", "viewer-start", "viewer-auth", "read")
 PHASE_STATES = ("verified", "initial-unverified", "prior-unverified", "read", "deadline", "strict-serial")
-SNAPSHOT_FIELDS = (
+SNAPSHOT_V1_FIELDS = (
     "listedNewRecordings", "newRecordings", "namedMatched", "optionalNamed", "missingNamed", "capacityRejected",
     "unexpectedRoots", "unclassifiedRecordings", "unreadRecordings", "routeLess",
+)
+SNAPSHOT_V2_FIELDS = SNAPSHOT_V1_FIELDS + (
+    "unassignedRecordings", "assignedPartialRecordings", "overmatchedRequests",
+    "unmatchedSentRequests", "unaccountedRequests", "excessAccountedRequests",
 )
 MAX_COUNT = 1_000_000
 
@@ -85,6 +89,12 @@ def snapshot(details, listing, before, boundary):
             "missingNamed": sum(max(0, row["requests"] - len(matched.intersection(row["recordingIds"])))
                                 for row in boundary["routes"]),
             "capacityRejected": boundary["capacityDrops"], "unreadRecordings": len(unread),
+            "unassignedRecordings": len(fresh - named - optional),
+            "assignedPartialRecordings": len(boundary["partialRecordingIds"]),
+            "overmatchedRequests": sum(max(0, -row["missing"]) for row in boundary["routes"]),
+            "unmatchedSentRequests": abs(boundary["requests"] - sum(row["requests"] for row in boundary["routes"])),
+            "unaccountedRequests": max(0, boundary["unaccounted"]),
+            "excessAccountedRequests": max(0, -boundary["unaccounted"]),
             **{key: counts[key] for key in ("unexpectedRoots", "unclassifiedRecordings")},
             "routeLess": [{"completion": completion, "method": method, "outcome": outcome,
                            "httpStatus": status, "recordings": count}
@@ -100,9 +110,10 @@ def _read_failure(row):
             and row["stage"] in READ_STAGES and row["reason"] in READ_REASONS)
 
 
-def _snapshot(row):
-    if (not isinstance(row, dict) or set(row) != set(SNAPSHOT_FIELDS)
-            or not all(_count(row[key]) for key in SNAPSHOT_FIELDS if key != "routeLess")
+def _snapshot(row, version):
+    fields = SNAPSHOT_V1_FIELDS if version == 1 else SNAPSHOT_V2_FIELDS
+    if (not isinstance(row, dict) or set(row) != set(fields)
+            or not all(_count(row[key]) for key in fields if key != "routeLess")
             or not isinstance(row["routeLess"], list) or len(row["routeLess"]) > 400):
         return False
     seen, counted = set(), 0
@@ -120,8 +131,29 @@ def _snapshot(row):
             return False
         seen.add(key)
         counted += bucket["recordings"]
+    if version == 2 and (row["unassignedRecordings"] > row["newRecordings"]
+            or row["assignedPartialRecordings"] > row["newRecordings"] - row["unassignedRecordings"]
+            or (row["unaccountedRequests"] and row["excessAccountedRequests"])):
+        return False
     return row["listedNewRecordings"] >= row["newRecordings"] == counted + sum(row[key] for key in (
         "namedMatched", "optionalNamed", "unexpectedRoots", "unclassifiedRecordings", "unreadRecordings"))
+
+
+def _complete_snapshot(phase):
+    complete, poll = phase["lastComplete"], phase["lastCompletePoll"]
+    if (complete is None) != (poll is None):
+        return False
+    if complete is not None and (
+            phase["snapshot"] is None or not _count(poll, maximum=phase["snapshotPoll"])
+            or not poll or not _snapshot(complete, 2)
+            or complete["listedNewRecordings"] != complete["newRecordings"] or complete["unreadRecordings"] != 0
+            or (poll == phase["snapshotPoll"] and complete != phase["snapshot"])):
+        return False
+    if phase["status"] in ("verified", "strict-serial"):
+        return poll == phase["polls"]
+    if phase["status"] == "read":
+        return bool(phase["polls"]) and poll != phase["polls"]
+    return True
 
 
 def projection(value):
@@ -129,7 +161,8 @@ def projection(value):
     if not isinstance(value, dict) or set(value) != {"schemaVersion", "initial", "phases"}:
         return None
     initial, phases = value["initial"], value["phases"]
-    if (type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1
+    version = value["schemaVersion"]
+    if (type(version) is not int or version not in (1, 2)
             or not isinstance(initial, dict) or set(initial) != {"status", "failure"}
             or initial["status"] not in INITIAL_STATES
             or (not _read_failure(initial["failure"]) if initial["status"] == "read"
@@ -139,9 +172,11 @@ def projection(value):
         return None
     if len(phases) == 0 and initial["status"] != "not-reached":
         return None
+    fields = {"ordinal", "kind", "status", "polls", "failure", "snapshot", "snapshotPoll"}
+    if version == 2:
+        fields.update(("lastComplete", "lastCompletePoll"))
     for index, phase in enumerate(phases):
-        if (not isinstance(phase, dict)
-                or set(phase) != {"ordinal", "kind", "status", "polls", "failure", "snapshot", "snapshotPoll"}
+        if (not isinstance(phase, dict) or set(phase) != fields
                 or type(phase["ordinal"]) is not int or phase["ordinal"] != index + 1
                 or phase["kind"] != ("serial", "burst", "serial")[index]
                 or phase["status"] not in PHASE_STATES or not _count(phase["polls"])
@@ -149,8 +184,9 @@ def projection(value):
                     else phase["failure"] is not None)
                 or ((phase["snapshot"] is None) != (phase["snapshotPoll"] is None))
                 or (phase["snapshot"] is not None and (not _count(phase["snapshotPoll"], maximum=phase["polls"])
-                    or not phase["snapshotPoll"] or not _snapshot(phase["snapshot"])))
+                    or not phase["snapshotPoll"] or not _snapshot(phase["snapshot"], version)))
                 or (phase["status"] in ("verified", "strict-serial") and phase["snapshot"] is None)
+                or (version == 2 and not _complete_snapshot(phase))
                 or (phase["status"] == "strict-serial" and phase["kind"] != "serial")):
             return None
         if index == 0 and initial["status"] != "verified":

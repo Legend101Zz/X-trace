@@ -698,9 +698,44 @@ def boundary_manifest(doc):
         bool(observed) and manifest["firstUnverifiedPhase"] is None) else None
 
 
+def capture_projection(value):
+    if (not isinstance(value, dict) or set(value) != {"markers", "truncated", "status", "completion"}
+            or type(value["truncated"]) is not bool
+            or value["status"] not in (None, *collect_sinks.LIFECYCLE_STATES)
+            or value["completion"] not in (None, *collect_sinks.COMPLETION_STATES)):
+        return None
+    markers = value["markers"]
+    if (not isinstance(markers, dict) or set(markers) != set(collect_sinks.MARKER_CLASSES)
+            or any(count(n) is None for n in markers.values())
+            or sum(markers.values()) > collect_sinks.MARKER_LIMIT
+            or (value["truncated"] and sum(markers.values()) != collect_sinks.MARKER_LIMIT)):
+        return None
+    return value
+
+
+def first_incomplete_projection(value):
+    if (not isinstance(value, dict) or set(value) != {"cli", "api", "apiRead", "cliReadScope"}
+            or value["apiRead"] not in ("complete-read", "partial-read", "missing", "rejected")
+            or value["cliReadScope"] not in ("whole-recording", "one-page")):
+        return None
+    cli = capture_projection(value["cli"])
+    api = capture_projection(value["api"])
+    state = value["apiRead"]
+    if ((value["cli"] is not None and (cli is None or not sum(cli["markers"].values())))
+            or (value["api"] is not None and (api is None or state in ("missing", "rejected")))):
+        return None
+    return {**value, "observationPhases": "earlier-saved-api-later-cli" if state in (
+                "complete-read", "partial-read") else None,
+            "sameReadScope": state == "complete-read" and value["cliReadScope"] == "whole-recording",
+            "sharedKnownCategories": (sum(cli["markers"][key] > 0 and api["markers"][key] > 0
+                                          for key in collect_sinks.MARKER_CLASSES if key != "unclassified")
+                                      if api is not None and cli is not None else None)}
+
+
 def cli_diagnostics(doc):
     """Project the first CLI failure only from a consistent bounded collection manifest."""
-    if not isinstance(doc, dict) or doc.get("schema") != "xtrace-jhipster-cli-sinks/2":
+    if not isinstance(doc, dict) or doc.get("schema") not in (
+            "xtrace-jhipster-cli-sinks/2", "xtrace-jhipster-cli-sinks/3"):
         return None
     keys = ("listCommands", "detailCommands", "recordings", "completedDetails")
     if any(count(doc.get(key)) is None for key in keys) or type(doc.get("complete")) is not bool:
@@ -726,7 +761,17 @@ def cli_diagnostics(doc):
         if (not (type(code) is int and -255 <= code <= 255 and code != 0)
                 if failure["reason"] == "nonzero-exit" else code is not None):
             return None
-    return {**{key: doc[key] for key in keys}, "firstFailure": failure}
+    projection = {**{key: doc[key] for key in keys}, "firstFailure": failure}
+    modern = doc["schema"] == "xtrace-jhipster-cli-sinks/3"
+    has_incomplete = failure is not None and failure["reason"] == "incomplete-evidence"
+    if ("firstIncomplete" in doc) != (modern and has_incomplete):
+        return None
+    if modern and has_incomplete:
+        incomplete = first_incomplete_projection(doc["firstIncomplete"])
+        if incomplete is None:
+            return None
+        projection["firstIncomplete"] = incomplete
+    return projection
 
 
 def build_summary(root):

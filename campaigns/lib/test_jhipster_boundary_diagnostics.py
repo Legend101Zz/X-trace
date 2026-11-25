@@ -30,11 +30,12 @@ def root(symbol, *, completion="complete", status=403, outcome="responded"):
 def phase(status, *, ordinal=1, polls=0, failure=None, snapshot=None, snapshot_poll=None):
     return {"ordinal": ordinal, "kind": ("serial", "burst", "serial")[ordinal - 1],
             "status": status, "polls": polls, "failure": failure,
-            "snapshot": snapshot, "snapshotPoll": snapshot_poll}
+            "snapshot": snapshot, "snapshotPoll": snapshot_poll,
+            "lastComplete": None, "lastCompletePoll": None}
 
 
 def manifest(initial, phases, failure=None):
-    return {"schemaVersion": 1, "initial": {"status": initial, "failure": failure}, "phases": phases}
+    return {"schemaVersion": 2, "initial": {"status": initial, "failure": failure}, "phases": phases}
 
 
 class JHipsterBoundaryDiagnostics(unittest.TestCase):
@@ -108,6 +109,8 @@ class JHipsterBoundaryDiagnostics(unittest.TestCase):
         self.assertEqual((diagnostic["status"], diagnostic["polls"], diagnostic["snapshotPoll"]), ("read", 2, 1))
         self.assertEqual(diagnostic["failure"], fail["readFailure"])
         self.assertEqual(diagnostic["snapshot"]["missingNamed"], 1)
+        self.assertEqual(diagnostic["lastCompletePoll"], 1)
+        self.assertEqual(diagnostic["lastComplete"], diagnostic["snapshot"])
         self.assertNotIn(PRIVATE, json.dumps(diagnostic))
         self.assertIsNone(client.deadline)
 
@@ -127,7 +130,13 @@ class JHipsterBoundaryDiagnostics(unittest.TestCase):
         self.assertEqual(diagnostic["snapshot"], {
             "listedNewRecordings": 1, "newRecordings": 0, "namedMatched": 0, "optionalNamed": 0,
             "missingNamed": 1, "capacityRejected": 0, "unexpectedRoots": 0,
-            "unclassifiedRecordings": 0, "unreadRecordings": 0, "routeLess": []})
+            "unclassifiedRecordings": 0, "unreadRecordings": 0, "routeLess": [],
+            "unassignedRecordings": 0, "assignedPartialRecordings": 0, "overmatchedRequests": 0,
+            "unmatchedSentRequests": 0, "unaccountedRequests": 1, "excessAccountedRequests": 0})
+        self.assertEqual(diagnostic["lastCompletePoll"], 1)
+        self.assertEqual(diagnostic["lastComplete"]["namedMatched"], 1)
+        self.assertEqual(diagnostic["lastComplete"]["capacityRejected"], 3)
+        self.assertEqual(diagnostic["lastComplete"]["excessAccountedRequests"], 3)
         self.assertNotIn(PRIVATE, json.dumps(diagnostic))
         self.assertIsNotNone(diag.projection(manifest("verified", [dict(diagnostic, ordinal=1, kind="serial")])))
 
@@ -140,6 +149,25 @@ class JHipsterBoundaryDiagnostics(unittest.TestCase):
                 mock.Mock(), Path("unused"), SENT, EXPECTED, {}, 10, require_complete=True, diagnose=True)
         self.assertFalse(boundary["verified"])
         self.assertEqual(boundary["diagnostic"]["status"], "strict-serial")
+        self.assertEqual(boundary["diagnostic"]["lastComplete"]["assignedPartialRecordings"], 1)
+
+    def test_late_complete_read_only_updates_the_attempt_snapshot(self):
+        prior = {"ok": True, "details": {"unknown": root("http.request GET")}}
+        late = {"ok": True, "details": {"named": root("http.request GET /known")}}
+        with mock.patch.object(xinstr.time, "monotonic", side_effect=[1, 2, 3, 11, 12]), \
+                mock.patch.object(xinstr, "collect_api", side_effect=[prior, late]):
+            boundary = xinstr.wait_burst_boundary(mock.Mock(), Path("unused"), SENT, EXPECTED, {}, 10,
+                                                 diagnose=True)
+        diagnostic = boundary["diagnostic"]
+        self.assertFalse(boundary["verified"])
+        self.assertEqual(diagnostic["status"], "deadline")
+        self.assertEqual(diagnostic["snapshot"]["namedMatched"], 1)
+        self.assertEqual(diagnostic["lastComplete"]["unassignedRecordings"], 1)
+        self.assertEqual((diagnostic["snapshotPoll"], diagnostic["lastCompletePoll"]), (2, 1))
+        phase_row = dict(diagnostic, ordinal=1, kind="serial")
+        self.assertIsNotNone(diag.projection(manifest("verified", [phase_row])))
+        phase_row["lastCompletePoll"] = 3
+        self.assertIsNone(diag.projection(manifest("verified", [phase_row])))
 
     def test_api_read_classifies_detail_cursor_and_keeps_private_text_out(self):
         client = mock.Mock()
@@ -166,6 +194,29 @@ class JHipsterBoundaryDiagnostics(unittest.TestCase):
                 node = changed["initial"] if path[0] == "initial" else changed["phases"][0]
                 node[path[1]] = value
                 self.assertIsNone(diag.projection(changed))
+
+    def test_saved_v1_boundary_projects_original_evidence_with_no_new_fields(self):
+        snapshot = {
+            "listedNewRecordings": 23, "newRecordings": 13, "namedMatched": 12, "optionalNamed": 0,
+            "missingNamed": 8, "capacityRejected": 0, "unexpectedRoots": 0,
+            "unclassifiedRecordings": 0, "unreadRecordings": 1, "routeLess": [],
+        }
+        old_phase = {"ordinal": 1, "kind": "serial", "status": "read", "polls": 138,
+                     "failure": {"stage": "detail", "reason": "deadline"}, "snapshot": snapshot, "snapshotPoll": 138}
+        skipped = {"ordinal": 2, "kind": "burst", "status": "prior-unverified", "polls": 0,
+                   "failure": None, "snapshot": None, "snapshotPoll": None}
+        data = {"schemaVersion": 1, "initial": {"status": "verified", "failure": None},
+                "phases": [old_phase, skipped, dict(skipped, ordinal=3, kind="serial")]}
+        receipt = {"project": "jhipster", "instrumented": True, "releaseAcceptance": False,
+                   "boundariesVerified": False, "notes": {"boundaryDiagnostics": data,
+                       "orderedBoundaries": [{"kind": item["kind"], "verified": False} for item in data["phases"]]}}
+        self.assertEqual(public.boundary_manifest(receipt), dict(data, firstUnverifiedPhase=1))
+        for target, key, value in ((old_phase, "lastComplete", None), (old_phase, "private", PRIVATE),
+                                   (snapshot, "unassignedRecordings", 1), (snapshot, "private", PRIVATE)):
+            with self.subTest(key=key):
+                target[key] = value
+                self.assertIsNone(public.boundary_manifest(receipt))
+                del target[key]
 
     def test_projection_never_reports_rejected_phase_as_verified(self):
         data = manifest("verified", [phase("deadline")])

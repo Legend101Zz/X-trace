@@ -26,6 +26,69 @@ FAILURE_REASONS = (
 )
 
 
+MARKER_LIMIT = 32
+MARKER_CLASSES = ("persisted-partial", "persisted-invalid", "verification-budget",
+                  "event-gap", "pending-tail", "unclassified")
+LIFECYCLE_STATES = ("recording", "finalizing", "complete", "partial", "invalid")
+COMPLETION_STATES = ("complete", "partial", "invalid", "unavailable")
+
+
+def marker_class(marker):
+    if isinstance(marker, str) and len(marker) <= 64:
+        if marker in ("persisted_status:partial", "persisted_status:invalid"):
+            return "persisted-" + marker.split(":")[1]
+        if marker == "verification_budget_exceeded":
+            return "verification-budget"
+        gap = re.fullmatch(r"gap_event_sequence:([1-9][0-9]{0,19})", marker)
+        if gap and int(gap[1]) <= 2**64 - 1:
+            return "event-gap"
+        tail = re.fullmatch(r"durable_tail_pending:([1-9][0-9]{0,19})\.\.([1-9][0-9]{0,19})", marker)
+        if tail and int(tail[1]) <= int(tail[2]) <= 2**64 - 1:
+            return "pending-tail"
+    return "unclassified"
+
+
+def capture_evidence(doc, marker_key):
+    markers = doc.get(marker_key)
+    if not isinstance(markers, list):
+        return None
+    counts = dict.fromkeys(MARKER_CLASSES, 0)
+    for marker in islice(markers, MARKER_LIMIT):
+        counts[marker_class(marker)] += 1
+    status, completion = doc.get("status"), doc.get("completion")
+    return {"markers": counts, "truncated": len(markers) > MARKER_LIMIT,
+            "status": status if status in LIFECYCLE_STATES else None,
+            "completion": completion if completion in COMPLETION_STATES else None}
+
+
+def paired_api_evidence(api, rid):
+    """Read only the earlier saved detail for the matching CLI identity."""
+    path = api / f"recording-{rid}.json"
+    try:
+        if any(parent.is_symlink() for parent in (api, *api.parents)):
+            return "rejected", None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_OUTPUT:
+                return "rejected", None
+            payload = stream.read(MAX_OUTPUT + 1)
+            if len(payload) > MAX_OUTPUT:
+                return "rejected", None
+            doc = json.loads(payload)
+    except FileNotFoundError:
+        return "missing", None
+    except (OSError, ValueError, RecursionError):
+        return "rejected", None
+    if not isinstance(doc, dict) or doc.get("recordingId") != rid or not isinstance(doc.get("events"), list):
+        return "rejected", None
+    if "_detailReadGap" in doc or "_http" in doc:
+        return "partial-read", capture_evidence(doc, "incompleteEvidence") if "_http" not in doc else None
+    if "nextCursor" not in doc or doc["nextCursor"] is not None:
+        return "rejected", None
+    return "complete-read", capture_evidence(doc, "incompleteEvidence")
+
+
 class CollectionFailure(Exception):
     def __init__(self, reason, exit_code=None):
         self.reason = reason
@@ -46,7 +109,7 @@ def collect(root: Path, *, list_limit: int = 100, detail_limit: int = 1000) -> b
         raise ValueError("collection root is not owner-only")
     output = root / "sinks" / "cli"
     output.mkdir(parents=True, mode=0o700)
-    status = {"schema": "xtrace-jhipster-cli-sinks/2", "complete": False,
+    status = {"schema": "xtrace-jhipster-cli-sinks/3", "complete": False,
               "listCommands": 0, "detailCommands": 0, "recordings": 0,
               "completedDetails": 0, "commandExits": [], "firstFailure": None}
     env = {**os.environ, "XTRACE_DATA_HOME": str(root / "data"), "TMPDIR": str(root / "tmp")}
@@ -81,6 +144,8 @@ def collect(root: Path, *, list_limit: int = 100, detail_limit: int = 1000) -> b
             raise CollectionFailure("invalid-schema")
         return doc
 
+    api = root / "campaign" / "java" / "jhipster" / "instrumented-1" / "api"
+    first_incomplete = None
     stage = "list"
     try:
         ids, after, seen = [], None, set()
@@ -126,7 +191,9 @@ def collect(root: Path, *, list_limit: int = 100, detail_limit: int = 1000) -> b
                     raise CollectionFailure("invalid-schema")
                 if "next_cursor" not in doc:
                     raise CollectionFailure("missing-cursor")
-                if doc.get("incomplete_evidence"):
+                if "incomplete_evidence" in doc and doc["incomplete_evidence"] != []:
+                    first_incomplete = rid, capture_evidence(doc, "incomplete_evidence"), (
+                        page == 0 and doc["next_cursor"] is None)
                     raise CollectionFailure("incomplete-evidence")
                 cursor = doc["next_cursor"]
                 if cursor is None:
@@ -142,10 +209,16 @@ def collect(root: Path, *, list_limit: int = 100, detail_limit: int = 1000) -> b
         status["firstFailure"] = {"stage": stage, "reason": error.reason, "exitCode": error.exit_code}
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
         status["firstFailure"] = {"stage": stage, "reason": "io-error", "exitCode": None}
+    if first_incomplete is not None:
+        rid, evidence, cli_full_read = first_incomplete
+        api_read, api_evidence = paired_api_evidence(api, rid)
+        status["firstIncomplete"] = {
+            "cli": evidence, "api": api_evidence, "apiRead": api_read,
+            "cliReadScope": "whole-recording" if cli_full_read else "one-page",
+        }
     artifact = root / "sinks" / "recordings.zip"
     status["artifactComplete"] = False
     try:
-        api = root / "campaign" / "java" / "jhipster" / "instrumented-1" / "api"
         files = sorted(islice(api.glob("*.json"), 1025))
         if (not files or len(files) > 1024 or api.is_symlink()
                 or any(p.is_symlink() or not stat.S_ISREG(p.stat().st_mode) for p in files)

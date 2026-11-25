@@ -599,6 +599,134 @@ class CollectSinks(unittest.TestCase):
         status["firstFailure"] = {"stage": "list", "reason": "invalid-schema", "exitCode": None}
         self.assertIsNone(public.cli_diagnostics(status))
 
+    def test_first_incomplete_pairs_only_matching_saved_api_and_discards_raw_markers(self):
+        api = self.root / "campaign/java/jhipster/instrumented-1/api"
+        (api / "recording-rec-1.json").write_text(json.dumps({
+            "recordingId": "rec-1", "events": [], "nextCursor": None, "status": "partial",
+            "completion": "partial", "incompleteEvidence": ["persisted_status:partial", "gap_event_sequence:12"],
+        }))
+
+        def incomplete(args, **kwargs):
+            if args[2] == "list":
+                return self.run_cli(args, **kwargs)
+            kwargs["stdout"].write(json.dumps({
+                "recording_id": "rec-1", "events": [], "next_cursor": "private-cursor",
+                "status": "partial", "completion": "partial",
+                "incomplete_evidence": ["persisted_status:partial", "persisted_status:invalid",
+                                        "verification_budget_exceeded", "gap_event_sequence:88",
+                                        "durable_tail_pending:90..91", "private-unknown", {"private": 3}],
+            }).encode())
+            return subprocess.CompletedProcess(args, 0)
+
+        with mock.patch.object(sinks.subprocess, "run", side_effect=incomplete) as run:
+            self.assertFalse(sinks.collect(self.root))
+        self.assertEqual(run.call_count, 2)
+        status = json.loads((self.root / "sinks/cli-status.json").read_text())
+        diagnosis = public.cli_diagnostics(status)
+        self.assertEqual(diagnosis["firstFailure"], {"stage": "detail", "reason": "incomplete-evidence", "exitCode": None})
+        comparison = diagnosis["firstIncomplete"]
+        self.assertEqual(comparison["cli"]["markers"], {
+            "persisted-partial": 1, "persisted-invalid": 1, "verification-budget": 1,
+            "event-gap": 1, "pending-tail": 1, "unclassified": 2,
+        })
+        self.assertEqual(comparison["apiRead"], "complete-read")
+        self.assertEqual(comparison["api"]["completion"], "partial")
+        self.assertEqual(comparison["api"]["status"], "partial")
+        self.assertEqual(comparison["observationPhases"], "earlier-saved-api-later-cli")
+        self.assertFalse(comparison["sameReadScope"])
+        self.assertEqual(comparison["sharedKnownCategories"], 2)
+        for private in ("private-unknown", "private-cursor", "90..91", "rec-1"):
+            self.assertNotIn(private, json.dumps(diagnosis))
+        old = dict(status, schema="xtrace-jhipster-cli-sinks/2")
+        self.assertIsNone(public.cli_diagnostics(old))
+        del old["firstIncomplete"]
+        self.assertEqual(public.cli_diagnostics(old)["firstFailure"], diagnosis["firstFailure"])
+        self.assertNotIn("firstIncomplete", public.cli_diagnostics(old))
+        list_failure = dict(status, detailCommands=0, firstFailure={
+            "stage": "list", "reason": "invalid-schema", "exitCode": None,
+        })
+        self.assertIsNone(public.cli_diagnostics(list_failure))
+        status["firstIncomplete"]["cli"]["markers"]["unclassified"] = 33
+        self.assertIsNone(public.cli_diagnostics(status))
+
+    def test_private_api_pair_distinguishes_missing_rejected_and_partial_reads(self):
+        api = self.root / "campaign/java/jhipster/instrumented-1/api"
+        detail = api / "recording-rec-1.json"
+        self.assertEqual(sinks.paired_api_evidence(api, "rec-1"), ("missing", None))
+        detail.symlink_to(api / "recording-private-id.json")
+        self.assertEqual(sinks.paired_api_evidence(api, "rec-1"), ("rejected", None))
+        detail.unlink()
+        detail.write_text('{"recordingId": "other", "events": [], "nextCursor": null}')
+        self.assertEqual(sinks.paired_api_evidence(api, "rec-1"), ("rejected", None))
+        detail.write_text(json.dumps({
+            "recordingId": "rec-1", "events": [], "_detailReadGap": "private detail",
+            "incompleteEvidence": ["durable_tail_pending:5..1"] * 50,
+        }))
+        state, capture = sinks.paired_api_evidence(api, "rec-1")
+        self.assertEqual(state, "partial-read")
+        self.assertIsNone(capture["status"])
+        self.assertTrue(capture["truncated"])
+        self.assertEqual(capture["markers"]["unclassified"], sinks.MARKER_LIMIT)
+        projection = public.first_incomplete_projection({
+            "cli": capture, "api": capture, "apiRead": state, "cliReadScope": "whole-recording",
+        })
+        self.assertFalse(projection["sameReadScope"])
+        self.assertEqual(projection["sharedKnownCategories"], 0)
+        self.assertIsNone(public.first_incomplete_projection({
+            "cli": capture, "api": capture, "apiRead": "rejected", "cliReadScope": "whole-recording",
+        }))
+
+    def test_api_read_error_before_first_page_has_no_capture_marker_counts(self):
+        api = self.root / "campaign/java/jhipster/instrumented-1/api"
+        detail = api / "recording-rec-1.json"
+        doc = {"recordingId": "rec-1", "events": [], "_detailReadGap": "detail transport failure"}
+        detail.write_text(json.dumps(doc))
+        self.assertEqual(sinks.paired_api_evidence(api, "rec-1"), ("partial-read", None))
+        capture = sinks.capture_evidence({"incomplete_evidence": ["persisted_status:partial"]}, "incomplete_evidence")
+        result = public.first_incomplete_projection({
+            "cli": capture, "api": None, "apiRead": "partial-read", "cliReadScope": "whole-recording",
+        })
+        self.assertIsNone(result["api"])
+        self.assertIsNone(result["sharedKnownCategories"])
+        self.assertFalse(result["sameReadScope"])
+        del doc["_detailReadGap"]
+        doc.update(nextCursor=None, incompleteEvidence={"private": "malformed"})
+        detail.write_text(json.dumps(doc))
+        self.assertEqual(sinks.paired_api_evidence(api, "rec-1"), ("complete-read", None))
+        doc["incompleteEvidence"] = []
+        detail.write_text(json.dumps(doc))
+        state, observed = sinks.paired_api_evidence(api, "rec-1")
+        self.assertEqual(state, "complete-read")
+        self.assertEqual(sum(observed["markers"].values()), 0)
+
+    def test_malformed_cli_capture_field_stays_red_with_no_capture_marker_counts(self):
+        for markers in ({"private": "malformed"}, None, ""):
+            with self.subTest(markers=type(markers).__name__), tempfile.TemporaryDirectory(dir=self.root) as tmp:
+                root = Path(tmp)
+                api = root / "campaign/java/jhipster/instrumented-1/api"
+                api.mkdir(parents=True)
+                (api / "recording-rec-1.json").write_text(json.dumps({
+                    "recordingId": "rec-1", "events": [], "nextCursor": None, "incompleteEvidence": [],
+                }))
+
+                def incomplete(args, **kwargs):
+                    if args[2] == "list":
+                        return self.run_cli(args, **kwargs)
+                    kwargs["stdout"].write(json.dumps({
+                        "recording_id": "rec-1", "events": [], "next_cursor": None, "incomplete_evidence": markers,
+                    }).encode())
+                    return subprocess.CompletedProcess(args, 0)
+
+                with mock.patch.object(sinks.subprocess, "run", side_effect=incomplete):
+                    self.assertFalse(sinks.collect(root))
+                diagnostic = public.cli_diagnostics(json.loads((root / "sinks/cli-status.json").read_text()))
+                self.assertEqual(diagnostic["firstFailure"], {
+                    "stage": "detail", "reason": "incomplete-evidence", "exitCode": None,
+                })
+                self.assertIsNone(diagnostic["firstIncomplete"]["cli"])
+                self.assertIsNone(diagnostic["firstIncomplete"]["sharedKnownCategories"])
+                self.assertNotIn("malformed", json.dumps(diagnostic))
+
     def test_detail_paging_reports_a_repeated_cursor_as_the_first_failure(self):
         def cycle(args, **kwargs):
             if args[2] == "list":

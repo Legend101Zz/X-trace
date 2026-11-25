@@ -636,6 +636,7 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
     """Poll observable read state within the caller's remaining scenario budget; no drain sleep."""
     boundary = burst_accounting({}, sent, expectations, before, before_capacity, optional_roots)
     polls, observed, observed_poll, failure = 0, None, None, None
+    last_complete, last_complete_poll = None, None
 
     def annotate(status):
         if diagnose:
@@ -643,8 +644,15 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
             # consume time inside the polling loop or change an on-time verification.
             snapshot = (boundary_diagnostics.snapshot(observed[0], observed[1], before, observed[2])
                         if observed is not None else None)
+            complete_snapshot = None
+            if last_complete is observed:
+                complete_snapshot = snapshot
+            elif last_complete is not None:
+                details, listing, accounting = last_complete
+                complete_snapshot = boundary_diagnostics.snapshot(details, listing, before, accounting)
             boundary["diagnostic"] = {"status": status, "polls": polls, "failure": failure,
-                                      "snapshot": snapshot, "snapshotPoll": observed_poll}
+                                      "snapshot": snapshot, "snapshotPoll": observed_poll,
+                                      "lastComplete": complete_snapshot, "lastCompletePoll": last_complete_poll}
 
     client.deadline = deadline
     try:
@@ -663,7 +671,13 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
                 if "problem" in api:
                     boundary["readProblem"] = api["problem"]
                 break
-            if boundary["verified"] and time.monotonic() <= deadline:
+            # Share the verdict clock sample with the diagnostic. The extra sample on
+            # an unverified poll is needed only for ordered campaign diagnostics.
+            on_time = (diagnose or boundary["verified"]) and time.monotonic() <= deadline
+            if diagnose and on_time:
+                last_complete = observed
+                last_complete_poll = polls
+            if boundary["verified"] and on_time:
                 if require_complete and (boundary["capacityDrops"] or boundary["partialRecordingIds"]):
                     boundary["verified"] = False
                     boundary["verifiedAt"] = None
@@ -1136,7 +1150,8 @@ def capture_ordered_phases(stack: Any, scenarios: list, norm_extra: list, expect
             boundary = burst_accounting({}, sent, {}, before, counters)
             boundary.update(verified=False, verifiedAt=None, readError="prior recording boundary unverified")
             boundary["diagnostic"] = {"status": "initial-unverified" if index == 0 else "prior-unverified",
-                                      "polls": 0, "failure": None, "snapshot": None, "snapshotPoll": None}
+                                      "polls": 0, "failure": None, "snapshot": None, "snapshotPoll": None,
+                                      "lastComplete": None, "lastCompletePoll": None}
         if "diagnostic" in boundary:
             boundary["diagnostic"].update(ordinal=index + 1, kind=kind)
         boundary["preDispatchRequests"] = len(pre_dispatch_roots)
@@ -1246,7 +1261,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
                 ordered_request_attempts = len(xcamp.SENT_LOG)
                 probes = ordered_campaign.inject_probes(stack.base, canaries)
             notes["orderedBoundaries"] = [{"kind": phase.kind, **phase.boundary} for phase in phases]
-            notes["boundaryDiagnostics"] = {"schemaVersion": 1, "initial": initial_diagnostic,
+            notes["boundaryDiagnostics"] = {"schemaVersion": 2, "initial": initial_diagnostic,
                                             "phases": [phase.boundary.get("diagnostic") for phase in phases]}
         else:
             stack.up()
