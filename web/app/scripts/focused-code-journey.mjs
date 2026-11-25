@@ -141,6 +141,9 @@ try {
     const shownLocal = active.locator('.value-binding').filter({ hasText: 'descriptionPresent' });
     assert.ok(await shownLocal.locator('.value-preview').textContent() === local.value.preview,
       `selected real local preview matches the read API inline at ${width}px`);
+    assert.ok(event.source.startLine === event.line && event.source.endLine === event.line && event.line > 1,
+      'the observed Spring adapter projects the selected line without its lexical prefix');
+    await expect(active.locator('button.source-name-match')).toHaveCount(0);
     const settingsButton = page.getByRole('button', { name: 'Settings', exact: true });
     const settings = page.getByRole('dialog', { name: 'Settings' });
     await settingsButton.press('Enter');
