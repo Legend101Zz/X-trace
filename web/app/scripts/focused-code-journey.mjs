@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { chromium, expect } from '@playwright/test';
 
 const chunks = [];
@@ -8,6 +10,8 @@ assert.ok(url && recordingId, 'focused viewer context is required');
 const browser = await chromium.launch({ headless: true });
 try {
   const page = await browser.newPage();
+  const screenshotDirectory = process.env.XTRACE_FOCUSED_SCREENSHOT_DIR;
+  if (screenshotDirectory) await mkdir(screenshotDirectory, { recursive: true, mode: 0o700 });
   page.setDefaultTimeout(8000);
   const origin = new URL(url).origin;
   let externalRequests = 0;
@@ -43,7 +47,18 @@ try {
     await page.setViewportSize({ width, height });
     const steps = page.getByRole('tab', { name: 'events' });
     if (await steps.isVisible()) await steps.click();
-    await page.locator('.event').nth(index).click();
+    const outcome = page.locator('#events-panel .recording-why');
+    await expect(outcome).toHaveJSProperty('open', true);
+    const step = page.locator('#events-panel .event').nth(index);
+    await step.scrollIntoViewIfNeeded();
+    const hitIsStep = await step.evaluate((row) => {
+      const { left, right, top, bottom } = row.getBoundingClientRect();
+      const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+      return hit != null && row.contains(hit);
+    });
+    assert.ok(hitIsStep, `an actual pointer can reach the focused event with Why expanded at ${width}px`);
+    await step.click();
+    await expect(step).toHaveAttribute('aria-current', 'true');
     const code = page.getByRole('region', { name: 'Code', exact: true });
     const active = code.locator('[aria-current="location"]');
     await expect(active).toHaveCount(1);
@@ -61,6 +76,7 @@ try {
       `focused source and values fit at ${width}px`);
     const rendered = await page.locator('body').textContent();
     assert.ok(canaries.every((canary) => !rendered.includes(canary)), 'private limits hold in the focused rendered UI');
+    if (screenshotDirectory) await page.screenshot({ path: join(screenshotDirectory, `focused-code-${width}.png`), fullPage: true });
   }
   assert.equal(externalRequests, 0, 'focused viewer made a request outside loopback');
   assert.equal(browserErrors, 0, 'focused browser reported an error');
