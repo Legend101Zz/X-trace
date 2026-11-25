@@ -2,6 +2,8 @@ package dev.xtrace.agent.bootstrap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -152,8 +154,8 @@ class XTraceAgentTest {
     BootstrapBridge.frameEnter("OrderController.create");
     BootstrapBridge.frameEnter("OrderService.place");
     BootstrapBridge.frameEnter("OrderRepository.save");
-    BootstrapBridge.databaseStart();
-    BootstrapBridge.databaseEnd(false);
+    var database = BootstrapBridge.databaseStart(JdbcOperation.H2_UPDATE);
+    BootstrapBridge.databaseEnd(database, false);
     BootstrapBridge.frameExit("OrderRepository.save", false);
     BootstrapBridge.frameExit("OrderService.place", false);
     BootstrapBridge.frameExit("OrderController.create", false);
@@ -240,6 +242,34 @@ class XTraceAgentTest {
   }
 
   @Test
+  void jdbcBoundaryRequiresRequestContextAndOnlyItsOwnerCanCloseIt() {
+    CapturingSink sink = new CapturingSink();
+    assertTrue(BootstrapBridge.install(sink));
+    assertNull(BootstrapBridge.databaseStart(JdbcOperation.PGJDBC_EXECUTE));
+    assertTrue(BootstrapBridge.requestStart("GET", "/jdbc"));
+    var outer = BootstrapBridge.databaseStart(JdbcOperation.PGJDBC_EXECUTE);
+    assertNotNull(outer);
+    var nested = BootstrapBridge.databaseStart(JdbcOperation.PGJDBC_BATCH);
+    assertNull(nested);
+    BootstrapBridge.databaseEnd(nested, false);
+    BootstrapBridge.databaseEnd(outer, true);
+    BootstrapBridge.databaseEnd(outer, false);
+    var next = BootstrapBridge.databaseStart(JdbcOperation.PGJDBC_BATCH);
+    assertNotNull(next);
+    BootstrapBridge.databaseEnd(next, false);
+    BootstrapBridge.requestEnd(200, false);
+
+    var database = sink.events.stream()
+        .filter(event -> event.kind == BridgeEventKind.DATABASE_START
+            || event.kind == BridgeEventKind.DATABASE_END)
+        .toList();
+    assertEquals(List.of("pgjdbc.execute", "pgjdbc.execute.failed",
+        "pgjdbc.executeBatch", "pgjdbc.executeBatch"), database.stream().map(Captured::symbol).toList());
+    assertEquals(database.get(0).id, database.get(1).parent);
+    assertEquals(database.get(2).id, database.get(3).parent);
+  }
+
+  @Test
   void rejectedEventsNeverBecomeParentsOfLaterAcceptedEvents() {
     CapturingSink sink = new CapturingSink();
     sink.rejectSymbol = "OrderRepository.save";
@@ -248,8 +278,8 @@ class XTraceAgentTest {
     BootstrapBridge.frameEnter("OrderController.create");
     BootstrapBridge.frameEnter("OrderService.place");
     BootstrapBridge.frameEnter("OrderRepository.save");
-    BootstrapBridge.databaseStart();
-    BootstrapBridge.databaseEnd(false);
+    var database = BootstrapBridge.databaseStart(JdbcOperation.H2_UPDATE);
+    BootstrapBridge.databaseEnd(database, false);
     BootstrapBridge.frameExit("OrderRepository.save", false);
     BootstrapBridge.frameExit("OrderService.place", false);
     BootstrapBridge.frameExit("OrderController.create", false);

@@ -95,7 +95,7 @@ public final class AgentRuntime {
       BoundedEventQueue queue = new BoundedEventQueue(8192, 2L * 1024 * 1024);
       sink = new RuntimeBridgeSink(queue);
       sink.useScope(config.scope());
-      writer = new RecordingWriter(session, queue, sink);
+      writer = new RecordingWriter(session, queue, sink, !attach);
       FixtureInstrumentation.CaptureLimitations limitations =
           new FixtureInstrumentation.CaptureLimitations();
       sink.untransformedCount(limitations::count);
