@@ -10,9 +10,13 @@
 }
 .viewer-dialog:has(.export-sheet)::backdrop { background: var(--scrim); }
 .viewer-dialog:has(.export-sheet) .viewer-dialog-body { padding: 0; }
+.viewer-dialog:has(.export-sheet) .viewer-dialog-header { flex-wrap: wrap; gap: .75rem; }
+.viewer-dialog:has(.export-sheet) .viewer-dialog-header h2 { margin: 0; flex: 1 1 auto; }
+.viewer-dialog:has(.export-sheet) .viewer-dialog-header nav { flex: 0 1 auto; min-width: 0; }
+.viewer-dialog:has(.export-sheet) .viewer-dialog-header > button { margin-inline-start: auto; }
 .export-sheet { font-size: .875rem; line-height: 1.45; overflow-wrap: anywhere; }
-.export-sheet nav, .export-sheet > section { padding: .6rem 1rem; }
-.export-sheet .export-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; padding: 0; margin: 0; list-style: none; }
+.export-sheet > nav, .export-sheet > section { padding: .6rem 1rem; }
+.export-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; padding: 0; margin: 0; list-style: none; font-size: .875rem; }
 .export-progress li { display: flex; gap: .35rem; align-items: center; color: var(--muted); }
 .export-progress li span { display: grid; place-items: center; width: 1.4rem; height: 1.4rem; border: 1px solid var(--line-strong); border-radius: 50%; }
 .export-progress li[aria-current] { color: var(--text); font-weight: 600; }
@@ -26,6 +30,7 @@
 }
 .export-sheet :is(button, select):focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .export-sheet [aria-pressed='true'] { border-color: var(--amber); box-shadow: inset 0 0 0 1px var(--amber); }
+.export-sheet [aria-selected='true'] { border-color: var(--amber); box-shadow: inset 3px 0 0 var(--amber); }
 .export-sheet [aria-pressed='true']::before { content: ''; display: inline-block; width: .45em; height: .75em; margin-right: .6em; border: solid var(--amber); border-width: 0 2px 2px 0; transform: rotate(45deg); }
 .export-sheet button:disabled { color: var(--muted); cursor: default; }
 .export-sheet h3 { font-size: .95rem; margin: .6rem 0 .4rem; }
@@ -38,16 +43,29 @@
 .export-footer span { margin-inline-end: auto; color: var(--muted); }
 .export-feedback:not(:empty) { padding: .5rem 1rem; }
 .export-preview { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
-.export-preview > *, .export-files li, .export-command { min-width: 0; }
+.export-preview > *, .export-files button, .export-command { min-width: 0; }
 .export-sheet code { display: block; font: .75rem/1.6 var(--mono); overflow-wrap: anywhere; }
-.export-files { list-style: none; margin: 0; padding: 0; }
-.export-files li { display: grid; gap: .2rem; padding: .5rem 0; border-top: 1px solid var(--line); }
-.export-files span { color: var(--muted); }
+.export-files { display: grid; gap: .3rem; margin: 0 0 .6rem; }
+.export-files button { width: 100%; text-align: start; overflow-wrap: anywhere; }
+.export-file-preview [role='tabpanel'] { padding: .75rem; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.export-sheet :is([role='tabpanel'], summary):focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.export-file-facts { margin: 0; }
+.export-sheet dt { color: var(--muted); }
+.export-sheet dd { margin-inline-start: 0; }
+.export-omissions { list-style: none; padding: 0; }
+.export-omissions li { padding-block: .5rem; border-top: 1px solid var(--line); }
+.export-omissions summary { display: flex; align-items: center; min-height: 44px; min-width: 44px; width: fit-content; padding-inline: .5rem; color: var(--amber); cursor: pointer; }
+.export-omissions details[open] { padding: .5rem; border: 1px solid var(--line); border-radius: var(--radius); }
+.export-omissions details[open] summary { padding-inline: 0; }
+.export-omissions dl { margin: 0; }
 .export-command { margin-top: .7rem; border-top: 1px solid var(--line); }
 .export-command code { margin: .4rem 0; padding: .5rem; background: var(--surface); }
 @media (max-width: 40rem) {
   .viewer-dialog:has(.export-sheet) { width: 100%; max-height: 100dvh; }
+  .viewer-dialog:has(.export-sheet) .viewer-dialog-header nav { order: 1; flex-basis: 100%; }
   .export-preview, .export-formats { grid-template-columns: minmax(0, 1fr); }
+  .export-footer > span { flex-basis: 100%; }
+  .export-footer > button { flex: 1 1 auto; }
 }
 
 .request-branch > .export-trigger, #recordings-panel > .export-trigger { margin: .25rem .65rem; }

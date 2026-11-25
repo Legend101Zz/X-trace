@@ -1,6 +1,8 @@
 """Judge regressions only; these fixtures are not installed-product evidence."""
 from copy import deepcopy
 import io
+import json
+import re
 from pathlib import Path
 import stat
 import sys
@@ -11,6 +13,181 @@ import zipfile
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import installed_export_journey as journey  # noqa: E402
+
+
+class BrowserReceiptTests(unittest.TestCase):
+    def row(self, **changes):
+        return {"width": 320, "coarse": False, "cases": 0, "status": "fail", "pageErrors": 0,
+                "consoleErrors": 0, "externalRequests": 0, "failureSubstage": "preview-focus",
+                "failureCase": "all-openapi-yaml", "cleanupFailures": [], **changes}
+
+    def receipt(self, rows=None, **changes):
+        return {"schemaVersion": 1, "rows": [self.row()] if rows is None else rows, "cases": [],
+                "status": "fail", "failureSubstage": None, "browserCleanup": "pass", **changes}
+
+    def test_partial_original_and_teardown_failures_remain_distinct(self):
+        receipt = self.receipt([self.row(cleanupFailures=["context-close", "viewer-stop"],
+                                         rawStack="private fixture value")], rawUrl="private fixture value")
+        projected = journey.project_browser_receipt(receipt)
+        self.assertEqual(projected["viewports"], 0)
+        self.assertEqual(projected["downloads"], 0)
+        self.assertEqual(projected["browserRows"][0]["failureSubstage"], "preview-focus")
+        self.assertEqual(projected["browserRows"][0]["cleanupFailures"], ["context-close", "viewer-stop"])
+        self.assertNotIn("private fixture value", json.dumps(projected))
+
+    def test_teardown_only_failure_is_not_a_pass(self):
+        projected = journey.project_browser_receipt(self.receipt([
+            self.row(failureSubstage=None, failureCase=None, cleanupFailures=["api-evidence-write"])]))
+        self.assertEqual(projected["browserRows"][0]["status"], "fail")
+        self.assertEqual(projected["viewports"], 0)
+
+    def test_launch_failure_has_no_invented_viewport(self):
+        projected = journey.project_browser_receipt(self.receipt([], failureSubstage="browser-launch", browserCleanup="not-reached"))
+        self.assertEqual(projected["browserFailureSubstage"], "browser-launch")
+        self.assertEqual(projected["browserRows"], [])
+
+    def test_unknown_or_raw_failure_values_are_rejected(self):
+        for changes in ({"failureSubstage": "private fixture value"}, {"failureCase": "private fixture value"},
+                        {"cleanupFailures": ["private fixture value"]}, {"cleanupFailures": ["viewer-stop", "viewer-stop"]},
+                        {"failureSubstage": ["preview-focus"]}, {"pageErrors": True}, {"cases": 11}):
+            with self.subTest(changes=changes), self.assertRaises(journey.JourneyFailure):
+                journey.project_browser_receipt(self.receipt([self.row(**changes)]))
+        with self.assertRaises(journey.JourneyFailure):
+            journey.project_browser_receipt(self.receipt(failureSubstage="private fixture value"))
+
+    def test_duplicate_viewports_and_unaccounted_cases_are_rejected(self):
+        with self.assertRaisesRegex(journey.JourneyFailure, "browser-receipt-duplicate"):
+            journey.project_browser_receipt(self.receipt([self.row(), self.row()]))
+        case = {"id": "320-fine", "caseId": "all-openapi-yaml", "scope": "all", "format": "openapi", "yaml": True}
+        with self.assertRaisesRegex(journey.JourneyFailure, "browser-receipt-count-parity"):
+            journey.project_browser_receipt(self.receipt(cases=[case]))
+        with self.assertRaisesRegex(journey.JourneyFailure, "browser-receipt-case-duplicate"):
+            journey.project_browser_receipt(self.receipt([self.row(cases=2)], cases=[case, case]))
+
+    def test_complete_matrix_and_browser_cleanup_outcome(self):
+        rows, cases = [], []
+        for width in journey.WIDTHS:
+            for coarse in (False, True):
+                rows.append(self.row(width=width, coarse=coarse, cases=10, status="pass", failureSubstage=None, failureCase=None))
+                for case_id, (scope, fmt, yaml) in journey.BROWSER_CASES.items():
+                    cases.append({"id": f"{width}-{'coarse' if coarse else 'fine'}", "caseId": case_id,
+                                  "scope": scope, "format": fmt, "yaml": yaml})
+        receipt = self.receipt(rows, cases=cases, status="pass")
+        projected = journey.project_browser_receipt(receipt)
+        self.assertEqual((projected["viewports"], projected["downloads"], projected["browserStatus"]), (10, 100, "pass"))
+        receipt.update(status="fail", browserCleanup="fail")
+        projected = journey.project_browser_receipt(receipt)
+        self.assertEqual((projected["browserStatus"], projected["browserCleanup"]), ("fail", "fail"))
+        receipt["status"] = "pass"
+        with self.assertRaisesRegex(journey.JourneyFailure, "browser-receipt-outcome"):
+            journey.project_browser_receipt(receipt)
+
+    def test_partial_receipt_cannot_claim_success(self):
+        with self.assertRaises(journey.JourneyFailure):
+            journey.project_browser_receipt(self.receipt(status="pass"))
+        with self.assertRaises(journey.JourneyFailure):
+            journey.project_browser_receipt(self.receipt([self.row(status="pass")]))
+        with self.assertRaises(journey.JourneyFailure):
+            journey.project_browser_receipt(self.receipt([self.row(failureSubstage=None, failureCase=None)]))
+
+    def test_javascript_substages_match_public_projection_vocabulary(self):
+        script = (Path(__file__).resolve().parents[2] / "web/app/scripts/installed-export-journey.mjs").read_text()
+        stages = set(re.findall(r"stage\('([^']+)'\)", script))
+        self.assertEqual(stages, journey.BROWSER_PROGRESS_STAGES - journey.BROWSER_CLEANUP_STAGES)
+        cleanup = set(re.findall(r"\['([^']+)', async", script))
+        self.assertEqual(cleanup, journey.BROWSER_CLEANUP_STAGES)
+
+    def progress(self, rows=None, cases=None, **changes):
+        row = self.row(status="in-progress", failureSubstage=None, failureCase=None,
+                       cleanupStatus="not-reached", cleanupStage=None)
+        return self.receipt([row] if rows is None else rows, cases=[] if cases is None else cases,
+                            schemaVersion=2, identity={"sourceSha": "a" * 40, "packageSha256": "b" * 64},
+                            checkpointSequence=7, status="in-progress", browserCleanup="not-reached",
+                            current={"rowId": "320-fine", "caseId": "all-openapi-yaml", "stage": "preview-keyboard"}, **changes)
+
+    def test_live_and_interrupted_checkpoints_never_pass_an_unfinished_row(self):
+        for status in ("in-progress", "interrupted"):
+            with self.subTest(status=status):
+                receipt = self.progress()
+                receipt["status"] = receipt["rows"][0]["status"] = status
+                receipt["rows"][0]["cases"] = 1
+                receipt["cases"] = [{"id": "320-fine", "caseId": "all-openapi-yaml", "scope": "all", "format": "openapi", "yaml": True}]
+                receipt["current"]["caseId"] = "all-openapi-json"
+                projected = journey.project_browser_receipt(receipt, receipt["identity"])
+                self.assertEqual((projected["viewports"], projected["downloads"], projected["browserCompletedCases"]), (0, 0, 1))
+                self.assertEqual(projected["browserStatus"], status)
+                self.assertEqual(projected["browserCurrent"], receipt["current"])
+
+    def test_clean_completed_rows_remain_separate_from_interrupted_cleanup(self):
+        first = self.row(cases=10, status="pass", failureSubstage=None, failureCase=None,
+                         cleanupStatus="pass", cleanupStage=None)
+        second = self.row(width=736, cases=1, status="interrupted", cleanupStatus="in-progress", cleanupStage="api-evidence-write")
+        cases = [{"id": "320-fine", "caseId": case_id, "scope": scope, "format": fmt, "yaml": yaml}
+                 for case_id, (scope, fmt, yaml) in journey.BROWSER_CASES.items()]
+        cases.append({"id": "736-fine", "caseId": "all-openapi-yaml", "scope": "all", "format": "openapi", "yaml": True})
+        receipt = self.progress([first, second], cases)
+        receipt.update(status="interrupted", current={"rowId": "736-fine", "caseId": "all-openapi-yaml", "stage": "api-evidence-write"})
+        projected = journey.project_browser_receipt(receipt)
+        self.assertEqual((projected["viewports"], projected["downloads"], projected["browserCompletedCases"]), (1, 10, 11))
+        self.assertEqual(projected["browserRows"][1]["cleanupStatus"], "in-progress")
+        self.assertEqual(projected["browserCurrent"]["stage"], "api-evidence-write")
+
+    def test_checkpoint_identity_and_fixed_progress_fields_reject_hostile_input(self):
+        changes = (
+            {"identity": {"sourceSha": "raw-private-value", "packageSha256": "b" * 64}},
+            {"identity": {"sourceSha": "a" * 40, "packageSha256": "b" * 64, "path": "raw-private-value"}},
+            {"checkpointSequence": True}, {"checkpointSequence": 0},
+            {"current": {"rowId": "raw-private-value", "caseId": None, "stage": "preview-keyboard"}},
+            {"current": {"rowId": None, "caseId": "all-openapi-yaml", "stage": "preview-keyboard"}},
+            {"current": {"rowId": "320-fine", "caseId": None, "stage": "raw-private-value"}},
+            {"current": {"rowId": "320-fine", "caseId": None, "stage": ["preview-keyboard"]}},
+        )
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(journey.JourneyFailure):
+                receipt = self.progress()
+                receipt.update(change)
+                journey.project_browser_receipt(receipt)
+        with self.assertRaisesRegex(journey.JourneyFailure, "identity-parity"):
+            journey.project_browser_receipt(self.progress(), {"sourceSha": "c" * 40, "packageSha256": "b" * 64})
+
+    def test_pass_before_cleanup_and_unaccounted_completed_case_are_rejected(self):
+        receipt = self.progress()
+        receipt["rows"][0].update(cases=10, status="pass")
+        with self.assertRaisesRegex(journey.JourneyFailure, "row-cleanup"):
+            journey.project_browser_receipt(receipt)
+        receipt = self.progress()
+        receipt["rows"][0]["cases"] = 1
+        with self.assertRaisesRegex(journey.JourneyFailure, "count-parity"):
+            journey.project_browser_receipt(receipt)
+        for cleanup_status, cleanup_stage in (("pass", "viewer-stop"), ("in-progress", None), ("fail", None)):
+            with self.subTest(cleanup_status=cleanup_status), self.assertRaises(journey.JourneyFailure):
+                receipt = self.progress()
+                receipt["rows"][0].update(cleanupStatus=cleanup_status, cleanupStage=cleanup_stage)
+                journey.project_browser_receipt(receipt)
+
+    def test_checkpoint_reader_rejects_partial_bytes_permissions_links_and_oversize(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "browser.private.json"
+            path.write_text(json.dumps(self.progress()))
+            path.chmod(0o600)
+            receipt, projected = journey.load_browser_receipt(path)
+            self.assertEqual(projected["browserIdentity"], receipt["identity"])
+            path.write_text('{"schemaVersion":2,"rows":[')
+            with self.assertRaisesRegex(journey.JourneyFailure, "receipt-json"):
+                journey.load_browser_receipt(path)
+            path.write_text(json.dumps(self.progress()))
+            path.chmod(0o644)
+            with self.assertRaisesRegex(journey.JourneyFailure, "receipt-permissions"):
+                journey.load_browser_receipt(path)
+            path.chmod(0o600)
+            link = root / "linked.json"
+            link.symlink_to(path)
+            with self.assertRaisesRegex(journey.JourneyFailure, "receipt-file"):
+                journey.load_browser_receipt(link)
+            path.write_bytes(b" " * (journey.MAX_BROWSER_RECEIPT + 1))
+            with self.assertRaisesRegex(journey.JourneyFailure, "private-file-limit"):
+                journey.load_browser_receipt(path)
 
 
 class DownloadJudgeTests(unittest.TestCase):

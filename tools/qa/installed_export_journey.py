@@ -46,6 +46,22 @@ WIDTHS = (320, 736, 1024, 1280, 1440)
 MAX_LOG = 32 * 1024 * 1024
 
 
+BROWSER_SUBSTAGES = frozenset("""
+viewer-start viewer-url browser-context requests-load system-theme choose-open choose-keyboard choose-format
+choose-scope choose-capture choose-geometry preview-activate preview-response preview-focus
+preview-content preview-inventory-keyboard preview-capture preview-command preview-geometry preview-keyboard save-activate
+save-response save-download save-focus save-content save-capture save-command save-geometry
+save-keyboard save-done recording-select recording-export-open recording-export-keyboard
+recording-export-scope page-health
+""".split())
+BROWSER_CLEANUP_STAGES = frozenset(("api-evidence-write", "context-close", "viewer-stop"))
+BROWSER_GLOBAL_SUBSTAGES = frozenset(("browser-launch", "viewport-setup"))
+BROWSER_PROGRESS_STAGES = BROWSER_SUBSTAGES | BROWSER_CLEANUP_STAGES | BROWSER_GLOBAL_SUBSTAGES | {"row-complete", "browser-close", "complete"}
+MAX_BROWSER_RECEIPT = 128 * 1024
+BROWSER_CASES = {f"{scope}-{fmt}-{'yaml' if yaml else 'json'}": (scope, fmt, yaml)
+                 for scope in ("all", "one") for fmt, yaml in FORMATS}
+
+
 def read_bounded(path, limit=MAX_LOG):
     require(path.stat().st_size <= limit, "private-file-limit")
     with path.open("rb") as stream:
@@ -61,6 +77,114 @@ class JourneyFailure(Exception):
 def require(condition, code):
     if not condition:
         raise JourneyFailure(code)
+
+
+def project_browser_receipt(receipt, expected_identity=None):
+    """Project partial private evidence only after validating closed, bounded fields.
+
+    Failure stacks, URLs, DOM and commands never enter the public summary. A passed
+    row counts only after its teardown, and browser teardown has its own outcome.
+    """
+    require(isinstance(receipt, dict) and type(receipt.get("schemaVersion")) is int and receipt["schemaVersion"] in (1, 2),
+            "browser-receipt-schema")
+    progress = receipt["schemaVersion"] == 2
+    build_identity = None
+    if progress:
+        build_identity = receipt.get("identity")
+        require(isinstance(build_identity, dict) and set(build_identity) == {"sourceSha", "packageSha256"}
+                and isinstance(build_identity["sourceSha"], str) and re.fullmatch(r"[0-9a-f]{40}", build_identity["sourceSha"])
+                and isinstance(build_identity["packageSha256"], str) and re.fullmatch(r"[0-9a-f]{64}", build_identity["packageSha256"]),
+                "browser-receipt-identity")
+        sequence = receipt.get("checkpointSequence")
+        require(type(sequence) is int and 1 <= sequence <= 10_000_000, "browser-receipt-sequence")
+    if expected_identity is not None:
+        require(progress and build_identity == expected_identity, "browser-receipt-identity-parity")
+    rows, cases = receipt.get("rows"), receipt.get("cases")
+    require(isinstance(rows, list) and len(rows) <= 10 and isinstance(cases, list) and len(cases) <= 100,
+            "browser-receipt-bounds")
+    status, global_stage, cleanup = receipt.get("status"), receipt.get("failureSubstage"), receipt.get("browserCleanup")
+    outcomes = ("pass", "fail", "in-progress", "interrupted") if progress else ("pass", "fail")
+    cleanups = ("not-reached", "in-progress", "pass", "fail") if progress else ("not-reached", "pass", "fail")
+    require(status in outcomes and (global_stage is None or isinstance(global_stage, str) and global_stage in BROWSER_GLOBAL_SUBSTAGES)
+            and cleanup in cleanups, "browser-receipt-status")
+    projected, identities = [], set()
+    for row in rows:
+        require(isinstance(row, dict), "browser-receipt-row")
+        width, coarse = row.get("width"), row.get("coarse")
+        require(type(width) is int and width in WIDTHS and type(coarse) is bool, "browser-receipt-viewport")
+        identity = f"{width}-{'coarse' if coarse else 'fine'}"
+        require(identity not in identities, "browser-receipt-duplicate")
+        identities.add(identity)
+        count, row_status = row.get("cases"), row.get("status")
+        stage, case, failures = row.get("failureSubstage"), row.get("failureCase"), row.get("cleanupFailures")
+        require(type(count) is int and 0 <= count <= 10 and row_status in outcomes, "browser-receipt-row-status")
+        require((stage is None or isinstance(stage, str) and stage in BROWSER_SUBSTAGES)
+                and (case is None or isinstance(case, str) and case in BROWSER_CASES)
+                and isinstance(failures, list) and len(failures) <= 3
+                and all(isinstance(item, str) and item in BROWSER_CLEANUP_STAGES for item in failures)
+                and len(set(failures)) == len(failures), "browser-receipt-substage")
+        require((case is None or stage is not None)
+                and (row_status != "pass" or count == 10 and stage is None and not failures)
+                and (row_status != "fail" or stage is not None or failures), "browser-receipt-row-outcome")
+        errors = {key: row.get(key) for key in ("pageErrors", "consoleErrors", "externalRequests")}
+        require(all(type(value) is int and 0 <= value <= 9_007_199_254_740_991 for value in errors.values())
+                and (row_status != "pass" or not any(errors.values())), "browser-receipt-errors")
+        clean = {}
+        if progress:
+            cleanup_status, cleanup_stage = row.get("cleanupStatus"), row.get("cleanupStage")
+            require(cleanup_status in cleanups and (cleanup_stage is None or isinstance(cleanup_stage, str)
+                    and cleanup_stage in BROWSER_CLEANUP_STAGES), "browser-receipt-row-cleanup")
+            require((cleanup_status == "in-progress") == (cleanup_stage is not None)
+                    and (cleanup_status != "pass" or not failures)
+                    and (cleanup_status != "fail" or failures)
+                    and (row_status != "pass" or cleanup_status == "pass"), "browser-receipt-row-cleanup")
+            clean = {"cleanupStatus": cleanup_status, "cleanupStage": cleanup_stage}
+        projected.append({"width": width, "coarse": coarse, "cases": count, "status": row_status,
+                          "failureSubstage": stage, "failureCase": case, "cleanupFailures": list(failures), **errors, **clean})
+    counts, seen = Counter(), set()
+    for case in cases:
+        require(isinstance(case, dict), "browser-receipt-case")
+        identity, case_id = case.get("id"), case.get("caseId")
+        require(isinstance(identity, str) and identity in identities and isinstance(case_id, str) and case_id in BROWSER_CASES,
+                "browser-receipt-case")
+        require((identity, case_id) not in seen, "browser-receipt-case-duplicate")
+        seen.add((identity, case_id))
+        require(type(case.get("yaml")) is bool
+                and (case.get("scope"), case.get("format"), case["yaml"]) == BROWSER_CASES[case_id], "browser-receipt-case")
+        counts[identity] += 1
+    require(all(counts[f"{row['width']}-{'coarse' if row['coarse'] else 'fine'}"] == row["cases"] for row in projected),
+            "browser-receipt-count-parity")
+    require(status != "pass" or len(rows) == 10 and len(cases) == 100 and global_stage is None
+            and cleanup == "pass" and all(row["status"] == "pass" for row in projected), "browser-receipt-outcome")
+    current = None
+    if progress:
+        current = receipt.get("current")
+        require(isinstance(current, dict) and set(current) == {"rowId", "caseId", "stage"}, "browser-receipt-current")
+        current_row, current_case, current_stage = current["rowId"], current["caseId"], current["stage"]
+        require((current_row is None or isinstance(current_row, str) and current_row in identities)
+                and (current_case is None or isinstance(current_case, str) and current_case in BROWSER_CASES)
+                and isinstance(current_stage, str) and current_stage in BROWSER_PROGRESS_STAGES
+                and (current_case is None or current_row is not None), "browser-receipt-current")
+        require(status != "pass" or current == {"rowId": None, "caseId": None, "stage": "complete"}, "browser-receipt-current")
+    result = {"viewports": sum(row["status"] == "pass" for row in projected),
+              "downloads": sum(row["cases"] for row in projected if row["status"] == "pass"),
+              "browserCompletedCases": len(cases), "browserStatus": status, "browserFailureSubstage": global_stage,
+              "browserCleanup": cleanup, "browserRows": projected}
+    if progress:
+        result.update(browserIdentity=dict(build_identity), browserCurrent=dict(current), browserCheckpointSequence=receipt["checkpointSequence"])
+    return result
+
+
+def load_browser_receipt(path, expected_identity=None):
+    """Read one atomically replaced checkpoint; malformed/truncated bytes never project."""
+    require(path.is_file() and not path.is_symlink(), "browser-receipt-file")
+    metadata = path.stat()
+    require(metadata.st_uid == os.getuid() and stat.S_IMODE(metadata.st_mode) == 0o600, "browser-receipt-permissions")
+    try:
+        receipt = json.loads(read_bounded(path, MAX_BROWSER_RECEIPT))
+    except (ValueError, UnicodeError) as error:
+        raise JourneyFailure("browser-receipt-json") from error
+    return receipt, project_browser_receipt(receipt, expected_identity)
 
 
 def private_json(path, value):
@@ -386,16 +510,25 @@ def run(args, private, report):
     browser_dir = private / "browser"
     browser_dir.mkdir(mode=0o700)
     browser_input = json.dumps({"xtrace": str(binary), "projectDir": str(project), "out": str(browser_dir), "operationId": operation,
-                                "catalogOperationId": catalog_operation, "recordingId": recording}).encode()
+                                "catalogOperationId": catalog_operation, "recordingId": recording,
+                                "identity": {"sourceSha": args.source_sha, "packageSha256": args.package_sha256}}).encode()
+    browser_error = None
     try:
         runner.run(["node", str(repo / "web/app/scripts/installed-export-journey.mjs")], timeout=900, input_data=browser_input)
-    finally:
-        receipt = browser_dir / "browser.private.json"
-        if receipt.is_file():
-            partial = json.loads(read_bounded(receipt))
-            report.update(viewports=sum(row["status"] == "pass" for row in partial["rows"]), downloads=len(partial["cases"]))
-    browser = json.loads(read_bounded(browser_dir / "browser.private.json"))
-    report.update(viewports=sum(row["status"] == "pass" for row in browser["rows"]), downloads=len(browser["cases"]))
+    except JourneyFailure as error:
+        browser_error = error
+    identity = {"sourceSha": args.source_sha, "packageSha256": args.package_sha256}
+    browser = None
+    try:
+        browser, projection = load_browser_receipt(browser_dir / "browser.private.json", identity)
+        report.update(projection)
+    except JourneyFailure as error:
+        report["browserReceiptFailure"] = str(error)
+        if browser_error is None:
+            raise
+    if browser_error is not None:
+        raise browser_error
+    require(browser is not None, "browser-receipt-missing")
     expected = {(f"{width}-{pointer}", scope, fmt, yaml) for width in WIDTHS for pointer in ("fine", "coarse") for scope in ("all", "one") for fmt, yaml in FORMATS}
     observed = [(case["id"], case["scope"], case["format"], case["yaml"]) for case in browser["cases"]]
     require(browser["status"] == "pass" and len(observed) == len(expected) and set(observed) == expected, "browser-coverage")

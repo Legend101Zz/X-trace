@@ -1,4 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { Endpoint } from '../../types';
 import { ExportProblem, fetchExportFile, previewExport, startDownload } from './client';
 import type { ExportPreview, ExportSelection } from './client';
@@ -11,59 +12,105 @@ const formats = [
   ['bundle', 'Developer bundle', 'The API description, collection and recipes with their manifest.'],
 ] as const;
 
-function terminalPreview(preview: ExportPreview) {
+function terminalCommand(preview: ExportPreview, write: boolean) {
   const { format, yaml } = preview.request;
-  const args = ['xtrace', 'export', '--preview', '--revision', preview.revisionId, '--format', format];
+  const args = ['xtrace', 'export', ...(write ? ['--output', './xtrace-export'] : ['--preview']), '--revision', preview.revisionId, '--format', format];
   if (preview.catalogOperationId) args.push('--operations', preview.catalogOperationId);
   if (yaml) args.push('--yaml');
   return args.join(' ');
 }
 
-function FileInventory({ preview }: { preview: ExportPreview }) {
+function fileLabel(file: ExportPreview['files'][number]) {
+  return file.name ?? `Recipe ${file.recipeOrdinal} (filename withheld)`;
+}
+
+function FileInventory({ preview, children }: { preview: ExportPreview; children: ReactNode }) {
   const [page, setPage] = useState(0);
+  const [selected, setSelected] = useState(0);
+  const buttons = useRef<(HTMLButtonElement | null)[]>([]);
+  const id = useId();
   const size = 16;
   const files = preview.files.slice(page * size, (page + 1) * size);
-  return <section aria-label="Files in this export">
+  const file = preview.files[selected];
+  function changePage(next: number) {
+    setPage(next);
+    setSelected(next * size);
+  }
+  return <div className="export-preview"><section aria-label="Files in this export">
     <h3>Files ({preview.files.length})</h3>
-    <ul className="export-files">{files.map((file) => <li key={file.name ?? file.recipeOrdinal}>
-      <strong>{file.name ?? `Recipe ${file.recipeOrdinal} (filename withheld)`}</strong>
-      <span>{file.bytes.toLocaleString()} bytes · mode {file.mode.toString(8).padStart(4, '0')}</span>
-      <code aria-label="File BLAKE3">{file.blake3}</code>
-    </li>)}</ul>
+    <div className="export-files" role="tablist" aria-label="Export files" aria-orientation="vertical">{files.map((entry, offset) => {
+      const index = page * size + offset;
+      return <button type="button" role="tab" key={entry.name ?? entry.recipeOrdinal}
+        ref={(element) => { buttons.current[index] = element; }} id={`${id}-file-${index}`} aria-controls={`${id}-metadata`}
+        aria-selected={selected === index} tabIndex={selected === index ? 0 : -1} onClick={() => setSelected(index)}
+        onKeyDown={(event) => {
+          const next = event.key === 'ArrowDown' ? (offset + 1) % files.length :
+            event.key === 'ArrowUp' ? (offset + files.length - 1) % files.length :
+              event.key === 'Home' ? 0 : event.key === 'End' ? files.length - 1 : null;
+          if (next === null) return;
+          event.preventDefault();
+          const nextIndex = page * size + next;
+          setSelected(nextIndex);
+          buttons.current[nextIndex]?.focus();
+        }}>{fileLabel(entry)}</button>;
+    })}</div>
     {preview.files.length > size && <nav className="export-actions" aria-label="File inventory pages">
-      <button type="button" disabled={page === 0} onClick={() => setPage(page - 1)}>Previous files</button>
+      <button type="button" disabled={page === 0} onClick={() => changePage(page - 1)}>Previous files</button>
       <span>Page {page + 1} of {Math.ceil(preview.files.length / size)}</span>
-      <button type="button" disabled={(page + 1) * size >= preview.files.length} onClick={() => setPage(page + 1)}>Next files</button>
+      <button type="button" disabled={(page + 1) * size >= preview.files.length} onClick={() => changePage(page + 1)}>Next files</button>
     </nav>}
-  </section>;
+    {children}
+  </section><section className="export-file-preview" aria-label="File metadata preview">
+    <h3>{file ? <>Preview of {fileLabel(file)} · metadata only</> : 'File metadata'}</h3>
+    {file ? <div role="tabpanel" id={`${id}-metadata`} aria-labelledby={`${id}-file-${selected}`} tabIndex={0}>
+      <dl className="export-file-facts">
+        <div><dt>Size</dt><dd>{file.bytes.toLocaleString()} bytes</dd></div>
+        <div><dt>Logical mode</dt><dd>{file.mode.toString(8).padStart(4, '0')}</dd></div>
+        <div><dt>File BLAKE3</dt><dd><code aria-label="File BLAKE3">{file.blake3}</code></dd></div>
+      </dl>
+    </div> : <p>The exporter reported no logical files.</p>}
+    <p>File contents are not included in this preview. The size, logical mode and digest describe the exported file.</p>
+  </section></div>;
 }
 
 function PreviewDetails({ preview }: { preview: ExportPreview }) {
-  return <div className="export-preview">
-    <div>
+  return <FileInventory preview={preview}>
       <h3>Included</h3>
       <p>{preview.selectedOperations} selected · {preview.emittedOperations} emitted</p>
       <p>{preview.totalBytes.toLocaleString()} bytes across the logical files</p>
       <p>Catalog revision {preview.revisionOrdinal} <code>{preview.revisionId}</code></p>
       <h3>What’s left out</h3>
       <p>Captured request and response bodies, cookies and credentials stay out of the export.</p>
-      {preview.omissions.length ? <ul>{preview.omissions.map((group) =>
+      {preview.omissions.length ? <ul className="export-omissions">{preview.omissions.map((group) =>
         <li key={[group.format, group.kind, group.reason].join('/')}>
-          {group.count} × {group.kind.replaceAll('_', ' ')}{group.format && ` (${group.format})`} · {group.reason.replaceAll('_', ' ')}
+          <p>{group.count} × {group.kind.replaceAll('_', ' ')}{group.format && ` (${group.format})`} · {group.reason.replaceAll('_', ' ')}</p>
+          <details><summary>Why?</summary><dl>
+            <div><dt>Exporter reason</dt><dd><code>{group.reason}</code></dd></div>
+            <div><dt>Subject</dt><dd>{group.kind}</dd></div>
+            <div><dt>Applies to</dt><dd>{group.format ?? 'Whole export'}</dd></div>
+            <div><dt>Omission entries</dt><dd>{group.count}</dd></div>
+          </dl></details>
         </li>)}</ul> : <p>The exporter reported no additional omissions.</p>}
       <p>Logical content BLAKE3 <code>{preview.contentHash}</code></p>
-    </div>
-    <FileInventory preview={preview} />
-  </div>;
+  </FileInventory>;
 }
 
-type Phase = 'Choose' | 'Preview' | 'Save';
+export type ExportPhase = 'Choose' | 'Preview' | 'Save';
 
-export function ExportSheet({ endpoint, onClose }: { endpoint: Pick<Endpoint, 'operationId' | 'method' | 'routeTemplate'> | null; onClose: () => void }) {
+export function ExportProgress({ phase }: { phase: ExportPhase }) {
+  return <nav aria-label="Export progress"><ol className="export-progress">{(['Choose', 'Preview', 'Save'] as const).map((label, index) =>
+    <li key={label} aria-current={phase === label ? 'step' : undefined}><span>{index + 1}</span>{label}</li>)}</ol></nav>;
+}
+
+export function ExportSheet({ endpoint, onClose, onPhaseChange }: {
+  endpoint: Pick<Endpoint, 'operationId' | 'method' | 'routeTemplate'> | null;
+  onClose: () => void;
+  onPhaseChange?: (phase: ExportPhase) => void;
+}) {
   const [format, setFormat] = useState<ExportSelection['format']>('openapi');
   const [yaml, setYaml] = useState(true);
   const [oneEndpoint, setOneEndpoint] = useState(endpoint !== null);
-  const [phase, setPhase] = useState<Phase>('Choose');
+  const [phase, setPhase] = useState<ExportPhase>('Choose');
   const [preview, setPreview] = useState<ExportPreview | null>(null);
   const [stale, setStale] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -78,6 +125,7 @@ export function ExportSheet({ endpoint, onClose }: { endpoint: Pick<Endpoint, 'o
   useEffect(() => {
     if (phase !== 'Choose') focusTarget.current?.focus();
   }, [phase]);
+  useEffect(() => { onPhaseChange?.(phase); }, [phase, onPhaseChange]);
 
   function choose() {
     active.current?.abort();
@@ -125,19 +173,18 @@ export function ExportSheet({ endpoint, onClose }: { endpoint: Pick<Endpoint, 'o
     }
   }
 
-  const terminal = preview && terminalPreview(preview);
+  const terminal = preview && terminalCommand(preview, phase === 'Save');
   async function copyCommand() {
     if (!terminal) return;
     try {
       await navigator.clipboard.writeText(terminal);
-      setFeedback('Terminal preview command copied.');
+      setFeedback(phase === 'Save' ? 'Terminal export command copied.' : 'Terminal preview command copied.');
     } catch {
       setFeedback('Clipboard access is unavailable. Select and copy the displayed command.');
     }
   }
   return <article className="export-sheet">
-    <nav aria-label="Export progress"><ol className="export-progress">{(['Choose', 'Preview', 'Save'] as const).map((label, index) =>
-      <li key={label} aria-current={phase === label ? 'step' : undefined}><span>{index + 1}</span>{label}</li>)}</ol></nav>
+    {!onPhaseChange && <ExportProgress phase={phase} />}
     <section ref={focusTarget} tabIndex={-1} aria-label={phase + ' export'} aria-busy={busy}>
       {phase === 'Choose' && <>
         <h3 id={formatId}>Format</h3>
@@ -160,17 +207,23 @@ export function ExportSheet({ endpoint, onClose }: { endpoint: Pick<Endpoint, 'o
       {phase === 'Preview' && preview && <PreviewDetails key={preview.approval.digest} preview={preview} />}
       {phase === 'Save' && preview && <><h3>Download started</h3><p>Check your browser’s downloads for <strong>{preview.download.filename}</strong>.</p>
         <p>Logical content BLAKE3 <code>{preview.contentHash}</code></p></>}
-      {phase !== 'Choose' && terminal && <div className="export-command"><h3>Preview this revision in the terminal</h3><p>Run from the initialized project root. Linked observations may have changed since this preview.</p><code>{terminal}</code>
-        <button type="button" onClick={() => void copyCommand()}>Copy terminal command</button></div>}
+      {phase !== 'Choose' && terminal && <div className="export-command"><h3>{phase === 'Save' ? 'The same export from a terminal' : 'Preview this revision in the terminal'}</h3>
+        <p>Run from the initialized project root. Linked observations may have changed since this preview.</p>
+        {phase === 'Save' ? <p>Use a fresh output directory, or an empty directory owned by you with private permissions (mode 0700).
+          This example creates ./xtrace-export if absent; choose a fresh path if it already contains files. Its parent directory must exist.</p> :
+          <p>This command previews metadata without writing files.</p>}
+        <code aria-label="Terminal command">{terminal}</code></div>}
       {format === 'postman' && <p>Configure Postman workspace delivery in the terminal.</p>}
     </section>
     <div className="export-feedback" role="status">{busy ? phase === 'Choose' || stale ? 'Preparing preview…' : 'Preparing download…' : feedback}</div>
     <footer className="export-actions export-footer">
-      {phase === 'Choose' && <><span>Preview the files before saving.</span><button type="button" className="export-primary" disabled={busy}
+      {phase === 'Choose' && <><span>Nothing is saved yet. You always see a preview first.</span><button type="button" className="export-primary" disabled={busy}
         onClick={() => void submit('preview')}>Preview</button></>}
-      {phase === 'Preview' && <><button type="button" onClick={choose}>Back</button><button type="button" className="export-primary"
+      {phase === 'Preview' && <><span>Files will be saved on this machine only. Nothing will be sent anywhere.</span><button type="button" onClick={choose}>Back</button>
+        <button type="button" onClick={() => void copyCommand()}>Copy terminal command</button><button type="button" className="export-primary"
         disabled={busy} onClick={() => void submit(stale ? 'preview' : 'save')}>{stale ? 'Refresh preview' : 'Save file'}</button></>}
       {phase === 'Save' && <><button type="button" onClick={choose}>Export something else</button>
+        <button type="button" onClick={() => void copyCommand()}>Copy terminal command</button>
         <button type="button" className="export-primary" onClick={onClose}>Done</button></>}
     </footer>
   </article>;
