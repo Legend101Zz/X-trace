@@ -90,6 +90,11 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private volatile long shutdownStartedNs;
   private volatile String capturePolicyId = "";
 
+  RecordingWriter(XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink)
+      throws ClientException {
+    this(session, queue, sink, false);
+  }
+
   RecordingWriter(
       XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink, boolean pgJdbcEnabled)
       throws ClientException {
