@@ -1,0 +1,39 @@
+name: viewer-policy-112-temporary
+on:
+  push:
+    branches: [codex/viewer-policy-112]
+permissions:
+  contents: read
+jobs:
+  viewer-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web/app
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Generate and verify the API client
+        run: |
+          npm run generate:api
+          git add -- src/api.generated.ts
+          npm run check:api
+      - run: npm run typecheck
+      - run: npm exec --no -- vitest run src/main.test.tsx
+      - run: node scripts/check-contrast.mjs
+      - run: npm run build
+      - run: npm run embed
+      - run: node scripts/embed-assets.mjs --check
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: generated-viewer-policy-112
+          path: |
+            web/app/src/api.generated.ts
+            crates/xtrace-daemon/assets/ui/
+          if-no-files-found: error
