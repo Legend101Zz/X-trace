@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 3d49d29fb5c1a53946823e4e49ec706311540f56
+          ref: 55779297fd2df67b9085339af59dfbb36dfd6a8d
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
@@ -37,7 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          test "$(git rev-parse HEAD)" = 3d49d29fb5c1a53946823e4e49ec706311540f56
+          test "$(git rev-parse HEAD)" = 55779297fd2df67b9085339af59dfbb36dfd6a8d
           root="$RUNNER_TEMP/xt"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/fragments"
           export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
@@ -53,6 +53,10 @@ jobs:
             cargo test --locked -p xtrace-application --lib observed_endpoint_queries
           python3 -B -m tools.qa.lane_run run --suite rust --step catalog-observation --min-passed 1 --max-ignored 0 --out "$root/fragments" -- \
             cargo test --locked -p xtrace-store --lib observation
+          for name in linked_replay_revalidates observed_query_validates observed_endpoint_query_rejects; do
+            python3 -B -m tools.qa.lane_run run --suite rust --step "$name" --min-passed 1 --max-ignored 0 --out "$root/fragments" -- \
+              cargo test --locked -p xtrace-store --lib "$name"
+          done
       - name: Build the actual scanners, adapters, fixtures and CLI
         run: |
           set -euo pipefail
