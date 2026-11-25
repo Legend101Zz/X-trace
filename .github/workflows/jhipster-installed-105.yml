@@ -1,0 +1,187 @@
+name: jhipster-installed
+
+# Scoped development proof for #105. It never invokes the six-project wrapper,
+# publishes a release, uploads raw receipts/logs, or accepts a release-ledger row.
+on:
+  push:
+    branches:
+      - codex/proof-jhipster-bound-port-105
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Exact candidate ref; empty uses the dispatched ref
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jhipster-installed-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  jhipster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: d5518db5d75434c8dcd061b3411254dde22c82a6
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Build the exact unsigned Linux archive privately
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private"
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private/package-build"
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private/run" "$RUNNER_TEMP/jhipster-proof-private/run/console"
+          export JHIPSTER_BUILD_STATUS="$RUNNER_TEMP/jhipster-proof-private/run/build-status.json"
+          export JHIPSTER_OUTER_BUILD_STATUS="$RUNNER_TEMP/jhipster-proof-private/package-build/status.json"
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          for key in ('JHIPSTER_BUILD_STATUS', 'JHIPSTER_OUTER_BUILD_STATUS'):
+              pathlib.Path(os.environ[key]).write_text(json.dumps({
+                  'schema': 'xtrace-jhipster-build/1', 'exitCode': None}) + '\n')
+          PY
+          rc=0
+          python3 -B packaging/build.py --out dist --platform linux-x86_64 \
+            > "$RUNNER_TEMP/jhipster-proof-private/run/console/package-build.stdout" \
+            2> "$RUNNER_TEMP/jhipster-proof-private/run/console/package-build.stderr" || rc=$?
+          BUILD_EXIT="$rc" python3 -B - <<'PY'
+          import json, os, pathlib
+          for key in ('JHIPSTER_BUILD_STATUS', 'JHIPSTER_OUTER_BUILD_STATUS'):
+              pathlib.Path(os.environ[key]).write_text(json.dumps({
+                  'schema': 'xtrace-jhipster-build/1', 'exitCode': int(os.environ['BUILD_EXIT'])}) + '\n')
+          PY
+          if [ "$rc" -ne 0 ]; then
+            cp "$RUNNER_TEMP/jhipster-proof-private/run/console/package-build.stderr" \
+              "$RUNNER_TEMP/jhipster-proof-private/package-build/stderr"
+          fi
+          echo "Candidate archive build exit $rc; raw streams retained privately"
+          exit "$rc"
+      - name: Campaign regression checks with private diagnostics
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private/checks"
+          rc=0
+          python3 -B -m tools.qa.unittest_run \
+            --result "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.json" \
+            discover -s campaigns/lib -p 'test_*.py' \
+            > "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.stdout" \
+            2> "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.stderr" || rc=$?
+          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.json"
+          exit "$rc"
+      - name: Bind the exact archive bytes and build revision
+        id: identity
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, os, pathlib, subprocess
+          archive = pathlib.Path('dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz')
+          digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
+          source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'source-sha={source}\npackage-sha256={digest}\n')
+          PY
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Verify, fresh-install and run only pinned JHipster
+        env:
+          PACKAGE_SHA256: ${{ steps.identity.outputs.package-sha256 }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source-sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private/driver"
+          export JHIPSTER_DRIVER_STATUS="$RUNNER_TEMP/jhipster-proof-private/driver/status.json"
+          export XTRACE_PRIVATE_DRIVER_DIAGNOSTIC=1
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          pathlib.Path(os.environ['JHIPSTER_DRIVER_STATUS']).write_text(json.dumps({
+              'schema': 'xtrace-jhipster-driver/1', 'exitCode': None}) + '\n')
+          PY
+          rc=0
+          python3 -B campaigns/java/jhipster/harness/installed.py \
+            --private-root "$RUNNER_TEMP/jhipster-proof-private/run" \
+            --archive "$GITHUB_WORKSPACE/dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz" \
+            --package-sha256 "$PACKAGE_SHA256" --source-sha "$SOURCE_SHA" --java "$JAVA_HOME/bin/java" \
+            > "$RUNNER_TEMP/jhipster-proof-private/driver/stdout" \
+            2> "$RUNNER_TEMP/jhipster-proof-private/driver/stderr" || rc=$?
+          DRIVER_EXIT="$rc" python3 -B - <<'PY'
+          import json, os, pathlib
+          pathlib.Path(os.environ['JHIPSTER_DRIVER_STATUS']).write_text(json.dumps({
+              'schema': 'xtrace-jhipster-driver/1', 'exitCode': int(os.environ['DRIVER_EXIT'])}) + '\n')
+          PY
+          echo "Installed campaign driver exit $rc; raw streams retained privately"
+          exit "$rc"
+      - name: Retain identified pre-receipt stderr as recipient-only ciphertext
+        id: diagnostic
+        env:
+          XTRACE_DIAGNOSTIC_CERT_PEM: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJUwyDQ+9vO7xAPtW6/AiQDiLem8wDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCBkaWFnbm9zdGljIHJl
+            Y2lwaWVudDAeFw0yNjExMjUxNzEwMjZaFw0yNjEyMDkxNzEwMjZaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgZGlhZ25vc3RpYyByZWNpcGllbnQwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDagbD2rPLoVyTA7+JETGkeoV+g
+            aeX8nH/waU5Nbd0ddYewY5o11niUoiNB5mAWTHo//CePeCT0u+t8szQsSPjpkSxi
+            QGMfvmHhr/2/TWpJuEx5zg0+ZgSCiKa7/gNmq843mywVJS00E3hFJrsRtSF/P5b7
+            i511cb3XjP14GW7kGiOltNrdzaY00dQZ1OmEFvp7xvYcp5iNckzsM46GUF9ANmjv
+            8P/cQKA8m4RvuAU+PHcYbN75uGfRvU60NJoSTFVocz5SXkae6LA7k+tDyyMp1s83
+            QEz99eWuB5VU1JzFGYpSq7Uuy3N4YhhzqhLw20cN6EdThmJmqa81b4O1394i49Zs
+            IG3yGED0sCLC3jwVeHFqBY0eKbmhgIdCuJjUkq8uRDtGeTettWXhtJN8K/2hXLaO
+            j4f/X5I/cA610eaFBFNpIK8k3PNbd/cWBi1x4qe9yx/OPLZm+/H3xfJLYbgmP1R0
+            UHZtw7yhdLdTg68FirgVFsEDlzd9neqgVxD1rakCAwEAAaNTMFEwHQYDVR0OBBYE
+            FGeVjUCYACKgYX2S3YdIjMzTtlZEMB8GA1UdIwQYMBaAFGeVjUCYACKgYX2S3YdI
+            jMzTtlZEMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAMDsepFD
+            mI4DRG3Qf7/BPgmzOPDHWpMvBXEfMpusS+4fZRdqQECuEHW+wSoCR1iJLrZDpKqn
+            75DL8gJTqfoKIdFB9W6Q9Fzh2sTUBSsHmfCAHs9RfMTSxae6Wm9us73GyZvawg3h
+            XA860/O98Mb3uR8NR0OQA1PrCc/uH9fA5EsdHgsp+YpB1yj8D0blbweXRYAAZb44
+            9zPHIrkfduzmeqBodJUg2XbXKYDg1PC+tFva5NWTYrp7CPY1xYcffaYb/RpPc2C1
+            O1PP7MpyuY/LH4bxtMd5Mjcz2qNw295S7RZAnoP9lU3R8af99OuSkhPgHz/x/jCW
+            7J5+uR/ZKMNP+o/7mPe55yXNuuyVH2v6mnf9nONqeHZPLxJWzAgqkF4zrUrA66YO
+            qwt3G2O2KErAwo5wT7n5u1BiJzTrU1oIvEoCR43oyiFlOHIJ3WxBLCgDb6frqMAt
+            XM0u/CD69DpfF4vMEsgraAxrGCQ81Qgj5knjCWPYZuT/bCjYa7zdX9ARDw==
+            -----END CERTIFICATE-----
+        if: always()
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B campaigns/java/jhipster/harness/encrypt_diagnostic.py \
+            --private-root "$RUNNER_TEMP/jhipster-proof-private/run" \
+            --encrypted-out "$RUNNER_TEMP/jhipster-proof-private/encrypted"
+      - name: Scan observed sinks and write the bounded public result
+        if: always()
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B campaigns/java/jhipster/harness/public_result.py \
+            --private-root "$RUNNER_TEMP/jhipster-proof-private/run" \
+            --public-out "$RUNNER_TEMP/jhipster-proof-public"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: jhipster-installed-public-result
+          path: ${{ runner.temp }}/jhipster-proof-public/summary.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() && steps.diagnostic.outputs.ready == 'true' }}
+        with:
+          name: jhipster-pre-receipt-encrypted-stderr
+          path: ${{ runner.temp }}/jhipster-proof-private/encrypted/failure-stderr.cms
+          if-no-files-found: error
+          retention-days: 1
