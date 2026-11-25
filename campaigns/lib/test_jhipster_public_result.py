@@ -22,6 +22,7 @@ def load(name):
 
 public = load("public_result")
 sinks = load("collect_sinks")
+from campaigns.java.jhipster.harness import evidence  # noqa: E402
 
 
 class PublicResult(unittest.TestCase):
@@ -50,7 +51,27 @@ class PublicResult(unittest.TestCase):
         for mode in ("baseline", "instrumented"):
             rows = []
             for sid, requests, checks in public.SCENARIOS:
-                row = {"id": sid, "requests": [{}] * requests, "recordingVerdict": {"passed": True, "expectations": [{}]},
+                sent = [{"label": label, "status": public.EXPECT[sid][index]["statuses"][0], "elapsedMs": 0.5}
+                        for label, index in public.response_labels(sid).items()]
+                items = []
+                for index, rule in enumerate(public.EXPECT[sid]):
+                    burst = sid == "concurrent-isolation"
+                    denied = sid == "anonymous-and-invalid-login-denied" and index < 2
+                    problems = ["individual-request-and-principal-attribution-unobserved"] if burst else (
+                        ["pre-dispatch-servlet-root-unobserved"] if denied else [])
+                    if (sid == "anonymous-and-invalid-login-denied" and index == 2
+                            or sid == "admin-and-user-authentication" and index in (2, 3)):
+                        problems += ["postgresql-boundary-unobserved", *[
+                            f"jdbc-operation-unobserved({verb} {table})" for verb, table in rule["jdbc"]]]
+                    if sid == "account-create-read-roundtrip" and index == 1:
+                        problems += [f"jdbc-operation-unobserved({verb} {table})" for verb, table in rule["jdbc"]]
+                    matched = int(not burst and not denied)
+                    items.append(evidence.item(rule, problems,
+                                 attribution="ambiguous" if burst else "external-http-only" if denied else "serial-boundary-order",
+                                 recordings=matched, statuses=matched, sources=int(bool(rule["handler"])) if matched else 0))
+                row = {"id": sid, "requests": sent, "recordingVerdict": {
+                       "passed": all(item["passed"] for item in items), "expectations": items, "problems": [],
+                       "checkedRequests": len(sent), "recordingsAttributed": sum(item["recordingsMatchingRoute"] for item in items)},
                        "fingerprintEqualsBaseline": True, "privateDetail": self.secret}
                 row["scenarioChecksPassed" if mode == "instrumented" else "passed"] = True
                 row["workloadChecks" if mode == "instrumented" else "checks"] = [{"passed": True}] * checks
@@ -58,6 +79,10 @@ class PublicResult(unittest.TestCase):
             self.write(self.base + mode + "-1/receipt.json", {
                 "project": "jhipster", "instrumented": mode == "instrumented", "releaseAcceptance": False,
                 "result": "recorded" if mode == "instrumented" else "passed_baseline_only", "scenarios": rows,
+                "burstRouteGroups": [{"evidenceScope": "burst-route-group", "requests": rule["minCount"], "problemRecordings": {},
+                                      **evidence.item(rule, [], attribution="route-counts", recordings=rule["minCount"],
+                                                      statuses=rule["minCount"], sources=rule["minCount"])}
+                                     for rule in public.EXPECT["concurrent-isolation"]],
                 "api": {"ok": True, "recordings": 79, "incompleteDetails": 0, "listReadGap": None},
                 "workloadsPassed": True, "boundariesVerified": True, "baselineMatched": True,
                 "recordingChecksPassed": True,
@@ -67,9 +92,8 @@ class PublicResult(unittest.TestCase):
                      "status": 401, "passed": True},
                     {"label": "environment", "surfaces": ["env-var"], "passed": True}]},
                 "problemClasses": {"pre-dispatch-servlet-root-unobserved": 2, "postgresql-boundary-unobserved": 3,
-                                   "jdbc-operation-unobserved(insert bank_account)": 4,
-                                   "individual-request-and-principal-attribution-unobserved": 4,
-                                   self.secret: 99}})
+                                   "jdbc-operation-unobserved": 4,
+                                   "individual-request-and-principal-attribution-unobserved": 4}})
         self.write("data/store.json", {"safe": True})
         self.write(self.base + "instrumented-1/api/recording-safe.json", {"events": []})
         for name in ("boundary-before", "phase-1-api", "phase-2-api", "phase-3-api"):
@@ -111,6 +135,67 @@ class PublicResult(unittest.TestCase):
                             if name not in ("child-stderr", "outer-driver-output")))
         self.assertEqual(summary["privacy"]["child-stderr"]["status"], "not-produced")
         self.assertEqual(summary["privacy"]["outer-driver-output"]["status"], "passed")
+
+    def test_normalized_jdbc_class_from_actual_producer_is_counted(self):
+        import xinstr
+        path = self.base + "instrumented-1/receipt.json"
+        doc = self.read(path)
+        normalized = xinstr.problem_classes({"scenario": {"expectations": [
+            {"problems": ["jdbc-operation-unobserved(insert private_table)", "postgresql-boundary-unobserved"]}]}})
+        self.assertEqual(normalized, {"jdbc-operation-unobserved": 1, "postgresql-boundary-unobserved": 1})
+        doc["problemClasses"] = xinstr.problem_classes({row["id"]: row["recordingVerdict"] for row in doc["scenarios"]},
+                                                       doc["burstRouteGroups"])
+        self.write(path, doc)
+        summary, _ = public.build_summary(self.root)
+        self.assertEqual(summary["recordingGapProblemCounts"]["postgresql"], 7)
+        self.assertNotIn("private_table", json.dumps(summary))
+
+    def test_wrong_envelope_and_missing_malformed_or_inconsistent_aggregate_are_unknown(self):
+        path = self.base + "instrumented-1/receipt.json"
+        original = self.read(path)
+        for field, value in (("project", "other"), ("instrumented", False), ("releaseAcceptance", True),
+                             ("releaseAcceptance", 0), ("problemClasses", None), ("problemClasses", []),
+                             ("problemClasses", {}), ("problemClasses", {self.secret: 99}),
+                             ("problemClasses", {"jdbc-operation-unobserved": False}),
+                             ("problemClasses", {"jdbc-operation-unobserved": 0}),
+                             ("problemClasses", {"jdbc-operation-unobserved": -1}),
+                             ("problemClasses", {"jdbc-operation-unobserved": public.MAX_COUNT + 1}),
+                             ("problemClasses", {"jdbc-operation-unobserved(select private_table)": 1})):
+            with self.subTest(field=field, value=value):
+                doc = {**original, field: value}
+                self.write(path, doc)
+                summary, _ = public.build_summary(self.root)
+                self.assertEqual(summary["recordingJudgement"], "not-observed")
+                self.assertTrue(all(value is None for value in summary["recordingGapProblemCounts"].values()))
+                self.assertNotIn("private_table", json.dumps(summary))
+        for field in ("project", "instrumented", "releaseAcceptance", "problemClasses"):
+            with self.subTest(missing=field):
+                doc = dict(original)
+                doc.pop(field)
+                self.write(path, doc)
+                summary, _ = public.build_summary(self.root)
+                self.assertEqual(summary["recordingJudgement"], "not-observed")
+                self.assertTrue(all(value is None for value in summary["recordingGapProblemCounts"].values()))
+
+    def test_missing_duplicate_or_partial_judge_rows_cannot_supply_aggregate_zeroes(self):
+        from copy import deepcopy
+        path = self.base + "instrumented-1/receipt.json"
+        original = self.read(path)
+        for mutation in ("missing-scenario", "duplicate-scenario", "missing-group", "partial-histogram"):
+            with self.subTest(mutation=mutation):
+                doc = deepcopy(original)
+                if mutation == "missing-scenario":
+                    doc["scenarios"].pop()
+                elif mutation == "duplicate-scenario":
+                    doc["scenarios"][-1] = deepcopy(doc["scenarios"][0])
+                elif mutation == "missing-group":
+                    doc["burstRouteGroups"].pop()
+                else:
+                    doc["burstRouteGroups"][-1].update(passed=False, problems=["recording-detail-incomplete"])
+                self.write(path, doc)
+                summary, _ = public.build_summary(self.root)
+                self.assertEqual(summary["recordingJudgement"], "not-observed")
+                self.assertTrue(all(value is None for value in summary["recordingGapProblemCounts"].values()))
 
     def test_outer_driver_must_explicitly_pass_even_when_all_inner_evidence_passes(self):
         self.assertTrue(public.publish(self.root, self.out))

@@ -7,7 +7,9 @@ The saved-recording artifact is a private ZIP of observed API JSON, not an expor
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from itertools import islice
+import math
 import json
 import os
 from pathlib import Path
@@ -18,8 +20,10 @@ import tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
 from tools.qa import camp_publication, canary  # noqa: E402
 from campaigns.lib.private_diagnostic import root_admitted  # noqa: E402
+from campaigns.java.jhipster.harness.evidence import EXPECT  # noqa: E402
 
 PHASES = ("prerequisite", "package-verify", "candidate-install", "installed-verify", "checkout-upstream",
           "build-upstream", "baseline", "instrumented", "collect-sinks")
@@ -40,6 +44,32 @@ DIAGNOSTIC_STATUSES = (
     "gap-stderr-oversized", "gap-encryption-failed", "gap-invalid-failure-state",
 )
 CHILD_STDERR_LABELS = ("host-java", "installed-payload-verify", "init", "recording-list", "stop")
+
+
+# Fixed names from evidence.inspect/judge. Details after '(' never leave the private receipt.
+RECORDING_PROBLEMS = frozenset("""
+recording-detail-incomplete exact-route-root-unobserved terminal-http-status-unobserved recording-incomplete
+controller-frame-unobserved controller-source-unobserved unexpected-controller-frame
+refused-controller-identity-unresolved controller-exception-type-unobserved
+repository-declaration-unobserved-in-handler repository-source-unobserved postgresql-boundary-unobserved
+jdbc-operation-unobserved unexpected-bank-account-write-frame-or-interaction workload-request-count-mismatch
+workload-http-status-mismatch burst-boundary-unverified burst-route-count-mismatch burst-capacity-drops
+individual-request-and-principal-attribution-unobserved pre-dispatch-servlet-root-unobserved
+pre-dispatch-request-unreached recording-attribution-unavailable workload-requests-without-exact-expectations
+scenario-unreached burst-drops burst-boundary-not-verified
+""".split())
+SEAM_PROBLEMS = {
+    "root": ("exact-route-root-unobserved",),
+    "outcome": ("exact-route-root-unobserved", "terminal-http-status-unobserved"),
+    "completion": ("recording-incomplete",),
+    "controller": ("controller-frame-unobserved", "unexpected-controller-frame",
+                   "refused-controller-identity-unresolved", "controller-exception-type-unobserved"),
+    "source": ("exact-route-root-unobserved", "controller-source-unobserved"),
+    "repository": ("repository-declaration-unobserved-in-handler", "repository-source-unobserved"),
+    "postgresql": ("postgresql-boundary-unobserved", "jdbc-operation-unobserved"),
+    "preDispatch": ("pre-dispatch-servlet-root-unobserved", "pre-dispatch-request-unreached"),
+    "requestAttribution": ("recording-attribution-unavailable", "individual-request-and-principal-attribution-unobserved"),
+}
 
 
 def read_object(path):
@@ -83,9 +113,13 @@ def phase_summary(doc):
     return out
 
 
+def valid_receipt(doc, instrumented=True):
+    return (isinstance(doc, dict) and doc.get("project") == "jhipster"
+            and doc.get("instrumented") is instrumented and doc.get("releaseAcceptance") is False)
+
+
 def receipt_summary(doc, state, instrumented):
-    valid = (isinstance(doc, dict) and doc.get("project") == "jhipster"
-             and doc.get("instrumented") is instrumented and doc.get("releaseAcceptance") is False)
+    valid = valid_receipt(doc, instrumented)
     if not valid:
         return {"status": state if state != "present" else "invalid", "scenarios": []}
     rows = doc.get("scenarios", [])
@@ -112,6 +146,337 @@ def receipt_summary(doc, state, instrumented):
     expected = "recorded" if instrumented else "passed_baseline_only"
     return {"status": "present", "result": "passed" if result == expected else "failed",
             "scenarios": scenarios}
+
+
+def problem_counts(raw, *, weighted=False, limit=None):
+    """Normalize the producer's parameterized strings into a closed count vocabulary."""
+    pairs = raw.items() if isinstance(raw, dict) else None
+    if not weighted:
+        pairs = ((key, 1) for key in raw) if isinstance(raw, list) else None
+    if pairs is None or len(raw) > 64:
+        return None
+    output = {}
+    for key, value in pairs:
+        if not isinstance(key, str) or count(value) is None or (limit is not None and value > limit):
+            return None
+        name = key.split("(", 1)[0]
+        name = name if name in RECORDING_PROBLEMS else "other"
+        output[name] = min(MAX_COUNT, output.get(name, 0) + value)
+    return output
+
+
+def merge_counts(rows):
+    if any(row is None for row in rows):
+        return None
+    output = {}
+    for row in rows:
+        for key, value in row.items():
+            output[key] = min(MAX_COUNT, output.get(key, 0) + value)
+    return output
+
+
+def matching_item(rows, rule, *, burst=False):
+    if not isinstance(rows, list) or len(rows) > 64:
+        return None
+    matches = [row for row in rows if isinstance(row, dict)
+               and (row.get("label"), row.get("method"), row.get("route")) ==
+               (rule["label"], rule["method"], rule["route"])]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    return row if (isinstance(row.get("expectedStatuses"), list)
+                   and all(type(status) is int for status in row["expectedStatuses"])
+                   and row["expectedStatuses"] == list(rule["statuses"])
+                   and row.get("expectedRepositoryDeclarations") == list(rule["repository"])
+                   and (not burst or row.get("evidenceScope") == "burst-route-group")) else None
+
+
+def response_labels(sid):
+    """Private identities from run.py; these labels never enter the projection."""
+    if sid != "concurrent-isolation":
+        return {rule["label"]: index for index, rule in enumerate(EXPECT[sid])}
+    labels = {"login admin": 0}
+    for index in range(12):
+        principal = "admin" if index % 2 == 0 else "user"
+        labels.update({f"login {principal} #{index}": 0, f"account as {principal} #{index}": 1,
+                       f"create Parallel {index:02d}": 2, f"reopen Parallel {index:02d}": 3})
+    return labels
+
+
+def response_counts(row, sid):
+    sent = row.get("requests")
+    labels = response_labels(sid)
+    if not isinstance(sent, list) or len(sent) > len(labels):
+        return None
+    observed = set()
+    statuses = [[] for _ in EXPECT[sid]]
+    for request in sent:
+        if not isinstance(request, dict) or set(request) != {"label", "status", "elapsedMs"}:
+            return None
+        label, status, elapsed = request["label"], request["status"], request["elapsedMs"]
+        if (not isinstance(label, str) or label not in labels or label in observed
+                or type(status) is not int or not 100 <= status <= 599
+                or type(elapsed) not in (int, float) or not 0 <= elapsed <= sys.float_info.max or not math.isfinite(elapsed)):
+            return None
+        observed.add(label)
+        statuses[labels[label]].append(status)
+    return statuses
+
+
+def inspect_problem_names(rule):
+    names = {"recording-detail-incomplete", "exact-route-root-unobserved", "terminal-http-status-unobserved", "recording-incomplete"}
+    if rule["handler"]:
+        names.update(("controller-frame-unobserved", "controller-source-unobserved"))
+    if rule["refusedHandler"]:
+        names.update(("unexpected-controller-frame", "refused-controller-identity-unresolved"))
+    if rule["exception"]:
+        names.add("controller-exception-type-unobserved")
+    names.update(f"repository-declaration-unobserved-in-handler({symbol})" for symbol in rule["repository"])
+    names.update(f"repository-source-unobserved({symbol})" for symbol in rule["repository"]
+                 if symbol.startswith("io.github.jhipster.sample.repository."))
+    if rule["jdbc"]:
+        names.add("postgresql-boundary-unobserved")
+        names.update(f"jdbc-operation-unobserved({verb} {table})" for verb, table in rule["jdbc"])
+    elif rule["method"] == "POST" and rule["route"] == "/api/bank-accounts":
+        names.add("unexpected-bank-account-write-frame-or-interaction")
+    return names
+
+
+def inspected_item(row, rule, statuses_sent, *, burst=False):
+    """Validate the producer's raw histogram before normalizing any problem names."""
+    if not isinstance(row, dict) or statuses_sent is None:
+        return None
+    matched = count(row.get("recordingsMatchingRoute"))
+    statuses, sources = count(row.get("recordingsWithStatus")), count(row.get("recordingsWithSource"))
+    raw = row.get("problems")
+    problems = problem_counts(raw)
+    if (matched is None or statuses is None or sources is None or problems is None
+            or len(set(raw)) != len(raw) or max(statuses, sources) > matched
+            or type(row.get("passed")) is not bool or row["passed"] != (not raw)):
+        return None
+    inspect_names = inspect_problem_names(rule)
+    context = {"workload-request-count-mismatch", "workload-http-status-mismatch"}
+    context.update(("burst-boundary-unverified", "burst-route-count-mismatch", "burst-capacity-drops") if burst else
+                   ("individual-request-and-principal-attribution-unobserved", "pre-dispatch-servlet-root-unobserved",
+                    "pre-dispatch-request-unreached", "recording-attribution-unavailable"))
+    if any(key not in inspect_names | context for key in raw):
+        return None
+    if (("workload-request-count-mismatch" in raw) != (len(statuses_sent) != rule["minCount"])
+            or ("workload-http-status-mismatch" in raw) != any(status not in rule["statuses"] for status in statuses_sent)):
+        return None
+    attribution = row.get("attribution")
+    if burst:
+        histogram = row.get("problemRecordings")
+        if (attribution != "route-counts" or type(row.get("requests")) is not int or row["requests"] != len(statuses_sent)
+                or (matched != rule["minCount"] and "burst-route-count-mismatch" not in raw)
+                or not isinstance(histogram, dict) or set(histogram) != set(raw) & inspect_names
+                or any(type(value) is not int or not 1 <= value <= matched for value in histogram.values())):
+            return None
+    else:
+        if (attribution not in ("serial-boundary-order", "ambiguous", "external-http-only", "unavailable")
+                or matched > 1 or (matched == 1) != (attribution == "serial-boundary-order")
+                or (not matched and set(raw) & inspect_names)):
+            return None
+        missing = {"individual-request-and-principal-attribution-unobserved", "pre-dispatch-servlet-root-unobserved",
+                   "pre-dispatch-request-unreached", "recording-attribution-unavailable"}
+        if ((attribution == "serial-boundary-order" and (len(statuses_sent) != 1 or set(raw) & missing))
+                or (attribution == "ambiguous" and (rule["label"] is not None
+                    or "individual-request-and-principal-attribution-unobserved" not in raw))
+                or (attribution == "external-http-only" and (not rule["preDispatch"] or not statuses_sent
+                    or "pre-dispatch-servlet-root-unobserved" not in raw))
+                or (attribution == "unavailable" and not ({"recording-attribution-unavailable",
+                    "pre-dispatch-request-unreached"} & set(raw)))):
+            return None
+        histogram = {key: 1 for key in raw if key in inspect_names} if matched else {}
+    unread = histogram.get("recording-detail-incomplete", 0)
+    checked = matched - unread
+    if unread > matched or max(statuses, sources) > checked:
+        return None
+    if any(value > checked for key, value in histogram.items() if key != "recording-detail-incomplete"):
+        return None
+    missing_pg = histogram.get("postgresql-boundary-unobserved", 0)
+    if any(histogram.get(f"jdbc-operation-unobserved({verb} {table})", 0) < missing_pg for verb, table in rule["jdbc"]):
+        return None
+    for source_check, observed, failures in ((False, statuses, ("exact-route-root-unobserved", "terminal-http-status-unobserved")),
+                               (True, sources, ("exact-route-root-unobserved", "controller-source-unobserved"))):
+        if source_check and not rule["handler"]:
+            if sources != 0:
+                return None
+            continue
+        bins = [histogram.get(key, 0) for key in failures]
+        if not checked - min(checked, sum(bins)) <= observed <= checked - max(bins):
+            return None
+    if histogram.get("controller-frame-unobserved", 0) > histogram.get("controller-source-unobserved", 0):
+        return None
+    affected = problem_counts(histogram, weighted=True, limit=matched)
+    return {"matched": matched, "checked": checked, "statuses": statuses,
+            "sources": sources, "problems": problems, "affected": affected, "burst": burst}
+
+
+def eligible(rule, seam):
+    return {"root": not rule["preDispatch"], "outcome": True, "completion": True,
+            "controller": bool(rule["handler"] or rule["refusedHandler"]), "source": bool(rule["handler"]),
+            "repository": bool(rule["repository"]), "postgresql": bool(rule["jdbc"]),
+            "preDispatch": rule["preDispatch"], "requestAttribution": True}[seam]
+
+
+def satisfied(item, seam):
+    if item is None or "other" in item["problems"]:
+        return None
+    if seam == "outcome":
+        return item["statuses"]
+    if seam == "source":
+        return item["sources"]
+    if seam == "preDispatch":
+        return item["matched"] if not item["problems"] else 0
+    if seam == "requestAttribution":
+        return item["matched"]
+    failures = [item["affected"].get(name, 0) for name in SEAM_PROBLEMS[seam]]
+    if not item["burst"]:
+        return max(0, item["checked"] - int(any(failures)))
+    if seam in ("repository", "postgresql") and any(failures):
+        return None  # Multiple declarations/operations can fail in the same recording.
+    # Histogram bins overlap. With two nonzero classes, their union is unavailable.
+    return max(0, item["checked"] - sum(failures)) if sum(value > 0 for value in failures) <= 1 else None
+
+
+def recording_evidence_summary(doc):
+    """Bounded scenario/seam diagnostics, without copying labels, symbols, SQL or IDs.
+
+    Mandatory roots exclude three pre-dispatch denials. Burst route groups carry
+    49 requests across four groups; their evidence never credits individual attribution.
+    PostgreSQL observation is inferable only for inspected JDBC-eligible recordings.
+    Receipt fields cannot establish that an unobserved database call was unexercised.
+    """
+    rows = doc.get("scenarios") if valid_receipt(doc) else None
+    rows = rows if isinstance(rows, list) and len(rows) <= 64 else []
+    groups = doc.get("burstRouteGroups") if valid_receipt(doc) else None
+    output = []
+    for sid, expected_requests, _ in SCENARIOS:
+        matches = [row for row in rows if isinstance(row, dict) and row.get("id") == sid]
+        row = matches[0] if len(matches) == 1 else {}
+        verdict_row = row.get("recordingVerdict")
+        verdict_row = verdict_row if isinstance(verdict_row, dict) else {}
+        items = verdict_row.get("expectations")
+        rules = EXPECT[sid]
+        burst = sid == "concurrent-isolation"
+        responses = response_counts(row, sid)
+        top_problems = verdict_row.get("problems")
+        row_valid = (responses is not None and isinstance(items, list) and len(items) <= len(rules)
+                     and isinstance(top_problems, list) and len(top_problems) <= 2
+                     and all(isinstance(problem, str) and problem in (
+                         "scenario-unreached", "workload-requests-without-exact-expectations") for problem in top_problems)
+                     and ("scenario-unreached" not in top_problems or not items and not row.get("requests")
+                          and verdict_row.get("recordingsAttributed") == 0)
+                     and type(verdict_row.get("checkedRequests")) is int
+                     and verdict_row["checkedRequests"] == sum(map(len, responses))
+                     and count(verdict_row.get("recordingsAttributed")) is not None
+                     and type(verdict_row.get("passed")) is bool
+                     and verdict_row["passed"] == (bool(items) and not top_problems
+                          and all(isinstance(item, dict) and item.get("passed") is True for item in items)))
+        if not row_valid:
+            responses = None
+        response_numbers = [len(values) for values in responses] if responses is not None else [None] * len(rules)
+        evidence = [inspected_item(matching_item(groups if burst else items, rule, burst=burst), rule,
+                                   responses[index] if responses is not None else None, burst=burst)
+                    for index, rule in enumerate(rules)]
+        individual = [inspected_item(matching_item(items, rule), rule, responses[index] if responses is not None else None)
+                      for index, rule in enumerate(rules)]
+        if burst:
+            evidence = [item if individual[index] is not None else None for index, item in enumerate(evidence)]
+        sent = row.get("requests") if responses is not None else None
+        scenario_problems = problem_counts(verdict_row.get("problems"))
+        observed_problems = [item["problems"] if item else None for item in individual]
+        seams = {}
+        for seam in SEAM_PROBLEMS:
+            indices = [index for index, rule in enumerate(rules) if eligible(rule, seam)]
+            selected = [individual[index] if seam == "requestAttribution" else evidence[index] for index in indices]
+            matched = [item["matched"] if item else None for item in selected]
+            checked = [item["checked"] if item else None for item in selected]
+            supported = [satisfied(item, seam) for item in selected]
+            total = lambda values: min(MAX_COUNT, sum(values)) if all(value is not None for value in values) else None
+            # Context failures explain why this seam was not checked; failures of other
+            # seams are retained in the scenario totals rather than mislabelled here.
+            names = set(SEAM_PROBLEMS[seam]) | {"recording-detail-incomplete", "recording-attribution-unavailable",
+                    "pre-dispatch-servlet-root-unobserved", "pre-dispatch-request-unreached",
+                    "individual-request-and-principal-attribution-unobserved", "workload-request-count-mismatch",
+                    "workload-http-status-mismatch", "burst-boundary-unverified", "burst-route-count-mismatch",
+                    "burst-capacity-drops", "other"}
+            filtered = lambda item, key: {name: value for name, value in item[key].items() if name in names} if item else None
+            seam_row = {"eligibleRequests": sum(rules[index]["minCount"] for index in indices),
+                        "eligibleGroups": len(indices), "observedResponses": total([response_numbers[index] for index in indices]),
+                        "observedGroups": sum(item is not None for item in selected),
+                        "matchedRecordings": total(matched), "knownMatchedRecordings": min(MAX_COUNT, sum(value or 0 for value in matched)),
+                        "checkedRecordings": total(checked), "satisfiedRecordings": total(supported),
+                        "failureClasses": merge_counts([filtered(item, "problems") for item in selected]),
+                        "recordingFailureAssertions": merge_counts([filtered(item, "affected") for item in selected])}
+            if seam == "postgresql":
+                # This is any accepted pgjdbc/postgresql boundary, independently of whether
+                # its verb/table satisfies all expected operations. No SQL is projected.
+                observations = [max(0, item["checked"] - item["affected"].get("postgresql-boundary-unobserved", 0))
+                                if item and "other" not in item["problems"] else None for item in selected]
+                observed = total(observations)
+                seam_row.update(pgjdbcObservedRecordings=observed,
+                                observation="unknown" if observed is None else "not-checked" if not indices or total(checked) == 0
+                                else "observed" if observed > 0 else "not-observed",
+                                actualExercise="unknown-from-receipt")
+            seams[seam] = seam_row
+        output.append({"id": sid, "expectedRequests": expected_requests,
+                       "eligibleRoots": sum(rule["minCount"] for rule in rules if not rule["preDispatch"]),
+                       "optionalPreDispatchRoots": sum(rule["minCount"] for rule in rules if rule["preDispatch"]),
+                       "observedResponses": count(len(sent)) if isinstance(sent, list) else None,
+                       "checkedRequests": len(sent) if sent is not None and verdict_row.get("checkedRequests") == len(sent) and ("scenario-unreached" not in top_problems or not items and not row.get("requests")
+                          and verdict_row.get("recordingsAttributed") == 0)
+                     and type(verdict_row.get("checkedRequests")) is int else None,
+                       "individualRecordingsAttributed": count(verdict_row.get("recordingsAttributed")) if all(item is not None for item in individual)
+                       and verdict_row.get("recordingsAttributed") == sum(item["matched"] for item in individual) else None,
+                       "recordingVerdict": verdict(verdict_row.get("passed")) if all(item is not None for item in individual)
+                       and scenario_problems is not None and verdict_row.get("passed") is
+                       (not scenario_problems and all(not item["problems"] for item in individual)) else "not-observed",
+                       "expectationGroups": len(rules), "observedExpectationGroups": sum(item is not None for item in individual),
+                       "failureClasses": merge_counts([scenario_problems, *observed_problems]),
+                       "routeGroupFailureClasses": merge_counts([item["problems"] if item else None for item in evidence]) if burst else {},
+                       "evidenceScope": "burst-route-groups" if burst else "serial-boundary-order",
+                       "seams": seams})
+    return {"countLimit": MAX_COUNT, "expectedRequests": 77, "eligibleRoots": 74,
+            "optionalPreDispatchRoots": 3, "expectedBurstRoots": 49, "expectedBurstGroups": 4,
+            "problemUnits": "failureClasses-count-assertions-per-group;recordingFailureAssertions-count-per-recording-assertions",
+            "scenarios": output}
+
+
+def aggregate_problem_counts(doc, projection):
+    """A missing, partial or inconsistent aggregate is unknown, never an empty map."""
+    if not valid_receipt(doc):
+        return None
+    raw = doc.get("problemClasses")
+    rows, groups = doc.get("scenarios"), doc.get("burstRouteGroups")
+    if (not isinstance(raw, dict) or len(raw) > 64 or any(not isinstance(key, str) or not key or "(" in key
+            or type(value) is not int or not 1 <= value <= MAX_COUNT for key, value in raw.items())
+            or not isinstance(rows, list) or len(rows) != len(SCENARIOS)
+            or not isinstance(groups, list) or len(groups) != 4):
+        return None
+    if any(row["observedExpectationGroups"] != row["expectationGroups"]
+           or row["checkedRequests"] is None or row["individualRecordingsAttributed"] is None
+           or row["recordingVerdict"] == "not-observed" for row in projection["scenarios"]):
+        return None
+    burst = next(row for row in projection["scenarios"] if row["id"] == "concurrent-isolation")
+    if burst["seams"]["root"]["observedGroups"] != 4:
+        return None
+    expected = Counter()
+    for row in rows:
+        verdict_row = row["recordingVerdict"]
+        expected.update(verdict_row["problems"])
+        for item in verdict_row["expectations"]:
+            expected.update(problem.split("(", 1)[0] for problem in item["problems"])
+    for group in groups:
+        expected.update(problem.split("(", 1)[0] for problem in group["problems"])
+    # xinstr also adds two session/boundary flags without per-recording histograms.
+    for key in ("burst-drops", "burst-boundary-not-verified"):
+        if key in raw:
+            if raw[key] != 1:
+                return None
+            expected[key] = 1
+    return dict(expected) if dict(expected) == raw else None
 
 
 def scan_sinks(root, values):
@@ -381,24 +746,22 @@ def build_summary(root):
             value = phases.get(key)
             summary[key] = value if isinstance(value, str) and re.fullmatch(pattern, value) else None
     # Only a fixed taxonomy survives; arbitrary source problem strings never become public labels.
-    problem_classes = instrumented.get("problemClasses", {}) if isinstance(instrumented, dict) else {}
-    problem_classes = problem_classes if isinstance(problem_classes, dict) else {}
+    projection = recording_evidence_summary(instrumented)
+    problem_classes = aggregate_problem_counts(instrumented, projection)
+    judge_observed = (valid_receipt(instrumented) and problem_classes is not None
+                      and any(row["observedExpectationGroups"] > 0 for row in projection["scenarios"]))
     taxonomy = {
-        "preDispatch": lambda k: k.startswith("pre-dispatch-"),
-        "postgresql": lambda k: k == "postgresql-boundary-unobserved" or k.startswith("jdbc-operation-unobserved("),
-        "burst": lambda k: k.startswith("burst-") or k == "individual-request-and-principal-attribution-unobserved",
+        "preDispatch": lambda key: key.startswith("pre-dispatch-"),
+        "postgresql": lambda key: key in ("postgresql-boundary-unobserved", "jdbc-operation-unobserved"),
+        "burst": lambda key: key.startswith("burst-") or key == "individual-request-and-principal-attribution-unobserved",
     }
-    judged_rows = instrumented.get("scenarios", []) if isinstance(instrumented, dict) else []
-    judge_observed = (isinstance(judged_rows, list) and any(
-        isinstance(row, dict) and isinstance(row.get("recordingVerdict"), dict)
-        and isinstance(row["recordingVerdict"].get("expectations"), list)
-        and bool(row["recordingVerdict"]["expectations"]) for row in judged_rows))
     summary["recordingJudgement"] = "observed" if judge_observed else "not-observed"
     summary["recordingGapProblemCounts"] = {
-        name: min(MAX_COUNT, sum(count(v) or 0 for k, v in problem_classes.items() if isinstance(k, str) and match(k)))
+        name: min(MAX_COUNT, sum(value for key, value in problem_classes.items() if match(key)))
         if judge_observed else None for name, match in taxonomy.items()
     }
     summary["recordingGapCountLimit"] = MAX_COUNT
+    summary["recordingEvidence"] = projection
     return summary, values
 
 
