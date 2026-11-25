@@ -1,6 +1,13 @@
+import copy
+import json
+import hashlib
 import pathlib
+import struct
 import sys
+import tempfile
 import unittest
+import zlib
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -13,6 +20,14 @@ def sc(i, checks=True, eq=True, rec=True):
 
 def by(steps):
     return {n: (st, note) for n, st, note in steps}
+
+
+def browser_png(width: int, gray: int = 0) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, 1, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\0" + bytes([gray]) * width)) + chunk(b"IEND", b""))
 
 
 class T(unittest.TestCase):
@@ -105,12 +120,113 @@ class T(unittest.TestCase):
         self.assertEqual(d["instrumented-fingerprints-equal-baseline"][0], "fail")
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
 
-    def test_browser_and_tui(self):
-        j = {"widths": [{"width": 320}], "linear": "pass", "canvas": "not-implemented", "overflowAt": []}
-        d = by(s.browser_steps(j))
-        self.assertEqual((d["browser-journeys-linear"][0], d["browser-journeys-canvas"][0]), ("pass", "not-implemented"))
-        j["overflowAt"] = [320]
-        self.assertEqual(by(s.browser_steps(j))["browser-journeys-linear"][0], "fail")
+    def test_legacy_browser_report_identifies_exercised_widths(self):
+        j = {"schemaVersion": 1, "kind": "browser_journeys", "linear": "pass", "canvas": "pass", "overflowAt": [],
+             "widths": [{"width": w, "horizontalOverflow": False, "pageErrors": 0,
+                         "steps": {mode: {"status": "pass"} for mode in ("list", "linear", "canvas")}}
+                        for w in (320, 736, 1280)]}
+
+        def diagnostic(report):
+            return tuple(status for _, status, _ in s.browser_steps(report))
+
+        self.assertEqual(diagnostic(j), ("reported", "reported"))
+        self.assertIn("320,736,1280", by(s.browser_steps(j))["browser-journeys-linear"][1])
+        self.assertEqual(diagnostic(dict(j, overflowAt=[320])), ("fail", "fail"))
+        self.assertEqual(diagnostic(dict(j, linear="fail")), ("fail", "reported"))
+
+        unavailable = copy.deepcopy(j)
+        unavailable["canvas"] = "not-implemented"
+        for row in unavailable["widths"]:
+            row["steps"]["canvas"] = {"status": "not-implemented"}
+        self.assertEqual(diagnostic(unavailable), ("reported", "not-implemented"))
+
+        incomplete = copy.deepcopy(j)
+        del incomplete["canvas"]
+        incomplete["widths"][0]["steps"]["linear"] = {}
+        self.assertEqual(diagnostic(incomplete), ("fail", "fail"))
+        unknown = dict(j, canvas="unknown")
+        self.assertEqual(diagnostic(unknown), ("reported", "fail"))
+        contradictory = copy.deepcopy(j)
+        contradictory["widths"][0]["steps"]["canvas"] = {"status": "fail"}
+        self.assertEqual(diagnostic(contradictory), ("reported", "fail"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            journey = pathlib.Path(tmp) / "journeys.json"
+            summary = pathlib.Path(tmp) / "summary.json"
+            for report in (j, unavailable, incomplete, unknown, contradictory):
+                journey.write_text(json.dumps(report))
+                argv = ["camp_instr_steps.py", "browser", "--file", str(summary), "--project", "petclinic",
+                        "--journeys", str(journey)]
+                with patch.object(sys, "argv", argv):
+                    self.assertEqual(s.main(), 1)
+                self.assertEqual(s.cs.gate(summary), 1)
+                self.assertEqual([step["status"] for step in json.loads(summary.read_text())["steps"]], ["fail", "fail"])
+
+    def test_packaged_browser_evidence(self):
+        source_sha, package_sha = "1" * 40, "2" * 64
+        j = {"schemaVersion": 2, "kind": "browser_journeys", "sourceSha": source_sha, "packageSha256": package_sha,
+             "linear": "pass", "canvas": "pass", "overflowAt": [], "widths": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            frames = pathlib.Path(tmp)
+            for w in (320, 736, 1024, 1280, 1440):
+                steps = {}
+                for name in ("list", "recordings", "linear", "canvas", "returnToSteps"):
+                    frame = f"{name}-{w}.png"
+                    image = browser_png(w)
+                    (frames / frame).write_bytes(image)
+                    steps[name] = {"status": "pass", "screenshot": frame, "horizontalOverflow": False,
+                                   "screenshotSha256": hashlib.sha256(image).hexdigest()}
+                j["widths"].append({"width": w, "steps": steps, "pageErrors": 0, "selectionContinuous": True})
+
+            def verdict(report, expected_source=source_sha):
+                checked = by(s.browser_steps(report, frame_dir=frames, source_sha=expected_source, package_sha256=package_sha))
+                return checked["browser-journeys-linear"][0], checked["browser-journeys-canvas"][0]
+
+            self.assertEqual(verdict(j), ("pass", "pass"))
+            self.assertEqual(verdict(j, "3" * 40), ("fail", "fail"))
+            for width_change in (j["widths"][:-1], j["widths"][:-1] + j["widths"][:1]):
+                self.assertEqual(verdict(dict(j, widths=width_change)), ("fail", "fail"))
+            for changes, expected in (
+                ({"pageErrors": 1}, ("fail", "fail")),
+                ({"selectionContinuous": False}, ("pass", "fail")),
+                ({"steps": {**j["widths"][0]["steps"], "returnToSteps": {"status": "fail"}}}, ("pass", "fail")),
+                ({"steps": {**j["widths"][0]["steps"], "linear": {"status": "fail"}}}, ("fail", "fail")),
+            ):
+                with self.subTest(changes=changes):
+                    changed = copy.deepcopy(j)
+                    changed["widths"][0].update(changes)
+                    self.assertEqual(verdict(changed), expected)
+
+            self.assertEqual(verdict(dict(j, overflowAt=[320])), ("fail", "fail"))
+            for phase in ("linear", "canvas", "returnToSteps"):
+                with self.subTest(overflow_phase=phase):
+                    overflow = copy.deepcopy(j)
+                    overflow["overflowAt"] = [320]
+                    if phase != "returnToSteps":
+                        overflow[phase] = "fail"
+                    overflow["widths"][0]["steps"][phase].update(status="fail", horizontalOverflow=True)
+                    self.assertEqual(verdict(overflow), ("fail", "fail"))
+            self.assertEqual(verdict(dict(j, canvas="fail")), ("pass", "fail"))
+
+            unavailable = copy.deepcopy(j)
+            unavailable["canvas"] = "not-implemented"
+            for row in unavailable["widths"]:
+                row["steps"]["canvas"] = {"status": "not-implemented"}
+                del row["steps"]["returnToSteps"]
+                row["selectionContinuous"] = False
+            self.assertEqual(verdict(unavailable), ("pass", "not-implemented"))
+            screenshot = frames / "canvas-736.png"
+            for malformed in (browser_png(320), browser_png(736)[:-4], b"\x89PNG\r\n\x1a\n"):
+                screenshot.write_bytes(malformed)
+                changed = copy.deepcopy(j)
+                changed["widths"][1]["steps"]["canvas"]["screenshotSha256"] = hashlib.sha256(malformed).hexdigest()
+                self.assertEqual(verdict(changed), ("pass", "fail"))
+            screenshot.write_bytes(browser_png(736, gray=255))
+            self.assertEqual(verdict(j), ("pass", "fail"))
+            screenshot.unlink()
+            self.assertEqual(verdict(j), ("pass", "fail"))
+
+    def test_tui(self):
         self.assertEqual(by(s.tui_steps({"verdict": "not-implemented", "reason": "x"}))["tui-pty-transcript"][0], "not-implemented")
         self.assertEqual(by(s.tui_steps({"verdict": "weird"}))["tui-pty-transcript"][0], "fail")
         self.assertEqual(by(s.tui_steps(None))["tui-pty-transcript"][0], "fail")

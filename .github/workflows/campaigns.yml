@@ -275,21 +275,26 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-      - name: Browser journeys, Linear and Canvas at 320, 736 and 1280 px
+      - name: Browser journeys, Steps and Map at 320, 736, 1024, 1280 and 1440 px
         if: matrix.project == 'petclinic' && always()
         run: |
           export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          widths=320,736,1024,1280,1440
+          source_sha="$(git rev-parse HEAD)"
+          package_sha="$(cat "$CAMP_OUT/package.sha256" 2>/dev/null || true)"
           rc=0
           (npm ci --prefix web/app --ignore-scripts --no-audit --no-fund && cd web/app && npx playwright install --with-deps chromium) \
             > "$RUNNER_TEMP/browser-setup.log" 2>&1 || rc=$?
           if [ "$rc" -eq 0 ]; then
             node tools/qa/browser_journeys.mjs --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
-              --out "$RUNNER_TEMP/priv/browser" --widths 320,736,1280 || true
+              --out "$RUNNER_TEMP/priv/browser" --widths "$widths" --source-sha "$source_sha" --package-sha256 "$package_sha" || rc=$?
           else
-            echo "browser tooling setup failed (exit $rc); last lines:"; tail -n 5 "$RUNNER_TEMP/browser-setup.log"
+            echo "browser tooling setup failed (exit $rc)"
           fi
           python3 -B tools/qa/camp_instr_steps.py browser --file "$CAMP_OUT/summary.json" --project petclinic \
-            --journeys "$RUNNER_TEMP/priv/browser/journeys.json"
+            --journeys "$RUNNER_TEMP/priv/browser/journeys.json" --widths "$widths" \
+            --source-sha "$source_sha" --package-sha256 "$package_sha" || exit $?
+          exit "$rc"
       - name: TUI PTY transcript
         if: matrix.project == 'petclinic' && always()
         run: |
