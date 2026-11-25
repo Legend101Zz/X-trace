@@ -88,6 +88,16 @@ class T(unittest.TestCase):
                 self.assertEqual(dict((n, st) for n, st, _ in steps)["export-bundle"], "fail")
         self.assertEqual(ce.judge({})[0], "fail")
 
+    def test_packaged_scan_leaves_analyzer_resolution_to_installed_cli(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(ce.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 2, "{}")
+            steps = ce.run_exports("/installed prefix/bin/xtrace", "project", None, pathlib.Path(td))
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:2], ["/installed prefix/bin/xtrace", "scan"])
+            self.assertNotIn("--analyzer", argv)
+            self.assertEqual(steps[0][1], "fail")
+            self.assertEqual(run.call_count, 1)
+
     def test_scan_precedes_every_export_and_stale_files_fail(self):
         calls = []
         with tempfile.TemporaryDirectory() as td:
