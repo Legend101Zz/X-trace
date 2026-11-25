@@ -47,7 +47,18 @@ try {
     await page.setViewportSize({ width, height });
     const steps = page.getByRole('tab', { name: 'events' });
     if (await steps.isVisible()) await steps.click();
-    await page.locator('.event').nth(index).click();
+    const outcome = page.locator('#events-panel .recording-why');
+    await expect(outcome).toHaveJSProperty('open', true);
+    const step = page.locator('#events-panel .event').nth(index);
+    await step.scrollIntoViewIfNeeded();
+    const hitIsStep = await step.evaluate((row) => {
+      const { left, right, top, bottom } = row.getBoundingClientRect();
+      const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+      return hit != null && row.contains(hit);
+    });
+    assert.ok(hitIsStep, `an actual pointer can reach the focused event with Why expanded at ${width}px`);
+    await step.click();
+    await expect(step).toHaveAttribute('aria-current', 'true');
     const code = page.getByRole('region', { name: 'Code', exact: true });
     const active = code.locator('[aria-current="location"]');
     await expect(active).toHaveCount(1);

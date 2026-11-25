@@ -25,6 +25,14 @@
 .recording-why > summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
 @media (max-width: 1023px), (pointer: coarse) { .recording-why > summary { min-height: 44px; } }
 
+/* In a bounded Steps pane, one scroll port keeps an expanded Why and the
+   later event rows reachable without spilling across the Inspector divider. */
+@media (min-width: 700px) {
+  .steps-and-code > .pane { flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; }
+  .steps-and-code > .pane > * { flex-shrink: 0; }
+  .steps-and-code > .pane > .event-rail { overflow: visible; }
+}
+
 @media (min-width: 861px) {
   .shell.viewer-shell { height: 100dvh; }
   .workspace.viewer-workspace { grid-template-columns: minmax(0, var(--requests-size)) 8px minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); grid-template-rows: minmax(0, 1fr) auto; }
