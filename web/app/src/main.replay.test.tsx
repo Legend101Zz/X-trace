@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './main';
 
@@ -27,7 +27,7 @@ const detail = {
   recordingId: recordingA, status: 'complete', completion: 'complete',
   adapterSummary: null as null | { Redacted: { rule_id: string; shape_hint: unknown } },
   capacity: null as null | { eventCap: number; eventCount: number; capacityDroppedEvents: string; dropsByPriority: Record<string, string> },
-  durationNs: '20', dropCountsByPriority: {}, segmentCount: '1', incompleteEvidence: [] as string[], nextCursor: null,
+  durationNs: '20', dropCountsByPriority: {}, segmentCount: '1', incompleteEvidence: [] as string[], nextCursor: null as string | null, prevCursor: null as string | null,
   sessionContext,
   unavailable: { source: 'unavailable', values: 'unavailable', completion: 'unavailable' },
   outcome: { kind: 'exception', httpStatus: 500, exception: { exceptionType: 'java.lang.IllegalStateException', message: 'boom' }, thrownFromEventId: null },
@@ -49,10 +49,14 @@ const inspector = () => screen.getByRole('tabpanel', { name: 'Inspector', hidden
 
 describe('replay wiring in the app', () => {
   let responseDetail = detail;
+  const continuationPages = new Map<string, typeof detail>();
+  const heldContinuations = new Map<string, Promise<Response>>();
   let responseLinked = linked;
   let secondDetail: typeof detail | null = null;
   beforeEach(() => {
     responseDetail = detail;
+    continuationPages.clear();
+    heldContinuations.clear();
     responseLinked = linked;
     secondDetail = null;
     window.history.replaceState(null, '', '/viewer#token=t');
@@ -62,7 +66,12 @@ describe('replay wiring in the app', () => {
       if (path.startsWith('/api/v1/endpoints?')) return json(endpoints);
       if (path.includes('/recordings') && path.includes('/endpoints/')) return json(responseLinked);
       if (path.startsWith(`/api/v1/recordings/${recordingB}?`) && secondDetail) return json(secondDetail);
-      if (path.startsWith('/api/v1/recordings/')) return json(responseDetail);
+      if (path.startsWith('/api/v1/recordings/')) {
+        const cursor = new URL(path, window.location.origin).searchParams.get('cursor');
+        const held = cursor !== null ? heldContinuations.get(cursor) : undefined;
+        if (held) return held;
+        return json(cursor !== null ? continuationPages.get(cursor) ?? responseDetail : responseDetail);
+      }
       throw new Error(`Unexpected request ${path}`);
     }));
   });
@@ -451,5 +460,69 @@ describe('replay wiring in the app', () => {
     expect(within(code).getByText('Source location is unavailable for this event')).toBeInTheDocument();
     expect(within(inspector()).queryByRole('region', { name: 'Event details' })).not.toBeInTheDocument();
     expect(screen.getByRole('region', { name: 'Recording summary' })).toHaveTextContent('Event sequence 1');
+  });
+  it('loads opaque earlier and later pages and jumps only to an exact retained event sequence', async () => {
+    const sameFrame = { ...events[2], frameId: events[1].frameId };
+    const frameLess = { ...events[3], frameId: null };
+    responseDetail = { ...detail, events: [events[1], sameFrame], prevCursor: 'earlier opaque+/=', nextCursor: 'later opaque+/=' };
+    continuationPages.set('earlier opaque+/=', { ...detail, events: [events[0]], nextCursor: 'different edge cursor' });
+    continuationPages.set('later opaque+/=', { ...detail, events: [frameLess], prevCursor: 'new preceding cursor' });
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
+    fireEvent.click(await screen.findByRole('button', { name: /Audit\.log/ }));
+    showEvents();
+    const controls = screen.getByRole('region', { name: 'Loaded event window' });
+    fireEvent.click(within(controls).getByRole('button', { name: 'Load earlier' }));
+    await within(controls).findByText('3 loaded events');
+    expect(within(controls).getByText('Start of the available recording window.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Audit\.log/ })).toHaveAttribute('aria-current', 'true');
+    fireEvent.click(within(controls).getByRole('button', { name: 'Load later' }));
+    await within(controls).findByText('4 loaded events');
+    expect(within(controls).getByText('No later events available from this window.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Audit\.log/ })).toHaveAttribute('aria-current', 'true');
+
+    const typedSequence = within(controls).getByRole('textbox', { name: 'Loaded event sequence' });
+    fireEvent.change(typedSequence, { target: { value: '99' } });
+    const requestCount = vi.mocked(fetch).mock.calls.length;
+    fireEvent.click(within(controls).getByRole('button', { name: 'Go to event' }));
+    expect(live()).toHaveTextContent('Event sequence is not in the loaded window.');
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(requestCount);
+    fireEvent.change(typedSequence, { target: { value: '4' } });
+    fireEvent.click(within(controls).getByRole('button', { name: 'Go to event' }));
+    const selected = screen.getByRole('button', { name: /Audit\.write/ });
+    expect(selected).toHaveAttribute('aria-current', 'true');
+    await waitFor(() => expect(selected).toHaveFocus());
+  });
+
+  it('rejects a continuation response for another recording without replacing the current window', async () => {
+    responseDetail = { ...detail, nextCursor: 'private opaque cursor' };
+    continuationPages.set('private opaque cursor', { ...detail, recordingId: recordingB, events: [] });
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: 'Load later' }));
+    const error = await screen.findByRole('alert');
+    expect(error).toHaveTextContent('The local viewer could not complete this request.');
+    expect(error).not.toHaveTextContent(/private opaque cursor|identity mismatch/);
+    expect(screen.getByRole('button', { name: /Controller\.create/ })).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByRole('button', { name: 'Load later' })).toBeEnabled();
+  });
+  it('ignores a continuation that resolves after switching recordings', async () => {
+    const token = 'old recording continuation';
+    responseDetail = { ...detail, nextCursor: token };
+    responseLinked = { ...linked, items: [...linked.items, { ...linked.items[0], recordingId: recordingB }] };
+    let finish: ((value: Response) => void) | undefined;
+    heldContinuations.set(token, new Promise<Response>((resolve) => { finish = resolve; }));
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: 'Load later' }));
+    expect(screen.getByText('Loading event window…')).toBeInTheDocument();
+    secondDetail = { ...detail, recordingId: recordingB, events: [{ ...events[0], symbol: 'Other.recording' }] };
+    fireEvent.click(screen.getByRole('tab', { name: 'Requests' }));
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
+    await screen.findByRole('button', { name: /Other\.recording/ });
+    await act(async () => {
+      finish?.(new Response(JSON.stringify({ ...detail, events: [{ ...events[3], symbol: 'Old.continuation' }] })));
+    });
+    expect(screen.queryByText('Old.continuation')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Other\.recording/ })).toHaveAttribute('aria-current', 'true');
   });
 });

@@ -115,6 +115,9 @@ try {
   await expect(firstEvent).toBeFocused();
   await expect(firstEvent).toHaveCSS('outline-offset', '-2px');
   await expect(firstEvent).toHaveCSS('outline-style', 'solid');
+  const windowControls = page.getByRole('region', { name: 'Loaded event window' });
+  await expect(windowControls.getByText('Start of the available recording window.')).toBeVisible();
+  await expect(windowControls.getByRole('button', { name: 'Load earlier', exact: true })).toHaveCount(0);
   const observed = await page.locator('.event-seq').allTextContents();
   assert.deepEqual(observed, expectedSequences, 'browser event order differs from the product query projection');
   await page.getByRole('tab', { name: 'Inspector' }).click();

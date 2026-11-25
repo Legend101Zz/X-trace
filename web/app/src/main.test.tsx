@@ -303,7 +303,7 @@ describe('endpoint-first recording viewer', () => {
     fireEvent.click(screen.getByRole('tab', { name: /^Values/ }));
     expect(screen.getByText(/No value bindings were recorded for this event/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Load next window' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Load later' }));
     expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /fixture\.Service\.call/ }));
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL) === `/api/v1/recordings/${recordingA}?limit=200&cursor=recording-a-next`)).toBe(true);
@@ -311,7 +311,7 @@ describe('endpoint-first recording viewer', () => {
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
     expect(await screen.findByText('recording-b-only')).toBeInTheDocument();
     expect(screen.queryByText('fixture.Service.call')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Load next window' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Load later' })).not.toBeInTheDocument();
 
     const tabs = screen.getByRole('tablist', { name: 'Open recordings' });
     fireEvent.keyDown(within(tabs).getByRole('tab', { name: new RegExp(recordingB) }), { key: 'ArrowLeft' });

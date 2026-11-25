@@ -4,6 +4,7 @@ import { CanvasView } from '../canvas/CanvasView';
 import type { NavAction, NavControl } from '../../replay/navigation';
 import type { ReplayMode } from '../../replay/state';
 import { OutcomeBanner } from './OutcomeBanner';
+import { ReplayWindows } from './ReplayWindows';
 import { ReplayToolbar } from './ReplayToolbar';
 import { StepsList } from './StepsList';
 
@@ -15,10 +16,13 @@ export interface EventsPanelProps {
   detailError: string;
   selectedEvent: ReplayEvent | undefined;
   selectionUnavailable: string | null;
-  olderEventsReleased: boolean;
+  releasedEvents: 'earlier' | 'later' | null;
+  startKnown: boolean;
   onRefresh: () => void;
+  onRetry: () => void;
   onPickEvent: (event: ReplayEvent) => void;
-  onNextWindow: () => void;
+  onChangeWindow: (direction: 'earlier' | 'later') => void;
+  onJumpToSequence: (sequence: string) => void;
   mode: ReplayMode;
   onMode: (mode: ReplayMode) => void;
   onSelectFrame: (frameId: string) => void;
@@ -29,10 +33,10 @@ export interface EventsPanelProps {
   frameControls: readonly NavControl[];
 }
 
-export function EventsPanel({ active, selectedRecording, detail, detailBusy, detailError, selectedEvent, selectionUnavailable, olderEventsReleased, onRefresh, onPickEvent, onNextWindow, mode, onMode, onSelectFrame, onNavigateKey, onMove, backReason, nextReason, frameControls }: EventsPanelProps) {
+export function EventsPanel({ active, selectedRecording, detail, detailBusy, detailError, selectedEvent, selectionUnavailable, releasedEvents, startKnown, onRefresh, onRetry, onPickEvent, onChangeWindow, onJumpToSequence, mode, onMode, onSelectFrame, onNavigateKey, onMove, backReason, nextReason, frameControls }: EventsPanelProps) {
   return <section className="pane" role="tabpanel" id="events-panel" aria-labelledby="events-tab" data-active={active} aria-label="Ordered event window">
         <div className="pane-head center-head"><div className="center-title"><div className="eyebrow">Replay steps</div><h1>{selectedRecording || 'Select a recording'}</h1></div><button className="button" onClick={onRefresh} disabled={detailBusy}>Refresh</button></div>
-        {detailError ? <ErrorState message={detailError} onRetry={onRefresh} /> : null}
+        {detailError ? <ErrorState message={detailError} onRetry={onRetry} /> : null}
         {!selectedRecording && !detailError ? <div className="empty"><strong>No recording selected</strong><p>Choose a linked or unmatched recording from the left pane.</p></div> : null}
         {detail ? <OutcomeBanner detail={detail} /> : null}
         {selectionUnavailable ? <p className="window-retention">{selectionUnavailable}</p> : null}
@@ -41,12 +45,13 @@ export function EventsPanel({ active, selectedRecording, detail, detailBusy, det
           <button className="button" aria-pressed={mode === 'linear'} onClick={() => onMode('linear')}>Steps</button>
           <button className="button" aria-pressed={mode === 'canvas'} onClick={() => onMode('canvas')}>Map</button>
         </div> : null}
+        {detail ? <ReplayWindows key={detail.recordingId} prevCursor={detail.prevCursor ?? null} nextCursor={detail.nextCursor ?? null}
+          count={detail.events.length} busy={detailBusy} startKnown={startKnown} released={releasedEvents}
+          onChange={onChangeWindow} onJump={onJumpToSequence} /> : null}
         {mode === 'canvas' && selectedEvent && selectedEvent.frameId == null ? <p className="window-retention">Frame ID unavailable for the selected event.</p> : null}
         {detail && detail.events.length && mode === 'canvas' ? <CanvasView events={detail.events} selectedFrameId={selectedEvent?.frameId ?? null} onSelectFrame={onSelectFrame} onNavigate={onNavigateKey} /> : null}
         {detailBusy && !detail ? <div className="loading">Verifying persisted event window…</div> : null}
         {detail && detail.events.length === 0 ? <div className="empty"><strong>No projected events</strong><p>The persisted recording has no event window to display.</p></div> : null}
         {detail?.events.length && mode === 'linear' ? <StepsList events={detail.events} selected={selectedEvent} onPick={onPickEvent} onMove={onMove} /> : null}
-        {olderEventsReleased ? <p className="window-retention" role="status">Earlier events were released from memory. Continue from the current event cursor.</p> : null}
-        {detail?.nextCursor ? <div className="page-controls"><span className="top-meta">More events in verified window</span><button className="button button-primary" onClick={onNextWindow} disabled={detailBusy}>Load next window</button></div> : null}
-      </section>;
+</section>;
 }
