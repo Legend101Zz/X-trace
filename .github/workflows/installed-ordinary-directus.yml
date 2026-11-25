@@ -1,0 +1,179 @@
+name: Installed Directus ordinary development proof
+on:
+  push:
+    branches: [codex/proof-directus-isolated-ordinary-119]
+permissions:
+  contents: read
+jobs:
+  ordinary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      PRODUCT: 07927522b741afb9d82f4fc32647dbb09ea1e9f2
+      PRODUCT_TREE: e172b267641967c4440fa7e2d083e09ea1f0d812
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_TERM_COLOR: never
+      XCAMP_PLATFORM: linux/amd64
+      DIRECTUS_SHA: d52fd4b29ecdd4d260aa47ca8cee58d9d62bf486
+      DATABASE_IMAGE: postgres@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db
+      RUNTIME_TAG: xtrace-camp-node:22.23.0-amd64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22.23.0'
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Check source and admit private runner scratch
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/xd119"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/logs" "$root/safe" "$root/console" "$root/campaign" "$root/campaign/directus" "$root/empty"
+          printf '%s\n' "PROOF=$root" "XTRACE_CAMP_NODE_ROOT=$root/campaign" >> "$GITHUB_ENV"
+      - name: Check scope guard and existing installed evidence unit tests
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          node --test --test-reporter=tap campaigns/node/directus/ordinary/installed-judge.test.mjs campaigns/node/directus/ordinary/isolation.test.mjs \
+            > "$PROOF/logs/unit.stdout" 2> "$PROOF/logs/unit.stderr" || rc=$?
+          printf 'Directus installed unit exit %d\n' "$rc"
+          test "$rc" -eq 0
+          python3 -B - <<'PYTHON'
+          import os, pathlib, re
+          path = pathlib.Path(os.environ['PROOF']) / 'logs/unit.stdout'
+          assert path.stat().st_size <= 131072
+          body = path.read_text()
+          expected = {'tests': 22, 'pass': 22, 'fail': 0, 'cancelled': 0, 'skipped': 0, 'todo': 0}
+          for key, count in expected.items():
+              assert re.findall(rf'^# {key} ([0-9]+)$', body, re.MULTILINE) == [str(count)]
+          print('Directus ordinary hosted unit cases passed: 22 of 22')
+          PYTHON
+      - name: Build exact unsigned X-trace package
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          python3 -B packaging/build.py --platform linux-x86_64 --out "$PROOF/dist" --work "$PROOF/build" \
+            > "$PROOF/logs/package.stdout" 2> "$PROOF/logs/package.stderr" || rc=$?
+          printf 'Exact development package build exit %d\n' "$rc"
+          test "$rc" -eq 0
+          archive="$PROOF/dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz"
+          test -f "$archive" && test ! -L "$archive"
+          printf '%s\n' "ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - name: Verify pinned Directus checkout license and lockfile
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          bash -euo pipefail -s > "$PROOF/logs/source.stdout" 2> "$PROOF/logs/source.stderr" <<'SOURCE' || rc=$?
+          upstream="$XTRACE_CAMP_NODE_ROOT/directus/upstream"
+          mkdir -m 700 "$upstream"
+          git -C "$upstream" init
+          git -C "$upstream" remote add origin https://github.com/directus/directus
+          git -C "$upstream" fetch --no-tags --depth 1 origin refs/tags/v12.4.1
+          test "$(git -C "$upstream" rev-parse FETCH_HEAD)" = "$DIRECTUS_SHA"
+          git -C "$upstream" checkout --detach "$DIRECTUS_SHA"
+          test -z "$(git -C "$upstream" status --porcelain --untracked-files=all)"
+          cd "$upstream"
+          sha256sum -c --status <<'PINNED'
+          f209dfa60e56b29f6e8e5cefde91dec4ce86f12289209ede63520556385d555d  license
+          45fe80c8c4c45b51b11e655993bc66486ec5dc13fbb2596e5fead56960958de6  pnpm-lock.yaml
+          PINNED
+          SOURCE
+          printf 'Pinned upstream source admission exit %d\n' "$rc"
+          exit "$rc"
+      - name: Build the pinned Ubuntu and Node preparation runtime
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          docker build --platform "$XCAMP_PLATFORM" --iidfile "$PROOF/image-id" --tag "$RUNTIME_TAG" \
+            --file campaigns/node/directus/ordinary/installed-ordinary-runtime.Dockerfile "$PROOF/empty" \
+            > "$PROOF/logs/image.stdout" 2> "$PROOF/logs/image.stderr" || rc=$?
+          printf 'Pinned runtime image build exit %d\n' "$rc"
+          test "$rc" -eq 0
+          image="$(<"$PROOF/image-id")"
+          [[ "$image" =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$(docker image inspect --format '{{.Id}}' "$RUNTIME_TAG")" = "$image"
+          printf 'RUNTIME_IMAGE_ID=%s\n' "$image" >> "$GITHUB_ENV"
+          rc=0
+          docker pull --platform "$XCAMP_PLATFORM" "$DATABASE_IMAGE" \
+            > "$PROOF/logs/postgres.stdout" 2> "$PROOF/logs/postgres.stderr" || rc=$?
+          printf 'Pinned PostgreSQL pull exit %d\n' "$rc"
+          exit "$rc"
+      - name: Prepare the exact Directus API build in the pinned runtime
+        run: |
+          set -euo pipefail
+          umask 077
+          upstream="$XTRACE_CAMP_NODE_ROOT/directus/upstream"
+          mkdir -m 700 "$PROOF/prep"
+          rc=0
+          id="$(docker create --platform "$XCAMP_PLATFORM" --user "$(id -u):$(id -g)" \
+            -v "$upstream:/work" -v "$PROOF/prep:/prep" -w /work \
+            -e HOME=/prep -e COREPACK_HOME=/prep/corepack -e NODE_OPTIONS=--max-old-space-size=6144 \
+            "$RUNTIME_IMAGE_ID" sh -ec '
+              test "$(node --version)" = v22.23.0
+              corepack prepare pnpm@10.27.0 --activate
+              test "$(pnpm --version)" = 10.27.0
+              pnpm config set store-dir /prep/pnpm-store
+              pnpm install --frozen-lockfile --filter @directus/api... --filter directus...
+              pnpm --filter @directus/api... build
+            ' 2> "$PROOF/logs/prepare-create.stderr")" || rc=$?
+          [[ "$id" =~ ^[a-f0-9]{64}$ ]] && test "$rc" -eq 0 || { echo 'Preparation container identity unavailable'; exit 1; }
+          cleanup() {
+            local remaining
+            docker rm -f -v "$id" > "$PROOF/logs/prepare-cleanup.stdout" 2> "$PROOF/logs/prepare-cleanup.stderr" || return
+            remaining="$(docker ps -a --no-trunc --filter "id=$id" --format '{{.ID}}' 2>> "$PROOF/logs/prepare-cleanup.stderr")" || return
+            test -z "$remaining"
+          }
+          trap cleanup EXIT
+          rc=0
+          docker start --attach "$id" > "$PROOF/logs/prepare.stdout" 2> "$PROOF/logs/prepare.stderr" || rc=$?
+          printf 'Pinned Directus preparation exit %d\n' "$rc"
+          trap - EXIT
+          cleanup || { echo 'Owned preparation cleanup unverified'; exit 1; }
+          test "$rc" -eq 0
+          test -f "$upstream/api/dist/cli/run.js"
+          test -z "$(git -C "$upstream" status --porcelain --untracked-files=no)"
+      - name: Run only the installed ordinary allowlist on two fresh databases
+        id: ordinary
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["PROOF"])
+          archive = Path(os.environ["ARCHIVE"])
+          with archive.open("rb") as stream:
+              digest = hashlib.file_digest(stream, "sha256").hexdigest()
+          result = dict(runId="gh-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"],
+                        archive=str(archive), archiveSha256=digest, candidateSha=os.environ["PRODUCT"],
+                        runtimeImageId=os.environ["RUNTIME_IMAGE_ID"])
+          with (root / "config.json").open("x") as stream:
+              json.dump(result, stream)
+          PY
+          rc=0
+          node campaigns/node/directus/ordinary/installed-public.mjs "$PROOF/config.json" "$PROOF/console" \
+            > "$PROOF/safe/ordinary.json" 2> "$PROOF/logs/public-driver.stderr" || rc=$?
+          printf 'Directus ordinary installed proof exit %d\n' "$rc"
+          exit "$rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() && (steps.ordinary.outcome == 'success' || steps.ordinary.outcome == 'failure') }}
+        with:
+          name: directus-ordinary-installed-development
+          path: ${{ env.PROOF }}/safe/ordinary.json
+          if-no-files-found: error
+          retention-days: 14
