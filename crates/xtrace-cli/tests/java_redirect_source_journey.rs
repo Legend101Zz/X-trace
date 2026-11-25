@@ -51,7 +51,7 @@ struct StopDaemon<'a> {
 
 impl Drop for StopDaemon<'_> {
     fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        let _ = Command::new(xtrace_binary())
             .args(["stop", "--project-dir"])
             .arg(self.repo)
             .env("XTRACE_DATA_HOME", self.data_home)
@@ -68,6 +68,13 @@ struct Captured {
     stderr: String,
     wire_events: Vec<RecordingEvent>,
     copied_source: Vec<u8>,
+}
+
+fn xtrace_binary() -> PathBuf {
+    if let Some(prefix) = std::env::var_os("XTRACE_TEST_JAVA_INSTALLED_PREFIX") {
+        return PathBuf::from(prefix).join("bin/xtrace");
+    }
+    PathBuf::from(env!("CARGO_BIN_EXE_xtrace"))
 }
 
 fn field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
@@ -307,6 +314,57 @@ fn assert_provisional(captured: &Captured, status: u16) {
     );
 }
 
+const REFUSAL_PRIVATE_INPUT: &str = "private-filter-refusal-canary-9ef0";
+
+#[test]
+fn filter_refusal_with_servlet_and_completed_async_controls_keeps_one_route_less_recording() {
+    let committed =
+        format!("/__fixture/refusal/committed/{REFUSAL_PRIVATE_INPUT}?q={REFUSAL_PRIVATE_INPUT}");
+    let captured = run_fixture_requests(
+        &[
+            ("GET", "/__fixture/refusal/async/control", 429),
+            ("GET", "/__fixture/service-control", 409),
+            ("POST", &committed, 403),
+        ],
+        "run",
+        Some(REFUSAL_PRIVATE_INPUT),
+    );
+    assert_filter_refusal(&captured);
+    assert_final_status(&captured, 403);
+}
+
+#[test]
+fn filter_send_error_remains_provisional_through_container_redispatch() {
+    let error =
+        format!("/__fixture/refusal/send-error/{REFUSAL_PRIVATE_INPUT}?q={REFUSAL_PRIVATE_INPUT}");
+    let captured =
+        run_fixture_requests(&[("POST", &error, 451)], "run", Some(REFUSAL_PRIVATE_INPUT));
+    assert_filter_refusal(&captured);
+    assert_provisional(&captured, 418);
+}
+
+fn assert_filter_refusal(captured: &Captured) {
+    assert_complete_single_recording(captured);
+    assert_eq!(captured.wire_events.len(), 2, "only the request and response were observed");
+    assert_eq!(captured.wire_events[0].symbol, "http.request POST");
+    let request = captured.wire_events[0].interaction.as_ref().expect("request interaction");
+    assert_eq!(request.driver, "servlet");
+    assert_eq!(request.method, "POST");
+    assert!(request.path.is_empty(), "no route was observed");
+    let response = captured.wire_events[1].interaction.as_ref().expect("response interaction");
+    assert_eq!(response.driver, "servlet");
+    for output in [captured.detail.to_string(), captured.stderr.clone()] {
+        assert!(!output.contains(REFUSAL_PRIVATE_INPUT), "private input reached readback or logs");
+    }
+    assert!(
+        captured
+            .wire_events
+            .iter()
+            .all(|event| !format!("{event:?}").contains(REFUSAL_PRIVATE_INPUT)),
+        "private input reached a stored event"
+    );
+}
+
 #[test]
 fn committed_outer_servlet_status_is_authoritative() {
     let captured = run_request("GET", "/__fixture/boundary/committed", 209);
@@ -338,13 +396,21 @@ fn run_request(method: &str, path: &str, client_status: u16) -> Captured {
 }
 
 fn run_request_with_launcher(method: &str, path: &str, client_status: u16, mode: &str) -> Captured {
+    run_fixture_requests(&[(method, path, client_status)], mode, None)
+}
+
+fn run_fixture_requests(
+    requests: &[(&str, &str, u16)],
+    mode: &str,
+    private_input: Option<&str>,
+) -> Captured {
     let root = temp_root();
     let repo = root.path().join("repository");
     let elsewhere = root.path().join("unrelated working directory");
     let data_home = root.path().join("data home");
     fs::create_dir_all(&repo).expect("repository");
     fs::create_dir_all(&elsewhere).expect("unrelated working directory");
-    let init = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+    let init = Command::new(xtrace_binary())
         .args(["init", "--project-dir"])
         .arg(&repo)
         .env("XTRACE_DATA_HOME", &data_home)
@@ -355,8 +421,13 @@ fn run_request_with_launcher(method: &str, path: &str, client_status: u16, mode:
     let project_root = project_data_root(&data_home);
 
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let agent =
-        workspace.join("adapters/java/agent-bootstrap/build/agent-dist/xtrace-java-agent.jar");
+    let agent = std::env::var_os("XTRACE_TEST_JAVA_INSTALLED_PREFIX").map_or_else(
+        || workspace.join("adapters/java/agent-bootstrap/build/agent-dist/xtrace-java-agent.jar"),
+        |prefix| {
+            PathBuf::from(prefix)
+                .join("current/share/xtrace/packs/java/agent/xtrace-java-agent.jar")
+        },
+    );
     let fixture =
         workspace.join("adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar");
     assert!(agent.is_file(), "Gradle agentDist must run before this test");
@@ -372,8 +443,18 @@ fn run_request_with_launcher(method: &str, path: &str, client_status: u16, mode:
     ];
     let _daemon = (mode != "run").then(|| StopDaemon { repo: &repo, data_home: &data_home });
     let mut launch = if mode == "run" {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_xtrace"));
+        let mut command = Command::new(xtrace_binary());
         command.args(["run", "--project-dir"]).arg(&repo).arg("--java-agent").arg(&agent);
+        if private_input.is_some() {
+            command.args([
+                "--observed-endpoint-policy",
+                "spring-orders-v1",
+                "--application-component",
+                "spring-fixture",
+                "--binding-key",
+                "default",
+            ]);
+        }
         command.args(capture_flags).args(["--", "java"]);
         command
     } else {
@@ -382,7 +463,7 @@ fn run_request_with_launcher(method: &str, path: &str, client_status: u16, mode:
         let project_arg = repo.join(".");
         let mut armed = Value::Null;
         for command in if mode == "restart" { vec!["record", "restart"] } else { vec!["record"] } {
-            let output = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+            let output = Command::new(xtrace_binary())
                 .current_dir(&elsewhere)
                 .arg(command)
                 .arg("--project-dir")
@@ -433,22 +514,31 @@ fn run_request_with_launcher(method: &str, path: &str, client_status: u16, mode:
     let stderr = thread::spawn(move || drain(stderr));
 
     let port = wait_for_fixture(&lines_rx);
-    let response = http_request(port, method, path);
-    assert!(
-        response.starts_with(format!("HTTP/1.1 {client_status}").as_bytes()),
-        "fixture must answer {client_status} for {path}: {}",
-        String::from_utf8_lossy(&response)
-    );
+    for &(method, path, client_status) in requests {
+        let response = http_request(port, method, path, private_input);
+        assert!(
+            response.starts_with(format!("HTTP/1.1 {client_status}").as_bytes()),
+            "fixture did not return the expected status {client_status}"
+        );
+    }
     wait_for_complete_recording(&project_root);
 
     let pid = rustix::process::Pid::from_raw(process.child.id() as i32).expect("CLI process ID");
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("signal xtrace run");
     process.child.wait().expect("wait for signal shutdown");
-    let _stdout = stdout.join().expect("join stdout");
+    let stdout = stdout.join().expect("join stdout");
     let stderr = stderr.join().expect("join stderr");
+    if let Some(canary) = private_input {
+        assert!(
+            [&stdout, &stderr]
+                .into_iter()
+                .all(|log| !String::from_utf8_lossy(log).contains(canary)),
+            "private input reached process logs"
+        );
+    }
 
     if mode != "run" {
-        let stopped = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        let stopped = Command::new(xtrace_binary())
             .args(["stop", "--project-dir"])
             .arg(&repo)
             .env("XTRACE_DATA_HOME", &data_home)
@@ -459,6 +549,26 @@ fn run_request_with_launcher(method: &str, path: &str, client_status: u16, mode:
     let list = cli(&["recording", "list"], &repo, &data_home);
     let list: Value = serde_json::from_slice(&list.stdout).expect("recording list JSON");
     let recordings = list["recordings"].as_array().expect("recordings");
+    if let Some(canary) = private_input {
+        assert!(!list.to_string().contains(canary), "private input reached the recording list");
+        let endpoints = cli(&["endpoint", "list"], &repo, &data_home);
+        assert!(endpoints.status.success(), "list observed endpoints");
+        let endpoints: Value = serde_json::from_slice(&endpoints.stdout).expect("endpoint list");
+        assert!(endpoints["items"].as_array().expect("observed endpoints").is_empty());
+        let database = rusqlite::Connection::open(project_root.join("metadata.sqlite3"))
+            .expect("recording metadata");
+        let unmatched: i64 = database
+            .query_row(
+                "SELECT COUNT(*) FROM recording_endpoint_observations
+                 WHERE disposition = 'unmatched' AND reason_code = 'route_unapproved'
+                 AND observation_policy_id = 'spring-orders-v1'
+                 AND route_template IS NULL AND operation_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("route-less observation");
+        assert_eq!(unmatched, 1, "one retained admissible request without a mapped route");
+    }
     let recording_id = recordings[0]["recording_id"].as_str().expect("recording id").to_owned();
 
     let mut detail = Value::Null;
@@ -530,7 +640,7 @@ fn persisted_events(project_root: &Path) -> Vec<RecordingEvent> {
 }
 
 fn cli(args: &[&str], repo: &Path, data_home: &Path) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_xtrace"));
+    let mut command = Command::new(xtrace_binary());
     command.arg(args[0]).arg(args[1]).arg("--project-dir").arg(repo).args(&args[2..]);
     command.env("XTRACE_DATA_HOME", data_home).output().expect("run xtrace")
 }
@@ -609,15 +719,22 @@ fn wait_for_fixture(lines: &std::sync::mpsc::Receiver<Vec<u8>>) -> u16 {
     }
 }
 
-fn http_request(port: u16, method: &str, path: &str) -> Vec<u8> {
+fn http_request(port: u16, method: &str, path: &str, private_input: Option<&str>) -> Vec<u8> {
     let mut stream =
         std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect Spring fixture");
     stream.set_read_timeout(Some(Duration::from_secs(10))).expect("read timeout");
+    let body = private_input.filter(|_| method == "POST").unwrap_or("");
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
     )
     .expect("write request");
+    if let Some(value) = private_input {
+        write!(stream, "Authorization: Bearer {value}\r\nX-Private-Refusal: {value}\r\n")
+            .expect("write private fixture headers");
+    }
+    write!(stream, "\r\n{body}").expect("write fixture body");
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
     response
