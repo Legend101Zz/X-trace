@@ -152,7 +152,82 @@ async function primaryActionVisible(dialog, name) {
   assert.ok(await dialog.getByRole('button', { name, exact: true }).evaluate(visibleControl), 'primary-phase-action-viewport');
 }
 
-async function shortPreviewProbes(page, dialog, row, out) {
+/** Measure each rendered line separately: a long block need not fit in the short viewport at once. */
+function landscapePreviewReachable(content, { fileCount, omissionCount }) {
+  const body = content.closest('.viewer-dialog-body');
+  const footer = body?.querySelector('.export-footer');
+  const disclosures = [...content.querySelectorAll('.export-omissions details')];
+  if (!body || !footer || getComputedStyle(body).overflowY !== 'auto'
+    || !content.querySelector('[aria-label="File metadata preview"] [role="tabpanel"]')
+    || !content.querySelector('code[aria-label="Terminal command"]')
+    || fileCount === 0 || content.querySelectorAll('[role="tab"]').length !== Math.min(fileCount, 16)
+    || disclosures.length !== omissionCount || disclosures.some((item) => !item.querySelector('summary'))) return false;
+
+  const initialScroll = body.scrollTop;
+  const initiallyClosed = disclosures.filter((item) => !item.open);
+  // Stay inside the same native scroller and its unobscured area above the footer.
+  function viewport() {
+    const box = body.getBoundingClientRect();
+    const top = Math.max(0, box.top + body.clientTop);
+    const bottom = Math.min(innerHeight, box.top + body.clientTop + body.clientHeight, footer.getBoundingClientRect().top);
+    return { top, bottom };
+  }
+  let measured = 0;
+  function canReveal(owner, getRect) {
+    if (++measured > 4096) return false;
+    const original = getRect();
+    if (!original || original.width <= 0 || original.height <= 0) return false;
+    const view = viewport();
+    body.scrollBy({ top: (original.top + original.bottom - view.top - view.bottom) / 2, behavior: 'instant' });
+    const box = getRect();
+    const { top, bottom } = viewport();
+    if (!box || box.width <= 0 || box.height <= 0 || box.top < top - 0.5 || box.bottom > bottom + 0.5
+      || box.left < 0 || box.right > innerWidth + 0.5) return false;
+    for (let parent = owner; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent);
+      if (style.visibility !== 'visible' || style.opacity === '0') return false;
+    }
+    // Hit-test the ink line or control across its width, including near opposite corners.
+    const dx = Math.min(2, box.width / 4), dy = Math.min(2, box.height / 4);
+    const points = [[box.left + dx, box.top + dy], [box.right - dx, box.top + dy],
+      [(box.left + box.right) / 2, (box.top + box.bottom) / 2],
+      [box.left + dx, box.bottom - dy], [box.right - dx, box.bottom - dy]];
+    return points.every(([x, y]) => owner.contains(document.elementFromPoint(x, y)));
+  }
+  function scan() {
+    const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
+    let lines = 0;
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (!node.textContent.trim()) continue;
+      const owner = node.parentElement;
+      const closed = owner.closest('details:not([open])');
+      if (closed && !closed.querySelector('summary')?.contains(owner)) continue;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const rects = [...range.getClientRects()];
+      if (!rects.some((box) => box.width > 0 && box.height > 0)) return false;
+      for (let index = 0; index < rects.length; index += 1) {
+        if (!rects[index].width || !rects[index].height) continue;
+        if (!canReveal(owner, () => range.getClientRects()[index])) return false;
+        lines += 1;
+      }
+    }
+    return lines > 0 && [...content.querySelectorAll('button, summary')].every((control) =>
+      canReveal(control, () => control.getBoundingClientRect()));
+  }
+  try {
+    if (!scan()) return false;
+    // Exercise the disclosed text too. Native summary activation changes only this local disclosure.
+    for (const item of initiallyClosed) item.querySelector('summary').click();
+    return disclosures.every((item) => item.open) && (initiallyClosed.length === 0 || scan());
+  } finally {
+    for (const item of initiallyClosed) if (item.open) item.querySelector('summary').click();
+    body.scrollTo({ top: initialScroll, behavior: 'instant' });
+  }
+}
+
+async function shortPreviewProbes(page, dialog, row, out, preview) {
   for (const height of [450, 260]) {
     const probe = { width: row.width, height, coarse: row.coarse, status: 'in-progress',
       checks: { viewport: 'not-reached', initialAction: height === 450 ? 'not-reached' : 'not-required',
@@ -185,6 +260,11 @@ async function shortPreviewProbes(page, dialog, row, out) {
       const bottom = await scroller.evaluate((node) => node.scrollTop);
       await page.keyboard.press('PageUp');
       await expect.poll(() => scroller.evaluate((node) => node.scrollTop)).toBeLessThan(bottom);
+      if (row.width === 736 && height === 260) {
+        assert.ok(await content.evaluate(landscapePreviewReachable, {
+          fileCount: preview.files.length, omissionCount: preview.omissions.length,
+        }), 'short-preview-content-obscured');
+      }
       probe.checks.contentScroll = 'pass'; checkpoint();
       check = 'keyboardAction';
       await dialog.getByRole('button', { name: 'Close', exact: true }).focus();
@@ -472,7 +552,7 @@ try {
         stage('preview-focus');
         await expect(dialog.getByRole('region', { name: 'Preview export' })).toBeFocused();
         await primaryActionVisible(dialog, 'Save file');
-        if ([320, 736].includes(width) && scope === 'all' && format === 'openapi' && yaml) await shortPreviewProbes(page, dialog, row, out);
+        if ([320, 736].includes(width) && scope === 'all' && format === 'openapi' && yaml) await shortPreviewProbes(page, dialog, row, out, preview);
         stage('preview-content');
         await expect(dialog.getByText(preview.contentHash, { exact: true })).toBeVisible();
         await expect(dialog.getByText('Captured request and response bodies, cookies and credentials stay out of the export.', { exact: true })).toBeVisible();
