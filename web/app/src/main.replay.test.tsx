@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './main';
 
 const operationA = '018f0000-0000-7000-8000-000000000001';
@@ -48,6 +48,24 @@ async function openRecording() {
 const inspector = () => screen.getByRole('tabpanel', { name: 'Inspector', hidden: true });
 
 describe('replay wiring in the app', () => {
+  // jsdom 26 reflects dialog.open but has no showModal/close. These cases
+  // exercise app shortcuts and preferences. Chromium exercises native modality.
+  const dialogPrototype = HTMLDialogElement.prototype;
+  const missingModal = typeof dialogPrototype.showModal !== 'function';
+  const missingClose = typeof dialogPrototype.close !== 'function';
+  beforeAll(() => {
+    if (missingModal) Object.defineProperty(dialogPrototype, 'showModal', {
+      configurable: true, value(this: HTMLDialogElement) { this.open = true; },
+    });
+    if (missingClose) Object.defineProperty(dialogPrototype, 'close', {
+      configurable: true, value(this: HTMLDialogElement) { this.open = false; },
+    });
+  });
+  afterAll(() => {
+    if (missingModal) Reflect.deleteProperty(dialogPrototype, 'showModal');
+    if (missingClose) Reflect.deleteProperty(dialogPrototype, 'close');
+  });
+
   let responseDetail = detail;
   const continuationPages = new Map<string, typeof detail>();
   const heldContinuations = new Map<string, Promise<Response>>();
