@@ -1,0 +1,87 @@
+name: PostgreSQL JDBC boundary proof
+on:
+  push:
+    branches: [diagnostic/pgjdbc-boundary-20261125]
+permissions:
+  contents: read
+jobs:
+  pgjdbc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: d3f8b7873d01ceb854b9f1556eda95f5b0839327
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Build exact subject and run Java bridge and runtime tests
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/pg-proof"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/classes" "$root/lib"
+          test "$(git rev-parse HEAD)" = d3f8b7873d01ceb854b9f1556eda95f5b0839327
+          if ! adapters/java/gradlew -p adapters/java --dependency-verification strict --no-daemon \
+            "-Porg.gradle.java.installations.paths=$JAVA_HOME_17_X64" \
+            :agent-bootstrap:test :agent-runtime:test agentDist fixtureBootJar >"$root/gradle.log" 2>&1; then
+            if grep -Fq 'Could not resolve' "$root/gradle.log"; then
+              echo 'Gradle dependency resolution failed.'
+            elif grep -Fq 'There were failing tests' "$root/gradle.log"; then
+              echo 'Java bridge or runtime test failed.'
+            else
+              echo 'Java compilation or fixture packaging failed.'
+            fi
+            exit 1
+          fi
+          python3 -B - "$GITHUB_STEP_SUMMARY" <<'PY'
+          from pathlib import Path
+          import sys
+          from xml.etree import ElementTree
+          with open(sys.argv[1], 'a') as summary:
+              for module in ('agent-bootstrap', 'agent-runtime'):
+                  results = Path(f'adapters/java/{module}/build/test-results/test').glob('TEST-*.xml')
+                  totals = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
+                  for path in results:
+                      counters = ElementTree.parse(path).getroot().attrib
+                      for key in totals:
+                          totals[key] += int(counters.get(key, 0))
+                  if totals['tests'] <= 0 or totals['failures'] or totals['errors'] or totals['skipped']:
+                      raise SystemExit('Test counters did not show a clean executed suite')
+                  line = f'{module}: {totals["tests"]} tests, zero failed or skipped.'
+                  print(line)
+                  print(line, file=summary)
+          PY
+          if ! cargo build --locked -p xtrace-cli >"$root/cargo.log" 2>&1; then
+            echo 'Locked xtrace-cli build failed.'
+            exit 1
+          fi
+      - name: Run actual PostgreSQL 18.3, pinned pgjdbc and instrumented Spring MVC
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/pg-proof"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          fixture="$GITHUB_WORKSPACE/adapters/java/agent-runtime/src/test/fixtures/pgjdbc"
+          driver="$root/postgresql.jar"
+          curl --silent --show-error --fail --max-time 60 \
+            -o "$driver" https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.13/postgresql-42.7.13.jar
+          cd "$root"
+          echo '6e0e4cc2d8cae902084f8a2b18728b073a6fd9d1f87c9d8bff8f298c18185b93  postgresql.jar' | sha256sum --check --status
+          cd "$root/lib"
+          jar -xf "$GITHUB_WORKSPACE/adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar" BOOT-INF/lib
+          cp "$driver" BOOT-INF/lib/
+          if ! javac --release 17 -cp 'BOOT-INF/lib/*' -d "$root/classes" "$fixture/PgJdbcFixture.java" >"$root/fixture-build.log" 2>&1; then
+            echo 'PostgreSQL Spring fixture compilation failed.'
+            exit 1
+          fi
+          python3 -B "$fixture/probe.py" "$root" "$GITHUB_WORKSPACE/target/debug/xtrace" \
+            "$GITHUB_WORKSPACE/adapters/java/agent-bootstrap/build/agent-dist/xtrace-java-agent.jar" \
+            "$root/classes:$root/lib/BOOT-INF/lib/*" | tee -a "$GITHUB_STEP_SUMMARY"
