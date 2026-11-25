@@ -1,0 +1,69 @@
+name: catalog-export-http-proof
+on:
+  push:
+    branches: [codex/export-http-102-proof]
+permissions:
+  contents: read
+jobs:
+  http:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PROBE_SOURCE: 57c5060e5d16b7c19023147dc695be55b057f30a
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Admit private test scratch
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          root="${RUNNER_TEMP:?}/xh"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/frag"
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+          echo "PROBE_ADMITTED=true" >> "$GITHUB_ENV"
+          printf '{"sourceSha":"%s","releaseAcceptance":false}\n' "$PROBE_SOURCE" > "$root/frag/source.json"
+      - name: Rust formatting and affected lint
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check > "$XTRACE_CI_PRIVATE_ROOT/fmt.log" 2>&1
+          cargo clippy --locked --all-features --all-targets -p xtrace-daemon -p xtrace-export -p xtrace-cli -- -D warnings > "$XTRACE_CI_PRIVATE_ROOT/clippy.log" 2>&1
+      - name: Authenticated HTTP, both scopes, approval and response lifetime
+        if: ${{ !cancelled() && env.PROBE_ADMITTED == 'true' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step http-export \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 9 --max-ignored 0 -- cargo test --locked -p xtrace-daemon --lib viewer::tests::export_contract_tests
+      - name: Attachment encoding and cancellation
+        if: ${{ !cancelled() && env.PROBE_ADMITTED == 'true' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step http-encoding \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 3 --max-ignored 0 -- cargo test --locked -p xtrace-daemon --lib viewer::export::tests
+      - name: Catalog projection and exact CLI byte parity
+        if: ${{ !cancelled() && env.PROBE_ADMITTED == 'true' }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --step http-projection \
+            --out "$XTRACE_CI_PRIVATE_ROOT/frag" --private-log-dir "$XTRACE_CI_PRIVATE_ROOT" \
+            --min-passed 14 --max-ignored 0 -- cargo test --locked -p xtrace-export --test catalog_export
+      - name: Verify the response lifetime and route-name regressions ran
+        run: |
+          set -euo pipefail
+          grep -Eq '^test .*::export_slots_follow_transferred_cloned_and_sliced_attachment_bytes_until_last_drop \.\.\. ok$' "$XTRACE_CI_PRIVATE_ROOT/xl/rust---http-export.log"
+          grep -Eq '^test .*::export_slots_release_on_query_error_and_preserve_preview_byte_lifetime \.\.\. ok$' "$XTRACE_CI_PRIVATE_ROOT/xl/rust---http-export.log"
+          grep -Eq '^test (.*::)?root_recipe_preview_names_require_source_root_without_literal_slug_collisions \.\.\. ok$' "$XTRACE_CI_PRIVATE_ROOT/xl/rust---http-projection.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && env.PROBE_ADMITTED == 'true' }}
+        with:
+          name: catalog-export-http-proof
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
+          if-no-files-found: error
+          retention-days: 14
