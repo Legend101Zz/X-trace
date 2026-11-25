@@ -1,0 +1,131 @@
+name: Package Spring analyzer proof
+on:
+  push:
+    branches: [diagnostic/package-spring-analyzer-20261125]
+permissions:
+  contents: read
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CANDIDATE_SHA: 8af7a70376d817242799094fc1ef7899b898c8d5
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8b928c1d
+        with:
+          toolchain: stable
+      - name: Build, install, and scan real pinned Petclinic sources
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP:?}/x84"
+          mkdir -m 700 "$root" "$root/private" "$root/public" "$root/tmp"
+          stage=source
+          record_failure() {
+            result=$?
+            if [ "$result" -ne 0 ]; then
+              printf '{"sourceSha":"%s","status":"failed","stage":"%s","releaseEvidence":false}\n' "$CANDIDATE_SHA" "$stage" > "$root/public/failure.json"
+            fi
+          }
+          trap record_failure EXIT
+          {
+            test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+            stage=package-unit-checks
+            python3 -B -m unittest discover -s packaging/test -p 'test_*.py'
+            stage=package-build
+            python3 -B packaging/build.py --out "$root/dist" --work "$root/build" --platform linux-x86_64
+            dist="$root/dist/linux-x86_64"
+            stage=archive-verification
+            sh packaging/install.sh verify-dist "$dist"
+            archives=("$dist"/xtrace-*-linux-x86_64.tar.gz)
+            test "${#archives[@]}" -eq 1
+            archive="${archives[0]}"
+            test -f "$archive"
+            python3 -B packaging/verify_package.py "$archive" --run-binary --repo . --out "$root/private/package-verification.json"
+            stage=install-journey
+            TMPDIR="$root/tmp" sh packaging/test/install_test.sh "$dist"
+            stage=fresh-install
+            mkdir -m 700 "$root/extracted" "$root/caller"
+            tar -xzf "$archive" -C "$root/extracted"
+            contents=("$root"/extracted/xtrace-*)
+            test "${#contents[@]}" -eq 1
+            prefix="$root/installed X-trace"
+            export XTRACE_DATA_HOME="$root/data" TMPDIR="$root/tmp"
+            unset XTRACE_JAVA_ANALYZER XTRACE_NODE_ANALYZER XTRACE_PREFIX
+            sh "${contents[0]}/install.sh" --prefix "$prefix" --data-home "$XTRACE_DATA_HOME"
+            sh "$prefix/current/install.sh" verify --prefix "$prefix"
+            installed=$(cd "$prefix/current" && pwd -P)
+            analyzer="$installed/share/xtrace/analyzers/java/bin/xtrace-java-static"
+            test -x "$analyzer"
+            archive_digest=$(sha256sum "$archive" | cut -d' ' -f1)
+            analyzer_digest=$(awk '$2 ~ /^share\/xtrace\/analyzers\/java\// { print; found = 1 } END { exit !found }' "$installed/share/xtrace/payload.sha256" | sha256sum | cut -d' ' -f1)
+            stage=pinned-petclinic-checkout
+            url=$(python3 -c 'import json; print(json.load(open("campaigns/java/petclinic/campaign.json"))["upstream"]["canonicalUrl"])')
+            upstream_sha=$(python3 -c 'import json; print(json.load(open("campaigns/java/petclinic/campaign.json"))["upstream"]["sha"])')
+            repo="$root/petclinic"
+            sh tools/qa/camp_clone.sh "$url" "$upstream_sha" "$repo"
+            mv adapters/java/static-analyzer/build/install/xtrace-java-static "$root/private/checkout-analyzer"
+            cd "$root/caller"
+            stage=installed-catalog
+            cli="$prefix/bin/xtrace"
+            "$cli" init --project-dir "$repo"
+            "$cli" scan --project-dir "$repo" --source "$repo/src/main/java" --framework spring-mvc --json > "$root/private/catalog.json"
+            revision=$(python3 - "$root/private/catalog.json" <<'PY'
+          import json, sys, uuid
+          data = json.load(open(sys.argv[1]))
+          scan = data.get("data", data)
+          assert scan["persisted"] is True
+          assert scan["result"]["framework"] == "spring-mvc"
+          assert scan["result"]["operations"] and scan["result"]["claimCount"] > 0
+          print(uuid.UUID(scan["catalogRevisionId"]))
+          PY
+            )
+            stage=installed-export
+            "$cli" export --project-dir "$repo" --format openapi --revision "$revision" --output "$root/openapi" --json > "$root/private/export.json"
+            python3 - "$root" "$CANDIDATE_SHA" "$upstream_sha" "$archive_digest" "$analyzer_digest" <<'PY'
+          import json, pathlib, re, sys
+          root = pathlib.Path(sys.argv[1])
+          source, upstream, archive, analyzer = sys.argv[2:]
+          assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (source, upstream))
+          assert all(re.fullmatch(r"[0-9a-f]{64}", sha) for sha in (archive, analyzer))
+          def read(path):
+              return json.loads((root / path).read_text())
+          scan = read("private/catalog.json")
+          scan = scan.get("data", scan)
+          export = read("private/export.json")
+          export = export.get("data", export)
+          spec = read("openapi/openapi.json")
+          operations = sum(len(methods) for methods in spec["paths"].values())
+          assert spec["openapi"] == "3.1.0" and operations == export["operationCount"] > 0
+          assert export["written"] is True
+          assert spec["info"]["x-xtrace"]["revision_id"] == scan["catalogRevisionId"]
+          (root / "public/result.json").write_text(json.dumps({
+              "status": "passed", "sourceSha": source, "petclinicSha": upstream,
+              "archiveSha256": archive, "installedAnalyzerInventorySha256": analyzer,
+              "catalogClaims": scan["result"]["claimCount"],
+              "catalogOperations": len(scan["result"]["operations"]), "openApiOperations": operations,
+              "freshPrefixWithSpaces": True, "verifiedDistribution": True, "verifiedInstall": True,
+              "checkoutBuildLauncherRemoved": True, "usedSourceBuildFallback": False, "releaseEvidence": False,
+          }, sort_keys=True) + "\n")
+          PY
+          } > "$root/private/proof.log" 2>&1
+          echo "Verified the installed analyzer and packaged OpenAPI export against pinned Petclinic sources."
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: packaged-analyzer-proof
+          path: ${{ runner.temp }}/x84/public/*.json
+          if-no-files-found: error
+          retention-days: 14
