@@ -1,0 +1,107 @@
+name: Viewer export unit checks and embedded assets
+on:
+  push:
+    branches: [codex/proof-export-auth-focus-unit-102]
+permissions:
+  contents: read
+jobs:
+  viewer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PRODUCT: 8fc2e3909f2f1f5651d60adf63bf337a9b9a1446
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PRODUCT }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Verify exact checkout and prepare private output
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          mkdir -m 700 "$RUNNER_TEMP/export-check" "$RUNNER_TEMP/export-counts"
+          echo "OUT=$RUNNER_TEMP/export-check" >> "$GITHUB_ENV"
+          echo "COUNTS=$RUNNER_TEMP/export-counts" >> "$GITHUB_ENV"
+          printf '{"sourceSha":"%s","releaseAcceptance":false}\n' "$PRODUCT" > "$RUNNER_TEMP/export-counts/source.json"
+      - name: Verify generated contract and web types
+        run: |
+          set -euo pipefail
+          cd web/app
+          npm ci > "$OUT/npm.log" 2>&1
+          npm run check:api > "$OUT/types-generated.log" 2>&1
+          npm run typecheck > "$OUT/tsc.log" 2>&1
+          for script in installed-export-journey api-evidence export-visibility; do node --check "scripts/$script.mjs"; done
+      - name: Run all viewer tests and verify every source test file participated
+        run: |
+          set -euo pipefail
+          umask 077
+          cd web/app
+          rc=0
+          node node_modules/vitest/vitest.mjs run --reporter=json --outputFile="$OUT/vitest.json" > "$OUT/vitest.log" 2>&1 || rc=$?
+          python3 - <<'PYTEST'
+          import json, os, pathlib, re, subprocess
+          root = pathlib.Path.cwd()
+          results = json.loads((pathlib.Path(os.environ['OUT'])/'vitest.json').read_text())
+          expected = {p for p in subprocess.check_output(['git','ls-files'],text=True).splitlines() if re.search(r'\.(test|spec)\.[cm]?[jt]sx?$',p)}
+          reports = results['testResults']
+          seen = {pathlib.Path(r['name']).relative_to(root).as_posix() for r in reports}
+          if seen != expected or len(reports) != len(expected):
+              raise SystemExit('viewer-test-file-coverage')
+          counts = {pathlib.Path(r['name']).relative_to(root).as_posix(): {
+              'passed': sum(t['status'] == 'passed' for t in r['assertionResults']),
+              'other': sum(t['status'] != 'passed' for t in r['assertionResults'])
+          } for r in reports}
+          (pathlib.Path(os.environ['COUNTS'])/'vitest-counts.json').write_text(json.dumps(counts)+'\n')
+          if (not results['success'] or any(r['status'] != 'passed' for r in reports)
+                  or any(not c['passed'] or c['other'] for c in counts.values())
+                  or counts['src/features/export/ExportSheet.test.tsx']['passed'] < 11
+                  or counts['scripts/api-evidence.test.mjs']['passed'] < 5):
+              raise SystemExit('viewer-test-outcome')
+          PYTEST
+          exit "$rc"
+      - name: Build and verify real embedded assets
+        run: |
+          set -euo pipefail
+          cd web/app
+          node scripts/check-contrast.mjs > "$OUT/contrast.log" 2>&1
+          npm run build > "$OUT/build.log" 2>&1
+          npm run embed > "$OUT/embed.log" 2>&1
+          npm run check:embedded > "$OUT/embed-verify.log" 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: export-sheet-generated-assets
+          path: crates/xtrace-daemon/assets/ui/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Verify the installed download judge on regression fixtures
+        if: ${{ !cancelled() && env.COUNTS != '' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! command -v b3sum >/dev/null; then
+            (cd "$OUT" && apt-get download b3sum > apt.log 2>&1 && dpkg-deb -x ./b3sum_*.deb ./b3)
+            export PATH="$OUT/b3/usr/bin:$PATH"
+          fi
+          rc=0
+          python3 -B -m tools.qa.unittest_run --result "$OUT/judge.json" tools.qa.test_installed_export_journey tools.qa.test_export_visual_evidence > "$OUT/judge.log" 2>&1 || rc=$?
+          python3 -B -m tools.qa.unittest_summary "$OUT/judge.json"
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          out = pathlib.Path(os.environ['OUT'])
+          counts = json.loads((out/'judge.json').read_text())['counts']
+          (pathlib.Path(os.environ['COUNTS'])/'judge.json').write_text(json.dumps(counts)+'\n')
+          if counts['testsRun'] != 51 or any(v for k,v in counts.items() if k != 'testsRun'):
+              raise SystemExit(1)
+          PY
+          exit "$rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && env.COUNTS != '' }}
+        with:
+          name: export-sheet-check-counts
+          path: ${{ env.COUNTS }}/*.json
+          if-no-files-found: error
+          retention-days: 14
