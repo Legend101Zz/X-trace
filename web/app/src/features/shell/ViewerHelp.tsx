@@ -1,4 +1,5 @@
 import { useId, useRef, useState } from 'react';
+import { StartTourButton } from './ViewerTour';
 import honesty from '../../../../../schema/fixtures/replay/honesty-strings.json';
 
 const sections = ['Glossary', 'Keyboard', 'Layout'] as const;
@@ -29,6 +30,7 @@ export function ViewerHelp() {
         <li>Open a recording and select an event in Steps. Use the replay controls to move through the loaded events.</li>
         <li>Open Code, Values, Missing, or Details for the selected event and its available evidence.</li>
       </ol>
+      <StartTourButton />
     </section>
     <section><h3>Words we use</h3>
       <dl>

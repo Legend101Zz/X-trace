@@ -121,8 +121,10 @@ try {
     await laterButton().click();
     await verifyMountedWindow(page, [...first.sequences, ...middle.sequences]);
     await jumpToLoadedSequence(page, selected);
+    if (width < 700) await switchPane('Requests');
     await tab(otherId).click();
     await verifyMountedWindow(page, initials[1 - pagedIndex].sequences);
+    if (width < 700) await switchPane('Requests');
     await tab(recordingId).click();
     await expect(currentStep.locator('.event-seq')).toHaveText(selected);
     stage = `navigate and retain selection at ${width}px`;

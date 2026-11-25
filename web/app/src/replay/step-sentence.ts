@@ -65,3 +65,7 @@ export function stepSentence(event: StepEvidence): StepSentence {
     default: return result(event.kind ? 'Event recorded' : 'Event kind unavailable');
   }
 }
+
+export function backToStepLabel(event: ReplayEvent) {
+  return `Back to step · sequence ${event.sequence} · ${stepSentence(event).text}`;
+}

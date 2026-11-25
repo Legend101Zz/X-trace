@@ -14,7 +14,7 @@ info:
     not claim framework discovery or catalog completeness. Every
     request must carry the exact Host authority printed by viewer readiness,
     Sec-Fetch-Site: same-origin, and X-XTrace-Client: viewer-v1. There is no
-    CORS support. Authentication POST requests require an exact same-origin
+    CORS support. All POST requests require an exact same-origin
     Origin; API GET requests accept an absent Origin only with the required
     same-origin Fetch Metadata and client header, and reject any supplied
     Origin that does not exactly match the viewer origin.
@@ -66,6 +66,83 @@ paths:
         '403': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
         '500': { $ref: '#/components/responses/Problem' }
+  /api/v1/exports/preview:
+    post:
+      operationId: previewCatalogExport
+      summary: Preview the files and omissions for a local catalog export.
+      description: >-
+        Resolves the scope and revision in one admitted project snapshot. JSON requests are
+        limited to 1 KiB and complete preview metadata to 2 MiB. A missing catalog, revision
+        or operation returns 404. Resource limits return 413. Unsafe or incomplete evidence
+        returns 422. The query lane returns 503 when busy and the request deadline returns 504.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/ExchangeOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportSelection' }
+      responses:
+        '200':
+          description: Safe metadata for one complete projection. No file contents or host paths.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportPreview' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /api/v1/exports/save:
+    post:
+      operationId: saveCatalogExport
+      summary: Download the exact approved projection after a fresh catalog read.
+      description: >-
+        Repeat the preview selection and its approval after explicit user confirmation.
+        The server rereads linked evidence even for an unchanged revision. A changed
+        approval returns 409. Logical file bytes are limited to 16 MiB and the encoded
+        attachment to 20 MiB. Errors use the preview route's fixed problem codes.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/ExchangeOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportSaveRequest' }
+      responses:
+        '200':
+          description: A direct single file or a deterministic ZIP of the approved logical files.
+          headers:
+            Content-Disposition:
+              required: true
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { type: string, format: binary }
+            application/yaml:
+              schema: { type: string, format: binary }
+            application/zip:
+              schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+        '504': { $ref: '#/components/responses/Problem' }
   /api/v1/recordings:
     get:
       operationId: listRecordings
@@ -439,6 +516,127 @@ components:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
   schemas:
+    ExportFormat:
+      type: string
+      enum: [openapi, postman, curl, bundle]
+    ExportDigest:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: Lowercase hexadecimal BLAKE3 digest.
+    ExportSelection:
+      type: object
+      additionalProperties: false
+      required: [format, yaml, revision, scope]
+      properties:
+        format: { $ref: '#/components/schemas/ExportFormat' }
+        yaml: { type: boolean, description: Allowed only for OpenAPI when true. }
+        revision:
+          description: The last catalog publication for this project or one explicit revision UUID.
+          oneOf:
+            - { type: string, const: latest }
+            - { type: string, format: uuid }
+        scope:
+          description: >-
+            Every eligible operation of the revision, a catalog operation UUID or an observed
+            endpoint UUID prefixed with observed:. The observed selector is resolved within this
+            project and revision using its recorded component, binding, HTTP method and declared
+            route. The supported finite observed alias shares its catalog UUID, but the selector
+            kind remains distinct for approval. Divergent stored aliases are corrupt. A missing or
+            ambiguous match is unavailable.
+          oneOf:
+            - { type: string, const: all }
+            - { type: string, format: uuid }
+            - { type: string, pattern: '^observed:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
+    ExportApproval:
+      type: object
+      additionalProperties: false
+      required: [revisionId, digest]
+      properties:
+        revisionId: { type: string, format: uuid }
+        digest: { $ref: '#/components/schemas/ExportDigest' }
+    ExportSaveRequest:
+      type: object
+      additionalProperties: false
+      required: [format, yaml, revision, scope, approval]
+      properties:
+        format: { $ref: '#/components/schemas/ExportFormat' }
+        yaml: { type: boolean, description: Allowed only for OpenAPI when true. }
+        revision:
+          description: The last catalog publication for this project or one explicit revision UUID.
+          oneOf:
+            - { type: string, const: latest }
+            - { type: string, format: uuid }
+        scope:
+          description: >-
+            Every eligible operation of the revision, a catalog operation UUID or an observed
+            endpoint UUID prefixed with observed:. The observed selector is resolved within this
+            project and revision using its recorded component, binding, HTTP method and declared
+            route. The supported finite observed alias shares its catalog UUID, but the selector
+            kind remains distinct for approval. Divergent stored aliases are corrupt. A missing or
+            ambiguous match is unavailable.
+          oneOf:
+            - { type: string, const: all }
+            - { type: string, format: uuid }
+            - { type: string, pattern: '^observed:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
+        approval: { $ref: '#/components/schemas/ExportApproval' }
+    ExportPreviewFile:
+      type: object
+      required: [name, recipeOrdinal, mode, bytes, blake3]
+      properties:
+        name:
+          type: [string, 'null']
+          description: Safe relative filename. Null when the logical recipe name embeds catalog route text.
+        recipeOrdinal:
+          type: [integer, 'null']
+          minimum: 1
+          description: Identifies a recipe whose name is withheld.
+        mode: { type: integer, const: 420, description: Non-executable logical file mode (octal 0644). }
+        bytes: { type: integer, minimum: 0, maximum: 16777216 }
+        blake3: { $ref: '#/components/schemas/ExportDigest' }
+    ExportOmissionGroup:
+      type: object
+      required: [format, kind, reason, count]
+      properties:
+        format: { type: [string, 'null'], enum: [openapi, postman, curl, bundle, null] }
+        kind: { type: string, description: Fixed subject label with no catalog names. }
+        reason: { type: string, description: Fixed omission reason with no offender paths or values. }
+        count: { type: integer, minimum: 1, maximum: 32768 }
+    ExportDownload:
+      type: object
+      required: [filename, mediaType]
+      properties:
+        filename: { type: string, enum: [openapi.json, openapi.yaml, collection.postman.json, xtrace-curl.zip, xtrace-bundle.zip] }
+        mediaType: { type: string, enum: [application/json, application/yaml, application/zip] }
+    ExportPreview:
+      type: object
+      required: [schemaVersion, requestId, projectId, request, revisionId, revisionOrdinal, catalogOperationId, selectedOperations, emittedOperations, files, omissions, totalBytes, contentHash, approval, download]
+      properties:
+        schemaVersion: { type: integer, const: 1 }
+        requestId: { type: string, format: uuid }
+        projectId: { type: string, format: uuid }
+        request: { $ref: '#/components/schemas/ExportSelection' }
+        revisionId: { type: string, format: uuid }
+        revisionOrdinal: { type: integer, minimum: 0 }
+        catalogOperationId:
+          type: [string, 'null']
+          format: uuid
+          description: Resolved catalog operation for this revision. Null for all operations.
+        selectedOperations: { type: integer, minimum: 0, maximum: 4096 }
+        emittedOperations: { type: integer, minimum: 0, maximum: 4096 }
+        files:
+          type: array
+          maxItems: 4101
+          items: { $ref: '#/components/schemas/ExportPreviewFile' }
+        omissions:
+          type: array
+          maxItems: 32768
+          items: { $ref: '#/components/schemas/ExportOmissionGroup' }
+        totalBytes: { type: integer, minimum: 0, maximum: 16777216 }
+        contentHash:
+          $ref: '#/components/schemas/ExportDigest'
+          description: Digest over the sorted logical paths, modes and exact file bytes.
+        approval: { $ref: '#/components/schemas/ExportApproval' }
+        download: { $ref: '#/components/schemas/ExportDownload' }
     AuthResponse:
       type: object
       required: [authenticated, requestId]

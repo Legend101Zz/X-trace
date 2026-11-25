@@ -554,6 +554,25 @@ pub(crate) fn open_recording_reader<F>(
 where
     F: Fn(&str) -> Option<PathBuf>,
 {
+    let (project_id, reader, correlation_id, _) = open_viewer_readers(project_dir, env_reader)?;
+    Ok((project_id, reader, correlation_id))
+}
+
+pub(crate) fn open_viewer_readers<F>(
+    project_dir: &Path,
+    env_reader: &F,
+) -> Result<
+    (
+        xtrace_domain::ProjectId,
+        SqliteRecordingReader,
+        xtrace_domain::CorrelationId,
+        xtrace_store::catalog_history_store::SqliteCatalogHistoryStore,
+    ),
+    CliError,
+>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
     let repo = resolve_repo(project_dir)?;
     let pointer = RepositoryPointer::read(&repo)?;
     let data_home = resolve_data_home(Some(&pointer), env_reader)?;
@@ -600,8 +619,10 @@ where
             context.correlation_id,
         )));
     }
+    let catalog =
+        xtrace_store::catalog_history_store::SqliteCatalogHistoryStore::new(store.clone());
     let reader = SqliteRecordingReader::new(store, project_directory).with_source_root(repo);
-    Ok((project.id(), reader, context.correlation_id))
+    Ok((project.id(), reader, context.correlation_id, catalog))
 }
 
 /// Resolves the user-data home directory for the supplied pointer

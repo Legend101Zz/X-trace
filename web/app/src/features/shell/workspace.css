@@ -186,3 +186,27 @@
     inset: 50% 0 auto; transform: translateY(-50%);
   }
 }
+
+/* Keep the selected phone view and its existing navigation in one bounded pane.
+   Only the steps body scrolls; the replay actions remain reachable below it. */
+@media (max-width: 699px) {
+  .viewer-workspace[data-pane='events'] .steps-and-code > .pane { overflow: hidden; }
+  .viewer-workspace[data-pane='events'] .steps-content { display: block; flex: 1 1 auto; min-height: 0; overflow: auto; order: 1; }
+  .viewer-workspace[data-pane='events'] .replay-toolbar { order: 2; flex: 0 0 auto; }
+  .shell .phone-back-to-step { text-align: left; overflow-wrap: anywhere; }
+}
+
+@media (max-width: 699px) {
+  .shell.viewer-shell[data-reading='true']:not([data-pane='recordings']) {
+    grid-template-rows: 0 auto auto minmax(0, 1fr) auto 44px;
+  }
+  .shell[data-reading='true']:not([data-pane='recordings']) > .topbar,
+  .shell[data-reading='true']:not([data-pane='recordings']) > .recording-tabs:not(:focus-within) { display: none; }
+  .replay-context-event { margin: 0; }
+  .phone-replay-toolbar { position: relative; background: var(--panel); }
+  .phone-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; }
+  .phone-actions .button { min-width: 0; min-height: 44px; padding-inline: 2px; }
+  .phone-more { position: absolute; z-index: 5; bottom: 100%; right: 0; width: min(100%, 28rem); max-height: 50dvh; overflow: auto; padding: 8px; background: var(--panel-raised); border: 1px solid var(--line-strong); }
+  .phone-more .button { min-height: 44px; }
+  .phone-more p { color: var(--muted); font-size: 12px; }
+}

@@ -5,7 +5,8 @@ import type { Playback, PlaybackSpeed } from '../../replay/state';
 import './replay-controls.css';
 
 /** Explicit display replay; it never sends a request to the recorded application. */
-export function ReplayControls({ playback, reason, pacing, onToggle, onPause, onSpeed }: {
+export function ReplayControls({ playback, reason, pacing, onToggle, onPause, onSpeed, speedOnly = false }: {
+  speedOnly?: boolean;
   playback: Playback;
   reason: string | null;
   pacing: string;
@@ -49,14 +50,14 @@ export function ReplayControls({ playback, reason, pacing, onToggle, onPause, on
   }, [open]);
   return <div className="replay-playback" role="group" aria-label="Replay playback">
     <div className="replay-playback-actions">
-      <button type="button" className="button replay-start" aria-pressed={playing}
+      {!speedOnly ? <button type="button" className="button replay-start" aria-pressed={playing}
         aria-disabled={!playing && reason !== null} aria-describedby={`${id}-status`} aria-keyshortcuts="Alt+P Escape"
-        onClick={onToggle}>{playing ? 'Pause' : 'Replay'}</button>
+        onClick={onToggle}>{playing ? 'Pause' : 'Replay'}</button> : null}
       <button type="button" className="button" ref={trigger} aria-label={`Replay speed, ${playback.speed}×`}
         aria-haspopup="dialog" aria-expanded={open} aria-controls={open ? `${id}-speed` : undefined}
         onClick={() => open ? close() : setOpen(true)}>{playback.speed}×</button>
     </div>
-    <p className="replay-playback-status" id={`${id}-status`}>{message}</p>
+    {!speedOnly ? <p className="replay-playback-status" id={`${id}-status`}>{message}</p> : null}
     {open ? createPortal(<div className="replay-speed-panel" role="dialog" aria-label="Replay speed" id={`${id}-speed`} ref={panel}
       onKeyDown={(event) => {
         if (event.key !== 'Escape') return;

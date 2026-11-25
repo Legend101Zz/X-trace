@@ -4,6 +4,7 @@ import type { NavAction } from '../../replay/navigation';
 import { missingEvidence } from '../../replay/missing';
 import type { MissingTarget } from '../../replay/missing';
 import { CodeEvidence } from '../code/CodeEvidence';
+import { backToStepLabel } from '../../replay/step-sentence';
 import { Values } from './Values';
 import { Missing } from './Missing';
 import { EvidenceDetails } from './EvidenceDetails';
@@ -50,7 +51,7 @@ export function EvidencePanel({ active, currentStatus, detail, event, selectionU
   return <section className="pane evidence-pane" role="tabpanel" id="evidence-panel" aria-labelledby="evidence-tab" data-active={active} aria-label="Evidence inspector">
     <div className="pane-head"><div><div className="eyebrow">Persisted facts</div><h1>Evidence inspector</h1></div><span className="top-meta">{currentStatus}</span></div>
     {event ? <button type="button" className={`button ${readingViewport ? 'button-primary phone-back-to-step' : 'wide-focus-event'}`}
-      onClick={onBackToEvent}>{readingViewport ? 'Back to event' : 'Focus event'} {event.sequence}</button> : null}
+      onClick={onBackToEvent}>{readingViewport ? backToStepLabel(event) : `Focus event ${event.sequence}`}</button> : null}
     {detail && reports ? <div className="inspector-tabs" role="tablist" aria-label="Inspector evidence" onKeyDown={(event) => {
       const index = tabs.findIndex((label) => label === tab);
       const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1

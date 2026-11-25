@@ -1,3 +1,4 @@
+import { useViewport } from './features/shell/viewport';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { components } from './api.generated';
 import { api, ApiError, failureMessage } from './api';
@@ -49,6 +50,7 @@ export default function App() {
   const [selectedOperation, setSelectedOperation] = useState('');
   const [catalogMode, setCatalogMode] = useState<CatalogMode>('endpoints');
   const [activePane, setActivePane] = useState<Pane>('recordings');
+  const [projectEmpty, setProjectEmpty] = useState(false);
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [endpointCursor, setEndpointCursor] = useState<string | null>(null);
   const [selectedEndpointSnapshot, setSelectedEndpointSnapshot] = useState<Endpoint | null>(null);
@@ -112,6 +114,7 @@ export default function App() {
   const applyEndpointPage = useCallback((page: components['schemas']['ObservedEndpointPage'], append: boolean) => {
     const result = retainPage(append ? endpointsRef.current : [], page.items, MAX_RETAINED_ROWS, page.nextCursor);
     endpointsRef.current = result.items;
+    if (page.items.length > 0 || page.nextCursor !== null) setProjectEmpty(false);
     setEndpoints(result.items);
     setEndpointCursor(result.nextCursor);
     setOlderEndpointsReleased(result.released > 0);
@@ -123,11 +126,25 @@ export default function App() {
     const { generation, signal } = endpointLane.begin();
     setEndpointBusy(true);
     setEndpointError('');
+    setProjectEmpty(false);
     try {
       const query = cursor ? `?limit=100&cursor=${encodeURIComponent(cursor)}` : '?limit=100';
       const page = await api<components['schemas']['ObservedEndpointPage']>(`/api/v1/endpoints${query}`, signal);
       if (!endpointLane.isCurrent(generation)) return;
       applyEndpointPage(page, append);
+      if (!append && page.items.length === 0 && page.nextCursor === null) {
+        // Empty endpoint results say nothing about recordings without a link.
+        // A single bounded metadata row is enough to distinguish a new project.
+        try {
+          const presence = await api<components['schemas']['RecordingList']>('/api/v1/recordings?limit=1', signal);
+          if (endpointLane.isCurrent(generation)
+              && presence.schemaVersion === 3 && Array.isArray(presence.recordings)
+              && presence.recordings.length === 0 && presence.nextAfter === null) setProjectEmpty(true);
+        } catch (error) {
+          if (endpointLane.isCurrent(generation)) markExpired(error);
+        }
+      }
+
     } catch (error) {
       if (!endpointLane.isCurrent(generation)) return;
       markExpired(error);
@@ -309,7 +326,11 @@ export default function App() {
       const { generation, signal } = authLane.begin();
       void api<components['schemas']['ObservedEndpointPage']>('/api/v1/endpoints?limit=100', signal).then((page) => {
         if (!authLane.isCurrent(generation)) return;
-        if (!endpointHasLoaded.current) applyEndpointPage(page, false);
+        if (!endpointHasLoaded.current) {
+          applyEndpointPage(page, false);
+          // Confirm emptiness through the ordinary guarded lane, including unmatched recordings.
+          if (page.items.length === 0 && page.nextCursor === null) void loadEndpoints();
+        }
         setAuth('ready');
       }).catch((cause: unknown) => {
         if (!authLane.isCurrent(generation)) return;
@@ -608,13 +629,53 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [changeReplayMode, changeSpeed, eventCount, moveEvent, navigateKey, playback.pause, playback.toggle, replay.mode, replay.playback.speed, replay.playback.status]);
 
+  const focusInspector = useRef(false);
+  function inspectSelection() {
+    focusInspector.current = true;
+    setActivePane('evidence');
+  }
+  useLayoutEffect(() => {
+    if (!focusInspector.current) return;
+    focusInspector.current = false;
+    if (activePane === 'evidence') {
+      document.querySelector<HTMLElement>('#evidence-panel .phone-back-to-step, #evidence-panel [role="tab"][aria-selected="true"]')?.focus();
+    }
+  }, [activePane]);
+
+  function backToSelectedEvent() {
+    setActivePane('events');
+    const recordingId = selectedRecording;
+    requestAnimationFrame(() => {
+      if (selectedRecordingRef.current !== recordingId) return;
+      const step = document.querySelector<HTMLElement>('#events-panel .event[aria-current="true"]');
+      if (step) {
+        focusStepControl(step);
+        return;
+      }
+      const row = document.querySelector<HTMLElement>('#events-panel .canvas-tree [aria-selected="true"]');
+      const tree = row?.closest<HTMLElement>('.canvas-tree');
+      if (row && tree) {
+        revealWithin(tree, row, 'vertical');
+        revealWithin(stepScrollOwner(tree), tree, 'vertical');
+        row.focus({ preventScroll: true });
+      } else {
+        document.getElementById('events-tab')?.focus({ preventScroll: true });
+      }
+    });
+  }
+
+  const phoneLayout = useViewport('(max-width: 699px)');
   return <AppShell activePane={activePane} onPane={setActivePane} announcement={announcement} auth={auth} authError={authError}
     openRecordings={openRecordings} selectedRecording={selectedRecording} onSelectRecording={activateRecording} onCloseRecording={closeRecording}
     appearance={appearance} onPausePlayback={playback.pause}
-    playbackControls={<ReplayControls playback={replay.playback} reason={playback.reason} pacing={playback.pacing}
-      onToggle={playback.toggle} onPause={playback.pause} onSpeed={changeSpeed} />}
+    playbackControls={!phoneLayout ? <ReplayControls playback={replay.playback} reason={playback.reason} pacing={playback.pacing}
+      onToggle={playback.toggle} onPause={playback.pause} onSpeed={changeSpeed} /> : null}
     sourceEvent={event} detail={detail} endpoint={activeRecordingTab?.endpoint ?? null}>
     <CatalogPanel
+      selectedStep={phoneLayout && activePane === 'recordings' ? event : undefined}
+      onBackToStep={backToSelectedEvent}
+      projectEmpty={auth === 'ready' && projectEmpty}
+      onAnnounce={setAnnouncement}
       active={activePane === 'recordings'}
       catalogMode={catalogMode}
       endpointLane={{ items: endpoints, cursor: endpointCursor, busy: endpointBusy || auth === 'checking', error: endpointError, released: olderEndpointsReleased }}
@@ -636,6 +697,7 @@ export default function App() {
       onSelectRecording={selectRecording}
     />
     <EventsPanel
+      phone={{ playback: replay.playback, reason: playback.reason, pacing: playback.pacing, toggle: playback.toggle, pause: playback.pause, speed: changeSpeed, inspect: inspectSelection }}
       active={activePane === 'events'}
       selectedRecording={selectedRecording}
       detail={detail}
@@ -667,26 +729,6 @@ export default function App() {
       nextReason={nextReason}
       frameControls={frameControls}
     />
-    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectionUnavailable={selectionUnavailable} onGoToMissing={goToMissing} onBackToEvent={() => {
-      setActivePane('events');
-      const recordingId = selectedRecording;
-      requestAnimationFrame(() => {
-        if (selectedRecordingRef.current !== recordingId) return;
-        const step = document.querySelector<HTMLElement>('#events-panel .event[aria-current="true"]');
-        if (step) {
-          focusStepControl(step);
-          return;
-        }
-        const row = document.querySelector<HTMLElement>('#events-panel .canvas-tree [aria-selected="true"]');
-        const tree = row?.closest<HTMLElement>('.canvas-tree');
-        if (row && tree) {
-          revealWithin(tree, row, 'vertical');
-          revealWithin(stepScrollOwner(tree), tree, 'vertical');
-          row.focus({ preventScroll: true });
-        } else {
-          document.getElementById('events-tab')?.focus({ preventScroll: true });
-        }
-      });
-    }} onNavigate={navigateToFrame} />
+    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectionUnavailable={selectionUnavailable} onGoToMissing={goToMissing} onBackToEvent={backToSelectedEvent} onNavigate={navigateToFrame} />
   </AppShell>;
 }

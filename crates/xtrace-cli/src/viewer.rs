@@ -8,7 +8,7 @@ use serde::Serialize;
 use xtrace_domain::ProjectId;
 use xtrace_store::SqliteRecordingReader;
 
-use crate::commands::open_recording_reader;
+use crate::commands::open_viewer_readers;
 use crate::error::CliError;
 use crate::output::write_success_line;
 use crate::paths::read_env_path;
@@ -24,19 +24,25 @@ struct ViewerReadyDocument {
 /// Composes the read-only project store with the daemon viewer and owns its
 /// foreground lifetime until Ctrl+C or SIGTERM.
 pub async fn run(project_dir: PathBuf, no_browser: bool) -> Result<(), CliError> {
-    let (project_id, reader, _) = open_recording_reader(&project_dir, &read_env_path)?;
-    start_viewer(project_id, reader, no_browser).await
+    let (project_id, reader, _, catalog) = open_viewer_readers(&project_dir, &read_env_path)?;
+    start_viewer(project_id, reader, catalog, no_browser).await
 }
 
 async fn start_viewer(
     project_id: ProjectId,
     reader: SqliteRecordingReader,
+    catalog: xtrace_store::catalog_history_store::SqliteCatalogHistoryStore,
     no_browser: bool,
 ) -> Result<(), CliError> {
-    let bound = xtrace_daemon::BoundViewer::bind(
+    let bound = xtrace_daemon::BoundViewer::bind_with_catalog_exports(
         xtrace_application::RecordingQueryService::new(reader.clone()),
         xtrace_application::ObservedEndpointQueryService::new(reader),
         project_id,
+        move |project_id, revision, scope, cancellation| {
+            catalog.read_export_snapshot(project_id, revision, scope, move || {
+                cancellation.is_cancelled()
+            })
+        },
     )
     .await
     .map_err(|_| CliError::InvalidArgument("could not bind experimental viewer".to_owned()))?;

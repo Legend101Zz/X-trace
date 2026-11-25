@@ -1,3 +1,4 @@
+import { ExportAction } from '../export/ExportAction';
 import { outcomeBanner } from '../../replay/outcome';
 import { stepSentence } from '../../replay/step-sentence';
 import type { Detail, Endpoint, ReplayEvent } from '../../types';
@@ -33,6 +34,15 @@ export function RecordingContext({ detail, endpoint, event, playback }: {
             {detail.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
           </ul> : null}
         </div>
+      </details>
+      <details className="recording-more" onKeyDown={(keyboard) => {
+        if (keyboard.key === 'Escape') {
+          keyboard.currentTarget.open = false;
+          keyboard.currentTarget.querySelector('summary')?.focus();
+        }
+      }}>
+        <summary aria-label="More recording actions">⋯</summary>
+        <div className="recording-more-options"><ExportAction endpoint={endpoint} label="Export…" /></div>
       </details>
     </div>
     {playback}

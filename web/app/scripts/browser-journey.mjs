@@ -191,6 +191,26 @@ try {
     const kinds = await observedRows.evaluateAll((rows) => rows.map((row) => row.dataset.eventKind));
     if (renderedStepKinds) assert.deepEqual(kinds, renderedStepKinds, 'Steps retains observed kinds and order across viewport changes');
     renderedStepKinds = kinds;
+    if (width === 320) {
+      for (const name of ['Back', 'Replay', 'Next', 'More', 'Inspect']) {
+        const action = toolbar.getByRole('button', { name, exact: true });
+        await expect(action).toBeVisible();
+        const box = await action.boundingBox();
+        assert.ok(box && box.width >= 44 && box.height >= 44, `${name} phone target is at least 44px`);
+      }
+      const more = toolbar.getByRole('button', { name: 'More', exact: true });
+      await more.click();
+      await expect(toolbar.getByRole('button', { name: 'Step in', exact: true })).toBeFocused();
+      await page.keyboard.press('Escape');
+      await expect(more).toBeFocused();
+      const sequence = await page.locator('.event[aria-current="true"] .event-seq').textContent();
+      await toolbar.getByRole('button', { name: 'Inspect', exact: true }).click();
+      const back = page.getByRole('button', { name: /Back to step · sequence/ });
+      await expect(back).toBeFocused();
+      await back.click();
+      await expect(page.locator('.event[aria-current="true"] .event-seq')).toHaveText(sequence);
+      await expect(page.locator('.event[aria-current="true"]')).toBeFocused();
+    }
     const currentRow = page.locator('.event[aria-current="true"]');
     const originalSequence = await currentRow.locator('.event-seq').textContent();
     const next = toolbar.getByRole('button', { name: 'Next', exact: true });
@@ -241,8 +261,8 @@ try {
   await page.locator('.event').nth(1).click();
   await page.getByRole('tabpanel', { name: 'Inspector' }).waitFor({ state: 'visible' });
   await page.getByRole('status').filter({ hasText: /Event .* selected/ }).waitFor();
-  const backToStep = page.getByRole('button', { name: /Back to event/ });
-  assert.ok((await backToStep.boundingBox())?.height >= 44, 'phone Back to event meets its touch target');
+  const backToStep = page.getByRole('button', { name: /^Back to step · sequence / });
+  assert.ok((await backToStep.boundingBox())?.height >= 44, 'phone Back to step meets its touch target');
   await backToStep.press('Enter');
   const currentEvent = page.locator('.event[aria-current="true"]');
   await expect(currentEvent).toBeFocused();
@@ -361,7 +381,9 @@ try {
     await page.locator('.event').nth(intoIndex).click();
     const eventsTab = page.getByRole('tablist', { name: 'Viewer panes' }).getByRole('tab', { name: 'Steps' });
     if (await eventsTab.isVisible()) await eventsTab.click();
-    const stepIn = page.getByRole('group', { name: 'Replay navigation' }).getByRole('button', { name: 'Step in', exact: true });
+    const navigation = page.getByRole('group', { name: 'Replay navigation' });
+    if (page.viewportSize().width < 700) await navigation.getByRole('button', { name: 'More', exact: true }).click();
+    const stepIn = navigation.getByRole('button', { name: 'Step in', exact: true });
     await expect(stepIn).toHaveAttribute('aria-disabled', 'false');
     await stepIn.click();
     await expect(page.locator('.event[aria-current="true"] .event-seq')).toHaveText(expectedTarget.sequence);
@@ -621,6 +643,17 @@ try {
     await glossary.click();
     await saveScreenshot(`viewer-help-${width}.png`, 'help-glossary', width, 844);
     await helpClose.press('Escape');
+    await expect(helpButton).toBeFocused();
+    await helpButton.press('Enter');
+    await help.getByRole('button', { name: 'Take the 3-step tour' }).press('Enter');
+    const guide = page.locator('.viewer-tour');
+    await expect(guide.getByRole('heading')).toHaveText('Find a recording');
+    await guide.getByRole('button', { name: 'Next', exact: true }).press('Enter');
+    await guide.getByRole('button', { name: 'Next', exact: true }).press('Enter');
+    await expect(guide.getByRole('heading')).toHaveText('Check what was recorded');
+    assert.equal(await page.locator('#events-panel .event[aria-current="true"] .event-seq').textContent(), selected,
+      'the tour preserves exact selection for the real recording');
+    await guide.getByRole('button', { name: 'Finish', exact: true }).press('Enter');
     await expect(helpButton).toBeFocused();
     await settingsButton.press('Enter');
   }

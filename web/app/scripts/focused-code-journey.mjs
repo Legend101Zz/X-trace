@@ -170,7 +170,7 @@ try {
     const details = tabs.getByRole('tab', { name: 'Details', exact: true });
     await details.click();
     await expect(page.locator('[data-event-field="symbol"]')).toHaveText(event.symbol);
-    const back = page.getByRole('button', { name: width < 861 ? `Back to event ${event.sequence}` : `Focus event ${event.sequence}`, exact: true });
+    const back = page.getByRole('button', { name: width < 861 ? new RegExp(`^Back to step · sequence ${event.sequence} · `) : `Focus event ${event.sequence}`, exact: true });
     await expect(back).toBeInViewport();
     await back.press('Enter');
     await expect(step).toBeFocused();

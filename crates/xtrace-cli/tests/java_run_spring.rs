@@ -843,6 +843,48 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
 }
 
 #[test]
+fn viewer_first_recording_and_help_tour_open_on_an_empty_project() {
+    let root = temp_root();
+    let repo = root.path().join("empty repository");
+    let data_home = root.path().join("empty data");
+    fs::create_dir_all(&repo).expect("empty repository");
+    let init = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize empty project");
+    assert!(init.status.success(), "empty project initialization failed");
+    let (ready, mut viewer) = launch_viewer(&repo, &data_home);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../web/app/scripts/first-recording-journey.mjs");
+    let mut browser = Command::new("node")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start empty project browser journey");
+    browser
+        .stdin
+        .take()
+        .expect("private readiness input")
+        .write_all(ready.to_string().as_bytes())
+        .expect("send readiness");
+    let result = browser.wait_with_output().expect("wait for empty project browser journey");
+    assert!(
+        result.status.success(),
+        "empty project browser journey failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("first recording and Help tour passed")
+    );
+    println!("{}", String::from_utf8_lossy(&result.stdout).trim());
+    stop_viewer(&mut viewer);
+}
+
+#[test]
 fn focused_spring_viewer_highlights_a_recorded_line_and_local() {
     run_focused_spring_viewer_journey(false);
 }

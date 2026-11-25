@@ -7,12 +7,14 @@ import type { OpenRecording } from './features/shell/RecordingTabs';
 import type { InspectorDock } from './features/shell/ResizableWorkspace';
 import { useViewport } from './features/shell/viewport';
 import { ResizableWorkspace } from './features/shell/ResizableWorkspace';
+import { BeforeExportOpen } from './features/export/ExportAction';
 import { RecordingContext } from './features/shell/RecordingContext';
 import { ViewerDialog } from './features/shell/ViewerDialog';
 import { ViewerHelp } from './features/shell/ViewerHelp';
 import { ViewerSettings } from './features/shell/ViewerSettings';
 import { ViewerPreferencesContext, ViewerPreferencesUpdateContext } from './features/shell/viewer-preferences';
 import type { useAppearancePreferences } from './features/shell/viewer-preferences';
+import { TourLauncher, tourPanes, ViewerTour } from './features/shell/ViewerTour';
 import './features/shell/viewer-dialog.css';
 
 const INSPECTOR_DOCK_KEY = 'xtrace.viewer.inspector-dock';
@@ -52,6 +54,27 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
   const [dock, setDock] = useState(readInspectorDock);
   const theme = useThemePreference();
   const [modal, setModal] = useState<{ title: 'Settings' | 'Help'; opener: HTMLElement } | null>(null);
+  const helpButton = useRef<HTMLButtonElement>(null);
+  const [tour, setTour] = useState<{ index: number; originalPane: Pane; opener: HTMLElement } | null>(null);
+  function prepareModal() {
+    onPausePlayback();
+    setTour(null);
+  }
+  function startTour(button: HTMLButtonElement) {
+    onPausePlayback();
+    setTour({ index: 0, originalPane: activePane, opener: modal?.opener ?? button });
+    setModal(null);
+    onPane(tourPanes[0]);
+  }
+  function closeTour() {
+    if (!tour) return;
+    setTour(null);
+    onPane(tour.originalPane);
+    requestAnimationFrame(() => {
+      const opener = tour.opener.isConnected && tour.opener.getClientRects().length ? tour.opener : helpButton.current;
+      opener?.focus();
+    });
+  }
   function changeDock(next: InspectorDock) {
     setDock(next);
     try { window.localStorage.setItem(INSPECTOR_DOCK_KEY, next); } catch {
@@ -77,11 +100,17 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
   };
   return <ViewerPreferencesContext.Provider value={appearance.preferences}>
     <ViewerPreferencesUpdateContext.Provider value={appearance.update}>
+    <TourLauncher.Provider value={startTour}>
+    <BeforeExportOpen.Provider value={prepareModal}>
     <div className="shell viewer-shell" data-pane={activePane} data-reading={detail !== null && sourceEvent !== undefined}
       data-density={appearance.preferences.density} data-motion={appearance.preferences.motion}
       style={{ '--viewer-code-size': `${appearance.preferences.codeSize}px` } as CSSProperties}
     onKeyDown={(event) => {
-      if (requestsDrawer && activePane === 'recordings' && event.key === 'Escape') {
+      if (tour && event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeTour();
+      } else if (requestsDrawer && activePane === 'recordings' && event.key === 'Escape') {
         event.preventDefault();
         closeRequests();
       }
@@ -116,9 +145,17 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
       <span>{auth === 'ready' ? 'Local viewer connected' : auth === 'checking' ? 'Connecting to local viewer' : 'Local viewer unavailable'}</span>
       <div className="viewer-dialog-actions">
         {(['Settings', 'Help'] as const).map((title) => <button type="button" className="button" key={title}
-          aria-haspopup="dialog" onClick={(event) => { onPausePlayback(); setModal({ title, opener: event.currentTarget }); }}>{title}</button>)}
+          ref={title === 'Help' ? helpButton : undefined} aria-haspopup="dialog" onClick={(event) => {
+            prepareModal();
+            setModal({ title, opener: event.currentTarget });
+          }}>{title}</button>)}
       </div>
     </footer>
+    {tour ? <ViewerTour index={tour.index} selectedRecording={selectedRecording !== ''}
+      onStep={(index) => {
+        setTour({ ...tour, index });
+        onPane(tourPanes[index]);
+      }} onClose={closeTour} /> : null}
     <div className="sr-only" role="status" aria-live="polite">{announcement}</div>
     {auth === 'checking' ? <div className="sr-only" role="status">Authenticating viewer link</div> : null}
     {auth === 'expired' ? <div role="alert" className="auth-overlay"><div><strong>Viewer session expired</strong><p>Restart the foreground viewer to create a new one-time link.</p></div></div> : null}
@@ -128,6 +165,8 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
       {modal.title === 'Settings' ? <ViewerSettings appearance={appearance} theme={theme} dock={dock} onDock={changeDock} />
         : <ViewerHelp />}
     </ViewerDialog> : null}
+    </BeforeExportOpen.Provider>
+    </TourLauncher.Provider>
     </ViewerPreferencesUpdateContext.Provider>
   </ViewerPreferencesContext.Provider>;
 }

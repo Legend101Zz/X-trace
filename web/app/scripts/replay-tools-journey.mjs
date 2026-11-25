@@ -79,7 +79,13 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     assert.ok(sizes.length > 0 && sizes.every(({ width, height }) => width >= 44 && height >= 44),
       `tools and opened-panel targets remain 44px in both dimensions at ${page.viewportSize().width}px ${pointer}: ${JSON.stringify(sizes)}`);
   };
+  const ensureMore = async () => {
+    if (page.viewportSize().width >= 700) return;
+    const more = page.getByRole('group', { name: 'Replay navigation' }).getByRole('button', { name: 'More', exact: true });
+    if (await more.getAttribute('aria-expanded') !== 'true') await activate(more);
+  };
   const openPanel = async (name) => {
+    await ensureMore();
     const tools = page.locator('.replay-tools');
     if (page.viewportSize().width < 1280) {
       await activate(tools.getByRole('button', { name: /^Tools(?: · 1)?$/ }));
@@ -138,6 +144,30 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     assert.equal(await page.evaluate((coarse) => matchMedia('(pointer: coarse)').matches === coarse, pointer === 'coarse'), true,
       `browser must use the requested ${pointer} pointer`);
     const tools = page.locator('.replay-tools');
+    await ensureMore();
+    if (width === 320) {
+      const more = page.getByRole('group', { name: 'More replay controls', exact: true });
+      const summary = page.getByRole('region', { name: 'Recording summary' });
+      for (const line of ['.replay-context-request', '.replay-context-event']) {
+        await expect(summary.locator(line)).toBeInViewport({ ratio: 1 });
+      }
+      const first = await summary.locator('.replay-context-request').boundingBox();
+      const second = await summary.locator('.replay-context-event').boundingBox();
+      assert.ok(first && second && first.y >= 0 && first.y + first.height <= second.y + 1,
+        'phone header places the request above the selected event');
+      await expect(page.locator('.topbar')).toBeHidden();
+      await expect(more.getByRole('button', { name: 'Step in', exact: true })).toBeFocused();
+      for (const label of ['Step in', 'Step over', 'Step out', 'Tools', /^Replay speed,/, 'Close']) {
+        const action = more.getByRole('button', { name: label, exact: true });
+        await expect(action).toBeInViewport({ ratio: 1 });
+        assert.ok(await action.evaluate((button) => {
+          const box = button.getBoundingClientRect();
+          return box.width >= 44 && box.height >= 44 &&
+            button.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2));
+        }), 'each phone More action is fully visible and hittable');
+      }
+      await saveScreenshot(`viewer-phone-more-${pointer}-320.png`, `open-phone-more-real-Spring-${pointer}`, width, height, page);
+    }
     if (width < 1280) {
       await expect(tools.getByRole('button', { name: 'Tools', exact: true })).toBeVisible();
       await expect(tools.getByRole('button', { name: 'Filter', exact: true })).toHaveCount(0);
@@ -193,7 +223,7 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       await expect(selected.locator('.event-seq')).toHaveText(sequence);
       await touchTargets(page.locator('.replay-filter-note'));
       await activate(page.getByRole('button', { name: 'Show all steps', exact: true }));
-      await expect(tools.getByRole('button', { name: page.viewportSize().width < 1280 ? 'Tools' : 'Go to step', exact: true })).toBeFocused();
+      await expect(width < 700 ? page.getByRole('button', { name: 'More', exact: true }) : tools.getByRole('button', { name: width < 1280 ? 'Tools' : 'Go to step', exact: true })).toBeFocused();
       await expect(selected.locator('.event-seq')).toHaveText(sequence);
     }
 
@@ -249,6 +279,7 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     }
 
     const openTiming = async () => {
+      await ensureMore();
       if (width < 1280) await activate(tools.getByRole('button', { name: 'Tools', exact: true }));
       return (width < 1280 ? panel('Tools') : tools).getByRole('button', { name: 'Show timing', exact: true });
     };
@@ -280,6 +311,7 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       await verifyRows(page, events.map(({ sequence }) => sequence), timingBySequence);
     }
     await saveScreenshot(`viewer-replay-tools-${pointer}-${width}.png`, `loaded-tools-real-Spring-${pointer}`, width, height, page);
+    await ensureMore();
     if (width < 1280) {
       await activate(tools.getByRole('button', { name: 'Tools', exact: true }));
       const menu = panel('Tools');
@@ -311,6 +343,7 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     }
     await activate((width < 1280 ? panel('Tools') : tools).getByRole('button', { name: 'Show timing', exact: true }));
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), `tools fit at ${width}px ${pointer}`);
+    await ensureMore();
     await touchTargets(tools);
     jumpReport.finishViewport();
   }

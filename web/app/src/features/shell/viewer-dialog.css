@@ -43,3 +43,26 @@
 }
 .viewer-help-tabs { display: flex; flex-wrap: wrap; gap: 6px; padding-block-start: 12px; }
 .viewer-help-tabs [aria-selected='true'] { border-color: var(--amber); background: var(--select); }
+.viewer-tour {
+  position: fixed;
+  z-index: 6;
+  inset: auto 12px 64px auto;
+  box-sizing: border-box;
+  width: min(23rem, calc(100% - 24px));
+  max-height: calc(100dvh - 120px);
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel-raised);
+  color: var(--text);
+}
+.viewer-tour--recordings { inset-inline: 12px auto; }
+.viewer-tour h2 { margin: 4px 0; }
+.viewer-tour-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: 6px; margin-top: 10px; }
+:is(.viewer-tour, .first-recording) .button { min-height: 44px; }
+.first-recording-command { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+.first-recording-command code { overflow-wrap: anywhere; }
+@media (max-width: 860px) {
+  .viewer-tour { inset-block-end: 104px; }
+}

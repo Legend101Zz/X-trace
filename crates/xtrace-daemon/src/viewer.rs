@@ -42,6 +42,9 @@ use xtrace_application::{
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{CorrelationId, OperationId, ProjectId, RecordingId};
 
+mod export;
+pub use export::CatalogExportCancellation;
+
 const MAX_CONNECTIONS: usize = 32;
 const MAX_HTTP_HEADERS: usize = 32;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -91,6 +94,8 @@ struct ViewerState<P> {
     recording_service: RecordingQueryService<P>,
     observed_service: ObservedEndpointQueryService<P>,
     query_lane: QueryLane,
+    catalog_exports: Option<Arc<export::CatalogExportReader>>,
+    export_slots: Arc<Semaphore>,
     project_id: ProjectId,
     origin: String,
     host: String,
@@ -187,6 +192,43 @@ impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundVie
         observed_service: ObservedEndpointQueryService<P>,
         project_id: ProjectId,
     ) -> Result<Self, ViewerError> {
+        Self::bind_inner(recording_service, observed_service, project_id, None).await
+    }
+
+    /// Binds the viewer with a read-only, already-admitted catalog snapshot reader.
+    /// The project ID supplied to the reader is always the viewer's bound project.
+    ///
+    /// # Errors
+    /// Returns the same listener and token-generation failures as [`Self::bind`].
+    pub async fn bind_with_catalog_exports<F>(
+        recording_service: RecordingQueryService<P>,
+        observed_service: ObservedEndpointQueryService<P>,
+        project_id: ProjectId,
+        reader: F,
+    ) -> Result<Self, ViewerError>
+    where
+        F: Fn(
+                ProjectId,
+                xtrace_application::catalog_discovery::history::CatalogExportRevision,
+                xtrace_application::catalog_discovery::history::CatalogExportScope,
+                CatalogExportCancellation,
+            ) -> Result<
+                xtrace_application::catalog_discovery::history::CatalogExportSnapshot,
+                xtrace_application::catalog_discovery::history::CatalogExportReadError,
+            > + Send
+            + Sync
+            + 'static,
+    {
+        Self::bind_inner(recording_service, observed_service, project_id, Some(Arc::new(reader)))
+            .await
+    }
+
+    async fn bind_inner(
+        recording_service: RecordingQueryService<P>,
+        observed_service: ObservedEndpointQueryService<P>,
+        project_id: ProjectId,
+        catalog_exports: Option<Arc<export::CatalogExportReader>>,
+    ) -> Result<Self, ViewerError> {
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.map_err(ViewerError::Listener)?;
         let address = listener.local_addr().map_err(ViewerError::Listener)?;
@@ -199,6 +241,8 @@ impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundVie
             recording_service,
             observed_service,
             query_lane: QueryLane::new(MAX_QUERY_CONCURRENCY),
+            catalog_exports,
+            export_slots: Arc::new(Semaphore::new(export::MAX_EXPORT_CONCURRENCY)),
             project_id,
             origin,
             host,
@@ -278,6 +322,7 @@ impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundVie
         drop(service);
         let end = Instant::now() + Duration::from_secs(2);
         self.state.query_lane.close();
+        self.state.export_slots.close();
         while !connections.is_empty() && Instant::now() < end {
             if timeout(Duration::from_millis(100), connections.join_next()).await.is_err() {
                 continue;
@@ -347,6 +392,8 @@ fn router<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static>(
         .route("/assets/fonts/chivo-latin-600-normal.woff2", get(chivo_bold_font))
         .route("/assets/fonts/azeret-mono-latin-400-normal.woff2", get(mono_font))
         .route("/api/v1/auth/exchange", post(exchange))
+        .route("/api/v1/exports/preview", post(export::preview_route))
+        .route("/api/v1/exports/save", post(export::save_route))
         .route("/api/v1/recordings", get(list_recordings))
         .route("/api/v1/recordings/:recording_id", get(show_recording))
         .route(
@@ -1758,6 +1805,8 @@ fn add_security_headers(headers: &mut HeaderMap) {
     reason = "HTTP tests use fixed local fixture data"
 )]
 mod tests {
+    include!("viewer/export_tests.rs");
+
     use super::*;
     use rusqlite::{Connection, params};
     #[cfg(unix)]
@@ -3358,6 +3407,8 @@ mod tests {
             recording_service: RecordingQueryService::new(ReadFixture::default()),
             observed_service: ObservedEndpointQueryService::new(ReadFixture::default()),
             query_lane: QueryLane::new(0),
+            catalog_exports: None,
+            export_slots: Arc::new(Semaphore::new(export::MAX_EXPORT_CONCURRENCY)),
             project_id: ProjectId::new(),
             origin: "http://127.0.0.1:12345".to_owned(),
             host: "127.0.0.1:12345".to_owned(),
@@ -3418,6 +3469,8 @@ mod tests {
             recording_service: RecordingQueryService::new(ReadFixture::default()),
             observed_service: ObservedEndpointQueryService::new(ReadFixture::default()),
             query_lane: QueryLane::new(MAX_QUERY_CONCURRENCY),
+            catalog_exports: None,
+            export_slots: Arc::new(Semaphore::new(export::MAX_EXPORT_CONCURRENCY)),
             project_id: ProjectId::new(),
             origin: format!("http://{address}"),
             host: address.to_string(),

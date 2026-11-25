@@ -11,7 +11,12 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
   assert.ok(start >= 0, 'real Spring playback needs an observed adjacent non-gap timed pair');
   const activate = (control) => pointer === 'coarse' ? control.tap() : control.click();
   const selected = page.locator('.event[aria-current="true"]');
-  const playback = page.getByRole('group', { name: 'Replay playback', exact: true });
+  const playback = page.locator('.phone-replay-toolbar, .replay-context .replay-playback');
+  const ensureMore = async () => {
+    if (page.viewportSize().width >= 700) return;
+    const more = playback.getByRole('button', { name: 'More', exact: true });
+    if (await more.getAttribute('aria-expanded') !== 'true') await activate(more);
+  };
   const replay = () => playback.getByRole('button', { name: 'Replay', exact: true });
   const pause = () => playback.getByRole('button', { name: 'Pause', exact: true });
   const selection = page.locator('#evidence-panel > button');
@@ -32,6 +37,7 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
     await expect(selected).toBeFocused();
   };
   const speed = async (value) => {
+    await ensureMore();
     const opener = playback.getByRole('button', { name: /^Replay speed,/ });
     await activate(opener);
     await activate(page.getByRole('dialog', { name: 'Replay speed', exact: true }).getByRole('button', { name: `${value}×`, exact: true }));
@@ -54,6 +60,7 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
         await page.clock.runFor(17);
         await expect(page.locator('.canvas-tree [aria-selected="true"]')).toBeFocused();
         await activate(mode('Steps'));
+        await ensureMore();
         await submitGo(events[start + 1].sequence);
         const speedButton = playback.getByRole('button', { name: /^Replay speed,/ });
         await activate(speedButton);
@@ -77,7 +84,7 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
       const pausedMessage = await playback.locator('.replay-playback-status').textContent();
       await activate(mode('Map'));
       await expect(replay()).toHaveAttribute('aria-pressed', 'false');
-      await expect(selection).toHaveText(new RegExp(`^(Back to event|Focus event) ${events[start].sequence}$`));
+      await expect(selection).toHaveText(new RegExp(`^(Back to step · sequence ${events[start].sequence} · |Focus event ${events[start].sequence}$)`));
       await expect(page.locator('.canvas-tree [aria-selected="true"]')).toBeFocused();
       await expect(playback.locator('.replay-playback-status')).toHaveText(pausedMessage);
       await activate(mode('Steps'));
@@ -117,17 +124,25 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
       for (const name of ['Map', 'Steps', 'Map']) {
         await activate(mode(name));
         await expect(pause()).toHaveAttribute('aria-pressed', 'true');
-        await expect(playback.getByRole('button', { name: 'Replay speed, 2×' })).toBeVisible();
         await expect(page.locator('.replay-filter-note')).toHaveText(filterMessage);
-        await expect(selection).toHaveText(new RegExp(`^(Back to event|Focus event) ${events[start].sequence}$`));
+        await expect(selection).toHaveText(new RegExp(`^(Back to step · sequence ${events[start].sequence} · |Focus event ${events[start].sequence}$)`));
         await expect(name === 'Map' ? page.locator('.canvas-tree [aria-selected="true"]') : selected).toBeFocused();
+        if (width < 700) {
+          await ensureMore();
+          await expect(playback.getByRole('button', { name: 'Replay speed, 2×' })).toBeVisible();
+          await playback.getByRole('button', { name: 'Close', exact: true }).press('Escape');
+          await activate(mode(name));
+          await expect(name === 'Map' ? page.locator('.canvas-tree [aria-selected="true"]') : selected).toBeFocused();
+        } else {
+          await expect(playback.getByRole('button', { name: 'Replay speed, 2×' })).toBeVisible();
+        }
       }
       await page.evaluate(() => {
         const changes = [];
         let previous = document.querySelector('#evidence-panel > button')?.textContent;
         const observer = new MutationObserver(() => {
           const next = document.querySelector('#evidence-panel > button')?.textContent;
-          if (next && next !== previous) { changes.push(next.match(/(\d+)$/)[1]); previous = next; }
+          if (next && next !== previous) { changes.push((next.match(/sequence (\d+)/) ?? next.match(/(\d+)$/))[1]); previous = next; }
         });
         observer.observe(document.querySelector('#evidence-panel'), { subtree: true, characterData: true, childList: true });
         window.__xtracePlaybackModeProof = { changes, observer };
@@ -147,7 +162,7 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
       await page.clock.runFor(16);
       await expect(page.locator('.canvas-tree [aria-selected="true"]')).toBeFocused();
       if (await pause().count()) await activate(pause());
-      const pausedSequence = (await selection.textContent()).match(/(\d+)$/)[1];
+      const pausedSequence = (await selection.textContent()).match(/^(?:Back to step · sequence |Focus event )(\d+)(?: · |$)/)[1];
       await activate(mode('Steps'));
       await expect(selected.locator('.event-seq')).toHaveText(pausedSequence);
       await expect(replay()).toHaveAttribute('aria-pressed', 'false');
@@ -190,6 +205,7 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
         await activate(page.getByRole('button', { name: 'Show all steps', exact: true }));
       }
       await go(events[start].sequence);
+      await ensureMore();
       await activate(playback.getByRole('button', { name: /^Replay speed,/ }));
       const speedChoices = page.getByRole('dialog', { name: 'Replay speed', exact: true });
       await expect(speedChoices).toContainText('display pacing, not a step duration');
@@ -220,7 +236,7 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
         await openCapture();
         await expect(playback.getByRole('button', { name: 'Replay speed, 0.5×' })).toBeVisible();
       }
-      const sizes = await playback.locator('button').evaluateAll((buttons) => buttons.map((button) => {
+      const sizes = await playback.locator('button').evaluateAll((buttons) => buttons.filter((button) => button.getClientRects().length).map((button) => {
         const box = button.getBoundingClientRect(); return [box.width,box.height];
       }));
       assert.ok(sizes.every(([w,h]) => w >= 44 && h >= 44), 'playback controls have 44px targets in both dimensions');

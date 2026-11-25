@@ -115,6 +115,19 @@ describe('replay wiring in the app', () => {
     expect(document.querySelector('.replay-start')).toHaveAttribute('aria-pressed', 'false');
   });
 
+  it('pauses playback and keeps Settings available when Help starts the tour', async () => {
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }));
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Help' }));
+    expect(document.querySelector('.replay-start')).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Help' })).getByRole('button', { name: 'Take the 3-step tour' }));
+    expect(screen.getByRole('dialog', { name: 'Find a recording' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Skip tour' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(screen.getByRole('combobox', { name: 'Default speed' })).toBeInTheDocument();
+  });
+
   it('focuses the selected row on click or Alt+M, and keeps arrow navigation on the view tab', async () => {
     await openRecording();
     const tabs = screen.getByRole('tablist', { name: 'Replay view' });
@@ -656,7 +669,7 @@ describe('replay wiring in the app', () => {
     expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
 
     fireEvent.click(screen.getByRole('tab', { name: 'Inspector' }));
-    const back = within(inspector()).getByRole('button', { name: /(?:Back to|Focus) event 2/, hidden: true });
+    const back = within(inspector()).getByRole('button', { name: /(?:Back to step · sequence 2|Focus event 2)/, hidden: true });
     back.focus();
     focus.mockClear();
     fireEvent.click(back);
@@ -672,6 +685,27 @@ describe('replay wiring in the app', () => {
     expect(recording).not.toHaveTextContent('Event capacity facts unavailable');
     expect(recording).toHaveTextContent('Value withheld by a redaction rule.');
     expect(recording).not.toHaveTextContent(/PRIVATE-RULE|PRIVATE-SUMMARY/);
+  });
+  it('offers phone replay actions and returns keyboard focus to the selected step', async () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query === '(max-width: 860px)' || query === '(max-width: 699px)', addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    }));
+    await openRecording();
+    const toolbar = screen.getByRole('group', { name: 'Replay navigation' });
+    for (const name of ['Back', 'Replay', 'Next', 'More', 'Inspect']) expect(within(toolbar).getByRole('button', { name })).toBeInTheDocument();
+    const more = within(toolbar).getByRole('button', { name: 'More' });
+    fireEvent.click(more);
+    expect(within(toolbar).getByRole('button', { name: 'Step in' })).toHaveFocus();
+    fireEvent.keyDown(within(toolbar).getByRole('group', { name: 'More replay controls' }), { key: 'Escape' });
+    expect(more).toHaveFocus();
+    fireEvent.click(screen.getByRole('tab', { name: 'Requests' }));
+    const requests = screen.getByRole('tabpanel', { name: 'Requests' });
+    fireEvent.click(within(requests).getByRole('button', { name: /^Back to step · sequence 1 · / }));
+    await waitFor(() => expect(document.querySelector('#events-panel .event[aria-current="true"]')).toHaveFocus());
+    fireEvent.click(within(toolbar).getByRole('button', { name: 'Inspect' }));
+    const back = within(inspector()).getByRole('button', { name: /Back to step · sequence 1/ });
+    fireEvent.click(back);
+    await waitFor(() => expect(document.querySelector('#events-panel .event[aria-current="true"]')).toHaveFocus());
   });
   it('opens the Code reading tab with explicit missing evidence on a narrow viewport', async () => {
     vi.stubGlobal('matchMedia', (query: string) => ({

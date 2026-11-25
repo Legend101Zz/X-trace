@@ -21,6 +21,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/exports/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview the files and omissions for a local catalog export.
+         * @description Resolves the scope and revision in one admitted project snapshot. JSON requests are limited to 1 KiB and complete preview metadata to 2 MiB. A missing catalog, revision or operation returns 404. Resource limits return 413. Unsafe or incomplete evidence returns 422. The query lane returns 503 when busy and the request deadline returns 504.
+         */
+        post: operations["previewCatalogExport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/exports/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Download the exact approved projection after a fresh catalog read.
+         * @description Repeat the preview selection and its approval after explicit user confirmation. The server rereads linked evidence even for an unchanged revision. A changed approval returns 409. Logical file bytes are limited to 16 MiB and the encoded attachment to 20 MiB. Errors use the preview route's fixed problem codes.
+         */
+        post: operations["saveCatalogExport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/recordings": {
         parameters: {
             query?: never;
@@ -162,6 +202,88 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @enum {string} */
+        ExportFormat: "openapi" | "postman" | "curl" | "bundle";
+        /** @description Lowercase hexadecimal BLAKE3 digest. */
+        ExportDigest: string;
+        ExportSelection: {
+            format: components["schemas"]["ExportFormat"];
+            /** @description Allowed only for OpenAPI when true. */
+            yaml: boolean;
+            /** @description The last catalog publication for this project or one explicit revision UUID. */
+            revision: "latest" | string;
+            /** @description Every eligible operation of the revision, a catalog operation UUID or an observed endpoint UUID prefixed with observed:. The observed selector is resolved within this project and revision using its recorded component, binding, HTTP method and declared route. The supported finite observed alias shares its catalog UUID, but the selector kind remains distinct for approval. Divergent stored aliases are corrupt. A missing or ambiguous match is unavailable. */
+            scope: "all" | string;
+        };
+        ExportApproval: {
+            /** Format: uuid */
+            revisionId: string;
+            digest: components["schemas"]["ExportDigest"];
+        };
+        ExportSaveRequest: {
+            format: components["schemas"]["ExportFormat"];
+            /** @description Allowed only for OpenAPI when true. */
+            yaml: boolean;
+            /** @description The last catalog publication for this project or one explicit revision UUID. */
+            revision: "latest" | string;
+            /** @description Every eligible operation of the revision, a catalog operation UUID or an observed endpoint UUID prefixed with observed:. The observed selector is resolved within this project and revision using its recorded component, binding, HTTP method and declared route. The supported finite observed alias shares its catalog UUID, but the selector kind remains distinct for approval. Divergent stored aliases are corrupt. A missing or ambiguous match is unavailable. */
+            scope: "all" | string;
+            approval: components["schemas"]["ExportApproval"];
+        };
+        ExportPreviewFile: {
+            /** @description Safe relative filename. Null when the logical recipe name embeds catalog route text. */
+            name: string | null;
+            /** @description Identifies a recipe whose name is withheld. */
+            recipeOrdinal: number | null;
+            /**
+             * @description Non-executable logical file mode (octal 0644).
+             * @constant
+             */
+            mode: 420;
+            bytes: number;
+            blake3: components["schemas"]["ExportDigest"];
+        };
+        ExportOmissionGroup: {
+            /** @enum {string|null} */
+            format: "openapi" | "postman" | "curl" | "bundle" | null;
+            /** @description Fixed subject label with no catalog names. */
+            kind: string;
+            /** @description Fixed omission reason with no offender paths or values. */
+            reason: string;
+            count: number;
+        };
+        ExportDownload: {
+            /** @enum {string} */
+            filename: "openapi.json" | "openapi.yaml" | "collection.postman.json" | "xtrace-curl.zip" | "xtrace-bundle.zip";
+            /** @enum {string} */
+            mediaType: "application/json" | "application/yaml" | "application/zip";
+        };
+        ExportPreview: {
+            /** @constant */
+            schemaVersion: 1;
+            /** Format: uuid */
+            requestId: string;
+            /** Format: uuid */
+            projectId: string;
+            request: components["schemas"]["ExportSelection"];
+            /** Format: uuid */
+            revisionId: string;
+            revisionOrdinal: number;
+            /**
+             * Format: uuid
+             * @description Resolved catalog operation for this revision. Null for all operations.
+             */
+            catalogOperationId: string | null;
+            selectedOperations: number;
+            emittedOperations: number;
+            files: components["schemas"]["ExportPreviewFile"][];
+            omissions: components["schemas"]["ExportOmissionGroup"][];
+            totalBytes: number;
+            /** @description Digest over the sorted logical paths, modes and exact file bytes. */
+            contentHash: components["schemas"]["ExportDigest"];
+            approval: components["schemas"]["ExportApproval"];
+            download: components["schemas"]["ExportDownload"];
+        };
         AuthResponse: {
             /** @constant */
             authenticated: true;
@@ -631,6 +753,92 @@ export interface operations {
             403: components["responses"]["Problem"];
             413: components["responses"]["Problem"];
             500: components["responses"]["Problem"];
+        };
+    };
+    previewCatalogExport: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
+                Host: components["parameters"]["ViewerHost"];
+                /** @description Must be exactly same-origin. */
+                "Sec-Fetch-Site": components["parameters"]["ViewerFetchSite"];
+                /** @description Required browser-client marker; must be exactly viewer-v1. */
+                "X-XTrace-Client": components["parameters"]["ViewerClient"];
+                /** @description Must exactly equal the printed viewer origin, including port. */
+                Origin: components["parameters"]["ExchangeOrigin"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExportSelection"];
+            };
+        };
+        responses: {
+            /** @description Safe metadata for one complete projection. No file contents or host paths. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportPreview"];
+                };
+            };
+            400: components["responses"]["Problem"];
+            401: components["responses"]["Problem"];
+            403: components["responses"]["Problem"];
+            404: components["responses"]["Problem"];
+            413: components["responses"]["Problem"];
+            422: components["responses"]["Problem"];
+            503: components["responses"]["Problem"];
+            504: components["responses"]["Problem"];
+        };
+    };
+    saveCatalogExport: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
+                Host: components["parameters"]["ViewerHost"];
+                /** @description Must be exactly same-origin. */
+                "Sec-Fetch-Site": components["parameters"]["ViewerFetchSite"];
+                /** @description Required browser-client marker; must be exactly viewer-v1. */
+                "X-XTrace-Client": components["parameters"]["ViewerClient"];
+                /** @description Must exactly equal the printed viewer origin, including port. */
+                Origin: components["parameters"]["ExchangeOrigin"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExportSaveRequest"];
+            };
+        };
+        responses: {
+            /** @description A direct single file or a deterministic ZIP of the approved logical files. */
+            200: {
+                headers: {
+                    "Content-Disposition": string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": string;
+                    "application/yaml": string;
+                    "application/zip": string;
+                };
+            };
+            400: components["responses"]["Problem"];
+            401: components["responses"]["Problem"];
+            403: components["responses"]["Problem"];
+            404: components["responses"]["Problem"];
+            409: components["responses"]["Problem"];
+            413: components["responses"]["Problem"];
+            422: components["responses"]["Problem"];
+            503: components["responses"]["Problem"];
+            504: components["responses"]["Problem"];
         };
     };
     listRecordings: {

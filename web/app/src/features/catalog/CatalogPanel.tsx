@@ -1,7 +1,10 @@
+import { ExportAction } from '../export/ExportAction';
 import { useState } from 'react';
-import type { CatalogMode, Endpoint, Recording } from '../../types';
+import { backToStepLabel } from '../../replay/step-sentence';
+import type { CatalogMode, Endpoint, Recording, ReplayEvent } from '../../types';
 import { ErrorState } from '../common/ErrorState';
 import { RecordingRows } from './RecordingRows';
+import { FirstRecording } from './FirstRecording';
 
 /** One paged catalog lane as the panel sees it. */
 export interface CatalogLaneView<T> {
@@ -14,6 +17,10 @@ export interface CatalogLaneView<T> {
 
 export interface CatalogPanelProps {
   active: boolean;
+  selectedStep?: ReplayEvent;
+  onBackToStep: () => void;
+  projectEmpty: boolean;
+  onAnnounce: (message: string) => void;
   catalogMode: CatalogMode;
   endpointLane: CatalogLaneView<Endpoint>;
   linkedLane: CatalogLaneView<Recording>;
@@ -36,7 +43,7 @@ export interface CatalogPanelProps {
 
 export function CatalogPanel(props: CatalogPanelProps) {
   const {
-    active, catalogMode, selectedEndpoint, selectedRecording, arrivals,
+    active, projectEmpty, onAnnounce, catalogMode, selectedEndpoint, selectedRecording, arrivals,
     onRefresh, onRetryEndpoints, onRetryLinked, onRetryUnmatched,
     onNextEndpoints, onNextLinked, onNextUnmatched, onOpenEndpoint, onOpenUnmatched, onBack, onSelectRecording,
   } = props;
@@ -64,6 +71,7 @@ export function CatalogPanel(props: CatalogPanelProps) {
           <span><span className="recording-title">{endpoint.routeTemplate}</span><span className="recording-sub">Component: {endpoint.applicationComponent}<br />Binding: {endpoint.binding}</span><span className="recording-status">observed</span></span>
         </button>
         {expanded ? <div className="request-branch">
+          <ExportAction endpoint={endpoint} label="Export this endpoint…" />
           {linkedBusy && linked.length === 0 ? <div className="loading">Reading linked recordings…</div> : null}
           {linkedError ? <ErrorState message={linkedError} onRetry={onRetryLinked} /> : null}
           {!linkedBusy && !linkedError && linked.length === 0 ? <div className="empty"><strong>No linked recordings</strong><p>This endpoint has no persisted linked recording in the current page.</p></div> : null}
@@ -75,8 +83,10 @@ export function CatalogPanel(props: CatalogPanelProps) {
     })}
   </ul>;
   return <section className="pane" role="tabpanel" id="recordings-panel" aria-labelledby="recordings-tab" data-active={active} aria-label="Recordings">
+        {props.selectedStep ? <button type="button" className="button button-primary phone-back-to-step" onClick={props.onBackToStep}>{backToStepLabel(props.selectedStep)}</button> : null}
         <div className="pane-head"><div><div className="eyebrow">Requests</div><h1>{catalogMode === 'endpoints' ? 'Endpoints' : catalogMode === 'linked' ? 'Linked recordings' : 'Unmatched recordings'}</h1></div>
           <button className="button" onClick={onRefresh} disabled={endpointBusy || linkedBusy || unmatchedBusy}>Refresh</button></div>
+        {catalogMode === 'endpoints' ? <ExportAction endpoint={null} label="Export endpoints…" /> : null}
         <label className="request-search" id="request-search-label" htmlFor="request-search">Search loaded requests</label>
         <input type="search" id="request-search" className="request-search-input" aria-labelledby="request-search-label"
           value={search} onChange={(event) => setSearch(event.currentTarget.value)} />
@@ -86,7 +96,10 @@ export function CatalogPanel(props: CatalogPanelProps) {
           <div className="policy-note"><strong>Operator-selected policy</strong><span>{endpoints[0]?.observationPolicy ?? 'spring-orders-v1'} does not attest which adapter or application produced the event.</span></div>
           {endpointBusy && endpoints.length === 0 ? <div className="loading">Reading observed endpoints…</div> : null}
           {endpointError ? <ErrorState message={endpointError} onRetry={onRetryEndpoints} /> : null}
-          {!endpointBusy && !endpointError && endpoints.length === 0 ? <div className="empty"><strong>No observed endpoints</strong><p>A persisted capture must include the exact operator-selected policy and approved route.</p></div> : null}
+          {!endpointBusy && !endpointError && endpoints.length === 0 ? projectEmpty
+            ? <FirstRecording onAnnounce={onAnnounce} />
+            : <div className="empty"><strong>No observed endpoints</strong><p>Check Not linked to an endpoint for other recordings.</p></div>
+            : null}
           {query && branches.length === 0 && endpoints.length > 0 ? <p className="context-note">No matching loaded endpoints</p> : null}
           {tree}
           {endpointCursor ? <div className="page-controls"><span className="top-meta">More endpoints</span><button className="button" onClick={onNextEndpoints} disabled={endpointBusy}>Load next page</button></div> : null}

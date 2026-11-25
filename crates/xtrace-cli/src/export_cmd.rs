@@ -9,20 +9,18 @@
 //! confidence, limitation codes). It holds no parameter, response or body claims, so the exports
 //! declare path parameters from the route template and say so; no body or value was observed.
 
-use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
-use xtrace_application::CatalogChangeKind;
 use xtrace_application::catalog_discovery::history::{
-    CatalogHistoryPort, CatalogHistoryService, HistoryError, OperationView, RevisionEntry,
+    CatalogHistoryPort, CatalogHistoryService, HistoryError,
 };
 use xtrace_domain::{
     AppError, CatalogRevisionId, CorrelationId, ErrorCategory, ErrorCode, ProjectId, RetryAdvice,
 };
 use xtrace_export::{
-    ClaimInput, EffectiveState, ExportError, ExportFormat, ExportInput, ExportOutput,
-    ExportRequest, OperationInput, RevisionInput,
+    ExportError, ExportFormat, ExportOutput, ExportRequest,
+    catalog::{self, CatalogExportError},
 };
 
 use crate::error::CliError;
@@ -87,105 +85,6 @@ fn open(project_dir: &Path) -> Result<(Store, ProjectId), CliError> {
     let preflight = crate::daemon::preflight_project(project_dir, &env_reader)?;
     let validated = crate::daemon::open_validated_project(preflight)?;
     Ok((Store::new(validated.store), validated.project_id))
-}
-
-type OperationIdentity = (String, String, String, String);
-
-fn state_of(view: &OperationView, confirmed: &BTreeSet<OperationIdentity>) -> EffectiveState {
-    if view.change_kind == CatalogChangeKind::Unknown {
-        return EffectiveState::Unknown;
-    }
-    if confirmed.contains(&(
-        view.application_component.clone(),
-        view.binding_key.clone(),
-        view.method.clone(),
-        view.route_template.clone(),
-    )) {
-        return EffectiveState::Observed;
-    }
-    if view.provenance.iter().all(|p| p == "static_inferred") {
-        EffectiveState::StaticOnly
-    } else {
-        EffectiveState::Registered
-    }
-}
-
-fn operation_input(
-    view: &OperationView,
-    confirmed: &BTreeSet<OperationIdentity>,
-) -> OperationInput {
-    let operation_id = serde_json::to_value(view.operation_id)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default();
-    OperationInput {
-        operation_id,
-        method: view.method.clone(),
-        route_template: view.route_template.clone(),
-        application_component: view.application_component.clone(),
-        binding_key: view.binding_key.clone(),
-        effective_state: state_of(view, confirmed),
-        claims_available: view.claims_available,
-        claims: view
-            .claims
-            .iter()
-            .map(|claim| ClaimInput {
-                claim_id: claim.claim_id.to_string(),
-                provenance: claim.provenance.clone(),
-                handler_symbol: claim.handler_symbol.clone(),
-                confidence_basis_points: claim.confidence_basis_points,
-                limitation_codes: claim.limitation_codes.clone(),
-                empty_limitations_reported: claim.limitation_codes.is_empty(),
-                source_evidence: Some(claim.source_evidence.clone()),
-                ..ClaimInput::default()
-            })
-            .collect(),
-        catalog_summary: None,
-    }
-}
-
-fn export_input(
-    entry: &RevisionEntry,
-    views: &[OperationView],
-    confirmed: &BTreeSet<OperationIdentity>,
-) -> ExportInput {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"xtrace.export.catalog.v1\0");
-    let mut identities: Vec<String> = views
-        .iter()
-        .map(|v| {
-            format!(
-                "{}\0{}\0{}\0{}\0{}",
-                v.method,
-                v.route_template,
-                v.application_component,
-                v.binding_key,
-                v.operation_version_id
-            )
-        })
-        .collect();
-    identities.sort();
-    for identity in &identities {
-        hasher.update(identity.as_bytes());
-        hasher.update(b"\n");
-    }
-    let components: BTreeSet<&str> =
-        views.iter().map(|v| v.application_component.as_str()).collect();
-    let application_name = match components.iter().collect::<Vec<_>>().as_slice() {
-        [one] => (**one).to_owned(),
-        _ => String::new(),
-    };
-    ExportInput {
-        revision: RevisionInput {
-            revision_id: entry.revision_id.to_string(),
-            ordinal: entry.ordinal,
-            catalog_hash: hasher.finalize().to_hex().to_string(),
-            policy_digest: String::new(),
-            application_name,
-        },
-        operations: views.iter().map(|v| operation_input(v, confirmed)).collect(),
-        truncated: false,
-    }
 }
 
 /// Validates a file path produced by the export crate: relative, no `..`, no separators tricks.
@@ -349,34 +248,24 @@ pub async fn run(args: ExportArgs) -> Result<i32, CliError> {
         .transpose()?;
     let (port, project) = open(&args.project_dir)?;
     // Read the full identities directly: reconciliation rows lose scope after joining routes.
-    let confirmed: BTreeSet<OperationIdentity> = port
+    let observed = port
         .observed_operations(project)
-        .map_err(|error| map_history(HistoryError::Port(error)))?
-        .into_iter()
-        .filter(|row| row.recording_count > 0)
-        .map(|row| (row.application_component, row.binding_key, row.method, row.route_template))
-        .collect();
+        .map_err(|error| map_history(HistoryError::Port(error)))?;
     let service = CatalogHistoryService::new(port);
     let (entry, views) = service.operations(project, revision).map_err(map_history)?;
-    let input = export_input(&entry, &views, &confirmed);
+    let input = catalog::prepare(&entry, &views, &observed);
 
-    let selection = if args.operations.is_empty() {
-        None
-    } else {
-        let known: BTreeSet<&str> =
-            input.operations.iter().map(|o| o.operation_id.as_str()).collect();
-        if let Some(missing) = args.operations.iter().find(|id| !known.contains(id.as_str())) {
-            return Err(not_found(format!(
-                "operation {missing} is not in catalog revision {}",
-                entry.revision_id
-            )));
-        }
-        Some(args.operations.clone())
-    };
     let mut request = ExportRequest::new(format);
-    request.operation_ids = selection;
+    request.operation_ids =
+        if args.operations.is_empty() { None } else { Some(args.operations.clone()) };
     request.yaml = args.yaml;
-    let output = xtrace_export::export(&input, &request).map_err(|e| map_export(&e, format))?;
+    let output = catalog::render(&input, &request).map_err(|error| match error {
+        CatalogExportError::OperationNotFound { operation_id } => not_found(format!(
+            "operation {operation_id} is not in catalog revision {}",
+            entry.revision_id
+        )),
+        CatalogExportError::Render(error) => map_export(&error, format),
+    })?;
 
     let written = if args.preview {
         false
