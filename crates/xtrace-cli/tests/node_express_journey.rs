@@ -11,7 +11,7 @@
 //! over real HTTP, and read back through the recording read API. The fixtures are npm workspace packages, so `npm ci --prefix adapters/node` provides them.
 
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -169,7 +169,6 @@ fn journey(fixture: &str) {
         "run `npm ci --prefix adapters/node` before this test (fixture {fixture} has no express)"
     );
 
-    let port = free_port();
     let mut child = RunChild(
         cli()
             .args(["run", "--project-dir"])
@@ -180,7 +179,7 @@ fn journey(fixture: &str) {
             .arg(&app)
             .current_dir(app.parent().expect("fixture directory"))
             .env("XTRACE_DATA_HOME", &data_home)
-            .env("APP_PORT", port.to_string())
+            .env("APP_PORT", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -193,9 +192,13 @@ fn journey(fixture: &str) {
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    let _ = line_sender.send(Err(()));
+                    break;
+                }
                 Ok(_) => {
-                    let _ = line_sender.send(line);
+                    let _ = line_sender.send(Ok(line));
                 }
             }
         }
@@ -206,15 +209,29 @@ fn journey(fixture: &str) {
         std::io::BufReader::new(stderr).read_to_end(&mut bytes).expect("drain stderr");
         bytes
     });
-    let ready = line_receiver.recv_timeout(Duration::from_secs(20)).expect("Express readiness");
-    assert_eq!(ready.trim(), "EXPRESS_READY", "unexpected child output: {ready}");
+    // Both lines belong to the same listening child. Selecting the port in the parent would
+    // release its reservation before Express binds, allowing another server to take that port.
+    let readiness_deadline = Instant::now() + Duration::from_secs(20);
+    let ready = readiness_line(&line_receiver, readiness_deadline);
+    assert!(ready.trim() == "EXPRESS_READY", "Express readiness failure: InvalidMarker");
+    let address = readiness_line(&line_receiver, readiness_deadline);
+    let port = address
+        .trim()
+        .strip_prefix("EXPRESS_PORT=")
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .expect("Express readiness failure: InvalidPort");
 
     for expected in COMMON {
         let status = get(port, expected.target);
         assert_eq!(status, expected.status, "status of {}", expected.target);
     }
     assert_eq!(get(port, SENTINEL), 200, "status of the shutdown request");
-    let closed = line_receiver.recv_timeout(Duration::from_secs(10)).expect("server close");
+    let closed = line_receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server close")
+        .expect("read server close");
     assert_eq!(closed.trim(), "EXPRESS_SERVER_CLOSED");
     let status = wait_for_child(&mut child.0, Duration::from_secs(20));
     assert!(status.success(), "Express run failed with {status}");
@@ -347,12 +364,16 @@ fn temp_root() -> TempDir {
         .expect("temporary root")
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral local port")
-        .local_addr()
-        .expect("port address")
-        .port()
+fn readiness_line(receiver: &mpsc::Receiver<Result<String, ()>>, deadline: Instant) -> String {
+    // Report only fixed categories: child output can contain private fixture or runtime data.
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(line)) => line,
+        Ok(Err(())) => panic!("Express readiness failure: ReadError"),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("Express readiness failure: Timeout"),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("Express readiness failure: Disconnected");
+        }
+    }
 }
 
 fn wait_for_child(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {

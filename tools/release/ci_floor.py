@@ -1169,14 +1169,126 @@ def _decode_ascii(raw: bytes) -> str | None:
     return text if text.isprintable() else None
 
 
+_WEB_ANSI_COLOR = re.compile(rb"\x1b\[[0-9;]*m")
+_WEB_VITEST_SIGNALS = (
+    (re.compile(rb"(?:Test Files|Tests) +[1-9][0-9]{0,8} failed(?: \| [0-9]{1,9} (?:passed|skipped|todo))* \([0-9]{1,9}\)"), "test-failure"),
+    (re.compile(rb"Errors +[1-9][0-9]{0,8} errors?"), "unhandled-error"),
+    (re.compile(rb"Error: Test timed out in [0-9]{1,9}ms\."), "timeout"),
+)
+_WEB_CONTRAST_RULE = re.compile(
+    rb"Error: (?:The nine-pixel recording status must use the audited quiet text token|"
+    rb"--(?:text|muted|quiet|amber|danger|good) on --(?:bg|panel|panel-raised) is [0-9]{1,3}\.[0-9]{2}:1; WCAG AA requires 4\.5:1|"
+    rb"--(?:quiet|amber) mark on --panel is [0-9]{1,3}\.[0-9]{2}:1; WCAG 1\.4\.11 requires 3:1)"
+)
+
+
+def _web_test_failure_hints(run_dir: pathlib.Path, receipt: dict, gate: dict) -> dict[str, Any]:
+    """Bind a private wrapper result to a finalized failed gate and its verified log.
+
+    Only the wrapper sidecar can identify the subcommand. The small log tail supplies advisory
+    fixed observations, never process provenance, names, paths, assertions or captured stderr.
+    """
+    unknown: dict[str, Any] = {"webFailedSubcommand": "unknown", "webFailureSignals": []}
+    original = next(item for item in run_gates.GATES if item.name == "web-tests")
+    code = gate.get("exitCode")
+    duration = gate.get("durationSeconds")
+    rows = receipt.get("gates")
+    index = EXPECTED_GATE_NAMES.index("web-tests")
+    if (type(receipt.get("schemaVersion")) is not int or receipt.get("schemaVersion") != 1
+            or receipt.get("decision") != "failed" or receipt.get("label") != run_dir.name
+            or not isinstance(rows, list) or len(rows) != len(EXPECTED_GATE_NAMES)
+            or [row.get("name") for row in rows if isinstance(row, dict)] != list(EXPECTED_GATE_NAMES)
+            or [row.get("status") for row in rows] != ["passed"] * index + ["failed"] + ["unreached"] * (22 - index)
+            or any(field in receipt for field in ("error", "integrityFailure", "leaseRetention"))
+            or gate.get("name") != "web-tests" or gate.get("status") != "failed"
+            or type(code) is not int or not 1 <= code <= 255
+            or type(duration) not in {int, float} or not math.isfinite(duration) or not 0 <= duration <= 21600
+            or gate.get("argv") != list(original.argv) or gate.get("cwd") != original.cwd
+            or gate.get("log") != "logs/web-tests.log" or not _valid_sha256(gate.get("logSha256"))
+            or (gate.get("cleanupUncertain") is not None and gate.get("cleanupUncertain") is not False)
+            or any(field in gate for field in (
+                "sourceIdentityAfter", "integrityFailure", "artifactFinalization", "logHash", "reason",
+            ))):
+        return unknown
+    for before, after, valid in (
+        ("headBefore", "headAfter", _valid_sha),
+        ("workingTreeDigestBefore", "workingTreeDigestAfter", _valid_sha256),
+        ("phaseDiffSha256Before", "phaseDiffSha256After", _valid_sha256),
+    ):
+        if (not valid(receipt.get(before)) or receipt.get(after) != receipt[before]
+                or gate.get(before) != receipt[before] or gate.get(after) != receipt[before]
+                or rows[index - 1].get(before) != receipt[before] or rows[index - 1].get(after) != receipt[before]):
+            return unknown
+    settle = gate.get("naturalExitSettle")
+    if settle is not None and not _successful_settle_report(settle):
+        return unknown
+    try:
+        if gate.get("provenance") is not None:
+            _provenance_classified_count(gate["provenance"])
+        outcome = private_roots.read_private_json(
+            run_dir / "logs" / "web-tests-outcome.json", maximum_bytes=256,
+            maximum_nodes=16, maximum_commas=4,
+        )
+        if (not isinstance(outcome, dict) or set(outcome) != {"schemaVersion", "subcommand", "exitCode"}
+                or type(outcome.get("schemaVersion")) is not int or outcome.get("schemaVersion") != 1
+                or outcome.get("subcommand") not in {"vitest", "contrast"}
+                or type(outcome.get("exitCode")) is not int or outcome.get("exitCode") != code):
+            return unknown
+        fd = private_roots.open_private_file_read(run_dir / gate["log"])
+    except (FloorInputError, private_roots.AdmissionError, OSError, ValueError, RuntimeError, TypeError):
+        return unknown
+    digest = hashlib.sha256()
+    kept = b""
+    total = 0
+    deadline = time.monotonic() + PRIVATE_GATE_LOG_READ_SECONDS
+    try:
+        while True:
+            if time.monotonic() >= deadline:
+                return unknown
+            chunk = os.read(fd, min(65536, PRIVATE_GATE_LOG_BYTES_LIMIT + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > PRIVATE_GATE_LOG_BYTES_LIMIT:
+                return unknown
+            digest.update(chunk)
+            kept = (kept + chunk)[-8192:]
+    except OSError:
+        return unknown
+    finally:
+        os.close(fd)
+    if digest.hexdigest() != gate["logSha256"]:
+        return unknown
+    stage = outcome["subcommand"]
+    signals: set[str] = set()
+    # Drop both partial boundary lines; newline-dense logs allocate only this fixed 8 KiB tail.
+    lines = kept.split(b"\n")
+    if total > len(kept):
+        lines = lines[1:]
+    for line in lines[:-1]:
+        if time.monotonic() >= deadline:
+            return {"webFailedSubcommand": stage, "webFailureSignals": []}
+        line = _WEB_ANSI_COLOR.sub(b"", line).strip()
+        if stage == "vitest":
+            for pattern, category in _WEB_VITEST_SIGNALS:
+                if pattern.fullmatch(line):
+                    signals.add(category)
+        elif _WEB_CONTRAST_RULE.fullmatch(line):
+            signals.add("contrast-rule")
+    return {"webFailedSubcommand": stage, "webFailureSignals": sorted(signals)}
+
+
 def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
-    """Read fixed Gradle signals or Cargo failure hints from an admitted private gate log.
+    """Read fixed web/Gradle signals or Cargo hints from an admitted private gate log.
 
     Every value must fully match a strict allowlist grammar (see the `_valid_*` helpers); anything
     else is dropped, never echoed. Panic message text is never published. Lists are bounded to
     MAX_FAILURE_HINTS with a truthful `hintsTruncated` count of valid values left out. Reads at most
     16 MiB.
     """
+    if log_path.name == "web-tests.log":
+        # Mixed child stdout/stderr cannot establish which subcommand exited.
+        return {"webFailedSubcommand": "unknown", "webFailureSignals": []}
     found: dict[str, list[str]] = {"failingTests": [], "panicSites": [], "errorCodes": [], "errorCategories": []}
     dropped = {key: 0 for key in found}
     compile_error = False
@@ -1262,7 +1374,9 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
     return hints
 
 
-def _describe_runner_failure(root: pathlib.Path, label: str) -> dict[str, Any]:
+def _describe_runner_failure(
+    root: pathlib.Path, label: str, *, validated_failed_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Sanitized description of where a floor run stopped: stage, fixed step name, exit code.
 
     Only fixed names (gate and version-probe names), small integers and a fixed reason code are
@@ -1271,14 +1385,15 @@ def _describe_runner_failure(root: pathlib.Path, label: str) -> dict[str, Any]:
     info: dict[str, Any] = {"stage": "unknown"}
     probe_names = {name for name, _argv, _cwd in run_gates.VERSION_COMMANDS}
     gate_names = set(EXPECTED_GATE_NAMES)
-    receipt: Any = None
-    try:
-        receipt = private_roots.read_private_json(
-            root / "release-gates" / label / "receipt.json",
-            maximum_nodes=CI_RECEIPT_JSON_BUDGET, maximum_commas=CI_RECEIPT_JSON_BUDGET,
-        )
-    except (private_roots.AdmissionError, OSError, ValueError, RuntimeError):
-        receipt = None
+    receipt: Any = validated_failed_receipt
+    if receipt is None:
+        try:
+            receipt = private_roots.read_private_json(
+                root / "release-gates" / label / "receipt.json",
+                maximum_nodes=CI_RECEIPT_JSON_BUDGET, maximum_commas=CI_RECEIPT_JSON_BUDGET,
+            )
+        except (private_roots.AdmissionError, OSError, ValueError, RuntimeError):
+            receipt = None
 
     def small_int(value: Any) -> int | None:
         return value if type(value) is int and -1000 <= value <= 1000 else None
@@ -1301,7 +1416,9 @@ def _describe_runner_failure(root: pathlib.Path, label: str) -> dict[str, Any]:
                     name = gate.get("name")
                     info.update({"stage": "gate", "step": name if name in gate_names else "unknown",
                                  "exitCode": small_int(gate.get("exitCode"))})
-                    if name in gate_names:
+                    if name == "web-tests" and validated_failed_receipt is not None:
+                        info.update(_web_test_failure_hints(root / "release-gates" / label, receipt, gate))
+                    elif name in gate_names:
                         info.update(_gate_failure_hints(root / "release-gates" / label / "logs" / f"{name}.log"))
                     break
         return info
@@ -1370,6 +1487,7 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
     }
     gate_rows: list[dict[str, Any]] = []
     receipt_was_read = False
+    validated_failed_receipt: dict[str, Any] | None = None
     try:
         if (not tuple_is_supported or not _valid_sha(args.expected_head)
                 or not _valid_sha(args.phase_base)):
@@ -1550,6 +1668,7 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
                 "gateCount": len(gate_rows), "passedGateCount": statuses.count("passed"), "gates": gate_rows,
                 "toolVersionNamesRecordedPrivately": False,
             })
+            validated_failed_receipt = receipt
             raise _HonestFailure()
         head = receipt.get("headBefore")
         base = receipt.get("phaseBase")
@@ -1658,7 +1777,9 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         summary["provenance"] = {"reportCount": 0, "classifiedCount": 0}
     if summary["floorStatus"] != "checks_passed_for_review":
         try:
-            summary["failure"] = _describe_runner_failure(root, args.label)
+            summary["failure"] = _describe_runner_failure(
+                root, args.label, validated_failed_receipt=validated_failed_receipt,
+            )
         except Exception:  # noqa: BLE001 - diagnostics must never break the summary
             summary["failure"] = {"stage": "unavailable"}
     # Progress is independent of the receipt and the full-suite result. Neither

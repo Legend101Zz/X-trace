@@ -11,6 +11,7 @@ import time
 import pathlib
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from argparse import Namespace
 from unittest import mock
@@ -475,6 +476,240 @@ class CiFloorEvidenceTests(unittest.TestCase):
         os.close(w)
         with mock.patch.object(ci_floor.private_roots, "open_private_file_read", return_value=r):
             return ci_floor._gate_failure_hints(pathlib.Path("/synthetic") / log_name)
+
+    def _web_failed_receipt(self, raw: bytes, label: str) -> dict:
+        receipt = self._passing_receipt(label)
+        receipt["decision"] = "failed"
+        index = ci_floor.EXPECTED_GATE_NAMES.index("web-tests")
+        receipt["gates"][index].update(status="failed", exitCode=1, logSha256=ci_floor.hashlib.sha256(raw).hexdigest())
+        for row in receipt["gates"][index + 1:]:
+            row.clear()
+        for row, name in zip(receipt["gates"][index + 1:], ci_floor.EXPECTED_GATE_NAMES[index + 1:]):
+            row.update(name=name, status="unreached")
+        return receipt
+
+    def test_web_gate_outcome_path_is_scoped_to_original_gate_command(self) -> None:
+        from tools.qa import release_floor
+
+        original = run_gates.GATES
+        web = next(gate for gate in original if gate.name == "web-tests")
+        other = next(gate for gate in original if gate.name == "web-typecheck")
+        calls: list[tuple[list[str], dict]] = []
+        incoming = {"PATH": "private-env-canary", "XTRACE_WEB_TEST_OUTCOME_PATH": "/private/inherited-canary"}
+
+        def run(argv: list[str], **kwargs: object):
+            calls.append((argv, kwargs))
+            return 1, 0.25
+
+        log = pathlib.Path("/synthetic/private-root/release-gates/floor-1/logs/web-tests.log")
+        with mock.patch.object(run_gates, "_run", side_effect=run):
+            with release_floor.configured_floor(pathlib.Path("/synthetic/private-root"), 7200):
+                self.assertEqual(run_gates._run(list(web.argv), env=incoming, log_path=log), (1, 0.25))
+                self.assertEqual(run_gates._run(list(other.argv), env=incoming, log_path=log), (1, 0.25))
+        self.assertIs(run_gates.GATES, original)
+        self.assertEqual([call[0] for call in calls], [list(web.argv), list(other.argv)])
+        self.assertEqual(calls[0][1]["env"], {
+            "PATH": "private-env-canary",
+            "XTRACE_WEB_TEST_OUTCOME_PATH": str(log.parent / "web-tests-outcome.json"),
+        })
+        self.assertEqual(calls[1][1]["env"], {"PATH": "private-env-canary"})
+        self.assertEqual(incoming["XTRACE_WEB_TEST_OUTCOME_PATH"], "/private/inherited-canary")
+
+    def _web_hints_for(self, raw: bytes, outcome: object, mutate: object = None) -> dict:
+        label = "floor-1-1-jdk17-node22"
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            run_dir = pathlib.Path(temporary) / label
+            logs = run_dir / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            os.chmod(run_dir, 0o700)
+            log = logs / "web-tests.log"
+            log.write_bytes(raw)
+            os.chmod(log, 0o600)
+            if outcome is not None:
+                sidecar = logs / "web-tests-outcome.json"
+                sidecar.write_text(json.dumps(outcome) + "\n")
+                os.chmod(sidecar, 0o600)
+            receipt = self._web_failed_receipt(raw, label)
+            gate = receipt["gates"][ci_floor.EXPECTED_GATE_NAMES.index("web-tests")]
+            if mutate is not None:
+                mutate(receipt, gate)  # type: ignore[operator]
+            return ci_floor._web_test_failure_hints(run_dir, receipt, gate)
+
+    def test_web_gate_vitest_failure_publishes_only_fixed_observations(self) -> None:
+        raw = (
+            b"FAIL private-name-canary.test.ts > captured-assertion-canary\n"
+            b"stderr | private-stderr-canary /private/path-canary SECRET=payload-canary\n"
+            b"test private_canary::name ... FAILED\n"
+            b"thread 'x' panicked at web/private-canary.rs:12:1:\n"
+            b'ErrorCode("XTR-PRIVATE-CANARY"), category: Validation,\n'
+            b"\x1b[31m Test Files  1 failed | 4 passed (5)\x1b[39m\n"
+            b"Tests  2 failed | 9 passed (11)\n"
+            b"Errors  1 error\n"
+            b"Error: Test timed out in 5000ms.\n"
+        )
+        hints = self._web_hints_for(raw, {"schemaVersion": 1, "subcommand": "vitest", "exitCode": 1})
+        self.assertEqual(hints, {
+            "webFailedSubcommand": "vitest",
+            "webFailureSignals": ["test-failure", "timeout", "unhandled-error"],
+        })
+        for canary in ("canary", "/private", "SECRET", "Validation", "5000", "FAILED"):
+            self.assertNotIn(canary, json.dumps(hints))
+
+    def test_web_gate_contrast_failure_publishes_only_fixed_advisory_signals(self) -> None:
+        raw = (
+            b"Tests  1 failed (1)\n"
+            b"file:///private/contrast-path-canary/check-contrast.mjs:1\n"
+            b"throw new Error('captured-assertion-canary')\n"
+            b"stderr-canary PRIVATE_TOKEN=contrast-payload-canary\n"
+            b"Error: --quiet on --bg is 4.00:1; WCAG AA requires 4.5:1\n"
+        )
+        hints = self._web_hints_for(raw, {"schemaVersion": 1, "subcommand": "contrast", "exitCode": 1})
+        self.assertEqual(hints, {
+            "webFailedSubcommand": "contrast", "webFailureSignals": ["contrast-rule"],
+        })
+        for canary in ("canary", "/private", "PRIVATE_TOKEN", "--quiet", "4.00", "Error:"):
+            self.assertNotIn(canary, json.dumps(hints))
+
+    def test_web_gate_requires_private_outcome_not_mixed_stream_markers(self) -> None:
+        unknown = {"webFailedSubcommand": "unknown", "webFailureSignals": []}
+        raw = (b"XTRACE_WEB_TESTS_V1 vitest start\nTests  1 failed (1)\n"
+               b"XTRACE_WEB_TESTS_V1 vitest fail\nprivate-stderr-canary\n")
+        for outcome in (
+            None, {}, {"schemaVersion": 1, "subcommand": "private-stage-canary", "exitCode": 1},
+            {"schemaVersion": 1, "subcommand": "vitest", "exitCode": 2},
+            {"schemaVersion": 1, "subcommand": "vitest", "exitCode": True},
+            {"schemaVersion": 1, "subcommand": ["vitest", "contrast"], "exitCode": 1},
+            {"schemaVersion": 1, "subcommand": "vitest", "exitCode": 1, "stderr": "private-canary"},
+        ):
+            with self.subTest(outcome=outcome):
+                self.assertEqual(self._web_hints_for(raw, outcome), unknown)
+        self.assertEqual(ci_floor._gate_failure_hints(pathlib.Path("/synthetic/web-tests.log")), unknown)
+        # A fake contrast marker cannot override the private completed Vitest outcome.
+        self.assertEqual(self._web_hints_for(raw + b"XTRACE_WEB_TESTS_V1 contrast fail\n", {
+            "schemaVersion": 1, "subcommand": "vitest", "exitCode": 1,
+        })["webFailedSubcommand"], "vitest")
+
+    def test_web_gate_rejects_unbound_or_unfinalized_receipt_evidence(self) -> None:
+        unknown = {"webFailedSubcommand": "unknown", "webFailureSignals": []}
+        outcome = {"schemaVersion": 1, "subcommand": "vitest", "exitCode": 1}
+        for changes in (
+            {"logSha256": None}, {"logSha256": "d" * 64}, {"log": "logs/other-canary.log"},
+            {"cleanupUncertain": True}, {"cleanupUncertain": []},
+            {"exitCode": 0}, {"exitCode": True}, {"status": "passed"},
+            {"naturalExitSettle": {"settled": False}}, {"provenance": {"available": False}},
+            {"artifactFinalization": "private-canary"}, {"sourceIdentityAfter": "private-canary"},
+            {"argv": ["private-canary"]}, {"cwd": "private-canary"}, {"headAfter": "d" * 40},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(self._web_hints_for(b"Tests  1 failed (1)\n", outcome,
+                                                  lambda _receipt, gate: gate.update(changes)), unknown)
+        for changes in (
+            {"decision": "running"}, {"headAfter": None}, {"workingTreeDigestAfter": None},
+            {"error": "private-canary"}, {"integrityFailure": "private-canary"}, {"gates": []},
+        ):
+            with self.subTest(receipt=changes):
+                self.assertEqual(self._web_hints_for(b"Tests  1 failed (1)\n", outcome,
+                                                  lambda receipt, _gate: receipt.update(changes)), unknown)
+        with mock.patch.object(ci_floor.private_roots, "open_private_file_read",
+                               side_effect=private_roots.AdmissionError("private-canary")):
+            self.assertEqual(self._web_hints_for(b"private-canary\n", outcome), unknown)
+        with mock.patch.object(ci_floor, "PRIVATE_GATE_LOG_BYTES_LIMIT", 1):
+            self.assertEqual(self._web_hints_for(b"private-canary\n", outcome), unknown)
+        with mock.patch.object(ci_floor, "PRIVATE_GATE_LOG_READ_SECONDS", 0):
+            self.assertEqual(self._web_hints_for(b"private-canary\n", outcome), unknown)
+
+    def test_web_gate_newline_dense_log_keeps_only_bounded_tail_and_deadline(self) -> None:
+        # Allocate the fixture before tracing; a whole-log split would exceed this bound.
+        raw = b"\n" * (2 * 1024 * 1024) + b"Tests  1 failed (1)\n"
+        label = "floor-1-1-jdk17-node22"
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            run_dir = pathlib.Path(temporary) / label
+            logs = run_dir / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            os.chmod(run_dir, 0o700)
+            for name, contents in (
+                ("web-tests.log", raw),
+                ("web-tests-outcome.json", b'{"schemaVersion":1,"subcommand":"vitest","exitCode":1}\n'),
+            ):
+                path = logs / name
+                path.write_bytes(contents)
+                os.chmod(path, 0o600)
+            receipt = self._web_failed_receipt(raw, label)
+            gate = receipt["gates"][ci_floor.EXPECTED_GATE_NAMES.index("web-tests")]
+            tracemalloc.start()
+            try:
+                hints = ci_floor._web_test_failure_hints(run_dir, receipt, gate)
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertLess(peak, 1024 * 1024)
+            self.assertEqual(hints, {"webFailedSubcommand": "vitest", "webFailureSignals": ["test-failure"]})
+            with mock.patch.object(ci_floor.time, "monotonic", side_effect=[0.0, 1.0, 16.0]):
+                self.assertEqual(ci_floor._web_test_failure_hints(run_dir, receipt, gate), {
+                    "webFailedSubcommand": "unknown", "webFailureSignals": [],
+                })
+
+    def test_web_gate_known_stage_keeps_unrecognized_causes_unknown(self) -> None:
+        for stage in ("vitest", "contrast"):
+            with self.subTest(stage=stage):
+                raw = (
+                    b"private-name-canary: Tests  1 failed (1)\n"
+                    b"Tests  1 failed (1) assertion-payload-canary\n"
+                    b"Error: Test timed out in 5000ms. stderr-canary\n"
+                    b"Error: --quiet on --bg is 4.00:1; WCAG AA requires 4.5:1 private-canary\n"
+                    b"Error: Missing --private-canary color token in viewer stylesheet\n"
+                )
+                self.assertEqual(self._web_hints_for(raw, {"schemaVersion": 1, "subcommand": stage, "exitCode": 1}), {
+                    "webFailedSubcommand": stage, "webFailureSignals": [],
+                })
+
+    def test_web_gate_failure_details_reach_serialized_failed_floor_only(self) -> None:
+        label = "floor-123456-1-jdk17-node22"
+        raw = b"private-stderr-canary\nTests  1 failed (1)\n"
+        outcome = {"schemaVersion": 1, "subcommand": "vitest", "exitCode": 1}
+        receipt = self._web_failed_receipt(raw, label)
+        real_hints = ci_floor._web_test_failure_hints
+        real_describe = ci_floor._describe_runner_failure
+
+        def private_fixture_read(path: pathlib.Path, **kwargs: object):
+            if path.name == "web-tests-outcome.json":
+                self.assertEqual(kwargs, {"maximum_bytes": 256, "maximum_nodes": 16, "maximum_commas": 4})
+                return outcome
+            self.fail("unexpected private fixture read")
+
+        def fixture_open(_path: pathlib.Path):
+            self.assertEqual(str(_path), f"/synthetic/private-root/release-gates/{label}/logs/web-tests.log")
+            stream = tempfile.TemporaryFile(dir=self._scratch_root())
+            self.addCleanup(stream.close)
+            stream.write(raw)
+            stream.seek(0)
+            return os.dup(stream.fileno())
+
+        def verified_hints(*args: object):
+            with mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=private_fixture_read), \
+                    mock.patch.object(ci_floor.private_roots, "open_private_file_read", side_effect=fixture_open):
+                return real_hints(*args)
+
+        def describe_without_reread(root: pathlib.Path, label: str, **kwargs: object):
+            self.assertEqual(kwargs["validated_failed_receipt"], receipt)
+            # The on-disk receipt could be replaced after admission. Diagnostics must use A.
+            replacement = copy.deepcopy(receipt)
+            replacement["gates"][ci_floor.EXPECTED_GATE_NAMES.index("web-tests")]["exitCode"] = 2
+            with mock.patch.object(ci_floor.private_roots, "read_private_json", return_value=replacement) as reread:
+                info = real_describe(root, label, **kwargs)
+            reread.assert_not_called()
+            return info
+
+        with mock.patch.object(ci_floor, "_web_test_failure_hints", side_effect=verified_hints), \
+                mock.patch.object(ci_floor, "_describe_runner_failure", side_effect=describe_without_reread):
+            public = self.sanitize_with_provenance(lambda candidate: candidate.update(copy.deepcopy(receipt)))
+        self.assertEqual((public["floorStatus"], public["passedGateCount"]), ("failed", 12))
+        self.assertEqual(public["failure"]["webFailedSubcommand"], "vitest")
+        self.assertEqual(public["failure"]["webFailureSignals"], ["test-failure"])
+        self.assertNotIn("canary", json.dumps(public))
+        with mock.patch.object(ci_floor.private_roots, "read_private_json", return_value=receipt):
+            info = ci_floor._describe_runner_failure(pathlib.Path("/synthetic/private-root"), label)
+        self.assertEqual(info["webFailedSubcommand"], "unknown")
 
     def test_java_gate_reports_known_tasks_and_fixed_failure_signals(self) -> None:
         raw = (
