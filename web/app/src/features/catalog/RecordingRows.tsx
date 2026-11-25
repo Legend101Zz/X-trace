@@ -1,10 +1,12 @@
 import { Fragment } from 'react';
 import type { Recording } from '../../types';
 import { formatRecordingDates } from './recording-dates';
+import { useViewerPreferences } from '../shell/viewer-preferences';
 import './recording-rows.css';
 
 export function RecordingRows({ items, selected, arrivals, onSelect }: { items: Recording[]; selected: string; arrivals: ReadonlySet<string>; onSelect: (id: string) => void }) {
-  const formatDate = formatRecordingDates(new Date());
+  const { time } = useViewerPreferences();
+  const formatDate = formatRecordingDates(new Date(), time === 'utc' ? 'UTC' : undefined);
   const rows = items.map((recording) => ({ recording, date: formatDate(recording.openedAt) }));
   return <div className="recording-list">{rows.map(({ recording, date }, index) => <Fragment key={recording.recordingId}>
     {rows[index - 1]?.date.key !== date.key ? <h2 className="recording-date-heading">{date.day}</h2> : null}

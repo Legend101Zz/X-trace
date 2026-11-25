@@ -19,7 +19,7 @@ function initialTheme(): Theme {
   return 'system';
 }
 
-export function ThemePreference() {
+export function useThemePreference() {
   const [theme, setTheme] = useState(initialTheme);
 
   useLayoutEffect(() => {
@@ -35,19 +35,29 @@ export function ThemePreference() {
     return () => light?.removeEventListener('change', applySystem);
   }, [theme]);
 
+  function changeTheme(value: string) {
+    if (!isTheme(value)) return;
+    setTheme(value);
+    try {
+      window.localStorage.setItem(STORAGE_KEY, value);
+    } catch {
+      // Keep the current selection without a persistent copy.
+    }
+  }
+
+  return { theme, changeTheme };
+}
+
+export function ThemeControl({ theme, changeTheme }: ReturnType<typeof useThemePreference>) {
   return <div className="theme-preference">
     <label id="viewer-theme-label" htmlFor="viewer-theme">Theme</label>
-    <select className="theme-select" id="viewer-theme" aria-labelledby="viewer-theme-label" value={theme} onChange={(event) => {
-      const value = event.currentTarget.value;
-      if (!isTheme(value)) return;
-      setTheme(value);
-      try {
-        window.localStorage.setItem(STORAGE_KEY, value);
-      } catch {
-        // Keep the current selection without a persistent copy.
-      }
-    }}>
+    <select className="theme-select" id="viewer-theme" aria-labelledby="viewer-theme-label" value={theme}
+      onChange={(event) => changeTheme(event.currentTarget.value)}>
       {Object.entries(THEMES).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
     </select>
   </div>;
+}
+
+export function ThemePreference() {
+  return <ThemeControl {...useThemePreference()} />;
 }
