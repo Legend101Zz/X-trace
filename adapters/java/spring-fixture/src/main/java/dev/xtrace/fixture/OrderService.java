@@ -19,6 +19,12 @@ public class OrderService {
     }
     int descriptionPresent = description == null ? 0 : 1;
 
+    if ("replay-window fixture".equals(description)) {
+      // Exercise ordinary application instructions and read-only H2 work within one request.
+      for (int iteration = 0; iteration < 220; iteration++) {
+        repository.count();
+      }
+    }
     repository.save(descriptionPresent == 0 ? null : description);
   }
 }
