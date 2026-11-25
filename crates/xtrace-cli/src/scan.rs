@@ -54,8 +54,8 @@ pub struct ScanArgs {
     /// Framework family: spring-mvc, spring-webflux, express, fastify or nest.
     #[arg(long, value_name = "FAMILY")]
     pub framework: String,
-    /// Analyzer executable. The environment override takes precedence over the
-    /// packaged Spring analyzer. Node requires an explicit executable or environment override.
+    /// Analyzer executable. Otherwise use the framework's environment override or
+    /// the analyzer in the installed versioned payload.
     #[arg(long, value_name = "PATH")]
     pub analyzer: Option<PathBuf>,
     /// Application component recorded in every operation identity.
@@ -470,13 +470,14 @@ async fn run_analyzer(
 
 /// Resolve the real CLI path so invoking it through the public installer symlink
 /// still selects the analyzer from the same version directory.
-fn installed_spring_analyzer(executable: &Path) -> Option<PathBuf> {
+fn installed_analyzer(executable: &Path, spring: bool) -> Option<PathBuf> {
     let executable = executable.canonicalize().ok()?;
     let bin = executable.parent()?;
     if bin.file_name()? != "bin" {
         return None;
     }
-    let analyzer = bin.parent()?.join("share/xtrace/analyzers/java/bin/xtrace-java-static");
+    let entry = if spring { "java/bin/xtrace-java-static" } else { "node/dist/main.js" };
+    let analyzer = bin.parent()?.join("share/xtrace/analyzers").join(entry);
     let resolved = analyzer.canonicalize().ok()?;
     (resolved == analyzer && resolved.is_file()).then_some(resolved)
 }
@@ -523,9 +524,7 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
         .analyzer
         .clone()
         .or_else(|| std::env::var_os(variable).map(PathBuf::from))
-        .or_else(|| {
-            if spring { installed_spring_analyzer(&std::env::current_exe().ok()?) } else { None }
-        })
+        .or_else(|| installed_analyzer(&std::env::current_exe().ok()?, spring))
         .ok_or_else(|| invalid(format!("no analyzer: pass --analyzer or set {variable}")))?;
 
     let (lines, problem) = run_analyzer(

@@ -39,12 +39,15 @@ class Journey:
             self.env.pop("XTRACE_JAVA_ANALYZER", None)
             self.env.pop("XTRACE_NODE_ANALYZER", None)
             self.env.pop("XTRACE_PREFIX", None)
+            self.env.pop("NODE_OPTIONS", None)
+            self.env.pop("NODE_PATH", None)
+        self.fixture_env = {}
         self.seed = secrets.token_hex(12)
 
-    def call(self, code, *args, expected_exit=0, allow_not_running=False):
+    def call(self, code, *args, expected_exit=0, allow_not_running=False, executable=None):
         try:
-            output = subprocess.run([self.cli, *args, "--project-dir", self.project], env=self.env,
-                                    capture_output=True, timeout=30)
+            output = subprocess.run([executable or self.cli, *args, "--project-dir", self.project],
+                                    env=self.env, capture_output=True, timeout=30)
         except subprocess.TimeoutExpired:
             raise JourneyFailure("cli_deadline_" + code) from None
         require(self.seed.encode() not in output.stdout + output.stderr, "cli_canary")
@@ -130,8 +133,8 @@ class Journey:
         log = self.root / (label + ".log")
         err = self.root / (label + ".stderr")
         with log.open("wb") as output, err.open("wb") as error:
-            child = subprocess.Popen([*args, *app], env=self.env, stdin=subprocess.DEVNULL,
-                                     stdout=output, stderr=error)
+            child = subprocess.Popen([*args, *app], env={**self.env, **self.fixture_env},
+                                     stdin=subprocess.DEVNULL, stdout=output, stderr=error)
         try:
             deadline = time.monotonic() + 40
             pattern = rb"^LINK_FIXTURE_READY ([0-9]{1,5})$"
@@ -170,6 +173,51 @@ class Journey:
                     child.wait(timeout=5)
             require(self.seed.encode() not in log.read_bytes() + err.read_bytes(), "application_canary")
 
+    def check_installed_scanner_requires_parser(self, payload, scan):
+        version = self.root / "scanner-without-parser"
+        binary = version / "bin/xtrace"
+        binary.parent.mkdir(parents=True)
+        shutil.copy2(self.cli.resolve(strict=True), binary)
+        shutil.copytree(payload / "analyzers/node",
+                        version / "share/xtrace/analyzers/node",
+                        ignore=shutil.ignore_patterns("node_modules"))
+        result = self.call("missing_installed_parser", *scan, expected_exit=10, executable=binary)
+        require(result["catalogRevisionId"] is None and not result["persisted"]
+                and result["result"]["completion"] == "incomplete"
+                and "analyzer_failed" in result["result"]["incompleteReasons"],
+                "missing_parser_must_not_publish")
+        print("installed Node scanner: missing parser refused without a catalog revision")
+
+    def check_installed_adapter_rejects_bad_dist(self, adapter):
+        # Exercise admission on copies so the verified installation stays byte-identical.
+        start = self.root / "must-not-start.cjs"
+        marker = self.root / "unexpected-process"
+        start.write_text("require('node:fs').writeFileSync(process.argv[2], 'started');\n")
+        for variant, failure in (
+            ("missing-manifest", b"a Node adapter file is unavailable"),
+            ("modified-file", b"the Node adapter distribution digest does not match"),
+            ("unlisted-file", b"the Node adapter manifest membership does not match"),
+        ):
+            candidate = self.root / variant
+            shutil.copytree(adapter, candidate)
+            if variant == "missing-manifest":
+                (candidate / "manifest.sha256").unlink()
+            elif variant == "modified-file":
+                with (candidate / "register.cjs").open("ab") as target:
+                    target.write(b"\n// changed\n")
+            else:
+                (candidate / "unlisted.cjs").write_text("// unlisted\n")
+            result = subprocess.run([
+                self.cli, "run", "--project-dir", self.project, "--node-adapter", candidate,
+                "--node-mode", "cjs", "--", "node", start, marker,
+            ], capture_output=True, timeout=30, env=self.env)
+            evidence = result.stdout + result.stderr
+            require(result.returncode == 2 and b"XTR-NODE-INVALID-LAUNCH" in evidence
+                    and failure in evidence and not marker.exists(), "adapter_rejected_" + variant)
+        require(self.call("no_pre_admission_recordings", "recording", "list")["recordings"] == [],
+                "unexpected_recording_during_adapter_rejection")
+        print("installed Node admission: missing manifest, modified file and unlisted file refused")
+
     def run(self):
         ws = self.workspace
         self.call("init", "init")
@@ -177,10 +225,19 @@ class Journey:
             require(self.call("installed_store_status", "status")["store_schema_version"] == 11,
                     "installed_v11_store")
         if self.framework == "express":
-            analyzer = self.root / "node-analyzer"
-            script = ws / "adapters/node/packages/analyzer/dist/main.js"
-            analyzer.write_text("#!/bin/sh\nexec node " + shlex.quote(str(script)) + ' "$@"\n')
-            analyzer.chmod(0o700)
+            adapter = ws / "adapters/node/packages/adapter-core/dist"
+            if self.installed_prefix is not None:
+                payload = (self.installed_prefix / "current/share/xtrace").resolve(strict=True)
+                analyzer = None  # The installed CLI discovers its bundled scanner.
+                adapter = payload / "packs/node/dist"
+                require((payload / "analyzers/node/dist/main.js").is_file()
+                        and (adapter / "manifest.sha256").is_file(), "installed_node_payload")
+                self.check_installed_adapter_rejects_bad_dist(adapter)
+            else:
+                analyzer = self.root / "node-analyzer"
+                script = ws / "adapters/node/packages/analyzer/dist/main.js"
+                analyzer.write_text("#!/bin/sh\nexec node " + shlex.quote(str(script)) + ' "$@"\n')
+                analyzer.chmod(0o700)
             src = self.source / "app.js"
             src.write_text("""const express = require('express');
 const app = express();
@@ -194,10 +251,10 @@ process.once('SIGTERM', () => server.close());
 """)
             main = self.project / "live.cjs"
             main.write_text(src.read_text() + "\napp.get('/unscanned', (_request, res) => res.send('extra'));\n")
-            self.env["NODE_PATH"] = os.pathsep.join(str(ws / "adapters/node" / rel) for rel in
-                                        ("examples/express4-app/node_modules", "node_modules"))
-            app = ["--node-adapter", ws / "adapters/node/packages/adapter-core/dist",
-                   "--node-mode", "cjs", "--", "node", main]
+            self.fixture_env["NODE_PATH"] = os.pathsep.join(
+                str(ws / "adapters/node" / rel) for rel in
+                ("examples/express4-app/node_modules", "node_modules"))
+            app = ["--node-adapter", adapter, "--node-mode", "cjs", "--", "node", main]
             endpoint = ("GET", "/owners/{id}")
             matched = [("GET", "/owners/42", 200), ("GET", "/owners/" + self.seed, 200)]
             negatives = [("GET", "/unscanned", 200), ("GET", "/missing", 404)]
@@ -225,8 +282,13 @@ process.once('SIGTERM', () => server.close());
                 "--application-component", scope, "--binding-key", "default", "--json"]
         if analyzer is not None:
             scan.extend(["--analyzer", analyzer])
+        if self.installed_prefix is not None and self.framework == "express":
+            self.check_installed_scanner_requires_parser(payload, scan)
         first = self.call("scan_complete", *scan)
         require(first["status"] == "persisted_complete", "scan_not_complete")
+        if self.installed_prefix is not None and self.framework == "express":
+            require(first["result"]["analyzer"] == "xtrace-node-static 0.0.1"
+                    and first["result"]["rulesetId"] == "express-routes/1", "installed_express_scanner")
         revision = first["catalogRevisionId"]
         listing = self.call("catalog_list", "catalog", "list", "--revision", revision, "--json")
         operations = [op["operationId"] for op in listing["operations"]
@@ -251,7 +313,7 @@ process.once('SIGTERM', () => server.close());
                     revision=second["catalogRevisionId"])
         self.launch("wrong_scope", app, matched[:1], component="wrong-scope", revision=revision)
         self.launch("default", app, matched[:1], policy=False)
-        if self.installed_prefix is not None:
+        if self.installed_prefix is not None and self.framework == "spring-mvc":
             self.check_static_refusals(scan, app, matched, scope, endpoint, catalog_id)
         rows = self.call("endpoint_list", "endpoint", "list")["items"]
         require(len(rows) == 1 and rows[0]["operationId"] == catalog_id
@@ -266,7 +328,7 @@ process.once('SIGTERM', () => server.close());
         reasons = ["no_catalog_match", "catalog_revision_unavailable", "observation_policy_missing"]
         if self.framework == "express":
             reasons.extend(["no_catalog_match", "route_template_unavailable_or_ineligible"])
-        if self.installed_prefix is not None:
+        if self.installed_prefix is not None and self.framework == "spring-mvc":
             reasons.append("no_catalog_match")
         require(sorted(row["unmatchedReason"] for row in unmatched) == sorted(reasons)
                 and all(row["operationId"] is None for row in unmatched), "unmatched_reasons")
@@ -290,13 +352,16 @@ if __name__ == "__main__":
     parser.add_argument("cli", type=Path)
     parser.add_argument("root", type=Path)
     parser.add_argument("--installed-prefix", type=Path)
+    parser.add_argument("--framework", choices=("express", "spring-mvc"))
     args = parser.parse_args()
     try:
         if args.installed_prefix is not None:
             require(args.cli == args.installed_prefix / "bin/xtrace"
                     and args.cli.resolve(strict=True) == (args.installed_prefix / "current/bin/xtrace").resolve(strict=True),
                     "public_installer_launcher")
-        frameworks = ("spring-mvc",) if args.installed_prefix is not None else ("express", "spring-mvc")
+        frameworks = (args.framework,) if args.framework else (
+            ("spring-mvc",) if args.installed_prefix is not None else ("express", "spring-mvc")
+        )
         for framework in frameworks:
             Journey(args.workspace, args.cli, args.root / framework, framework, args.installed_prefix).run()
     except JourneyFailure as error:

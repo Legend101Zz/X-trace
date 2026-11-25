@@ -29,11 +29,11 @@ are compiled into the store crate, so no separate migration files ship.
 
 ## Static analyzers and `xtrace scan`
 
-`xtrace scan` runs an analyzer as a separate subprocess. The installed CLI finds its packaged Spring analyzer
-inside the same versioned payload. Supply `--analyzer PATH` or `XTRACE_JAVA_ANALYZER` to override it.
-Express, Fastify, and Nest scans require `--analyzer PATH` or `XTRACE_NODE_ANALYZER`. Build that analyzer in
-`adapters/node` and wrap `node packages/analyzer/dist/main.js` in an executable script. The hosted
-`scan_real_node_analyzer` test scans the Express fixture with the built analyzer and reads the catalog back.
+`xtrace scan` runs an analyzer as a separate subprocess. The installed CLI finds the Spring and Node analyzers
+inside the same versioned payload. Use `--analyzer PATH`, `XTRACE_JAVA_ANALYZER`, or `XTRACE_NODE_ANALYZER`
+to select an analyzer explicitly. Express, Fastify, and Nest scans use Node 22 or newer and the
+packaged TypeScript parser. The Node runtime adapter has its own exact manifest over the installed
+`share/xtrace/packs/node/dist` files. Pass that directory to `xtrace run --node-adapter`.
 
 ## Install, upgrade, uninstall
 
