@@ -1,0 +1,91 @@
+name: acl-probe-measurement-temporary
+on:
+  push:
+    branches: [codex/acl-probe-measurement]
+permissions:
+  contents: read
+jobs:
+  linux-file-acl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Prepare private measurement root
+        run: |
+          umask 077
+          root="${RUNNER_TEMP:?}/acl-probe"
+          mkdir -m 700 "$root" "$root/fixture" "$root/diagnostic"
+          echo "XTRACE_ACL_MEASUREMENT_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Verify equivalence and measure paired file ACL operations
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_ACL_MEASUREMENT_ROOT"
+          export CARGO_TARGET_DIR="$root/target"
+          export XTRACE_ACL_PROBE_SCRATCH="$root/fixture"
+          cargo build --locked -p xtrace-private-storage --message-format=json             > "$root/diagnostic/cargo.jsonl" 2> "$root/diagnostic/cargo.log"
+          python3 -B - "$root" > "$root/diagnostic/compile.log" 2>&1 <<'PY'
+          import json, pathlib, subprocess, sys, tomllib
+          root = pathlib.Path(sys.argv[1])
+          pin, = [pkg["version"] for pkg in tomllib.loads(pathlib.Path("Cargo.lock").read_text())["package"] if pkg["name"] == "rustix"]
+          artifacts = set()
+          for line in (root / "diagnostic/cargo.jsonl").read_text().splitlines():
+              receipt = json.loads(line)
+              if receipt["reason"] == "compiler-artifact" and receipt["target"]["name"] == "rustix":
+                  assert receipt["package_id"].rsplit("#", 1)[-1] == "rustix@" + pin
+                  artifacts.update(path for path in receipt["filenames"] if path.endswith(".rlib"))
+          artifact, = artifacts
+          subprocess.run(["rustc", "--edition=2024", "-C", "opt-level=0", "-C", "debuginfo=1",
+                          "-L", f"dependency={pathlib.Path(artifact).parent}", "--extern", f"rustix={artifact}",
+                          "tools/qa/fixtures/linux_acl_probe_measurement.rs", "-o", root / "acl-probe"], check=True)
+          PY
+          "$root/acl-probe" > "$root/diagnostic/measurement.log" 2>&1
+          python3 -B - "$root/diagnostic/measurement.log" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import collections, pathlib, re, statistics, sys
+          rows = collections.defaultdict(list)
+          decisions = []
+          raw = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          assert raw[-1] == "acl_probe_measurement_complete"
+          for line in raw[:-1]:
+              row = re.fullmatch(r"timing fixture=(named_absent|descriptor_absent|named_present|descriptor_present) pair=([1-5]) calls=(20000) baseline_ns=(\d+) size_only_ns=(\d+)", line)
+              if row:
+                  fixture, pair, calls, baseline, size_only = row.groups()
+                  rows[fixture].append((int(pair), (int(baseline) - int(size_only)) / int(calls)))
+              else:
+                  assert re.fullmatch(r"decisions [a-z_= ]+(?: errno=-?\d+)?", line)
+                  decisions.append(line)
+          assert {"named_absent", "descriptor_absent"} <= rows.keys()
+          print("Standalone Linux ACL presence measurement")
+          print("")
+          for label, samples in sorted(rows.items()):
+              assert [pair for pair, _ in samples] == [1, 2, 3, 4, 5]
+              deltas = [delta for _, delta in samples]
+              print(f"- {label}: median baseline minus size-only {statistics.median(deltas):.1f} ns/call; "
+                    f"paired range {min(deltas):.1f} to {max(deltas):.1f} ns/call")
+          for line in decisions:
+              print(f"- {line}")
+          print("- Not an end-to-end floor measurement.")
+          PY
+      - name: Encrypt raw measurement diagnostics
+        if: always() && env.XTRACE_ACL_MEASUREMENT_ROOT != ''
+        env:
+          EVIDENCE_CERT: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVOVENDQXAyZ0F3SUJBZ0lVZkxxMVlkSWI5OVZQa1lFSUJwVUw2RVpUL2RVd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0tqRW9NQ1lHQTFVRUF3d2ZXQzEwY21GalpTQndjbWwyWVhSbElIWnBaWGRsY2lCbGRtbGtaVzVqWlRBZQpGdzB5TmpFeE1qVXhOVEV6TWpaYUZ3MHlOakV5TURreE5URXpNalphTUNveEtEQW1CZ05WQkFNTUgxZ3RkSEpoClkyVWdjSEpwZG1GMFpTQjJhV1YzWlhJZ1pYWnBaR1Z1WTJVd2dnR2lNQTBHQ1NxR1NJYjNEUUVCQVFVQUE0SUIKandBd2dnR0tBb0lCZ1FDMkJ3Mi9QdURTZWFQeWNZby9HblhUNjhKMVpVWmhvM285U2dhQ3NjR0UvdXZrRXNyTQo0OUtvcVNKeExaSmdrbUcwODRvUEs1SXhKQVkzd29jcGRBL3dUVW5UYWZTWTc1N0JBZ0dFbGVjQTh1T2lpcHZyCm9XTFloUS9YVUxOaUNaVTUrRHB3OGs5cmxWQ3lNa1FNa2NJNWRkTE1JL0MyTDFzSnExSWx3Ulo3dzBmV3MzVXoKc1hwaUxjb2VJejdGalphV2tPUzdwMHVvREowMkQ0alFaR2p1WUl2a0xwL3c3b3JtdHFYOW5tazhmWDdOK0JXeQowTnpjYlFvV1B5QzlTalYzaUNNMkNDMCtxRzBINDB2Uy9zU2s3c0RhQVVDTFVrTHFCTHduY2tWNGJ4Sk1mdE9BClZ3VUpNUSt1aUhpUUsyNnVCcXovUDNOcFBqRGFZT3BCK1ppZlN2Y0V6TjFQWndLTlM5d2JzZm1WdjlCTjg2UkYKK1VYSzdHdURSUHpKdDkrckc5RHZneHZJWG4ydWxrNXhlYStuRGR5d3k1TGRZSFNMZ1NRekZWWXpCLzVXaXA5VQpSTmdDekRPU01FTXZ4SFBibXpaSzF4QWtlbjZHK1hpbG1MMW9XNmlTU01kOUpTNU1jbXZ3bWN6RmtLU293SWQvCnFydVdVV0VmNUUzck9Gc0NBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmMKVmxpK01COEdBMVVkSXdRWU1CYUFGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmNWbGkrTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dHQkFCa0ZsN3Znc05TN0tMVWp3bDFnSFlKL1BYMDEydnlpCi9VNExVM0g3eHZHZFZBSUpXejIvYjdZaHg0OFh6SWFyb0RoQ1lYNzY5ZStBODM1Si9pQ042cExmeTYyM3R1WU8KWUhVMEZUSFZqdUZ0OFVxRDVYdExpdGVmMHJuN0luam9HWmJvR3lLbXBrTWs3TkgydmFCcDY3SHA3UnV5anBTTQp6UmY3LzNPOFN3U1FxK1RxNENvaVh6OWgwdzBjV3AxRytqRGtBR2pOMXNUeU45amNrM0VnSkpia2trR2lENC9wCkw5eE5WbUFqZmhrRExqc2t0VmZaQ1hNcDVlbVZmWkJqZW9wUHpDS3YwN1NrOERTeWFNcnRFTFJhbU9JMXZUM08KSWkzNTFoaTVuNnpiamVCTUM4dmt4T0pCckxsc2FVUHV6V0M4OEpQQzRCUGk0SXVFanA3eHVFdUlLSTR3YTVuUApZVC81SDAzWUwrajJ2V3pUa2Z3UVUvS0wrMEx3NkIwNVByTC9ZRFY4dXcrU3crK1A4bG5TK2ZsaisxUi9iY0tTClg3NFVnY2g0c0tESXd2clBzemRUZXh4cVBrajlHYXpPbzk4RHRlTys5RUdvWDZKcU9ZWmVCU3VIUndoTGNqNXYKK0c5blVacDc1R1djYmlzYk1udUpIQkVOV3RQVzhFUTZQZz09Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+        run: |
+          set -eu
+          umask 077
+          root="$XTRACE_ACL_MEASUREMENT_ROOT"
+          printf '%s' "$EVIDENCE_CERT" | base64 -d > "$root/evidence.crt"
+          tar -C "$root" -cf "$root/acl-probe-diagnostic.tar" diagnostic
+          openssl cms -encrypt -binary -aes-256-cbc -in "$root/acl-probe-diagnostic.tar"             -outform DER -out "$RUNNER_TEMP/acl-probe-diagnostic.enc" "$root/evidence.crt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && env.XTRACE_ACL_MEASUREMENT_ROOT != ''
+        with:
+          name: encrypted-acl-probe-diagnostic
+          path: ${{ runner.temp }}/acl-probe-diagnostic.enc
+          if-no-files-found: error
+          retention-days: 1
