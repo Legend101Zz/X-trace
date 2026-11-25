@@ -1,0 +1,106 @@
+name: main-java-resolution-probe
+
+on:
+  push:
+    branches: [diagnostic/main-java-resolution-20261125]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PROBE_SOURCE: 117fa172705e70d25f88078083570c4488f82fe9
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PROBE_SOURCE }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Observe strict Gradle resolution with fresh private caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PROBE_SOURCE"
+          export PROBE_ROOT="$RUNNER_TEMP/xf"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$PROBE_ROOT"
+          lsof -nP -a -p "$$" -d cwd -Fp >/dev/null 2>&1
+          status=0
+          python3 -B - >"$PROBE_ROOT/probe-runner.log" 2>&1 <<'PY' || status=$?
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          from tools.release import ci_floor, private_roots, run_gates
+
+          root = Path(os.environ["PROBE_ROOT"])
+          repo = Path.cwd()
+          for name in ("home", "tmp", "logs"):
+              private_roots.ensure_private_directory(root / name)
+          env = run_gates.build_task_env(root, os.environ.copy(), home=root / "home", scratch=root / "tmp")
+          run_gates.prewarm_gradle(repo, env, root / "logs", provenance=True)
+          observations = {"sourceSha": os.environ["PROBE_SOURCE"], "fullFloor": False, "gates": []}
+          exit_code = 1
+          for gate in run_gates.GATES:
+              path = root / "logs" / f"{gate.name}.log"
+              gate_env = dict(env)
+              if gate.env == "rustdoc":
+                  gate_env["RUSTDOCFLAGS"] = "-D warnings"
+              exit_code, _ = run_gates._run(
+                  gate.argv, cwd=repo / gate.cwd, env=gate_env, timeout=7200,
+                  log_path=path, provenance=True,
+              )
+              observations["gates"].append({"name": gate.name, "exitCode": exit_code})
+              if exit_code and gate.name == "java-strict":
+                  observations.update(ci_floor._gate_failure_hints(path))
+                  # Match fixed error classes and configured public hosts. Never print operands.
+                  fd = private_roots.open_private_file_read(path)
+                  with os.fdopen(fd, "rb") as stream:
+                      data = stream.read(1024 * 1024 + 1)
+                  if len(data) <= 1024 * 1024:
+                      facts = {
+                          "dns-lookup": rb"UnknownHostException|Name or service not known|Temporary failure in name resolution",
+                          "transport-timeout": rb"SocketTimeoutException|Connect timed out|Read timed out",
+                          "transport-reset": rb"Connection reset|Connection refused|No route to host",
+                          "tls-validation": rb"SSLHandshakeException|PKIX path building failed",
+                          "plugin-portal": rb"Could not (?:GET|HEAD) 'https://plugins\.gradle\.org/",
+                          "maven-central": rb"Could not (?:GET|HEAD) 'https://repo\.maven\.apache\.org/",
+                      }
+                      observations["fixedResolutionSignals"] = [
+                          label for label, pattern in facts.items() if re.search(pattern, data)
+                      ]
+              if exit_code or gate.name == "java-strict":
+                  break
+          private_roots.atomic_write_private(
+              root / "gradle-resolution-observations.json", (json.dumps(observations) + "\n").encode()
+          )
+          sys.exit(exit_code != 0)
+          PY
+          if test -f "$PROBE_ROOT/gradle-resolution-observations.json"; then
+            cat "$PROBE_ROOT/gradle-resolution-observations.json"
+          else
+            echo "Probe stopped before the bounded observation was written"
+          fi
+          exit "$status"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: gradle-resolution-observations
+          path: ${{ runner.temp }}/xf/gradle-resolution-observations.json
+          if-no-files-found: error
+          retention-days: 14
