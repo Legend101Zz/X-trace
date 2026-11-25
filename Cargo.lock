@@ -1624,6 +1624,7 @@ dependencies = [
  "uuid",
  "xtrace-application",
  "xtrace-domain",
+ "xtrace-export",
  "xtrace-ingest",
  "xtrace-private-storage",
  "xtrace-protocol",

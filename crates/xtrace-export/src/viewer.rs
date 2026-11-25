@@ -177,6 +177,10 @@ fn hash_count(hash: &mut Hasher, count: usize) {
 pub enum ViewerExportLimit {
     /// Catalog rows supplied to this seam.
     Operations,
+    /// HTTP-only serialized input admission, before projection or renderer allocation.
+    Input,
+    /// HTTP-only structural work admission, before projection or renderer allocation.
+    Work,
     /// Number of rendered files.
     Files,
     /// Sum of rendered logical file sizes.
@@ -219,6 +223,8 @@ impl fmt::Display for ViewerExportError {
             Self::LimitExceeded(ViewerExportLimit::Operations) => {
                 "export exceeds the operation limit"
             }
+            Self::LimitExceeded(ViewerExportLimit::Input) => "export exceeds the HTTP input limit",
+            Self::LimitExceeded(ViewerExportLimit::Work) => "export exceeds the HTTP work limit",
             Self::LimitExceeded(ViewerExportLimit::Files) => "export exceeds the file limit",
             Self::LimitExceeded(ViewerExportLimit::Bytes) => "export exceeds the byte limit",
             Self::LimitExceeded(ViewerExportLimit::Omissions) => {
@@ -239,6 +245,88 @@ impl VerifiedViewerExport {
     pub fn into_files(self) -> Vec<ExportFile> {
         self.0
     }
+}
+
+/// Admits the viewer HTTP renderer before creating its projection, document trees or strings.
+/// This policy is deliberately separate from CLI exports. It bounds serialized input to 8 MiB,
+/// revision members and selected views to 4,096 each, claims to 4,096 in total, source items per
+/// claim to eight, and aggregate collection entries to 65,536. The existing renderers are finite
+/// transformations of these bounded inputs. This is structural admission, not an allocator/RSS
+/// quota. Post-render logical output limits still apply independently.
+///
+/// # Errors
+/// Returns a categorical input or work limit without copying input text into diagnostics.
+pub fn admit_http_render(snapshot: &CatalogExportSnapshot) -> Result<(), ViewerExportError> {
+    use std::io::Write as _;
+    const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_WORK_ITEMS: usize = 65_536;
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|n| *n <= MAX_INPUT_BYTES)
+                .ok_or_else(|| std::io::Error::other("HTTP export input limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    if snapshot.catalog_identities.len() > MAX_OPERATIONS
+        || snapshot.operations.len() > MAX_OPERATIONS
+    {
+        return Err(ViewerExportError::LimitExceeded(ViewerExportLimit::Operations));
+    }
+    let input_error = || ViewerExportError::LimitExceeded(ViewerExportLimit::Input);
+    let work_error = || ViewerExportError::LimitExceeded(ViewerExportLimit::Work);
+    let mut counter = Counter(0);
+    let mut work = snapshot.catalog_identities.len() + snapshot.operations.len();
+    let mut claims = 0_usize;
+    for row in &snapshot.catalog_identities {
+        for text in [
+            &row.application_component,
+            &row.binding_key,
+            &row.method,
+            &row.route_template,
+            &row.operation_version_id,
+        ] {
+            counter.write_all(text.as_bytes()).map_err(|_| input_error())?;
+        }
+    }
+    for view in &snapshot.operations {
+        claims = claims
+            .checked_add(view.claims.len())
+            .filter(|n| *n <= MAX_OPERATIONS)
+            .ok_or_else(work_error)?;
+        work = work
+            .checked_add(view.provenance.len())
+            .and_then(|n| n.checked_add(view.limitation_codes.len()))
+            .and_then(|n| n.checked_add(view.handlers.len()))
+            .and_then(|n| n.checked_add(view.claims.len()))
+            .filter(|n| *n <= MAX_WORK_ITEMS)
+            .ok_or_else(work_error)?;
+        serde_json::to_writer(&mut counter, view).map_err(|_| input_error())?;
+        for claim in &view.claims {
+            if claim.source_evidence.len() > 8 {
+                return Err(work_error());
+            }
+            work = work
+                .checked_add(claim.limitation_codes.len())
+                .and_then(|n| n.checked_add(claim.source_evidence.len()))
+                .filter(|n| *n <= MAX_WORK_ITEMS)
+                .ok_or_else(work_error)?;
+            serde_json::to_writer(&mut counter, &claim.provenance).map_err(|_| input_error())?;
+            serde_json::to_writer(&mut counter, &claim.handler_symbol)
+                .map_err(|_| input_error())?;
+            serde_json::to_writer(&mut counter, &claim.limitation_codes)
+                .map_err(|_| input_error())?;
+            serde_json::to_writer(&mut counter, &claim.source_evidence)
+                .map_err(|_| input_error())?;
+        }
+    }
+    Ok(())
 }
 
 /// Renders metadata from a resolved, already-admitted catalog snapshot. The result contains
@@ -347,7 +435,15 @@ fn summarize(
         return Err(ViewerExportError::InvalidArtifact);
     }
     let omissions = summarize_omissions(&output.omissions, request.format)?;
-    let (files, total_bytes) = summarize_files(&output.files, request, selected_operations)?;
+    // The fixed root spelling alone does not prove a root route: /root, /ROOT,
+    // parameter-only and punctuation-only paths can produce the same renderer slug.
+    // In any such selection, withhold all ambiguous root-slug recipe names.
+    let root_names_unambiguous = snapshot.operations.iter().all(|view| {
+        view.route_template == "/"
+            || crate::curl::slug(&crate::projection::normalize_path(&view.route_template)) != "root"
+    });
+    let (files, total_bytes) =
+        summarize_files(&output.files, request, selected_operations, root_names_unambiguous)?;
     let metadata = ViewerExportPreview {
         request,
         revision_id: snapshot.revision.revision_id,
@@ -367,6 +463,7 @@ fn summarize_files(
     files: &[ExportFile],
     request: ViewerExportRequest,
     selected_operations: usize,
+    root_names_unambiguous: bool,
 ) -> Result<(Vec<PreviewFile>, usize), ViewerExportError> {
     use ViewerExportError::{InvalidArtifact, LimitExceeded};
 
@@ -390,7 +487,8 @@ fn summarize_files(
             .filter(|sum| *sum <= MAX_RENDERED_BYTES)
             .ok_or(LimitExceeded(ViewerExportLimit::Bytes))?;
         let (name, ordinal) =
-            preview_filename(&file.path, request, selected_operations).ok_or(InvalidArtifact)?;
+            preview_filename(&file.path, request, selected_operations, root_names_unambiguous)
+                .ok_or(InvalidArtifact)?;
         if file.mode != 0o644 || ordinal.is_some_and(|number| !recipe_ordinals.insert(number)) {
             return Err(InvalidArtifact);
         }
@@ -413,6 +511,7 @@ fn preview_filename(
     path: &str,
     request: ViewerExportRequest,
     selected_operations: usize,
+    root_names_unambiguous: bool,
 ) -> Option<(PreviewFilename, Option<usize>)> {
     let fixed = match request.format {
         ExportFormat::OpenApi if request.yaml => path == "openapi.yaml",
@@ -455,7 +554,7 @@ fn preview_filename(
     }
     // A root recipe's name uses only the ordinal, a recognized HTTP method and the fixed slug.
     // Other slugs encode caller-provided route text even when made filename-safe by the renderer.
-    let name = if slug == "root" {
+    let name = if slug == "root" && root_names_unambiguous {
         PreviewFilename::Available(path.to_owned())
     } else {
         PreviewFilename::WithheldRecipe { ordinal }
@@ -558,30 +657,36 @@ mod tests {
             yaml: false,
         };
         assert_eq!(
-            summarize_files(&vec![artifact("openapi.json", vec![]); MAX_FILES + 1], request, 0),
+            summarize_files(
+                &vec![artifact("openapi.json", vec![]); MAX_FILES + 1],
+                request,
+                0,
+                true
+            ),
             Err(LimitExceeded(ViewerExportLimit::Files)),
         );
         assert_eq!(
             summarize_files(
                 &[artifact("openapi.json", vec![0; MAX_RENDERED_BYTES + 1])],
                 request,
-                0
+                0,
+                true
             ),
             Err(LimitExceeded(ViewerExportLimit::Bytes)),
         );
         assert_eq!(
-            summarize_files(&[artifact("../openapi.json", vec![])], request, 0),
+            summarize_files(&[artifact("../openapi.json", vec![])], request, 0, true),
             Err(InvalidArtifact)
         );
         let runnable = ExportFile { mode: 0o755, ..artifact("openapi.json", vec![]) };
-        assert_eq!(summarize_files(&[runnable], request, 0), Err(InvalidArtifact));
+        assert_eq!(summarize_files(&[runnable], request, 0, true), Err(InvalidArtifact));
         let curl = ViewerExportRequest { format: ExportFormat::Curl, ..request };
         let duplicate_recipe_ordinal = [
             artifact("001-get-other.sh", vec![]),
             artifact("001-get-root.sh", vec![]),
             artifact("all.sh", vec![]),
         ];
-        assert_eq!(summarize_files(&duplicate_recipe_ordinal, curl, 2), Err(InvalidArtifact));
+        assert_eq!(summarize_files(&duplicate_recipe_ordinal, curl, 2, true), Err(InvalidArtifact));
     }
 
     #[test]

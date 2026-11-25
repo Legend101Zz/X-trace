@@ -1,6 +1,6 @@
 # ADR 0014: Viewer catalog export preview and download
 
-- Status: **Proposed**. The extraction described below does not accept these HTTP, download or resource-policy choices.
+- Status: **Proposed**. The HTTP implementation is staged for independent shared-contract and privacy review. Release qualification remains open.
 - Date: 2026-11-25
 - Refs: #102, #7, #32 and #80.
 - Related: ADR 0010 (CLI exports), ADR 0012 (shared-contract and privacy review), and the approved viewer brief on #7.
@@ -21,7 +21,7 @@ The first slice moves the existing catalog-read conversion and operation-selecti
 the application does not depend on the renderer. The caller still admits the project and supplies an already-read
 revision, operation views and linked observations. No SQL, filesystem writes or CLI types enter the shared seam.
 The CLI retains argument validation, read order, error mapping, output metadata and private file publication.
-This slice implements no viewer route, client schema, modal, download or snapshot store.
+The HTTP adapter uses this seam after reading the admitted project snapshot.
 
 The existing conversion matches linked observations by exact application component, binding, method and route,
 with a positive recording count. It does not use route-only reconciliation or infer a match from a request URL.
@@ -45,11 +45,11 @@ catalog revision rows. Any future catalog retention, compaction or migration tha
 publication order or establish an explicit sequence before using it for Latest. External database rewrites,
 including `VACUUM`, are outside this guarantee.
 
-## Proposed authenticated read contract
+## Authenticated read contract
 
-These choices require review before routes or generated clients are added:
+The OpenAPI contract documents both routes and their generated browser types.
 
-1. Add explicit preview and download operations, provisionally JSON POSTs under `/api/v1/exports/`. A POST here
+1. Preview and save accept JSON POSTs at `/api/v1/exports/preview` and `/api/v1/exports/save`. A POST here
    requests computation of a read projection, not a filesystem write or application request. Reuse the viewer's
    project binding, cookie session, exact Host and Origin, same-origin Fetch Metadata and client header. Accept
    no arbitrary project path, output directory, remote URL, shell command, Postman credential or workspace.
@@ -61,7 +61,9 @@ These choices require review before routes or generated clients are added:
    the byte count, logical mode and exact-byte digest of each file. OpenAPI counts native method/path slots, which
    may be fewer than the selected operations when alternate scopes are attached to a native slot. Fixed artifact
    paths and recipe paths containing only an ordinal, a standard HTTP method and the fixed `root` slug are shown
-   as actual relative paths. Other recipe names embed catalog route text, even when their characters and shape
+   as actual relative paths only when the exporter can establish the root slug came from the actual root route.
+   If another selected route normalizes to the same slug, the preview withholds ambiguous root recipe names.
+   Other recipe names embed catalog route text, even when their characters and shape
    pass filename checks. Preview returns an explicit filename-withheld state and the recipe ordinal for these
    entries. The raw path is available only in the existing saved artifacts and is included in the aggregate
    digest. Omission entries are grouped by fixed subject and reason and applicable format, with every entry counted. Extra
@@ -95,14 +97,15 @@ Recomputation costs a second render and can require refresh during capture. Reta
 would require per-session memory, expiry, ownership and shutdown rules. No payload is retained between the two
 calls by the exporter seam.
 
-## Proposed download representation and bounds
+## Download representation and bounds
 
-For one-file OpenAPI or Postman, propose a direct attachment with a controlled filename and media type. For cURL
-and bundle, propose a deterministic ZIP containing exactly the exporter's relative paths: sorted entries, fixed
-ZIP timestamps, no machine paths, no extra comments, a fixed encoding/compression choice and non-executable modes.
+OpenAPI and Postman use direct attachments named `openapi.json`, `openapi.yaml` or `collection.postman.json`.
+The media type is `application/json` or `application/yaml`. cURL and bundle use `xtrace-curl.zip` and
+`xtrace-bundle.zip` with `application/zip`. The adapter writes ZIP32 STORE entries in logical filename order
+with fixed DOS timestamps, UTF-8 names, non-executable file modes and no archive comments or machine paths.
 Archive encoding is a new adapter concern; the exporter still returns its existing file collection. Validate
 entry membership and extracted bytes against the preview file manifest and CLI output. Bind logical payload
-digests independently of any transport/archive digest. Review any archive dependency separately before adding it.
+digests independently of any transport/archive digest. The encoder uses the existing Rust dependencies.
 
 Downloads use authenticated fetch with the required client header; a plain anchor bypasses that client contract.
 The response remains no-store with existing security headers. The browser saves locally only after the explicit
@@ -114,12 +117,21 @@ and refuses rendered results above 4,101 logical files, 16 MiB aggregate logical
 entries. Latest refuses projects above 4,096 catalog scopes after a bounded index walk. An explicit historical
 revision uses a point lookup and remains available under the other export limits. The file limit covers one
 recipe per operation plus the cURL index and bundle metadata/other formats.
-The raw omission limit applies before grouping, so the safe preview contains only a fixed vocabulary of subject,
-reason and format combinations. These checks reject the whole projection. The byte and omission checks run after
-rendering and do not bound the renderer's peak allocation. Input admission must apply at the catalog read.
-Measure the full read and render path before accepting these budgets for HTTP. The existing 1 KiB JSON request
-ceiling, two-worker query lane, busy response and 15-second request lifetime remain the proposed transport
-constraints. Exact response-encoding bounds and cancellation behavior need HTTP review.
+The raw omission limit applies before grouping. Metadata uses fixed subject, reason and format labels.
+The HTTP adapter admits at most 8 MiB of counted input and 65,536 structural items before projection, with
+separate claim and source-evidence limits. Its metadata writer stops at 2 MiB and its attachment encoder
+at 20 MiB. SQLite applies input admission during the read. Serialization, exporter allocations and archive
+buffers have different lifetimes. Actual peak memory still requires measurement under representative loads.
+
+Both routes retain the viewer's 1 KiB JSON request ceiling, project/session admission and two-worker query lane.
+The adapter applies a 14-second computation deadline within the existing 15-second connection lifetime. The
+blocking worker keeps its query permit until it finishes. SQLite checks cancellation while reading. Pure rendering
+checks cancellation at phase boundaries, so a request timeout can precede release of its worker. Saturation returns
+a fixed busy problem. Two independent export slots cover computation through the final owner of the response
+bytes. Across those slots the logical response allocations total at most 40 MiB. Kernel and HTTP buffers,
+allocator metadata, active renderer working memory and store snapshots are separate. The database connection
+mutex can delay cancellation before SQLite's progress handler is installed. The worker retains its permits while
+waiting. No route retains rendered bytes for a later request.
 
 ## Verification and open review points
 
@@ -132,7 +144,8 @@ The modal needs choose/preview/save, focus trapping, Escape, focus return, visib
 keyboard/coarse-pointer use and narrow layouts. Final acceptance needs a real framework catalog through the
 embedded packaged viewer, actual downloaded byte/digest checks at both scopes and the installed archive journey.
 
-Open questions include final HTTP names/methods and DTOs, any file-text preview, archive encoding/media/naming
-policy, transport resource accounting and measured limits. Adding OpenAPI/client fields is
-an additive shared-contract change and needs the reviews required by ADR 0012. No proposal here grants Postman
-access, replaces owner acceptance evidence or authorizes publication.
+The approved user flow starts with Choose, moves to safe metadata and omissions at Preview, then initiates
+the browser download on Save file. The browser reports when the download starts. Filesystem completion and
+terminal Postman connections remain outside the viewer's observations. A file-text or request-body preview
+would require a separately bounded redaction contract. Release acceptance requires the installed catalog journey,
+including real keyboard, pointer and responsive behavior at the approved widths.

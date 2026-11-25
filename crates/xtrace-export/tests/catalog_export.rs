@@ -494,3 +494,75 @@ fn viewer_refuses_invalid_requests_incomplete_catalogs_and_sanitizer_paths_safel
         Err(ViewerExportError::SanitizerRefused)
     ));
 }
+
+#[test]
+fn http_render_admission_bounds_inputs_and_structural_work_before_rendering() {
+    use xtrace_export::viewer::{ViewerExportError, ViewerExportLimit, admit_http_render};
+    let one = operation(3, "/orders/{id}");
+    let admitted = snapshot(std::slice::from_ref(&one), CatalogExportScope::All, &[]);
+    assert_eq!(admit_http_render(&admitted), Ok(()));
+
+    let mut large = admitted.clone();
+    large.operations[0].application_component = "x".repeat(8 * 1024 * 1024);
+    assert_eq!(
+        admit_http_render(&large),
+        Err(ViewerExportError::LimitExceeded(ViewerExportLimit::Input))
+    );
+
+    let mut claims = admitted.clone();
+    claims.operations[0].claims = vec![one.claims[0].clone(); 4097];
+    assert_eq!(
+        admit_http_render(&claims),
+        Err(ViewerExportError::LimitExceeded(ViewerExportLimit::Work))
+    );
+
+    let mut entries = admitted.clone();
+    entries.operations[0].claims[0].limitation_codes = vec!["fixture".to_owned(); 65_536];
+    assert_eq!(
+        admit_http_render(&entries),
+        Err(ViewerExportError::LimitExceeded(ViewerExportLimit::Work))
+    );
+
+    let mut identities = admitted;
+    identities.catalog_identities = vec![identities.catalog_identities[0].clone(); 4097];
+    assert_eq!(
+        admit_http_render(&identities),
+        Err(ViewerExportError::LimitExceeded(ViewerExportLimit::Operations))
+    );
+}
+
+#[test]
+fn root_recipe_preview_names_require_source_root_without_literal_slug_collisions() {
+    let root = operation(3, "/");
+    for format in [ExportFormat::Curl, ExportFormat::Bundle] {
+        let request = viewer_request(format, CatalogExportScope::All);
+        let true_root = snapshot(std::slice::from_ref(&root), CatalogExportScope::All, &[]);
+        let preview = viewer::preview(&true_root, request).unwrap();
+        let root_name =
+            if format == ExportFormat::Bundle { "curl/001-get-root.sh" } else { "001-get-root.sh" };
+        assert!(
+            preview
+                .files
+                .iter()
+                .any(|file| file.name == PreviewFilename::Available(root_name.to_owned()))
+        );
+        for route in ["/root", "/ROOT", "/ROOT/", "/{root}", "//", "/---"] {
+            let literal = operation(4, route);
+            for views in [vec![literal.clone()], vec![root.clone(), literal.clone()]] {
+                let fixture = snapshot(&views, CatalogExportScope::All, &[]);
+                let preview = viewer::preview(&fixture, request).unwrap();
+                let files =
+                    viewer::save(&fixture, request, preview.approval()).unwrap().into_files();
+                let cli_input = catalog::prepare(&fixture.revision, &views, &[]);
+                let cli = catalog::render(&cli_input, &ExportRequest::new(format)).unwrap();
+                assert_eq!(files, cli.files, "preview privacy must preserve CLI artifact bytes");
+                let withheld = preview
+                    .files
+                    .iter()
+                    .filter(|file| matches!(file.name, PreviewFilename::WithheldRecipe { .. }))
+                    .count();
+                assert_eq!(withheld, views.len(), "every ambiguous root slug must be withheld");
+            }
+        }
+    }
+}
