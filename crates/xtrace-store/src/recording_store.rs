@@ -3793,8 +3793,9 @@ fn project_matching_source(
             truncated = end_line.is_some_and(|end| end > upper);
             break;
         }
+        // A retained blank line has no bytes but still needs a separator before the next line.
+        let separator_bytes = usize::from(found);
         found = true;
-        let separator_bytes = usize::from(!excerpt.is_empty());
         if excerpt.len().saturating_add(separator_bytes) > MAX_SOURCE_EXCERPT_BYTES {
             truncated = true;
             break;
@@ -3957,6 +3958,57 @@ mod source_projection_tests {
             .expect("source projection");
         assert_eq!(projected.status, SourceStatus::Matched);
         assert_eq!(projected.excerpt.as_deref(), Some("two\nthree"));
+    }
+
+    #[test]
+    fn matching_source_preserves_leading_and_consecutive_blank_lines() {
+        let root = tempdir();
+        for (bytes, end_line, expected) in [
+            (&b"header\n\nbody\nfooter\n"[..], 3, "\nbody"),
+            (&b"header\n\n\nbody\n\nfooter\n"[..], 5, "\n\nbody\n"),
+        ] {
+            write_source(root.path(), bytes);
+            let mut source = range(PATH, ContentHash::of_bytes(bytes));
+            source.end_line = Some(end_line);
+            let projected = project(&source, Some(root.path())).expect("matched source projection");
+            assert_eq!(projected.status, SourceStatus::Matched);
+            assert_eq!(projected.start_line, 2);
+            assert_eq!(projected.end_line, Some(end_line));
+            assert_eq!(projected.excerpt.as_deref(), Some(expected));
+            assert!(!projected.truncated);
+        }
+    }
+
+    #[test]
+    fn leading_blank_line_consumes_separator_at_excerpt_byte_limit() {
+        let root = tempdir();
+        let tail = "a".repeat(MAX_SOURCE_EXCERPT_BYTES - 2);
+        let contents = format!("header\n\n{tail}é\n");
+        let bytes = contents.as_bytes();
+        write_source(root.path(), bytes);
+        let projected = project(&range(PATH, ContentHash::of_bytes(bytes)), Some(root.path()))
+            .expect("matched source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.start_line, 2);
+        assert_eq!(projected.end_line, Some(3));
+        let expected = format!("\n{tail}");
+        assert_eq!(projected.excerpt.as_deref(), Some(expected.as_str()));
+        assert_eq!(expected.len(), MAX_SOURCE_EXCERPT_BYTES - 1);
+        assert!(projected.truncated);
+
+        let contents = format!("header\n\n{tail}\nnext\n");
+        let bytes = contents.as_bytes();
+        write_source(root.path(), bytes);
+        let mut source = range(PATH, ContentHash::of_bytes(bytes));
+        source.end_line = Some(4);
+        let projected = project(&source, Some(root.path())).expect("matched source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.start_line, 2);
+        assert_eq!(projected.end_line, Some(4));
+        let expected = format!("\n{tail}\n");
+        assert_eq!(projected.excerpt.as_deref(), Some(expected.as_str()));
+        assert_eq!(expected.len(), MAX_SOURCE_EXCERPT_BYTES);
+        assert!(projected.truncated);
     }
 
     #[test]
