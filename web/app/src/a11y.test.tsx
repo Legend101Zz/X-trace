@@ -3,7 +3,7 @@
 // rules over the rendered DOM): accessible names, unique ids, valid references, roving tabindex,
 // landmarks, hidden decoration, and the keyboard-only focus order. They do not replace a manual
 // screen-reader pass (UX-ACCESSIBILITY stays partial until the owner does one).
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './main';
@@ -75,7 +75,7 @@ async function openRecording() {
   render(<App />);
   fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
-  await screen.findByText('Controller.create');
+  await within(screen.getByRole('tabpanel', { name: 'Steps' })).findByText('Controller.create');
   fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
 }
 

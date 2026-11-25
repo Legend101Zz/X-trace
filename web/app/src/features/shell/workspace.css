@@ -139,3 +139,10 @@
   .steps-and-code .event { grid-template-columns: minmax(0, 3ch) minmax(0, 1fr); gap: 3px 6px; padding-inline: 6px; }
   .steps-and-code .event-time { grid-column: 2; justify-self: start; text-align: start; }
 }
+
+/* At the desktop splitter limit, reserve the full row for the sentence. */
+@container replay-steps (max-width: 175px) {
+  .steps-and-code .step-row { margin-inline-start: min(var(--event-indent, 0px), 5%); }
+  .steps-and-code .event { grid-template-columns: minmax(0, 1fr); }
+  .steps-and-code .event-time { grid-column: 1; }
+}
