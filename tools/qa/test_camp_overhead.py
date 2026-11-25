@@ -68,6 +68,8 @@ class T(unittest.TestCase):
                      lambda rs: rs[1]["receipt"]["scenarios"][0].update(fingerprintEqualsBaseline=False),
                      lambda rs: rs[1]["receipt"]["scenarios"][0].update(semanticEffectFingerprint="different"),
                      lambda rs: rs[1]["receipt"]["api"].update(recordings=0),
+                     lambda rs: rs[1]["receipt"]["api"].update(listReadGap="recordings list HTTP 503"),
+                     lambda rs: rs[1]["receipt"]["api"].update(incompleteDetails=1),
                      lambda rs: rs[1]["receipt"]["notes"].update(launcherExitCode=1),
                      lambda rs: rs[1]["receipt"]["scenarios"][0].update(requests=[])]
         for mutate in mutations:

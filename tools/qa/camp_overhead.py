@@ -91,6 +91,7 @@ def compare_interleaved(runs: list[dict]) -> dict:
             api = receipt.get("api", {})
             valid = (valid and receipt.get("instrumented") is True and receipt.get("result") == "recorded"
                      and api.get("ok") is True and api.get("recordings", 0) > 0
+                     and not (api.get("listReadGap") or api.get("incompleteDetails"))
                      and receipt.get("notes", {}).get("launcherExitCode") in (0, 143, -15)
                      and all(sc.get("scenarioChecksPassed") is True and sc.get("fingerprintEqualsBaseline") is True
                              for sc in scenarios))
