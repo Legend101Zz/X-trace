@@ -4,9 +4,9 @@ import { psqlRows } from "../../lib/stack.mjs";
 const errShape = (j) => ({ type: j?.type, message: typeof j?.message === "string" ? j.message.replace(/\s+/g, " ").slice(0, 160) : undefined });
 const prodShape = (p) => ({ title: p?.title, handle: p?.handle, status: p?.status, options: (p?.options || []).map((o) => o.title) });
 
-export function medusaScenarios({ db, admin }) {
+export function medusaScenarios({ db, admin }, queryRows = psqlRows) {
   const dbRows = () =>
-    psqlRows(db.container, db.database, `select handle, title, status from product where deleted_at is null and handle like 'xtrace-%' order by handle`, db.user);
+    queryRows(db.container, db.database, `select handle, title, status from product where deleted_at is null and handle like 'xtrace-%' order by handle`, db.user);
   const state = {};
 
   const createProduct = (http, token, label, suffix, extra = {}) =>
