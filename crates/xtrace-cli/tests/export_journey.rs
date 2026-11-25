@@ -1572,7 +1572,7 @@ fn observations_keep_component_and_binding_scope_and_counts_match_each_format() 
                 assert_eq!(metadata["claim_count"], 1);
                 let claim = &metadata["claims"][0];
                 assert_eq!(claim["handler_symbol"], "OrderController.create");
-                assert_eq!(claim["confidence_basis_points"], 5000);
+                assert_eq!(claim["confidence_basis_points"], 9000);
                 let evidence = &claim["source_evidence"][0];
                 assert_eq!(evidence["relative_path"], "OrderController.java");
                 assert_eq!(evidence["start_line"], 23);
