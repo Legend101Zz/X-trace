@@ -18,8 +18,15 @@ named unmatched disposition. An invalid CLI UUID is a validation error without t
 The adapter's `RecordingStarted.method` and `matched_route_template` are the input facts. No URL,
 host, event path, handler name or later event can supply or repair a missing start template. Express
 uses its decorated route and observable literal or declared-parameter mounts. Spring MVC uses the
-framework's matched-pattern attribute. The run policy is an operator assertion and does not attest
-framework or application identity.
+framework's matched-pattern attribute. The run policy is an operator assertion. It establishes the
+selected scope and does not attest framework or application identity.
+
+At the application boundary use a typed selection with a `CatalogRevisionId` and a closed
+`SpringMvc | Express` dialect. Raw CLI policy values enter classification as absent, invalid,
+`SpringOrdersV1`, or `RuntimeRouteV1`. Model successful and unmatched dispositions as separate
+variants. A success carries the scoped `OperationId`, accepted method and canonical catalog
+template. An unmatched result carries a closed reason and only context approved for that reason.
+Store conversion and JSON projection use explicit string mappings for stable public values.
 
 The first slice accepts bounded slash-prefixed literal segments and whole, simple named parameters
 in the launcher dialect, plus the explicit root `/`. Refuse absent, empty, concrete URLs with query or
@@ -27,16 +34,22 @@ fragment, control bytes, repeated/trailing separators, percent escapes, wildcard
 segments, regex constraints and ambiguous forms. Use the existing dialect normalizer after
 eligibility checks. Match the canonical method and identity already present in the pinned revision
 with the **full** project/component/binding/transport/method/template tuple. A removed or unknown
-revision entry, a conflicting declaration, or a static entry that cannot substantiate the bounded
-route form is ineligible. Never pattern-match a concrete request path against declarations. Only
+revision entry or one with competing handler symbols is ineligible. At scan time, record positive
+eligibility only when the accepted static declarations all substantiate the bounded route form,
+have compatible literal and parameter shapes, and carry no unresolved mount or computed route
+limitation. The current stored claim keeps the normalized identity and can discard distinctions
+such as a regex constraint. Use the scanner's bounded pre-normalization facts to make this
+decision. The eligibility marker stores no raw declaration. Revisions created before the marker
+was introduced remain readable and require a new scan to qualify for runtime linking. Never
+pattern-match a concrete request path against declarations. Only
 the catalog's resolved canonical tuple is persisted on success. The matching operation's UUIDv7
 and fingerprint are validated and reused. Matching establishes the operation identity, not the
 controller's identity, discovery completeness, or coverage of another binding.
 
 ## Recording and migration
 
-Use the next migration number, v11 as of `4c3002a`. The six historical SQL cases prove groundwork
-for rebuilding the v3 projection, not an applied schema or product behavior. Preserve all v1–v10
+Use the next migration number, v11 as of `4c3002a`. The six historical SQL cases exercise the
+unregistered rebuild of the v3 projection. Preserve all v1–v10
 labels and checksums and copy every existing observation and operation byte-for-byte. Existing
 UUIDv4/v7 recordings, absent sidecars and historical nulls stay as they are. Production tests must
 exercise an actual registered migration on v10 and independently exercise bounded FK and null
@@ -47,8 +60,9 @@ projection's structural bounds and, on the first successful runtime link, mirror
 catalog operation with the same UUID and fingerprint. Static scan alone does not populate the
 observed listing. Preserve the existing `spring-orders-v1` rule and its fixture alias. Enforce the
 project and complete endpoint tuple in the operation link FK. Add a nullable
-`catalog_revision_id` to the observation sidecar. A new runtime link must reference both the
-project-scoped revision and its project-scoped operation membership. A qualified unmatched result
+`catalog_revision_id` to the observation sidecar. A separate eligibility table binds the scanner's
+positive route decision to the immutable project/revision/operation member. A new runtime link
+must reference both the project-scoped revision and that eligible member. A qualified unmatched result
 can retain a validated revision and its exact scope; an invalid revision or identity cannot.
 
 Classification, alias creation, the recording and its sidecar share the existing immediate
@@ -70,7 +84,7 @@ null behavior. A recording-detail link field is outside this slice; list and ope
 queries expose the link and detail remains the existing exact-ID read.
 
 Keep the existing unmatched codes. For the runtime policy, use `catalog_revision_unavailable`
-for a missing, inaccessible or wrong-scope revision; `method_unsupported` for an unsupported
+for a missing, inaccessible, incomplete, non-static or wrong-scope revision; `method_unsupported` for an unsupported
 method after resolving scope; `route_unmatched_after_normalization` for missing or ineligible
 template syntax; and `no_catalog_match` for a safe canonical identity absent or ineligible in the
 selected revision. Use that precedence after policy and identity checks. Persist only closed
