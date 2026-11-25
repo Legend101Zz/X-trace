@@ -10,8 +10,9 @@ info:
     states. Captured values, an active execution line, and independently
     verified application or HTTP outcomes remain unavailable; a producer
     summary is not outcome proof. It also exposes a finite persisted
-    observed-endpoint projection for the exact Spring fixture policy; it does
-    not claim framework discovery or catalog completeness. Every
+    observed-endpoint projection under the Spring fixture and scoped runtime
+    route policies. Endpoint summaries represent persisted linked observations
+    and do not claim framework discovery or catalog completeness. Every
     request must carry the exact Host authority printed by viewer readiness,
     Sec-Fetch-Site: same-origin, and X-XTrace-Client: viewer-v1. There is no
     CORS support. Authentication POST requests require an exact same-origin
@@ -131,10 +132,12 @@ paths:
       operationId: listObservedEndpoints
       summary: List bounded persisted endpoint observations.
       description: >-
-        Lists only persisted observations accepted under the finite
-        spring-orders-v1 operator-selected policy. The policy does not attest
-        which adapter or application produced the event, and this endpoint does
-        not claim framework handler discovery or catalog completeness.
+        Lists persisted operations with linked recordings under the
+        spring-orders-v1 or runtime-route-v1 operator-selected policy.
+        Each operation shows a representative policy. Use a linked recording's
+        own policy for its disposition. Neither policy attests which adapter
+        or application produced the event, and this endpoint does not claim
+        framework handler discovery or catalog completeness.
       security: [{ viewerCookie: [] }]
       parameters:
         - $ref: '#/components/parameters/ViewerHost'
@@ -509,15 +512,35 @@ components:
           type: string
           format: uuid
           pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-        applicationComponent: { type: string, const: spring-fixture }
-        binding: { type: string, const: default }
-        method: { type: string, const: POST }
-        routeTemplate: { type: string, const: /orders }
+        applicationComponent:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z0-9][a-z0-9._-]*$'
+          description: Application component included in the linked operation's identity.
+        binding:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z0-9][a-z0-9._-]*$'
+          description: Binding included in the linked operation's identity.
+        method:
+          type: string
+          enum: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS, TRACE, CONNECT]
+        routeTemplate:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          pattern: '^(?!(?:[^{]*\{id\}){33})(?:/|(?:/(?:\{id\}|(?!\.{1,2}(?:/|$))[A-Za-z0-9._~-]+))+)$'
+          description: Canonical linked operation template with at most 32 whole-segment {id} parameters.
         observation: { type: string, const: observed }
         observationPolicy:
           type: string
-          const: spring-orders-v1
-          description: Operator-selected policy; it does not attest the adapter or application.
+          enum: [spring-orders-v1, runtime-route-v1]
+          description: >-
+            Representative operator-selected policy. When both policies have a
+            valid link to the operation, the representative is spring-orders-v1.
+            This field does not attest the adapter or application.
     ObservedRecordingPage:
       type: object
       required: [items, nextCursor]
@@ -542,10 +565,24 @@ components:
         incompleteEvidence: { type: array, items: { type: string } }
         sessionContext: { $ref: '#/components/schemas/SessionContext' }
         operationId: { type: [string, 'null'], format: uuid }
-        observationPolicy: { type: [string, 'null'], enum: [spring-orders-v1, null] }
+        observationPolicy:
+          type: [string, 'null']
+          enum: [spring-orders-v1, runtime-route-v1, null]
+          description: Accepted policy recorded on this recording's sidecar, if available.
         unmatchedReason:
           type: [string, 'null']
-          enum: [observation_policy_missing, observation_policy_invalid, identity_context_missing, identity_context_invalid, method_unsupported, route_unapproved, null]
+          enum:
+            - observation_policy_missing
+            - observation_policy_invalid
+            - identity_context_missing
+            - identity_context_invalid
+            - method_unsupported
+            - route_unapproved
+            - catalog_revision_unavailable
+            - route_template_unavailable_or_ineligible
+            - no_catalog_match
+            - null
+          description: Closed unmatched reason, if recorded. Historical recordings may have no recorded reason.
     RecordingDetail:
       type: object
       required: [schemaVersion, projectId, recordingId, status, completion, adapterSummary, durationNs, dropCountsByPriority, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, sessionContext, unavailable, outcome, capacity, limitations, honesty, anchorFrameId, firstSequence, lastSequence, prevCursor, projection, requestId]
