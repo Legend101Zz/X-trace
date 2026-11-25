@@ -205,6 +205,8 @@
      the pointer target between pointerdown and click. */
   .shell[data-reading='true']:not([data-pane='recordings']) > .replay-context { grid-row: 2; }
   .shell[data-reading='true']:not([data-pane='recordings']) > .recording-tabs { grid-row: 3; }
+  .replay-context { padding-inline: 8px; }
+  .replay-context-request { gap: 3px; }
   .replay-context-event { margin: 0; }
   .phone-replay-toolbar { position: relative; background: var(--panel); }
   .phone-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; }
@@ -212,4 +214,16 @@
   .phone-more { position: absolute; z-index: 5; bottom: 100%; right: 0; width: min(100%, 28rem); max-height: 50dvh; overflow: auto; padding: 8px; background: var(--panel-raised); border: 1px solid var(--line-strong); }
   .phone-more .button { min-height: 44px; }
   .phone-more p { color: var(--muted); font-size: 12px; }
+}
+
+@media (min-width: 1280px) {
+  .replay-context {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.4fr);
+    align-items: center;
+    column-gap: 16px;
+  }
+  .replay-context-request { grid-area: 1 / 1; }
+  .replay-context-event { grid-area: 1 / 2; margin: 0; }
+  .replay-context > .replay-playback { grid-area: 1 / 3; }
 }

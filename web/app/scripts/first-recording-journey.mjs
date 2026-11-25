@@ -57,7 +57,21 @@ try {
     const copy = empty.getByRole('button', { name: 'Copy example command' });
     assert.ok((await copy.boundingBox())?.height >= 44, 'copy has a full touch target');
     await copy.press('Enter');
-    await expect(empty.getByText('Example command copied.')).toBeVisible();
+    const feedback = empty.getByText('Example command copied.');
+    await expect(feedback).toBeVisible();
+    if (width === 1024) {
+      assert.ok(await feedback.evaluate((label) => {
+        const range = document.createRange();
+        range.selectNodeContents(label);
+        const pane = label.closest('#recordings-panel').getBoundingClientRect();
+        const lines = [...range.getClientRects()].filter((line) => line.width && line.height);
+        return lines.length > 0 && lines.every((line) => {
+          const y = line.top + line.height / 2;
+          return line.left >= pane.left && line.right <= pane.right && line.top >= pane.top && line.bottom <= pane.bottom
+            && [line.left + 1, line.right - 1].every((x) => label.contains(document.elementFromPoint(x, y)));
+        });
+      }), 'the Requests drawer contains every line of the copy confirmation');
+    }
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'xtrace run --project-dir ./your-project --java-agent ./xtrace-java-agent.jar -- java -jar ./your-app.jar');
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     if (screenshotDirectory) await page.screenshot({ path: join(screenshotDirectory, `empty-${width}.png`) });

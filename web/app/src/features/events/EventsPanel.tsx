@@ -64,8 +64,7 @@ export function EventsPanel({ active, phone, selectedRecording, detail, detailBu
         <div className="steps-content">
           <div className="pane-head center-head"><div className="center-title"><div className="eyebrow">Replay steps</div><h1>{selectedRecording || 'Select a recording'}</h1></div><button className="button" onClick={onRefresh} disabled={detailBusy}>Refresh</button></div>
           {detailError ? <ErrorState message={detailError} onRetry={onRetry} /> : null}
-          {!selectedRecording && !detailError ? <div className="empty"><strong>No recording selected</strong><p>Choose a linked or unmatched recording from the left pane.</p></div> : null}
-          {detail ? <OutcomeBanner detail={detail} /> : null}
+          {!selectedRecording && !detailError ? <div className="empty"><strong>No recording selected</strong><p>Choose a linked or unmatched recording in Requests.</p></div> : null}
           {selectionUnavailable ? <p className="window-retention">{selectionUnavailable}</p> : null}
           {detail && detail.events.length ? <div className="mode-switch" role="tablist" aria-label="Replay view" onKeyDown={(event) => {
             let next: ReplayMode;
@@ -83,6 +82,7 @@ export function EventsPanel({ active, phone, selectedRecording, detail, detailBu
             <button className="button" role="tab" id="replay-view-steps-tab" aria-controls="replay-view-steps-panel" data-mode="linear" aria-selected={mode === 'linear'} tabIndex={mode === 'linear' ? 0 : -1} onClick={() => onMode('linear', true)}>Steps</button>
             <button className="button" role="tab" id="replay-view-map-tab" aria-controls="replay-view-map-panel" data-mode="canvas" aria-selected={mode === 'canvas'} tabIndex={mode === 'canvas' ? 0 : -1} onClick={() => onMode('canvas', true)}>Map</button>
           </div> : null}
+          {detail ? <OutcomeBanner detail={detail} /> : null}
           {detail ? <ReplayWindows key={detail.recordingId} prevCursor={detail.prevCursor ?? null} nextCursor={detail.nextCursor ?? null}
             count={detail.events.length} busy={detailBusy} startKnown={startKnown} released={releasedEvents}
             onChange={onChangeWindow} /> : null}

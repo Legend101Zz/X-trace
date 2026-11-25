@@ -61,6 +61,7 @@
 .viewer-tour h2 { margin: 4px 0; }
 .viewer-tour-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: 6px; margin-top: 10px; }
 :is(.viewer-tour, .first-recording) .button { min-height: 44px; }
+.empty.first-recording { box-sizing: border-box; width: 100%; min-width: 0; overflow-wrap: anywhere; }
 .first-recording-command { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
 .first-recording-command code { overflow-wrap: anywhere; }
 @media (max-width: 860px) {

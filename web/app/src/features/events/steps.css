@@ -70,6 +70,7 @@
   .replay-tool-panel .button, .replay-tool-panel .link-button, .replay-filter-note .link-button, .replay-tool-sequence > input { min-height: 44px; min-width: 44px; }
 }
 @media (max-width: 400px) {
+  .replay-tool-panel--jump { max-height: calc(100dvh - 16px); }
   .replay-jump-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .replay-jump-row > span { grid-column: 1 / -1; }
   .event-with-timing { grid-template-columns: minmax(0, 40px) minmax(0, 1fr); }

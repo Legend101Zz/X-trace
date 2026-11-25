@@ -112,6 +112,19 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     await expect(selected.locator('.event-seq')).toHaveText(sequence);
     await expect(selected).toBeFocused();
   };
+  const assertLabelUncovered = async (locator) => {
+    await expect(locator).toBeInViewport({ ratio: 1 });
+    assert.ok(await locator.evaluate((element) => {
+      const text = document.createRange();
+      text.selectNodeContents(element);
+      const lines = [...text.getClientRects()].filter((rect) => rect.width && rect.height);
+      return lines.length > 0 && lines.every(({ left, top, width, height }) => {
+        const y = top + height / 2;
+        return [left + 1, left + width / 2, left + width - 1].every((x) =>
+          element.contains(document.elementFromPoint(x, y)));
+      });
+    }), 'the rendered label is inside the viewport and unobscured by neighboring panes or controls');
+  };
   const verifyCompactJumpClose = async () => {
     const opener = page.locator('.replay-tools').getByRole('button', { name: 'Tools', exact: true });
     await openPanel('jump');
@@ -127,6 +140,8 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
         [(box.left + box.right) / 2, (box.top + box.bottom) / 2]]
         .every(([x, y]) => button.contains(document.elementFromPoint(x, y)));
     });
+    const scope = dialog.getByText(/Only the .* loaded steps .* are searched/);
+    await assertLabelUncovered(scope);
     // Inspect before an automation action can scroll Close into view.
     assert.ok(await hitTest(), 'compact Jump Close starts fully within the dialog and hit-testable');
     await dialog.getByRole('button', { name: 'Next http call', exact: true }).press('Tab');
@@ -151,6 +166,10 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       for (const line of ['.replay-context-request', '.replay-context-event']) {
         await expect(summary.locator(line)).toBeInViewport({ ratio: 1 });
       }
+      const route = summary.locator('.replay-context-route');
+      await expect(route).toHaveText('POST /orders');
+      assert.ok(await route.evaluate((node) => node.scrollWidth <= node.clientWidth + 1),
+        'the complete short request identity fits the phone recording summary');
       const first = await summary.locator('.replay-context-request').boundingBox();
       const second = await summary.locator('.replay-context-event').boundingBox();
       assert.ok(first && second && first.y >= 0 && first.y + first.height <= second.y + 1,
@@ -309,6 +328,10 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       await settings.getByRole('button', { name: 'Close', exact: true }).press('Escape');
       await expect(tools.getByRole('button', { name: 'Show timing', exact: true })).toHaveAttribute('aria-pressed', 'true');
       await verifyRows(page, events.map(({ sequence }) => sequence), timingBySequence);
+    }
+    if (width >= 1280) {
+      const views = page.getByRole('tablist', { name: 'Replay view' });
+      for (const name of ['Steps', 'Map']) await assertLabelUncovered(views.getByRole('tab', { name, exact: true }));
     }
     await saveScreenshot(`viewer-replay-tools-${pointer}-${width}.png`, `loaded-tools-real-Spring-${pointer}`, width, height, page);
     await ensureMore();
