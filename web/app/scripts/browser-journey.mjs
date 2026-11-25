@@ -64,7 +64,7 @@ try {
   assert.ok(tabHeights.every((height) => height >= 44), `mobile pane tabs must be at least 44px tall: ${tabHeights}`);
   const wordmarkHeight = await page.locator('.brand > span:nth-child(2)').evaluate((node) => node.getBoundingClientRect().height);
   assert.ok(wordmarkHeight <= 24, `wordmark must remain on one line: ${wordmarkHeight}px`);
-  assert.equal(await page.getByRole('tab', { name: 'recordings' }).getAttribute('aria-selected'), 'true', 'mobile opens on the endpoint catalog');
+  assert.equal(await page.getByRole('tab', { name: 'Requests' }).getAttribute('aria-selected'), 'true', 'mobile opens on the endpoint catalog');
   await saveScreenshot('viewer-mobile-endpoints.png', 'observed-endpoints', 390, 844);
 
   const requestSearch = page.getByRole('searchbox', { name: 'Search loaded requests' });
@@ -114,8 +114,8 @@ try {
   await expect(firstEvent).toHaveCSS('outline-style', 'solid');
   const observed = await page.locator('.event-seq').allTextContents();
   assert.deepEqual(observed, expectedSequences, 'browser event order differs from the product query projection');
-  await page.getByRole('tab', { name: 'evidence' }).click();
-  await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
+  await page.getByRole('tab', { name: 'Inspector' }).click();
+  await page.getByRole('tabpanel', { name: 'Inspector' }).waitFor({ state: 'visible' });
   const statusMark = page.locator('.status-mark').first();
   assert.equal(await statusMark.evaluate((node) => node.classList.contains('recording')), false);
   assert.deepEqual(await statusMark.evaluate((node) => {
@@ -123,7 +123,7 @@ try {
     return { width: style.width, height: style.height };
   }), { width: '6px', height: '6px' });
   assert.deepEqual(await page.locator('.recording').first().locator('.recording-title, .recording-sub, .recording-status').evaluateAll((labels) => labels.map((label) => getComputedStyle(label).display)), ['block', 'block', 'block']);
-  await page.getByRole('tab', { name: 'events' }).click();
+  await page.getByRole('tab', { name: 'Steps' }).click();
   await page.locator('.event').filter({ hasText: 'OrderService.place' }).first().click();
   await page.getByText(/Adapter reported a compile-time source binding; current source matches the recorded identity/).waitFor();
   const sourceExcerpt = await page.locator('.source-excerpt').textContent();
@@ -135,8 +135,8 @@ try {
   await saveScreenshot('viewer-desktop-genuine-detail.png', 'genuine-recording-detail', 1280, 720);
   await page.setViewportSize({ width: 390, height: 844 });
   await saveScreenshot('viewer-mobile-genuine-detail.png', 'genuine-recording-detail', 390, 844);
-  await page.getByRole('tab', { name: 'events' }).click();
-  await page.getByRole('tabpanel', { name: 'events' }).waitFor({ state: 'visible' });
+  await page.getByRole('tab', { name: 'Steps' }).click();
+  await page.getByRole('tabpanel', { name: 'Steps' }).waitFor({ state: 'visible' });
   const eventKind = page.locator('.event-kind').first();
   const originalKind = await eventKind.textContent();
   const stressKind = `recording_event_kind:${'long-technical-segment-'.repeat(10)}`;
@@ -162,9 +162,9 @@ try {
   let renderedStepKinds;
   for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1440, 900]]) {
     await page.setViewportSize({ width, height });
-    const eventsTab = page.getByRole('tab', { name: 'events' });
+    const eventsTab = page.getByRole('tab', { name: 'Steps' });
     if (await eventsTab.isVisible()) await eventsTab.click();
-    await page.getByRole('tabpanel', { name: 'events' }).waitFor({ state: 'visible' });
+    await page.getByRole('tabpanel', { name: 'Steps' }).waitFor({ state: 'visible' });
     const noHorizontalScroll = async (view) => {
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
       assert.ok(overflow <= 0, `${view} view scrolls the page horizontally by ${overflow}px at ${width}px`);
@@ -213,21 +213,21 @@ try {
     assert.equal(await page.locator('.event[aria-current="true"]').count(), 1, 'exactly one selected event in Linear');
   }
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole('tab', { name: 'events' }).click();
-  await page.getByRole('tab', { name: 'evidence' }).click();
-  await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
-  await page.getByRole('tab', { name: 'recordings' }).click();
-  await page.getByRole('tabpanel', { name: 'recordings' }).waitFor({ state: 'visible' });
-  await page.getByRole('tab', { name: 'events' }).click();
-  await page.getByRole('tabpanel', { name: 'events' }).waitFor({ state: 'visible' });
-  const eventTab = page.getByRole('tab', { name: 'events' });
+  await page.getByRole('tab', { name: 'Steps' }).click();
+  await page.getByRole('tab', { name: 'Inspector' }).click();
+  await page.getByRole('tabpanel', { name: 'Inspector' }).waitFor({ state: 'visible' });
+  await page.getByRole('tab', { name: 'Requests' }).click();
+  await page.getByRole('tabpanel', { name: 'Requests' }).waitFor({ state: 'visible' });
+  await page.getByRole('tab', { name: 'Steps' }).click();
+  await page.getByRole('tabpanel', { name: 'Steps' }).waitFor({ state: 'visible' });
+  const eventTab = page.getByRole('tab', { name: 'Steps' });
   await eventTab.focus();
   await eventTab.press('ArrowRight');
-  assert.equal(await page.getByRole('tab', { name: 'evidence' }).getAttribute('aria-selected'), 'true');
-  await page.getByRole('tab', { name: 'evidence' }).press('ArrowLeft');
+  assert.equal(await page.getByRole('tab', { name: 'Inspector' }).getAttribute('aria-selected'), 'true');
+  await page.getByRole('tab', { name: 'Inspector' }).press('ArrowLeft');
   assert.equal(await eventTab.getAttribute('aria-selected'), 'true');
   await page.locator('.event').nth(1).click();
-  await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
+  await page.getByRole('tabpanel', { name: 'Inspector' }).waitFor({ state: 'visible' });
   await page.getByRole('status').filter({ hasText: /Event .* selected/ }).waitFor();
   const backToStep = page.getByRole('button', { name: /Back to event/ });
   assert.ok((await backToStep.boundingBox())?.height >= 44, 'phone Back to event meets its touch target');
@@ -235,8 +235,8 @@ try {
   const currentEvent = page.locator('.event[aria-current="true"]');
   await expect(currentEvent).toBeFocused();
   const priorSequence = await currentEvent.locator('.event-seq').textContent();
-  await page.getByRole('tab', { name: 'recordings' }).click();
-  await page.getByRole('tabpanel', { name: 'recordings' }).waitFor({ state: 'visible' });
+  await page.getByRole('tab', { name: 'Requests' }).click();
+  await page.getByRole('tabpanel', { name: 'Requests' }).waitFor({ state: 'visible' });
   await page.getByRole('button', { name: 'Not linked to an endpoint' }).click();
   const historicalRow = page.getByRole('button', { name: new RegExp(legacyV4Id) });
   await historicalRow.waitFor();
@@ -253,7 +253,7 @@ try {
   await page.setViewportSize({ width: 1280, height: 720 });
   await saveScreenshot('viewer-desktop-historical-unmatched.png', 'historical-unmatched-detail', 1280, 720);
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole('tab', { name: 'events' }).click();
+  await page.getByRole('tab', { name: 'Steps' }).click();
   await page.getByText('No projected events').waitFor();
   await saveScreenshot('viewer-mobile-historical-unmatched.png', 'historical-unmatched-detail', 390, 844);
   const recordingTabs = page.getByRole('tablist', { name: 'Open recordings' });
@@ -347,7 +347,7 @@ try {
   if (intoIndex >= 0) {
     const expectedTarget = verifiedEvents.find(({ frameId }) => frameId === verifiedEvents[intoIndex].navigation.into.frameId);
     await page.locator('.event').nth(intoIndex).click();
-    const eventsTab = page.getByRole('tab', { name: 'events' });
+    const eventsTab = page.getByRole('tab', { name: 'Steps' });
     if (await eventsTab.isVisible()) await eventsTab.click();
     const stepIn = page.getByRole('group', { name: 'Replay navigation' }).getByRole('button', { name: 'Step in', exact: true });
     await expect(stepIn).toHaveAttribute('aria-disabled', 'false');
@@ -365,7 +365,7 @@ try {
   let observedMissingLabels;
   for (const [width, height] of [[320, 640], [736, 900], [1024, 768], [1440, 900]]) {
     await page.setViewportSize({ width, height });
-    const eventsTab = page.getByRole('tab', { name: 'events' });
+    const eventsTab = page.getByRole('tab', { name: 'Steps' });
     if (await eventsTab.isVisible()) await eventsTab.click();
     await page.locator('.event').nth(methodIndex).click();
     const code = page.getByRole('region', { name: 'Code', exact: true });
@@ -413,7 +413,7 @@ try {
     }
   }
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole('tab', { name: 'events' }).click();
+  await page.getByRole('tab', { name: 'Steps' }).click();
   process.stdout.write('packaged Code and Values: hash-matched method extent, source numbering, no active line based on method range, and binding count at 320/736/1024/1440\n');
   process.stdout.write(`packaged Inspector Details and Missing checked at 320/736/1024/1440; observed loaded row categories: ${observedMissingLabels.join(', ') || 'none'}\n`);
   process.stdout.write('focused Code proof: not exercised by the standard fixture browser journey\n');

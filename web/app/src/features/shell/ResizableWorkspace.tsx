@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, PointerEvent, ReactNode } from 'react';
 import { clampPanel, DEFAULT_LAYOUT, PANEL_LIMITS, readPanelLayout, savePanelLayout } from './panel-layout';
 import type { Panel, PanelLayout } from './panel-layout';
@@ -121,6 +121,8 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
     '--inspector-size': sizes.inspector ? `${sizes.inspector}%` : '44px',
   } as CSSProperties;
   const showSourcePane = useViewport('(min-width: 861px)');
+  const codePane = useRef<HTMLElement>(null);
+  useLayoutEffect(() => { if (codePane.current) codePane.current.scrollTop = 0; }, [sourceEvent, showSourcePane]);
 
   return <main className="workspace viewer-workspace" data-pane={activePane} style={style}>
     <div className="workspace-requests" data-collapsed={sizes.requests === 0}>
@@ -130,7 +132,7 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
     <div className="steps-and-code" data-code-collapsed={sizes.code === 0}>
       {steps}
       {splitter('code')}
-      <section id="code-panel" className="workspace-code" aria-label="Code">
+      <section id="code-panel" ref={codePane} className="workspace-code" aria-label="Code">
         {sizes.code === 0 ? restore('code') : <div className="workspace-code-body">
           <h2>Code</h2>
           {showSourcePane && sourceEvent ? <CodeEvidence event={sourceEvent} /> : <p>Select an event</p>}

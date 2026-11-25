@@ -56,3 +56,11 @@ it('preserves precise gap counts and uses verbatim canonical Why text', () => {
     gap: { wording: honesty.markers.gap, reason: null },
   });
 });
+
+it('removes only the recognized Java method identity digest from a display sentence', () => {
+  const prefix = 'OrderService.place';
+  const symbol = `${prefix}#m1:${'a'.repeat(64)}`;
+  const kind = 'recording_event_kind:frame_enter';
+  expect(stepSentence({ ...empty, kind, symbol }).text).toBe(`Called ${prefix}`);
+  expect(stepSentence({ ...empty, kind, symbol: `${prefix}#m1:ordinary` }).text).toBe(`Called ${prefix}#m1:ordinary`);
+});

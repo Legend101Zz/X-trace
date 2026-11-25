@@ -11,7 +11,7 @@ export function CodeEvidence({ event }: { event: ReplayEvent }) {
   const localBindings = (event.bindings ?? []).filter((binding) => binding.role === 'local');
 
   return <>
-    {source ? <p className="inspector-value">{source.path} · debug range L{source.startLine}
+    {source ? <p className="inspector-value">{source.path.split('/').at(-1)} · debug range L{source.startLine}
       {source.endLine && source.endLine !== source.startLine ? `–L${source.endLine}` : ''}</p> : null}
     <p className="evidence-state">{sourceStateText(event.sourceBinding, source)}</p>
     {source?.truncated ? <p className="evidence-state">Source excerpt is bounded</p> : null}

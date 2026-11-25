@@ -34,9 +34,9 @@ export function RecordingTabs({ recordings, selected, onSelect, onClose }: {
     <div className="recording-tabs-list" role="tablist" aria-label="Open recordings">
       {recordings.map(({ id, endpoint }, index) => <button key={id} type="button" role="tab"
         id={`open-recording-${id}`} tabIndex={id === selected ? 0 : -1} aria-selected={id === selected}
-        aria-controls="events-panel" className="open-recording" onClick={() => onSelect(id)}
+        aria-controls="events-panel" aria-label={endpoint ? `${endpoint.method} ${endpoint.routeTemplate} · ${id}` : id} className="open-recording" onClick={() => onSelect(id)}
         onKeyDown={(event) => handleKey(event, index)}>
-        {endpoint ? `${endpoint.method} ${endpoint.routeTemplate} · ` : ''}{id}
+        {endpoint ? `${endpoint.method} ${endpoint.routeTemplate} · ` : 'Unlinked · '}{id.slice(-8)}
       </button>)}
     </div>
     {selected ? <button type="button" className="button" onClick={() => onClose(selected)}>Close recording</button> : null}

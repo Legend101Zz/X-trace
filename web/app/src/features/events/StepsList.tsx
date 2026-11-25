@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef } from 'react';
 import type { CSSProperties } from 'react';
+import { displaySymbol } from '../../replay/display-symbol';
 import { stepSentence } from '../../replay/step-sentence';
 import type { ReplayEvent } from '../../types';
 import './steps.css';
@@ -21,6 +22,7 @@ export function StepsList({ events, selected, onPick, onMove }: {
     <div className="window-note"><span>{events.length} ordered events</span><span>ALT + ↑ / ↓ to step</span></div>
     {events.map((item, index) => {
       const step = stepSentence(item);
+      const symbol = item.symbol ? displaySymbol(item.symbol) : null;
       const active = item === selected;
       const indentation = step.depth === null ? undefined : { '--event-indent': `${Math.min(step.depth, 100) * 18}px` } as CSSProperties;
       return <div key={item.sequence} className="step-row" style={indentation}>
@@ -35,7 +37,7 @@ export function StepsList({ events, selected, onPick, onMove }: {
           <span className="event-seq">{item.sequence}</span>
           <span className="event-copy">
             <span className="event-kind" title={item.kind}>{step.text}</span>
-            {item.symbol && !step.text.includes(item.symbol) ? <span className="event-symbol">{item.symbol}</span> : null}
+            {symbol && !step.text.includes(symbol) ? <span className="event-symbol">{symbol}</span> : null}
             {item.frameId == null ? <span className="event-symbol">Frame ID unavailable</span> : null}
           </span>
           <span className="event-time">{item.monotonicNs} ns</span>

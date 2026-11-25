@@ -42,10 +42,10 @@ async function openRecording() {
   fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
   await screen.findByText('Controller.create');
-  fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+  fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
 }
 
-const inspector = () => screen.getByRole('tabpanel', { name: 'evidence', hidden: true });
+const inspector = () => screen.getByRole('tabpanel', { name: 'Inspector', hidden: true });
 
 describe('replay wiring in the app', () => {
   let responseDetail = detail;
@@ -239,10 +239,10 @@ describe('replay wiring in the app', () => {
     await waitFor(() => expect(live()).toHaveTextContent('Selected event 2'));
   });
 
-  const showEvents = () => fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+  const showEvents = () => fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
   const refreshEvents = () => {
     showEvents();
-    fireEvent.click(within(screen.getByRole('tabpanel', { name: 'events' })).getByRole('button', { name: 'Refresh' }));
+    fireEvent.click(within(screen.getByRole('tabpanel', { name: 'Steps' })).getByRole('button', { name: 'Refresh' }));
   };
 
   it('preserves the exact same-frame event through Canvas, reordering, and a missing window', async () => {
@@ -316,7 +316,7 @@ describe('replay wiring in the app', () => {
     expect(screen.getByRole('button', { name: /Request boundary/ })).toHaveAttribute('aria-current', 'true');
 
     responseDetail = { ...detail, recordingId: recordingB };
-    fireEvent.click(screen.getByRole('tab', { name: 'recordings' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Requests' }));
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
     expect(await within(inspector()).findByText('event-1')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Controller\.create/ })).toHaveAttribute('aria-current', 'true');
@@ -327,7 +327,7 @@ describe('replay wiring in the app', () => {
     fireEvent.click(screen.getByRole('button', { name: /Audit\.write/ }));
     expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
     secondDetail = { ...detail, recordingId: recordingB, events: [{ ...events[0], eventId: 'other-recording-event' }] };
-    fireEvent.click(screen.getByRole('tab', { name: 'recordings' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Requests' }));
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
     expect(await within(inspector()).findByText('other-recording-event')).toBeInTheDocument();
 
@@ -405,7 +405,7 @@ describe('replay wiring in the app', () => {
     responseDetail = { ...detail, events: [event, sentinel],
       incompleteEvidence: ['gap_event_sequence:2', 'gap_event_sequence:12', 'future_persisted_code'] };
     await openRecording();
-    fireEvent.click(screen.getByRole('tab', { name: 'evidence' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Inspector' }));
     const details = within(inspector()).getByRole('tab', { name: 'Details', hidden: true });
     const missing = within(inspector()).getByRole('tab', { name: /^Missing/, hidden: true });
     expect(within(inspector()).getByText('Event capacity facts unavailable')).toBeInTheDocument();
@@ -438,5 +438,18 @@ describe('replay wiring in the app', () => {
     expect(recording).not.toHaveTextContent('Event capacity facts unavailable');
     expect(recording).toHaveTextContent('Value withheld by a redaction rule.');
     expect(recording).not.toHaveTextContent(/PRIVATE-RULE|PRIVATE-SUMMARY/);
+  });
+  it('opens the Code reading tab with explicit missing evidence on a narrow viewport', async () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query === '(max-width: 860px)', addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    }));
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Controller\.create/ }));
+    const inspectorTabs = within(inspector()).getByRole('tablist', { name: 'Inspector evidence' });
+    expect(within(inspectorTabs).getByRole('tab', { name: 'Code' })).toHaveAttribute('aria-selected', 'true');
+    const code = within(inspector()).getByRole('region', { name: 'Code' });
+    expect(within(code).getByText('Source location is unavailable for this event')).toBeInTheDocument();
+    expect(within(inspector()).queryByRole('region', { name: 'Event details' })).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Recording summary' })).toHaveTextContent('Event sequence 1');
   });
 });

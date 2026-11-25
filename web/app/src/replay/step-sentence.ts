@@ -1,4 +1,5 @@
 import honesty from '../../../../schema/fixtures/replay/honesty-strings.json';
+import { displaySymbol } from './display-symbol';
 import type { ReplayEvent } from '../types';
 
 type StepEvidence = Pick<ReplayEvent, 'kind' | 'symbol' | 'line' | 'depth' | 'interaction' | 'gap' | 'exception'>;
@@ -25,11 +26,12 @@ export function stepSentence(event: StepEvidence): StepSentence {
   const depth = typeof event.depth === 'number' && Number.isInteger(event.depth) && event.depth >= 0 ? event.depth : null;
   const result = (text: string, gap: StepSentence['gap'] = null): StepSentence => ({ text, depth, gap });
   const interaction = event.interaction;
+  const symbol = event.symbol ? displaySymbol(event.symbol) : null;
 
   switch (kind) {
     case 'request_update': return result('Request updated');
-    case 'frame_enter': return result(event.symbol ? `Called ${event.symbol}` : 'Call recorded');
-    case 'frame_exit': return result(event.symbol ? `Returned from ${event.symbol}` : 'Return recorded');
+    case 'frame_enter': return result(symbol ? `Called ${symbol}` : 'Call recorded');
+    case 'frame_exit': return result(symbol ? `Returned from ${symbol}` : 'Return recorded');
     case 'frame_throw':
     case 'exception': {
       const type = event.exception?.exceptionType;

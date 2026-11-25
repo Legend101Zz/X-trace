@@ -76,7 +76,7 @@ async function openRecording() {
   fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
   await screen.findByText('Controller.create');
-  fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+  fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
 }
 
 describe('accessibility rules over the rendered viewer', () => {
@@ -126,8 +126,9 @@ describe('accessibility rules over the rendered viewer', () => {
       order.push(`${role}:${accessibleName(active).slice(0, 40)}`);
       if (active === document.body) break;
     }
-    // The first stop is the single active tab, never an inactive one.
-    expect(order[0]).toBe('tab:events');
+    // The header request shortcut precedes the one active viewer-pane tab.
+    expect(order[0]).toBe('button:Requests');
+    expect(order.filter((entry) => ['tab:Requests', 'tab:Steps', 'tab:Inspector'].includes(entry))).toEqual(['tab:Steps']);
     expect(order.filter((entry) => entry.startsWith('treeitem:'))).toHaveLength(1);
     // Expand buttons inside the tree are reachable by pointer, not by Tab (roving tabindex).
     expect(order.some((entry) => entry.startsWith('button:Expand') || entry.startsWith('button:Collapse'))).toBe(false);

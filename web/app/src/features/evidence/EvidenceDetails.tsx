@@ -48,6 +48,7 @@ export function EvidenceDetails({ detail, event, selectionUnavailable, showSourc
       <section className="inspector-section" aria-label="Event details">
         <h2 className="inspector-label">Event identity</h2>
         <div className="inspector-value mono" data-event-field="event-id">{event.eventId || 'Unavailable'}</div>
+        {event.symbol ? <div className="inspector-value">Recorded symbol · <span className="mono" data-event-field="symbol">{event.symbol}</span></div> : null}
         <div className="inspector-value">Recorded kind · <span className="mono">{event.kind || 'Unavailable'}</span></div>
         <div className="inspector-value">Event sequence · <span className="mono">{event.sequence}</span></div>
         <div className="inspector-value">Frame ID · <span className="mono">{event.frameId ?? 'Unavailable'}</span></div>
@@ -58,7 +59,10 @@ export function EvidenceDetails({ detail, event, selectionUnavailable, showSourc
         <div className="inspector-value">Async parent: <span className="mono">{event.asyncParentEventId || 'Unavailable'}</span></div>
         <div className="inspector-value">Async parent frame: <span className="mono">{event.asyncParentFrameId ?? 'Unavailable'}</span></div>
         <div className="inspector-value">Source binding · <span className="mono">{event.sourceBinding || 'Unavailable'}</span></div>
-        {event.source ? <div className="inspector-value">Source status · <span className="mono">{event.source.status}</span></div> : null}
+        {event.source ? <>
+          <div className="inspector-value">Source status · <span className="mono">{event.source.status}</span></div>
+          <div className="inspector-value">Recorded source path · <span className="mono">{event.source.path}</span></div>
+        </> : null}
         {showSourceExplanation && (event.source || (event.sourceBinding && event.sourceBinding !== 'unspecified'))
           ? <p className="evidence-state">{sourceStateText(event.sourceBinding, event.source)}</p> : null}
         {INTERACTION_FIELDS.flatMap((field) => event.interaction?.[field]

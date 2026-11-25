@@ -77,7 +77,7 @@ describe('endpoint-first recording viewer', () => {
     expect(screen.queryByText(recordingB)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingA) }));
     expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
     fireEvent.keyDown(window, { key: 'ArrowDown', altKey: true });
     expect(window.location.hash).toBe('');
     for (const [input, init] of vi.mocked(fetch).mock.calls) {
@@ -270,7 +270,7 @@ describe('endpoint-first recording viewer', () => {
     render(<App />);
     expect(await screen.findByText('Viewer session expired')).toBeInTheDocument();
     expect(screen.queryByText('sensitive server wording')).not.toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: 'recordings' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Requests' })).toBeInTheDocument();
   });
 
   it('keeps event stepping, truncation, unavailable evidence, and recording-scoped cursors', async () => {
@@ -302,12 +302,12 @@ describe('endpoint-first recording viewer', () => {
     expect(screen.getByText('Per-event duration is not recorded')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: /^Values/ }));
     expect(screen.getByText(/No value bindings were recorded for this event/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Steps' }));
     fireEvent.click(screen.getByRole('button', { name: 'Load next window' }));
     expect(await screen.findByText('fixture.Service.call')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /fixture\.Service\.call/ }));
     expect(vi.mocked(fetch).mock.calls.some(([input]) => route(input as RequestInfo | URL) === `/api/v1/recordings/${recordingA}?limit=200&cursor=recording-a-next`)).toBe(true);
-    fireEvent.click(screen.getByRole('tab', { name: 'recordings' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Requests' }));
     fireEvent.click(screen.getByRole('button', { name: new RegExp(recordingB) }));
     expect(await screen.findByText('recording-b-only')).toBeInTheDocument();
     expect(screen.queryByText('fixture.Service.call')).not.toBeInTheDocument();
