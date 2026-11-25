@@ -31,12 +31,12 @@ export interface EventsPanelProps {
 
 export function EventsPanel({ active, selectedRecording, detail, detailBusy, detailError, selectedEvent, selectionUnavailable, olderEventsReleased, onRefresh, onPickEvent, onNextWindow, mode, onMode, onSelectFrame, onNavigateKey, onMove, backReason, nextReason, frameControls }: EventsPanelProps) {
   return <section className="pane" role="tabpanel" id="events-panel" aria-labelledby="events-tab" data-active={active} aria-label="Ordered event window">
-        <div className="pane-head center-head"><div className="center-title"><div className="eyebrow">Replay steps</div><h1>{selectedRecording || 'Select a recording'}</h1></div><button className="button" onClick={onRefresh} disabled={detailBusy}>Refresh</button></div>
+        {detail?.events.length ? <ReplayToolbar backReason={backReason} nextReason={nextReason} frameControls={frameControls} onMove={onMove} onNavigate={onNavigateKey} /> : null}
+        <div className="steps-content"><div className="pane-head center-head"><div className="center-title"><div className="eyebrow">Replay steps</div><h1>{selectedRecording || 'Select a recording'}</h1></div><button className="button" onClick={onRefresh} disabled={detailBusy}>Refresh</button></div>
         {detailError ? <ErrorState message={detailError} onRetry={onRefresh} /> : null}
         {!selectedRecording && !detailError ? <div className="empty"><strong>No recording selected</strong><p>Choose a linked or unmatched recording from the left pane.</p></div> : null}
         {detail ? <OutcomeBanner detail={detail} /> : null}
         {selectionUnavailable ? <p className="window-retention">{selectionUnavailable}</p> : null}
-        {detail?.events.length ? <ReplayToolbar backReason={backReason} nextReason={nextReason} frameControls={frameControls} onMove={onMove} onNavigate={onNavigateKey} /> : null}
         {detail && detail.events.length ? <div className="mode-switch" role="group" aria-label="Replay view">
           <button className="button" aria-pressed={mode === 'linear'} onClick={() => onMode('linear')}>Steps</button>
           <button className="button" aria-pressed={mode === 'canvas'} onClick={() => onMode('canvas')}>Map</button>
@@ -48,5 +48,6 @@ export function EventsPanel({ active, selectedRecording, detail, detailBusy, det
         {detail?.events.length && mode === 'linear' ? <StepsList events={detail.events} selected={selectedEvent} onPick={onPickEvent} onMove={onMove} /> : null}
         {olderEventsReleased ? <p className="window-retention" role="status">Earlier events were released from memory. Continue from the current event cursor.</p> : null}
         {detail?.nextCursor ? <div className="page-controls"><span className="top-meta">More events in verified window</span><button className="button button-primary" onClick={onNextWindow} disabled={detailBusy}>Load next window</button></div> : null}
+        </div>
       </section>;
 }

@@ -51,7 +51,23 @@ try {
     const step = page.locator('#events-panel .event').nth(index);
     const measureTextColumn = () => step.locator('.event-copy').evaluate((copy) => copy.getBoundingClientRect().width);
     if (width === 1024) {
-      for (const name of ['Resize Requests', 'Resize Inspector', 'Resize Code']) {
+      const requests = page.locator('#header-requests');
+      await expect(requests).toHaveAttribute('aria-expanded', 'false');
+      await requests.press('Enter');
+      const search = page.getByRole('searchbox', { name: 'Search loaded requests' });
+      await expect(search).toBeFocused();
+      await page.getByRole('separator', { name: 'Resize Requests' }).press('End');
+      await page.keyboard.press('Escape');
+      await expect(requests).toBeFocused();
+      await expect(search).not.toBeVisible();
+      await requests.press('Enter');
+      const drawerRecording = page.locator('.recording-list .recording').filter({ hasText: recordingId });
+      await drawerRecording.press('Enter');
+      const activeRecordingTab = page.getByRole('tablist', { name: 'Open recordings' })
+        .getByRole('tab', { selected: true });
+      await expect(activeRecordingTab).toBeFocused();
+      await expect(search).not.toBeVisible();
+      for (const name of ['Resize Inspector', 'Resize Code']) {
         await page.getByRole('separator', { name }).press('End');
       }
       assert.ok(await measureTextColumn() >= 80, 'maximum saved panel preferences still leave a readable Steps column at 1024px');
@@ -64,6 +80,23 @@ try {
       const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
       return hit != null && row.contains(hit);
     }), `the real event receives pointer input with Why expanded at ${width}px`);
+    if (width >= 861) {
+      const inspector = page.locator('.workspace-inspector');
+      const codeDock = page.locator('.workspace-code');
+      const dockLayout = await inspector.evaluate((element) => {
+        const code = document.querySelector('.workspace-code').getBoundingClientRect();
+        return element.getBoundingClientRect().top >= code.bottom &&
+          Math.abs(element.getBoundingClientRect().right - code.right) <= 1;
+      });
+      assert.ok(dockLayout && await codeDock.isVisible(), `Code is above docked Inspector at ${width}px`);
+      await expect(page.getByRole('separator', { name: 'Resize Inspector' })).toHaveAttribute('aria-orientation', 'horizontal');
+      const nav = page.getByRole('group', { name: 'Replay navigation' });
+      await expect(nav.getByRole('button', { name: 'Step out' })).toBeInViewport();
+      const navTop = (await nav.boundingBox()).y;
+      await page.locator('.steps-content').evaluate((body) => { body.scrollTop = body.scrollHeight; });
+      assert.equal((await nav.boundingBox()).y, navTop, 'desktop navigation is outside the scrolling Steps body');
+      await step.scrollIntoViewIfNeeded();
+    }
     const copyWidth = await measureTextColumn();
     assert.ok(copyWidth >= 80, `focused Steps preserve a readable text column at ${width}px`);
     assert.ok(!(await step.locator('.event-copy').textContent()).includes('#m1:'), 'Java identity digest stays out of short step text');

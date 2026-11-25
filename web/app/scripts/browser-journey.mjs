@@ -498,7 +498,11 @@ try {
   const codeSplitter = page.getByRole('separator', { name: 'Resize Code' });
   for (const width of [861, 1024]) {
     await page.setViewportSize({ width, height: 900 });
+    const openRequests = page.locator('#header-requests');
+    await openRequests.press('Enter');
     await requestsSplitter.press('End');
+    await page.keyboard.press('Escape');
+    await expect(openRequests).toBeFocused();
     await inspectorSplitter.press('End');
     await codeSplitter.press('End');
     await expect(codeSplitter).toBeFocused();
@@ -529,6 +533,11 @@ try {
   await expect(codeSplitter).toHaveAttribute('aria-valuenow', '52');
   await expect(codeSplitter).toBeFocused();
 
+  const inspectorDock = page.getByLabel('Inspector dock');
+  await expect(inspectorSplitter).toHaveAttribute('aria-orientation', 'horizontal');
+  await inspectorDock.selectOption('right');
+  await expect(inspectorSplitter).toHaveAttribute('aria-orientation', 'vertical');
+  assert.equal(await page.evaluate(() => localStorage.getItem('xtrace.viewer.inspector-dock')), 'right');
   const inspectorBounds = await inspectorSplitter.boundingBox();
   assert.ok(inspectorBounds, 'desktop Inspector splitter is visible');
   const handleX = inspectorBounds.x + inspectorBounds.width / 2;
@@ -541,6 +550,8 @@ try {
   await page.getByRole('button', { name: 'Reset panels' }).click();
   await expect(requestsSplitter).toHaveAttribute('aria-valuenow', '22');
   await expect(inspectorSplitter).toHaveAttribute('aria-valuenow', '26');
+  await inspectorDock.selectOption('bottom');
+  await expect(inspectorSplitter).toHaveAttribute('aria-orientation', 'horizontal');
   await codeSplitter.press('Home');
   await expect(codeSplitter).toHaveAttribute('aria-valuenow', '28');
   await saveScreenshot('viewer-shell-desktop-1440.png', 'active-recording-tab-and-resized-panels', 1440, 900);
