@@ -4,3 +4,24 @@
 .source-number { color: var(--quiet); font-variant-numeric: tabular-nums; }
 .source-text { white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
 .source-inline { grid-column: 2; margin-block: 4px; min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
+.source-name-match {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 0.2em;
+  cursor: pointer;
+}
+.source-name-card {
+  grid-column: 2;
+  min-width: 0;
+  margin-block: 4px;
+  padding: 6px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  overflow-wrap: anywhere;
+}
+.source-name-card > .button { min-block-size: 44px; }

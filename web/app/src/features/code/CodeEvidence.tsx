@@ -3,6 +3,7 @@ import { sourceStateText } from '../../replay/source-states';
 import type { ReplayEvent } from '../../types';
 import { BindingList } from '../evidence/Values';
 import { useViewerPreferences } from '../shell/viewer-preferences';
+import { CodeNameValues } from './CodeNameValues';
 import './code-evidence.css';
 
 export function CodeEvidence({ event }: { event: ReplayEvent }) {
@@ -23,7 +24,9 @@ export function CodeEvidence({ event }: { event: ReplayEvent }) {
       {rows.map((row) => <li className="source-row" key={row.number} data-source-line={row.number}
         aria-current={row.active ? 'location' : undefined}>
         <span className="source-number"><span className="sr-only">Line </span>{row.number}</span>
-        <code className="source-text">{row.text}</code>
+        {preferences.inline === 'on' && row.active
+          ? <CodeNameValues key={`${event.eventId}:${event.sequence}`} event={event} text={row.text} />
+          : <code className="source-text">{row.text}</code>}
         {preferences.inline === 'on' && row.active && localBindings.length ? <div className="source-inline">
           <p>Local bindings at the recorded line cursor</p>
           <BindingList bindings={localBindings} inline />
