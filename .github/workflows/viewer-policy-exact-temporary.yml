@@ -1,0 +1,24 @@
+name: viewer-policy-exact-temporary
+on:
+  push:
+    branches: [codex/viewer-policy-112]
+permissions:
+  contents: read
+jobs:
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web/app
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: a2f03b1b2b2366d15dfaddbefbe1a360558d914a
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run typecheck && npm test
+      - run: npm run check:api && npm run check:embedded
