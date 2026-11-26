@@ -18,7 +18,7 @@ import time
 import traceback
 from urllib.parse import urlencode
 
-from installed_evidence import capture, detail, keys, pages, require, workload
+from installed_evidence import EvidenceError, capture, detail, keys, pages, require, workload
 from installed_process import contain_children, verify_children_gone
 
 
@@ -108,6 +108,44 @@ def local_transport(value):
     return {key: value[key] for key in sorted(labels)}
 
 
+class LifecycleProcessExit(RuntimeError):
+    def __init__(self, returncode):
+        super().__init__("unexpected Medusa process exit")
+        self.returncode = returncode
+
+
+HEALTH_FAILURES = {
+    71: "listener-not-verified",
+    72: "connection-not-verified",
+    73: "accepted-socket-not-verified",
+    74: "response-not-read",
+    75: "redirect-refused",
+    76: "health-status-mismatch",
+    77: "health-body-mismatch",
+}
+
+
+def lifecycle_failure(phase, exc):
+    """Project exceptions into finite facts without reading their messages or arguments."""
+    if isinstance(exc, (LifecycleProcessExit, subprocess.CalledProcessError)):
+        value = exc.returncode
+        if (phase == "owned-health" and isinstance(exc, subprocess.CalledProcessError)
+                and type(value) is int and value in HEALTH_FAILURES):
+            return {"reason": HEALTH_FAILURES[value]}
+        if type(value) is int and -127 <= value <= 255:
+            return {"reason": "process-exited", "exitCode": value}
+        return {"reason": "process-exited"}
+    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+        return {"reason": "deadline"}
+    if isinstance(exc, EvidenceError):
+        return {"reason": "condition-failed"}
+    if isinstance(exc, OSError):
+        return {"reason": "io-or-spawn-failed"}
+    if isinstance(exc, KeyboardInterrupt):
+        return {"reason": "interrupted"}
+    return {"reason": "unclassified"}
+
+
 class Process:
     """Observe owned process readiness and preserve its streams only in private files."""
 
@@ -168,7 +206,9 @@ class Process:
         pending = b""
         with self.stdout.open("rb") as stream:
             while time.monotonic() < deadline:
-                require(self.child.poll() is None)
+                code = self.child.poll()
+                if code is not None:
+                    raise LifecycleProcessExit(code)
                 pending += stream.read(65536)
                 require(len(pending) <= 4 * 1024 * 1024 and stream.tell() <= 4 * 1024 * 1024)
                 complete = pending.split(b"\n")
@@ -250,6 +290,7 @@ class Proof:
             "archiveSha256": None, "installedCliSha256": None, "nodeSha256": None, "nodePackSha256": None,
             "stages": {}, "workload": None, "capture": None, "unmatched": None,
             "localTransport": {"baseline": None, "installed": None},
+            "lifecycle": {"baseline": {}, "installed": {}},
             "perRequestAttribution": "unverified", "concurrentRecordingAttribution": "unverified",
         }
 
@@ -267,6 +308,21 @@ class Proof:
             raise
         else:
             self.summary["stages"][name] = "passed"
+            self.save()
+
+    @contextmanager
+    def phase(self, leg, name):
+        phases = self.summary["lifecycle"][leg]
+        phases[name] = {"status": "running"}
+        self.save()
+        try:
+            yield
+        except BaseException as exc:
+            phases[name] = {"status": "failed", **lifecycle_failure(name, exc)}
+            self.save()
+            raise
+        else:
+            phases[name] = {"status": "passed"}
             self.save()
 
     def command(self, args, *, cwd=REPO, env=None, timeout=60, fail=True):
@@ -473,30 +529,40 @@ class Proof:
             medusa = [str(self.node), "./node_modules/@medusajs/cli/cli.js"]
             with self.stage(f"{name}:startup"):
                 deadline = time.monotonic() + 300
-                self.command(medusa + ["db:migrate"], cwd=backend, env=env, timeout=remaining(deadline))
-                self.command(medusa + ["user", "-e", admin["email"], "-p", admin_password],
-                             cwd=backend, env=env, timeout=remaining(deadline))
-                require(port_vacant(PORT))
+                with self.phase(name, "migrate"):
+                    self.command(medusa + ["db:migrate"], cwd=backend, env=env, timeout=remaining(deadline))
+                with self.phase(name, "create-admin"):
+                    self.command(medusa + ["user", "-e", admin["email"], "-p", admin_password],
+                                 cwd=backend, env=env, timeout=remaining(deadline))
+                with self.phase(name, "prelaunch-port"):
+                    require(port_vacant(PORT))
                 command = medusa + ["start"]
                 if name == "installed":
-                    require(not keys(self.list_cli(), "recordings", "recording_id"))
+                    with self.phase(name, "prelaunch-readback"):
+                        require(not keys(self.list_cli(), "recordings", "recording_id"))
                     command = [str(self.cli), "run", "--project-dir", str(self.project), "--node-adapter",
                                str(self.pack), "--node-mode", "auto", "--", *command]
-                process = Process(notes, command, backend, env, descendants=True)
-                process.ready(lambda line: True if "Server is ready on port: 9000" in line else None, remaining(deadline))
-                require(process.child.poll() is None)
-                if name == "installed":
-                    children = [pid for pid in process.owned_children
-                                if (Path(f"/proc/{pid}") / "exe").resolve() == self.node
-                                and re.search(rf"^PPid:\s+{process.child.pid}$",
-                                              Path(f"/proc/{pid}/status").read_text(), re.M)]
-                    require(len(children) == 1)
-                else:
-                    children = [process.child.pid]
-                owner = listener_owner(children[0], PORT)
-                self.check_health(notes, owner, deadline)
-                private_json(notes / "process-identity.json", {"launcherPid": process.child.pid,
-                             "nodePid": children[0], "nodeSha256": self.summary["nodeSha256"]})
+                with self.phase(name, "spawn"):
+                    process = Process(notes, command, backend, env, descendants=True)
+                with self.phase(name, "await-readiness-log"):
+                    process.ready(lambda line: True if "Server is ready on port: 9000" in line else None,
+                                  remaining(deadline))
+                with self.phase(name, "identify-server-process"):
+                    require(process.child.poll() is None)
+                    if name == "installed":
+                        children = [pid for pid in process.owned_children
+                                    if (Path(f"/proc/{pid}") / "exe").resolve() == self.node
+                                    and re.search(rf"^PPid:\s+{process.child.pid}$",
+                                                  Path(f"/proc/{pid}/status").read_text(), re.M)]
+                        require(len(children) == 1)
+                    else:
+                        children = [process.child.pid]
+                    owner = listener_owner(children[0], PORT)
+                with self.phase(name, "owned-health"):
+                    self.check_health(notes, owner, deadline)
+                with self.phase(name, "save-process-identity"):
+                    private_json(notes / "process-identity.json", {"launcherPid": process.child.pid,
+                                 "nodePid": children[0], "nodeSha256": self.summary["nodeSha256"]})
             if name == "installed":
                 try:
                     with self.stage(f"{name}:readiness-recording"):
@@ -520,12 +586,19 @@ class Proof:
                 if process:
                     with self.stage(f"{name}:shutdown"):
                         live = process.child.poll() is None
-                        require_code = process.stop()
-                        require(live and require_code == 0 and port_vacant(PORT))
+                        with self.phase(name, "stop-process"):
+                            require_code = process.stop()
+                        with self.phase(name, "check-graceful-exit"):
+                            require(live)
+                            if require_code != 0:
+                                raise LifecycleProcessExit(require_code)
+                        with self.phase(name, "shutdown-port-vacant"):
+                            require(port_vacant(PORT))
                         if name == "installed":
-                            log = process.stderr
-                            require(log.stat().st_size <= 16 * 1024 * 1024)
-                            require(b"XTR-RUN-CAPTURE-INCOMPLETE" not in log.read_bytes())
+                            with self.phase(name, "capture-drain"):
+                                log = process.stderr
+                                require(log.stat().st_size <= 16 * 1024 * 1024)
+                                require(b"XTR-RUN-CAPTURE-INCOMPLETE" not in log.read_bytes())
             except Exception:
                 traceback.print_exc()
             try:
@@ -533,11 +606,18 @@ class Proof:
                     cid = cid or owned_id(cidfile)
                     try:
                         if cid:
-                            self.command(["docker", "rm", "-f", "-v", cid])
-                            require(not self.text(["docker", "ps", "-aq", "--no-trunc", "--filter", f"id={cid}"]).strip())
+                            with self.phase(name, "remove-database"):
+                                self.command(["docker", "rm", "-f", "-v", cid])
+                            with self.phase(name, "check-database-absent"):
+                                require(not self.text(["docker", "ps", "-aq", "--no-trunc", "--filter",
+                                                       f"id={cid}"]).strip())
                     finally:
-                        verify_children_gone()
-                    require(created and (process is None or process.cleaned) and port_vacant(PORT))
+                        with self.phase(name, "check-owned-children-absent"):
+                            verify_children_gone()
+                    with self.phase(name, "verify-cleanup-state"):
+                        require(created and (process is None or process.cleaned))
+                    with self.phase(name, "cleanup-port-vacant"):
+                        require(port_vacant(PORT))
             except Exception:
                 traceback.print_exc()
         return ready_id, notes / "scenarios.json"

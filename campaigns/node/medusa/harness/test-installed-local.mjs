@@ -27,7 +27,8 @@ test('local commerce reads and writes use the verified accepted socket', async (
     response.end(JSON.stringify({ method: request.method, path: request.url, body: Buffer.concat(chunks).toString() }));
   }, async (owner, origin, connections) => {
     verifyListener(owner);
-    const local = ownedRequest(owner);
+    const phases = [];
+    const local = ownedRequest(owner, { observe: (phase) => phases.push(phase) });
     const read = await local(origin + '/store/products?fields=title', { method: 'GET', signal: AbortSignal.timeout(2000) });
     assert.equal(read.status, 200);
     assert.equal(read.headers.get('content-type'), 'application/json');
@@ -38,6 +39,8 @@ test('local commerce reads and writes use the verified accepted socket', async (
     });
     assert.deepEqual(JSON.parse(await write.text()), { method: 'POST', path: '/admin/products', body });
     assert.equal(connections(), 2);
+    const expected = ['listener', 'connect', 'accepted-socket', 'response'];
+    assert.deepEqual(phases, [...expected, ...expected]);
   });
 });
 
@@ -74,9 +77,12 @@ test('listener verification refuses a stale birth identity before sending a loca
     requests++;
     response.end();
   }, async (owner, origin) => {
-    await assert.rejects(ownedRequest({ ...owner, start: '0' })(origin + '/store/products', {
+    const phases = [];
+    const stale = ownedRequest({ ...owner, start: '0' }, { observe: (phase) => phases.push(phase) });
+    await assert.rejects(stale(origin + '/store/products', {
       method: 'GET', signal: AbortSignal.timeout(2000),
     }), /local process changed/);
+    assert.deepEqual(phases, ['listener']);
     assert.equal(requests, 0);
   });
 });

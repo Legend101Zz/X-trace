@@ -44,10 +44,18 @@ if (config.mode === 'package-inventory') {
   if (config.owner.port !== 9000 || !(config.timeoutMs > 0 && config.timeoutMs <= 3000)) {
     throw new Error('invalid local readiness budget');
   }
-  const response = await ownedRequest(config.owner)(baseUrl + '/health', {
-    method: 'GET', signal: AbortSignal.timeout(config.timeoutMs),
-  });
-  if (response.status !== 200 || await response.text() !== 'OK') throw new Error('owned Medusa readiness failed');
+  // Only this health command uses these fixed codes. No response content is emitted.
+  const healthExit = { listener: 71, connect: 72, 'accepted-socket': 73, response: 74 };
+  let phase;
+  try {
+    const response = await ownedRequest(config.owner, { observe: (step) => { phase = step; } })(baseUrl + '/health', {
+      method: 'GET', signal: AbortSignal.timeout(config.timeoutMs),
+    });
+    if (response.status !== 200) process.exitCode = 76;
+    else if (await response.text() !== 'OK') process.exitCode = 77;
+  } catch (error) {
+    process.exitCode = error?.name === 'MedusaRedirectRefused' ? 75 : (healthExit[phase] ?? 1);
+  }
 } else if (config.mode === 'viewer') {
   const response = await ownedViewerRequest(config.owner, config);
   fs.writeFileSync(config.out, await response.text(), { flag: 'wx', mode: 0o600 });

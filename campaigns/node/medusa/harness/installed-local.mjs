@@ -42,15 +42,17 @@ export function verifyListener(owner) {
   }
 }
 
-export function ownedRequest(owner, { maxBytes = Infinity } = {}) {
+export function ownedRequest(owner, { maxBytes = Infinity, observe } = {}) {
   const { port } = owner;
   const origin = new URL(`http://${host}:${port}`).origin;
   return async (address, { method, headers, body, signal }) => {
     const target = new URL(address);
     if (target.origin !== origin || target.username || target.password || target.hash
       || !['GET', 'POST', 'DELETE'].includes(method)) throw new Error('local commerce target required');
+    observe?.('listener');
     signal.throwIfAborted();
     verifyListener(owner);
+    observe?.('connect');
     const socket = net.createConnection({ host, port });
     // During kernel ownership checks there may not yet be a request to handle an error.
     socket.on('error', () => {});
@@ -58,6 +60,7 @@ export function ownedRequest(owner, { maxBytes = Infinity } = {}) {
       await once(socket, 'connect', { signal });
       if (socket.remoteAddress !== host || socket.remotePort !== port || socket.localAddress !== host
         || !socket.localPort) throw new Error('unexpected loopback peer');
+      observe?.('accepted-socket');
       const client = tuple(socket.localPort);
       // TCP connect may complete before the server accepts. Send no HTTP bytes until
       // the exact reverse connection appears in the expected process's descriptor table.
@@ -65,6 +68,7 @@ export function ownedRequest(owner, { maxBytes = Infinity } = {}) {
         if (socket.destroyed) throw new Error('owned socket closed before verification');
         await wait(10, undefined, { signal });
       }
+      observe?.('response');
       const response = await new Promise((resolve, reject) => {
         const request = http.request({
           host, port, path: target.pathname + target.search, method, headers,
