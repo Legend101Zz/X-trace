@@ -6,7 +6,8 @@ scenarios against the UNINSTRUMENTED application and records a semantic effect
 fingerprint per scenario. It never patches upstream sources.
 
 Naming rule: every container, network and volume created here is prefixed
-`xtrace-camp-`. Nothing else is ever stopped, removed or pruned.
+`xtrace-camp-`. Cleanup additionally requires this invocation's creation ID;
+a name or prefix alone never authorizes removal.
 """
 from __future__ import annotations
 
@@ -21,16 +22,23 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+if __package__:
+    from .owned_fixture import CleanupFailure, DockerFixture, stop_child
+else:
+    from owned_fixture import CleanupFailure, DockerFixture, stop_child
 
 PREFIX = "xtrace-camp-"
 PLATFORM = os.environ.get("XCAMP_PLATFORM", "linux/arm64")  # CI x86_64 runners set linux/amd64
 POSTGRES_IMAGE = "postgres:18.3"
 POSTGRES_DIGEST = "sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+JAVA_OPTIONS_ENV = ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")
 
 
 # ---------------------------------------------------------------- hashing ----
@@ -115,21 +123,6 @@ def docker(*args: str, check: bool = True, timeout: int | None = 600, input_text
     if check and proc.returncode != 0:
         raise RuntimeError(f"docker {' '.join(args[:3])} failed rc={proc.returncode}: {proc.stderr.strip()[:800]}")
     return proc
-
-
-def _guard(name: str) -> None:
-    if not name.startswith(PREFIX):
-        raise RuntimeError(f"refusing to touch non-campaign docker object {name!r}")
-
-
-def rm_container(name: str) -> None:
-    _guard(name)
-    docker("rm", "-f", "-v", name, check=False)
-
-
-def rm_network(name: str) -> None:
-    _guard(name)
-    docker("network", "rm", name, check=False)
 
 
 def published_port(container: str, port: int) -> int:
@@ -320,14 +313,19 @@ class Stack:
     extra_db_init: list[str] = field(default_factory=list)
     ready_timeout: float = 420.0
     app_mem: str = "2g"
+    db_image: str = POSTGRES_IMAGE
+    launch_prefix: tuple[str, ...] = ()
     run_id: str = ""
     host_port: int = 0
 
     def __post_init__(self) -> None:
         self.run_id = self.run_id or f"{int(time.time())}"
         self.net = f"{PREFIX}{self.project}-net-{self.run_id}"
-        self.db = f"{PREFIX}{self.project}-db-{self.run_id}"
-        self.app = f"{PREFIX}{self.project}-app-{self.run_id}"
+        self.db_container_name = f"{PREFIX}{self.project}-db-{self.run_id}"
+        self._db_id: str | None = None
+        self.app_container_name = f"{PREFIX}{self.project}-app-{self.run_id}"
+        self._app_id: str | None = None
+        self._owned = DockerFixture(lambda *args, **kwargs: docker(*args, **kwargs))
 
     # ---- lifecycle
     mode: str = field(default_factory=lambda: os.environ.get("XCAMP_APP_MODE", "docker"))  # docker | host
@@ -335,6 +333,18 @@ class Stack:
     _logfile: pathlib.Path | None = None
     db_host_port: int = 0
     launcher_exit: int | None = None
+
+    @property
+    def db(self) -> str:
+        if self._db_id is None or self._db_id not in self._owned.containers:
+            raise RuntimeError("campaign database container unavailable")
+        return self._db_id
+
+    @property
+    def app(self) -> str:
+        if self._app_id is None or self._app_id not in self._owned.containers:
+            raise RuntimeError("campaign application container unavailable")
+        return self._app_id
 
     def _subst(self, value: str) -> str:
         host = self.mode == "host"
@@ -344,19 +354,32 @@ class Stack:
                      .replace("{APPPORT}", str(self.host_port) if host else str(self.app_port)))
 
     def up(self) -> None:
-        self.down()
-        docker("network", "create", self.net)
+        if self._proc is not None or self._owned.network is not None or self._owned.containers:
+            raise RuntimeError("campaign stack still owns resources; explicit cleanup is required")
+        try:
+            self._up()
+        except BaseException as error:
+            try:
+                self.down()
+            except Exception as cleanup:
+                raise CleanupFailure((error, cleanup), self) from error
+            raise
+
+    def _up(self) -> None:
+        self._db_id = self._app_id = None
+        self._logfile = None
+        self._owned.create_network(self.net)
         self.host_port = 0
         if self.db_name:
             publish = []
             if self.mode == "host":
                 publish = ["-p", "127.0.0.1::5432"]
-            docker("run", "-d", "--name", self.db, "--platform", PLATFORM, "--network", self.net, "--network-alias", "db",
+            self._db_id = self._owned.run_container(["run", "-d", "--name", self.db_container_name, "--platform", PLATFORM, "--network", self._owned.network, "--network-alias", "db",
                    *publish,
                    "-e", f"POSTGRES_USER={self.db_user}", "-e", f"POSTGRES_PASSWORD={self.db_password}",
                    "-e", f"POSTGRES_DB={self.db_name}", "--tmpfs", "/var/lib/postgresql:rw,size=1g",
-                   POSTGRES_IMAGE, "-c", "fsync=off", "-c", "max_connections=200", "-c", "timezone=UTC",
-                   "-c", "log_timezone=UTC")
+                   self.db_image, "-c", "fsync=off", "-c", "max_connections=200", "-c", "timezone=UTC",
+                   "-c", "log_timezone=UTC"])
             if self.mode == "host":
                 self.db_host_port = published_port(self.db, 5432)
             self._wait_db()
@@ -370,50 +393,52 @@ class Stack:
             java = os.environ.get("XCAMP_JAVA")
             if not java:
                 raise RuntimeError("XCAMP_APP_MODE=host requires XCAMP_JAVA (path to the JDK `java` binary)")
-            prefix = shlex.split(os.environ.get("XCAMP_LAUNCH_PREFIX", ""))
-            self._logfile = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / f"{PREFIX}{self.project}-{self.run_id}.log"
+            prefix = self.launch_prefix or shlex.split(os.environ.get("XCAMP_LAUNCH_PREFIX", ""))
             child_env = {**os.environ, **env, "TZ": "UTC"}
-            for k in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
+            for k in JAVA_OPTIONS_ENV:
                 child_env.pop(k, None)
-            with open(self._logfile, "wb") as fh:
+            with tempfile.NamedTemporaryFile(mode="wb", prefix=f"{PREFIX}{self.project}-{self.run_id}-",
+                                             suffix=".log", dir=os.environ.get("TMPDIR", "/tmp"), delete=False) as fh:
+                self._logfile = pathlib.Path(fh.name)
                 self._proc = subprocess.Popen(
                     [*prefix, java, "-Duser.timezone=UTC", "-Dfile.encoding=UTF-8", *self.java_opts, "-jar", str(self.jar), *args],
                     stdout=fh, stderr=subprocess.STDOUT, env=child_env, start_new_session=True)
         else:
-            cmd = ["run", "-d", "--name", self.app, "--platform", PLATFORM, "--network", self.net, "--memory", self.app_mem,
+            cmd = ["run", "-d", "--name", self.app_container_name, "--platform", PLATFORM, "--network", self._owned.network, "--memory", self.app_mem,
                    "-p", f"127.0.0.1::{self.app_port}",
                    "-v", f"{self.jar.parent}:/app:ro", "-w", "/app", "-e", "TZ=UTC"]
             for k, v in env.items():
                 cmd += ["-e", f"{k}={v}"]
             cmd += [self.jdk_image, "java", "-Duser.timezone=UTC", "-Dfile.encoding=UTF-8", *self.java_opts,
                     "-jar", f"/app/{self.jar.name}", *args]
-            docker(*cmd)
+            self._app_id = self._owned.run_container(cmd)
             self.host_port = published_port(self.app, self.app_port)
         self._wait_ready()
 
     def down(self) -> None:
+        failures = []
         if self._proc is not None:
-            import signal
-            if self._proc.poll() is None:
-                try:
-                    # SIGTERM to the launcher PID we started (not the whole group): under `xtrace run` the launcher forwards
-                    # it to the JVM and then drains the daemon, which a group-wide signal would cut short.
-                    os.kill(self._proc.pid, signal.SIGTERM)
-                    self._proc.wait(timeout=90)
-                except Exception:
-                    try:
-                        os.killpg(self._proc.pid, signal.SIGKILL)  # only the process group we started
-                    except Exception:
-                        pass
+            try:
+                # The direct launcher forwards TERM to its JVM and drains the daemon.
+                # Its full original graceful wait is retained; no descendant is signalled here.
+                stop_child(self._proc, 90)
+            except Exception as error:
+                failures.append(error)
             self.launcher_exit = self._proc.poll()
-            self._proc = None
-        rm_container(self.app)
-        rm_container(self.db)
-        rm_network(self.net)
+            if self.launcher_exit is not None:
+                self._proc = None
+        try:
+            self._owned.cleanup()
+        except Exception as error:
+            failures.append(error)
+        if failures:
+            raise CleanupFailure(failures, self)
 
     def logs(self) -> str:
         if self.mode == "host":
             return self._logfile.read_text(errors="replace") if self._logfile and self._logfile.exists() else ""
+        if self._app_id not in self._owned.containers:
+            return ""  # No application output was observed for this invocation.
         p = docker("logs", self.app, check=False)
         return p.stdout + p.stderr
 
@@ -489,8 +514,8 @@ class Stack:
                 try:
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    proc.terminate()  # only the docker exec process this harness started
-                    proc.wait(timeout=10)
+                    stop_child(proc, 10)  # only the docker exec process this harness started
+                    raise
                 finally:
                     proc.stdout.close()
 
@@ -519,14 +544,18 @@ def git_pin_check(src: pathlib.Path, sha: str) -> dict[str, Any]:
 def docker_build(project: str, src: pathlib.Path, image: str, cmd: str, volumes: dict[str, str],
                  log: pathlib.Path, mem: str = "6g", timeout: int = 5400) -> int:
     name = f"{PREFIX}build-{project}"
-    rm_container(name)
     args = ["run", "--rm", "--name", name, "--platform", PLATFORM, "--memory", mem, "-v", f"{src}:/work", "-w", "/work"]
     for vol, mount in volumes.items():
         args += ["-v", f"{vol}:{mount}"]
     args += [image, "sh", "-c", cmd]
     log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "wb") as fh:
-        p = subprocess.run(["docker", *args], stdout=fh, stderr=subprocess.STDOUT, env=_docker_env(), timeout=timeout)
+    owned = DockerFixture(lambda *args, **kwargs: docker(*args, **kwargs))
+    try:
+        with open(log, "wb") as fh, owned.container_run(args) as (argv, result):
+            p = subprocess.run(["docker", *argv], stdout=fh, stderr=subprocess.STDOUT, env=_docker_env(), timeout=timeout)
+            result[0] = p
+    finally:
+        owned.cleanup()
     return p.returncode
 
 

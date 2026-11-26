@@ -16,6 +16,12 @@ class Ports(unittest.TestCase):
         return xcamp.Stack(project="petclinic", jdk_image="jdk", jar=pathlib.Path("app.jar"),
                            app_args=["--server.port={APPPORT}"], app_port=8080, ready_path="/health", **kw)
 
+    def acquired_database(self):
+        stack = self.stack(db_name="petclinic")
+        stack._db_id = "b" * 64
+        stack._owned.containers.append(stack._db_id)
+        return stack
+
     def test_bound_port_requires_a_started_server_message(self):
         self.assertIsNone(xcamp.spring_bound_port("Tomcat initialized with port 0 (http)"))
         self.assertEqual(xcamp.spring_bound_port("Tomcat started on port 39451 (http) with context path '/'"), 39451)
@@ -25,7 +31,7 @@ class Ports(unittest.TestCase):
     def test_host_starts_with_zero_and_discovers_actual_port_before_http(self):
         stack = self.stack(mode="host")
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(xcamp.os.environ, {"XCAMP_JAVA": "java", "TMPDIR": td}), \
-             mock.patch.object(stack, "down"), mock.patch.object(xcamp, "docker"), \
+             mock.patch.object(stack, "down"), mock.patch.object(xcamp, "docker", return_value=subprocess.CompletedProcess([], 0, "a" * 64, "")), \
              mock.patch.object(xcamp.subprocess, "Popen") as launch, \
              mock.patch.object(stack, "logs", return_value="Tomcat started on port 39451 (http)"), \
              mock.patch.object(xcamp, "http_request", return_value={"status": 200, "body": b"UP"}) as request:
@@ -38,7 +44,7 @@ class Ports(unittest.TestCase):
     def test_docker_allocates_both_host_bindings(self):
         stack = self.stack(mode="host", db_name="petclinic")
         with mock.patch.object(stack, "down"), mock.patch.object(stack, "_wait_db"), \
-             mock.patch.object(stack, "_wait_ready"), mock.patch.object(xcamp, "docker") as docker, \
+             mock.patch.object(stack, "_wait_ready"), mock.patch.object(xcamp, "docker", return_value=subprocess.CompletedProcess([], 0, "a" * 64, "")) as docker, \
              mock.patch.object(xcamp, "published_port", return_value=39452), \
              tempfile.TemporaryDirectory() as td, mock.patch.dict(xcamp.os.environ, {"XCAMP_JAVA": "java", "TMPDIR": td}), \
              mock.patch.object(xcamp.subprocess, "Popen"):
@@ -48,7 +54,7 @@ class Ports(unittest.TestCase):
             self.assertEqual(stack.db_host_port, 39452)
         stack = self.stack(mode="docker")
         with mock.patch.object(stack, "down"), mock.patch.object(stack, "_wait_ready"), \
-             mock.patch.object(xcamp, "docker") as docker, mock.patch.object(xcamp, "published_port", return_value=39453):
+             mock.patch.object(xcamp, "docker", return_value=subprocess.CompletedProcess([], 0, "a" * 64, "")) as docker, mock.patch.object(xcamp, "published_port", return_value=39453):
             stack.up()
             app_run = next(c.args for c in docker.call_args_list if c.args[0] == "run")
             self.assertIn("127.0.0.1::8080", app_run)
@@ -61,7 +67,7 @@ class Ports(unittest.TestCase):
                     xcamp.published_port("app", 8080)
 
     def test_database_readiness_requires_tcp_query_not_init_socket(self):
-        stack = self.stack(db_name="petclinic")
+        stack = self.acquired_database()
         with mock.patch.object(xcamp, "docker", side_effect=[
             subprocess.CompletedProcess([], 0, "ready"), subprocess.CompletedProcess([], 0, "1\n")
         ]) as docker, mock.patch.object(xcamp.time, "sleep") as sleep:
@@ -81,7 +87,7 @@ class Ports(unittest.TestCase):
         self.assertEqual(events, [("pace", 0.4), ("request", "/vets")])
 
     def test_owner_write_barrier_requires_lock_acknowledgement_and_releases_on_error(self):
-        stack = self.stack(db_name="petclinic")
+        stack = self.acquired_database()
         for acknowledged in (True, False):
             proc = mock.Mock(stdin=mock.Mock(), stdout=io.BytesIO(b"1\n" if acknowledged else b""))
             entered = False
@@ -102,7 +108,7 @@ class Ports(unittest.TestCase):
                 sleep.assert_not_called()
 
     def test_owner_write_barrier_silence_never_admits_a_request(self):
-        stack = self.stack(db_name="petclinic")
+        stack = self.acquired_database()
         proc = mock.Mock()
         with mock.patch.object(xcamp.subprocess, "Popen", return_value=proc), \
                 mock.patch("select.select", return_value=([], [], [])):
