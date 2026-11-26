@@ -166,19 +166,24 @@ public final class BootstrapBridge {
 
   /** Opens a request context for one matched route and emits its sanitized request identity. */
   public static boolean requestStart(String method, String route) {
-    return requestStart(method, route, 0, false);
+    return requestStart(method, route, 0, false, false);
   }
 
   /** Closes a route-less root from a completed standard filter-chain observation. */
   static void filterRefusal(String method, long started, int status, boolean errorPending) {
-    if (!hasContext() && requestStart(method, "", started, true)) {
+    if (!hasContext() && requestStart(method, "", started, true, false)) {
       if (errorPending) provisionalRequestEnd(status, null);
       else requestEnd(status, (Throwable) null);
     }
   }
 
+  /** The concrete service entry was reached earlier on this thread. */
+  static boolean jerseyStart(String method, String route, long serviceStarted) {
+    return requestStart(method, route, serviceStarted, false, true);
+  }
+
   private static boolean requestStart(
-      String method, String route, long chainStarted, boolean filterOnly) {
+      String method, String route, long boundaryStarted, boolean filterOnly, boolean jersey) {
     RequestContext stale = CONTEXT.get();
     // A request whose end was deferred for exception resolution but never resolved on this
     // thread is closed without a status so it cannot leak into the next request. Only the
@@ -190,13 +195,23 @@ public final class BootstrapBridge {
     BridgeSink sink = SINK.get();
     if (sink == null) return false;
     String recordingId = UuidV7.random().toString();
-    long started = filterOnly ? chainStarted : System.nanoTime();
+    long started = filterOnly || jersey ? boundaryStarted : System.nanoTime();
     RequestContext context = new RequestContext(recordingId, started);
-    if (!safeStart(sink, context, method, route)) {
+    if (!safeStart(sink, context, method, route, jersey)) {
       safeIncomplete(sink, BridgeSink.INCOMPLETE_START_REJECTED);
       return false;
     }
     CONTEXT.set(context);
+    if (jersey) {
+      // Emit the buffered concrete service entrance at its observed time, before the
+      // later dispatch publishes the matched template. No source binding is implied.
+      String service = JerseyBridge.SERVICE;
+      String event = context.nextEventId();
+      boolean accepted = safeEventAt(sink, context, event, "", BridgeEventKind.FRAME_ENTER,
+          service, started, 0);
+      if (!accepted) context.dropped++;
+      context.frames.push(new Frame(service, accepted ? event : ""));
+    }
     String requestId = context.nextEventId();
     if (safeEvent(
         sink,
@@ -691,8 +706,9 @@ public final class BootstrapBridge {
   }
 
   private static boolean safeStart(
-      BridgeSink sink, RequestContext context, String method, String route) {
+      BridgeSink sink, RequestContext context, String method, String route, boolean jersey) {
     try {
+      if (jersey) return sink.offerJerseyStart(context.recordingId, context.startedMonotonicNs, method, route);
       return sink.offerStart(context.recordingId, context.startedMonotonicNs, method, route);
     } catch (RuntimeException | LinkageError ignored) {
       disable(sink);
@@ -708,15 +724,13 @@ public final class BootstrapBridge {
       int kind,
       String symbol,
       int detail) {
+    return safeEventAt(sink, context, eventId, parentEventId, kind, symbol, System.nanoTime(), detail);
+  }
+
+  private static boolean safeEventAt(BridgeSink sink, RequestContext context, String eventId,
+      String parentEventId, int kind, String symbol, long observedAt, int detail) {
     try {
-      return sink.offerEvent(
-          context.recordingId,
-          eventId,
-          parentEventId,
-          kind,
-          symbol,
-          System.nanoTime(),
-          detail);
+      return sink.offerEvent(context.recordingId, eventId, parentEventId, kind, symbol, observedAt, detail);
     } catch (RuntimeException | LinkageError ignored) {
       disable(sink);
       return false;

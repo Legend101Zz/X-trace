@@ -64,6 +64,15 @@ final class RuntimeBridgeSink implements BridgeSink {
 
   @Override
   public boolean offerStart(String recordingId, long monotonicNs, String method, String route) {
+    return offerStart(recordingId, monotonicNs, method, route, false);
+  }
+
+  @Override
+  public boolean offerJerseyStart(String recordingId, long monotonicNs, String method, String route) {
+    return offerStart(recordingId, monotonicNs, method, route, true);
+  }
+
+  private boolean offerStart(String recordingId, long monotonicNs, String method, String route, boolean jersey) {
     inFlightStartAdmissions.incrementAndGet();
     try {
       afterStartIncrement.run();
@@ -77,7 +86,7 @@ final class RuntimeBridgeSink implements BridgeSink {
       int bytes = estimate(recordingId, method, route);
       boolean accepted =
           queue.offerLifecycle(
-              new QueueSignal.Start(recordingId, monotonicNs, method, route, bytes, metadata));
+              new QueueSignal.Start(recordingId, monotonicNs, method, route, bytes, metadata, jersey));
       if (!accepted) {
         if (metadata) {
           metadataOnly.remove(recordingId);

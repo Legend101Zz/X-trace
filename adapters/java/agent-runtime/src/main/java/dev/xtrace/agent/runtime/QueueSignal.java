@@ -9,8 +9,17 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
       String method,
       String route,
       int estimatedBytes,
-      boolean metadataOnly)
+      boolean metadataOnly,
+      boolean jersey)
       implements QueueSignal {
+    Start(String recordingId, long monotonicNs, String method, String route, int estimatedBytes, boolean metadataOnly) {
+      this(recordingId, monotonicNs, method, route, estimatedBytes, metadataOnly, false);
+    }
+
+    String frameworkDriver() {
+      return jersey ? "jersey" : route.isEmpty() ? "servlet" : "spring-mvc";
+    }
+
     Start(String recordingId, long monotonicNs, String method, String route, int estimatedBytes) {
       this(recordingId, monotonicNs, method, route, estimatedBytes, false);
     }

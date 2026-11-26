@@ -222,6 +222,7 @@ final class FixtureInstrumentation {
               (target, type, loader, module, domain) ->
                   target.visit(Advice.to(PgJdbcAdvice.class).on(pgJdbcMethods())));
     }
+    if (!attach) JerseyInstrumentation.install(instrumentation);
     builder.installOn(instrumentation);
     ServletBoundaryInstrumentation.install(instrumentation, onFailure, attach);
   }

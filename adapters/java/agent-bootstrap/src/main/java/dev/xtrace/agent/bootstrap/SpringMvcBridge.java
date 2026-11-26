@@ -53,6 +53,7 @@ public final class SpringMvcBridge {
     private int depth;
     private boolean recorded;
     private boolean errorPending;
+    private boolean jersey;
     private boolean asyncStarted;
   }
 
@@ -90,6 +91,24 @@ public final class SpringMvcBridge {
     state.depth++;
   }
 
+  static boolean jerseyMayStart() {
+    ServletState state = SERVLET.get();
+    return state != null && !state.recorded && !state.errorPending && DISPATCH.get() == null
+        && !BootstrapBridge.hasContext();
+  }
+
+  static void jerseyStarted() {
+    ServletState state = SERVLET.get();
+    state.recorded = true;
+    state.jersey = true;
+  }
+
+  /** A Jersey activation encountered async work, a nested service or an escaped dispatch. */
+  public static void jerseyOutcomeUncertain() {
+    ServletState state = SERVLET.get();
+    if (state != null && state.jersey) state.asyncStarted = true;
+  }
+
   /** sendError may report committed before the container has rendered its error page. */
   public static void servletSendError() {
     ServletFilterBridge.sendError();
@@ -108,7 +127,8 @@ public final class SpringMvcBridge {
     if (--state.depth != 0) return;
     try {
       if (state.recorded && BootstrapBridge.hasContext()) {
-        if (state.asyncStarted || (request != null && asyncStarted(request))) {
+        Boolean async = asyncState(request);
+        if (state.asyncStarted || Boolean.TRUE.equals(async) || (state.jersey && async == null)) {
           BootstrapBridge.provisionalRequestEnd(status(response), null);
         } else {
           finish(response, thrown, !state.errorPending && thrown == null);

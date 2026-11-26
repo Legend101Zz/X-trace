@@ -175,6 +175,7 @@ final class ServletBoundaryInstrumentation {
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static void enter() {
+      SpringMvcBridge.jerseyOutcomeUncertain();
       ServletFilterBridge.downstreamEnter();
     }
   }
