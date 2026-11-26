@@ -1,4 +1,4 @@
-name: Medusa installed development proof successor
+name: Medusa installed development lifecycle proof
 on:
   push:
     branches: [codex/proof-medusa-installed-120]
@@ -12,8 +12,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      MEDUSA_PRODUCT_SHA: 89596b9cc51b1fa283b55842f5ffd83b53895ccd
-      MEDUSA_PRODUCT_TREE: dae23c4eb3d5aaa87542c1cfd1f1962ab3ec2bd9
+      MEDUSA_PRODUCT_SHA: 25cb8d8209b55a49acf44737a4d2a41d85cccd6c
+      MEDUSA_PRODUCT_TREE: 3979a273ada5c5ade848dd45bc92133933f00ea5
       CARGO_TERM_COLOR: never
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -65,28 +65,28 @@ jobs:
           from contextlib import contextmanager
           from pathlib import Path
 
-          INSTALLED_SHA = "fcc453f29238c6fa0e0e92adc7fa0da76ac82fe3a310956547eedf7db8efc5ca"
-          PRODUCT_TREE = "dae23c4eb3d5aaa87542c1cfd1f1962ab3ec2bd9"
+          INSTALLED_SHA = "7b7e618e8c793aa58328a22011eb20b34c45c7f05ce987d71d901fd7654a17df"
+          PRODUCT_TREE = "3979a273ada5c5ade848dd45bc92133933f00ea5"
 
           # Ordered, exhaustive line ranges for the body of Proof.install's package stage.
           # Exact source bytes are checked before compiling, and each original statement
           # is covered exactly once. The names are finite and never taken from runtime data.
           OPERATIONS = (
-              ("hash-archive", 331, 331),
-              ("verify-dist", 332, 332),
-              ("verify-package-binary-schema-tui", 333, 334),
-              ("load-archive-verifier", 335, 337),
-              ("extract-archive", 338, 340),
-              ("check-package-identity", 341, 343),
-              ("check-fresh-prefix-and-archive-digest", 344, 344),
-              ("install-fresh-prefix", 345, 346),
-              ("verify-installed-prefix", 347, 348),
-              ("check-installed-cli-target", 349, 349),
-              ("compare-package-manifests", 350, 350),
-              ("compare-cli-bytes", 351, 351),
-              ("compare-node-runtime-manifests", 352, 353),
-              ("hash-installed-cli-and-node-manifest", 354, 354),
-              ("installed-cli-version", 355, 355),
+              ("hash-archive", 387, 387),
+              ("verify-dist", 388, 388),
+              ("verify-package-binary-schema-tui", 389, 390),
+              ("load-archive-verifier", 391, 393),
+              ("extract-archive", 394, 396),
+              ("check-package-identity", 397, 399),
+              ("check-fresh-prefix-and-archive-digest", 400, 400),
+              ("install-fresh-prefix", 401, 402),
+              ("verify-installed-prefix", 403, 404),
+              ("check-installed-cli-target", 405, 405),
+              ("compare-package-manifests", 406, 406),
+              ("compare-cli-bytes", 407, 407),
+              ("compare-node-runtime-manifests", 408, 409),
+              ("hash-installed-cli-and-node-manifest", 410, 410),
+              ("installed-cli-version", 411, 411),
           )
 
 
@@ -96,7 +96,7 @@ jobs:
               parsed = ast.parse(source, filename=filename)
               (proof,) = [node for node in parsed.body if isinstance(node, ast.ClassDef) and node.name == "Proof"]
               (install,) = [node for node in proof.body if isinstance(node, ast.FunctionDef) and node.name == "install"]
-              (package,) = [node for node in install.body if isinstance(node, ast.With) and node.lineno == 330]
+              (package,) = [node for node in install.body if isinstance(node, ast.With) and node.lineno == 386]
               remaining = package.body.copy()
               wrapped = []
               for label, start, end in OPERATIONS:
@@ -205,7 +205,7 @@ jobs:
               main()
           MEDUSA_PACKAGE_CHECKPOINTS
           helper_sum=$(sha256sum "$MEDUSA_ROOT/outer/package-checkpoints.py")
-          test "${helper_sum%% *}" = "784903a35280cd66bc3038f4a0b48140ffad5a8e407980d0fb5359b60cdec01d"
+          test "${helper_sum%% *}" = "3633a355eb903531b7eeed51aa76bbaa723da02c9244e12876f7c1c2fa0dc3fb"
           rc=0
           python3 -B - <<'PYTHON' >"$MEDUSA_ROOT/outer/controller.stdout" 2>"$MEDUSA_ROOT/outer/controller.stderr" || rc=$?
           import json, os, pathlib, re, subprocess, sys
@@ -221,13 +221,14 @@ jobs:
           contain_children()
           stages = ('named-tests', 'named-counts', 'local-transport-tests', 'local-transport-counts',
                     'staged-copy-tests', 'staged-copy-counts', 'package-verifier-tests', 'package-verifier-counts',
+                    'lifecycle-tests', 'lifecycle-counts',
                     'package-build', 'clone-starter', 'database-image', 'installed-journey', 'runner-cleanup')
           docker = ['docker', '--host', 'unix:///var/run/docker.sock']
           receipt = {'schemaVersion': 1, 'kind': 'medusa-proof-120-host',
                      'sourceSha': os.environ['MEDUSA_PRODUCT_SHA'], 'sourceTree': os.environ['MEDUSA_PRODUCT_TREE'],
                      'status': 'failed', 'stages': dict.fromkeys(stages, 'unreached'),
                      'namedTests': None, 'localTransportTests': None,
-                     'stagedCopyTests': None, 'packageVerifierTests': None}
+                     'stagedCopyTests': None, 'packageVerifierTests': None, 'lifecycleTests': None}
           def save():
               atomic_write_private(root / 'safe/host.json', (json.dumps(receipt, sort_keys=True)+'\n').encode())
           def command(stage, args, timeout):
@@ -252,10 +253,10 @@ jobs:
                       verify_children_gone()
               receipt['stages'][stage] = 'passed'
               save()
-          def package_tests(label, pattern, field, expected):
+          def package_tests(label, pattern, field, expected, *, directory='packaging/test'):
               result_path = root/'outer'/(label+'.json')
               command(label+'-tests', ['python3', '-B', '-m', 'tools.qa.unittest_run', '--result',
-                      str(result_path), 'discover', '-s', 'packaging/test', '-p', pattern], 30)
+                      str(result_path), 'discover', '-s', directory, '-p', pattern], 30)
               count_stage = label+'-counts'
               receipt['stages'][count_stage] = 'failed'
               save()
@@ -332,6 +333,7 @@ jobs:
           save()
           package_tests('staged-copy', 'test_node_pack.py', 'stagedCopyTests', 1)
           package_tests('package-verifier', 'test_verify_package.py', 'packageVerifierTests', 12)
+          package_tests('lifecycle', 'test_installed_lifecycle.py', 'lifecycleTests', 2, directory=harness)
           command('package-build', ['python3', '-B', 'packaging/build.py', '--out', str(proof/'dist'),
                                      '--work', str(root/'build'), '--platform', 'linux-x86_64'], 3600)
           archives = list((proof/'dist/linux-x86_64').glob('xtrace-*-linux-x86_64.tar.gz'))
@@ -355,7 +357,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() && steps.root.outputs.admitted == 'true' }}
         with:
-          name: medusa-installed-120-successor-counts
+          name: medusa-installed-120-lifecycle-counts
           path: |
             ${{ env.MEDUSA_ROOT }}/safe/host.json
             ${{ env.MEDUSA_ROOT }}/safe/package.json
