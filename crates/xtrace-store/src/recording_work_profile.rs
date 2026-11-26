@@ -28,6 +28,7 @@ struct Profile {
     checkpoint_detail: bool,
     #[cfg(unix)]
     checkpoint_prepare_detail: bool,
+    segment_sql_detail: bool,
     started: Instant,
     changed: Instant,
     probes: u64,
@@ -132,6 +133,8 @@ impl WorkProfile {
                 #[cfg(unix)]
                 checkpoint_prepare_detail: std::env::var_os("XTRACE_CHECKPOINT_PREPARE_DETAIL")
                     .is_some_and(|value| value == "1"),
+                segment_sql_detail: std::env::var_os("XTRACE_SEGMENT_SQL_DETAIL")
+                    .is_some_and(|value| value == "1"),
                 started: now,
                 changed: now,
                 probes: ls_spawns_on_this_thread(),
@@ -204,6 +207,12 @@ impl Phase {
         let enabled = PROFILE.with(|slot| {
             slot.borrow().as_ref().is_some_and(|profile| profile.checkpoint_prepare_detail)
         });
+        enabled.then(|| Self::enter(name))
+    }
+
+    pub(crate) fn segment_sql_detail(name: &'static str) -> Option<Self> {
+        let enabled = PROFILE
+            .with(|slot| slot.borrow().as_ref().is_some_and(|profile| profile.segment_sql_detail));
         enabled.then(|| Self::enter(name))
     }
 

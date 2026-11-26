@@ -1706,9 +1706,15 @@ impl SqliteRecordingStore<'_> {
             commit_failpoint("before-transaction", correlation_id, false)?;
             let connection =
                 self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+            #[cfg(test)]
+            let mut sql_detail = work_profile::Phase::segment_sql_detail("segment_sql_begin");
             let transaction = connection.unchecked_transaction().map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
+            #[cfg(test)]
+            if let Some(phase) = sql_detail.as_mut() {
+                phase.switch("segment_sql_segment_insert");
+            }
             let inserted = transaction.execute(
                 "INSERT INTO recording_segments \
                  (recording_id, segment_ordinal, object_hash, first_recording_seq, \
@@ -1728,7 +1734,15 @@ impl SqliteRecordingStore<'_> {
             );
             match inserted {
                 Ok(_) => {
+                    #[cfg(test)]
+                    if let Some(phase) = sql_detail.as_mut() {
+                        phase.switch("segment_sql_frame_index_insert");
+                    }
                     insert_frame_index_rows(&transaction, request, correlation_id)?;
+                    #[cfg(test)]
+                    if let Some(phase) = sql_detail.as_mut() {
+                        phase.switch("segment_sql_commit");
+                    }
                     commit_failpoint("before-transaction-commit", correlation_id, false)?;
                     transaction.commit().map_err(|error| {
                         map_store_error(
@@ -1739,6 +1753,10 @@ impl SqliteRecordingStore<'_> {
                     Ok(None)
                 }
                 Err(error) => {
+                    #[cfg(test)]
+                    if let Some(phase) = sql_detail.as_mut() {
+                        phase.switch("segment_sql_rollback");
+                    }
                     let mapped = StoreError::from_rusqlite(error, correlation_id);
                     transaction.rollback().map_err(|rollback| {
                         map_store_error(
@@ -1747,6 +1765,10 @@ impl SqliteRecordingStore<'_> {
                         )
                     })?;
                     if matches!(mapped.kind(), StoreErrorKind::AlreadyExists) {
+                        #[cfg(test)]
+                        if let Some(phase) = sql_detail.as_mut() {
+                            phase.switch("segment_sql_conflict");
+                        }
                         let existing = load_segment_row(
                             &connection,
                             request.recording_id,
