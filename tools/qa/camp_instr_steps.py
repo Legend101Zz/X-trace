@@ -12,8 +12,10 @@ A missing or unreadable input is a failed step, never a pass.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
+import re
 import sys
 
 sys.dont_write_bytecode = True
@@ -101,17 +103,149 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
     return out
 
 
-def browser_steps(j: dict | None) -> list[tuple[str, str, str]]:
-    if j is None:
-        return [("browser-journeys-linear", "fail", "no journeys.json (browser run did not finish)"),
-                ("browser-journeys-canvas", "fail", "no journeys.json")]
-    widths = ",".join(str(w["width"]) for w in j.get("widths", []))
-    lin = j.get("linear")
-    note = f"widths {widths}; overflow at [{','.join(map(str, j.get('overflowAt', [])))}]"
-    out = [("browser-journeys-linear", "pass" if lin == "pass" and not j.get("overflowAt") else "fail", note)]
-    can = j.get("canvas")
-    out.append(("browser-journeys-canvas", {"pass": "pass", "not-implemented": "not-implemented"}.get(can, "fail"), note))
-    return out
+BROWSER_WIDTHS = (320, 736, 1024, 1280, 1440)
+BROWSER_PHASES = ("list", "recordings", "linear", "canvas", "returnToSteps")
+
+
+def _browser_screenshot(path: pathlib.Path, width: int, digest: object) -> bool:
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return False
+    try:
+        image = path.read_bytes()
+    except OSError:
+        return False
+    return (len(image) > 45 and image.startswith(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
+            and width <= int.from_bytes(image[16:20], "big") <= width + 1
+            and int.from_bytes(image[20:24], "big") > 0
+            and image.endswith(b"\0\0\0\0IEND\xaeB`\x82")
+            and hashlib.sha256(image).hexdigest() == digest)
+
+
+def browser_steps(j: dict | None, widths: tuple[int, ...] = BROWSER_WIDTHS, *,
+                  frame_dir: pathlib.Path | None = None, source_sha: str = "",
+                  package_sha256: str = "", require_current: bool = False) -> list[tuple[str, str, str]]:
+    def results(linear: str, canvas: str, note: str):
+        return [("browser-journeys-linear", linear, note), ("browser-journeys-canvas", canvas, note)]
+
+    if not isinstance(j, dict):
+        return results("fail", "fail", "browser report missing or unreadable")
+    rows = j.get("widths")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) or type(row.get("width")) is not int
+                                        or not 0 < row["width"] <= 2**53 - 1 for row in rows):
+        return results("fail", "fail", "invalid viewport rows")
+    observed = [row["width"] for row in rows]
+    width_note = f"observed widths {','.join(map(str, observed)) or 'none'}"
+    if j.get("schemaVersion") == 1 and j.get("kind") == "browser_journeys":
+        note = f"legacy evidence without selection proof; {width_note}"
+        if require_current:
+            return results("fail", "fail", note)
+        if not rows or len(set(observed)) != len(observed) or j.get("overflowAt") != []:
+            return results("fail", "fail", note)
+        legacy = []
+        for mode in ("linear", "canvas"):
+            declared = j.get(mode)
+            earned = declared == "pass" or (mode == "canvas" and declared == "not-implemented")
+            for row in rows:
+                steps = row.get("steps")
+                if (not isinstance(steps, dict) or "error" in steps
+                        or row.get("horizontalOverflow") is not False
+                        or type(row.get("pageErrors")) is not int or row["pageErrors"] != 0):
+                    earned = False
+                    break
+                listing = steps.get("list")
+                result = steps.get(mode)
+                if (not isinstance(listing, dict) or listing.get("status") != "pass"
+                        or not isinstance(result, dict) or result.get("status") != declared):
+                    earned = False
+                    break
+            legacy.append("reported" if earned and declared == "pass" else "not-implemented" if earned else "fail")
+        return results(*legacy, note)
+    if j.get("schemaVersion") != 2 or j.get("kind") != "browser_journeys":
+        return results("fail", "fail", "unsupported browser report schema")
+    if len(set(observed)) != len(observed) or set(observed) != set(widths):
+        return results("fail", "fail", f"incomplete, duplicate or unexpected viewports; {width_note}")
+    if (not source_sha or j.get("sourceSha") != source_sha
+            or not package_sha256 or j.get("packageSha256") != package_sha256):
+        return results("fail", "fail", "browser package provenance missing or mismatched")
+
+    raw_statuses = {"linear": [], "canvas": []}
+    failures = {"linear": [], "canvas": []}
+    overflow_at = []
+    notes = []
+    for row in rows:
+        w = row["width"]
+        issues = []
+        steps = row.get("steps")
+        if not isinstance(steps, dict):
+            steps = {}
+        for mode, statuses in raw_statuses.items():
+            entry = steps.get(mode)
+            statuses.append(entry.get("status") if isinstance(entry, dict) else None)
+
+        shared_failure = type(row.get("pageErrors")) is not int or row["pageErrors"] != 0 or "cleanup" in steps
+        if shared_failure:
+            issues.append("page errors or cleanup failure")
+        linear_failed = shared_failure
+        canvas_failed = shared_failure
+        map_unavailable = steps.get("canvas") == {"status": "not-implemented"}
+        if map_unavailable:
+            issues.append("Map unavailable")
+
+        row_overflow = False
+        for phase in BROWSER_PHASES:
+            if map_unavailable and phase == "canvas":
+                continue
+            if map_unavailable and phase == "returnToSteps" and phase not in steps:
+                continue
+            step = steps.get(phase)
+            overflow = isinstance(step, dict) and step.get("horizontalOverflow") is True
+            row_overflow |= overflow
+            if overflow:
+                issues.append(f"{phase} overflow")
+                earned = False
+            elif not isinstance(step, dict) or step.get("status") != "pass" or step.get("horizontalOverflow") is not False:
+                issues.append(f"{phase} not passed")
+                earned = False
+            else:
+                screenshot = f"{phase}-{w}.png"
+                earned = (frame_dir is not None and step.get("screenshot") == screenshot
+                          and _browser_screenshot(frame_dir / screenshot, w, step.get("screenshotSha256")))
+                if not earned:
+                    issues.append(f"{phase} screenshot missing or invalid")
+            if not earned:
+                canvas_failed = True
+                if phase in ("list", "recordings", "linear"):
+                    linear_failed = True
+        if row_overflow:
+            overflow_at.append(w)
+            linear_failed = True
+        if not map_unavailable and row.get("selectionContinuous") is not True:
+            issues.append("selection continuity unavailable")
+            canvas_failed = True
+        failures["linear"].append(linear_failed)
+        failures["canvas"].append(canvas_failed)
+        if issues:
+            notes.append(f"{w}: {', '.join(issues)}")
+
+    if j.get("browserCloseFailed", False) is not False:
+        return results("fail", "fail", f"{width_note}; browser cleanup failed")
+    declared_overflow = j.get("overflowAt")
+    if (not isinstance(declared_overflow, list) or any(type(w) is not int for w in declared_overflow)
+            or declared_overflow != overflow_at):
+        return results("fail", "fail", f"{width_note}; inconsistent overflow aggregate")
+    rollups = {}
+    for mode, statuses in raw_statuses.items():
+        aggregate = ("pass" if all(v == "pass" for v in statuses) else
+                     "not-implemented" if all(v == "not-implemented" for v in statuses) else "fail")
+        if j.get(mode) != aggregate:
+            notes.append(f"inconsistent {mode} aggregate")
+            rollups[mode] = "fail"
+        elif any(failures[mode]) or (mode == "linear" and aggregate != "pass"):
+            rollups[mode] = "fail"
+        else:
+            rollups[mode] = aggregate
+    note = "; ".join([width_note, *notes])
+    return results(rollups["linear"], rollups["canvas"], note)
 
 
 def tui_steps(t: dict | None) -> list[tuple[str, str, str]]:
@@ -162,12 +296,32 @@ def main() -> int:
     ap.add_argument("--project", required=True)
     for n in ("receipt", "journeys", "tui", "overhead", "flows"):
         ap.add_argument(f"--{n}", default="")
+    ap.add_argument("--widths", default=",".join(map(str, BROWSER_WIDTHS)))
+    ap.add_argument("--source-sha", default="")
+    ap.add_argument("--package-sha256", default="")
     a = ap.parse_args()
-    src = {"instrumented": (a.receipt, instrumented_steps), "flows": (a.flows, flow_steps), "browser": (a.journeys, browser_steps),
-           "tui": (a.tui, tui_steps), "overhead": (a.overhead, overhead_steps)}[a.kind]
-    for step, status, note in src[1](_load(src[0])):
+    if a.kind == "browser":
+        declared = a.widths.split(",")
+        if any(not re.fullmatch(r"[1-9][0-9]{0,15}", w) for w in declared):
+            ap.error("invalid browser widths")
+        widths = tuple(map(int, declared))
+        if len(set(widths)) != len(widths) or any(w > 2**53 - 1 for w in widths):
+            ap.error("invalid browser widths")
+        if ((a.source_sha and not re.fullmatch(r"[0-9a-f]{40}", a.source_sha))
+                or (a.package_sha256 and not re.fullmatch(r"[0-9a-f]{64}", a.package_sha256))):
+            ap.error("invalid browser package provenance")
+        journey = pathlib.Path(a.journeys)
+        steps = browser_steps(_load(a.journeys), widths, frame_dir=journey.parent,
+                              source_sha=a.source_sha, package_sha256=a.package_sha256, require_current=True)
+    else:
+        src = {"instrumented": (a.receipt, instrumented_steps), "flows": (a.flows, flow_steps),
+               "tui": (a.tui, tui_steps), "overhead": (a.overhead, overhead_steps)}[a.kind]
+        steps = src[1](_load(src[0]))
+    for step, status, note in steps:
         cs.record(pathlib.Path(a.file), a.project, step, status, note)
         print(f"campaign step {step}: {status} ({note})")
+    if a.kind == "browser" and any(status != "pass" for _, status, _ in steps):
+        return 1
     return 0
 
 
