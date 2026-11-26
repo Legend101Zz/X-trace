@@ -1,0 +1,132 @@
+# Draft only. Bind SOURCE_PRODUCT after reviewed source is committed; do not dispatch unbound.
+name: Vendure focused installed preflight discriminator
+on:
+  push:
+    branches: [codex/proof-vendure-preflight-only-125]
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      PRODUCT: 'eca0fef629256ed149db534c64cb75acc8a7cd50'
+      PRODUCT_TREE: 'b31a68ea616bb27db3c077a1a9c65d6113245615'
+      PRODUCT_PARENT: '0b34e21ee318b3e46f3d1a81317a1f6478b34866'
+      PATCH_SHA256: '6a86269340362daeaf01b0f906d30ebec60f1e9ed4ca01b551130a18d875f614'
+      XCAMP_PLATFORM: linux/amd64
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Admit exact reviewed source and direct wrapper
+        id: admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$XCAMP_PLATFORM" = linux/amd64
+          test "$GITHUB_REPOSITORY" = Legend101Zz/X-trace
+          test "$GITHUB_REF" = refs/heads/codex/proof-vendure-preflight-only-125
+          test "$GITHUB_EVENT_NAME" = push && test "$GITHUB_RUN_ATTEMPT" = 1
+          [[ "$PRODUCT" =~ ^[a-f0-9]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT"
+          test "$(git show -s --format=%P "$PRODUCT")" = "$PRODUCT_PARENT"
+          test "$(git rev-parse "$PRODUCT^{tree}")" = "$PRODUCT_TREE"
+          test "$(git diff --no-ext-diff --no-textconv --no-color --binary --full-index "$PRODUCT_PARENT" "$PRODUCT" | sha256sum | cut -d' ' -f1)" = "$PATCH_SHA256"
+          test "$(git diff --name-status --no-renames "$PRODUCT" HEAD)" = $'A\t.github/workflows/vendure-preflight-only.yml'
+          test "$(git ls-tree HEAD -- .github/workflows/vendure-preflight-only.yml | cut -d' ' -f1)" = 100644
+          git checkout --detach --quiet "$PRODUCT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/vendure-installed-ordinary-125"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/safe" "$root/logs" "$root/preparation-parent" "$root/image-context"
+          printf '%s\n' "PROOF=$root" "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+          printf '%s\n' 'ready=true' >> "$GITHUB_OUTPUT"
+      - name: Set up package Node 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Set up package JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Build one exact candidate archive
+        id: package
+        timeout-minutes: 90
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          rustup show active-toolchain >"$PROOF/logs/rust-toolchain" 2>&1 || rustup toolchain install stable --profile minimal >>"$PROOF/logs/rust-toolchain" 2>&1
+          python3 -B packaging/build.py --out "$PROOF/dist" --platform linux-x86_64 >"$PROOF/logs/package.stdout" 2>"$PROOF/logs/package.stderr"
+      - name: Set up campaign Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.21.0
+      - name: Run bounded source regressions
+        id: regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(node -p process.versions.node)" = '24.21.0'
+          node --test --test-reporter=tap campaigns/node/vendure/harness/installed-preflight-observation.test.mjs >"$PROOF/logs/node-tests" 2>&1
+          python3 -B campaigns/node/vendure/harness/test_installed_preflight_project.py -v >"$PROOF/logs/python-tests" 2>&1
+          python3 -B - <<'PYCASE'
+          import os, re
+          from pathlib import Path
+          logs = Path(os.environ['PROOF']) / 'logs'
+          tap = (logs / 'node-tests').read_text().splitlines()
+          expected = ['preflight observations distinguish running, failed and passed boundaries', 'preflight observation reader rejects extra, duplicate, malformed and oversized fields', "container attach and process failures cannot borrow one another's success", 'only closed signal classes are reported', 'receipt reader requires exact private keys and a UUIDv7 identity']
+          assert [line for line in tap if re.match(r'^(not )?ok ', line)] == [f'ok {i} - {name}' for i, name in enumerate(expected, 1)]
+          for label, value in dict(tests=len(expected), pass_count=len(expected), fail=0, cancelled=0, skipped=0, todo=0).items():
+              label = 'pass' if label == 'pass_count' else label
+              assert [line for line in tap if line.startswith(f'# {label} ')] == [f'# {label} {value}']
+          unittest = (logs / 'python-tests').read_text().splitlines()
+          names = ['test_complete_success_requires_both_process_observations', 'test_extra_or_nonstructural_values_are_rejected', 'test_failed_phase_and_signal_remain_distinct', 'test_partial_documents_cannot_claim_unreached_work']
+          # Python 3.12 unittest includes the qualified method in its verbose case label.
+          rows = [line for line in unittest if line.startswith('test_')]
+          assert len(rows) == len(names)
+          for line, name in zip(rows, names):
+              assert re.fullmatch(re.escape(name) + r' \(__main__\.ProjectTest(?:\.' + re.escape(name) + r')?\) \.\.\. ok', line)
+          assert sum(bool(re.fullmatch(r'Ran ' + str(len(names)) + r' tests in [0-9.]+s', line)) for line in unittest) == 1 and unittest.count('OK') == 1
+          print(f'{len(expected)} Node and {len(names)} Python named cases passed')
+          PYCASE
+      - name: Build the paired image and run one installed preflight
+        id: focused
+        timeout-minutes: 90
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -z "$(git status --porcelain --untracked-files=all)"
+          cp campaigns/node/vendure/harness/paired-image.Dockerfile "$PROOF/image-context/Dockerfile"
+          cp web/app/package.json web/app/package-lock.json "$PROOF/image-context/"
+          docker build --platform linux/amd64 --build-arg NODE_VERSION=24.21.0 --iidfile "$PROOF/preparation-parent/vendure-image.id" "$PROOF/image-context" >"$PROOF/logs/image.stdout" 2>"$PROOF/logs/image.stderr"
+          printf '%s\n' 'image_built=true' >> "$GITHUB_OUTPUT"
+          node campaigns/node/vendure/harness/installed-preflight-focused.mjs >"$PROOF/logs/focused.stdout" 2>"$PROOF/logs/focused.stderr"
+      - name: Project bounded observations
+        id: projection
+        if: ${{ always() && steps.admission.outputs.ready == 'true' }}
+        env:
+          IMAGE_BUILT: ${{ steps.focused.outputs.image_built }}
+          PREFLIGHT_OUTCOME: ${{ steps.focused.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B campaigns/node/vendure/harness/installed-preflight-project.py
+      - name: Upload bounded preflight receipt
+        if: ${{ always() && steps.projection.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: vendure-preflight-only-bounded
+          path: ${{ env.PROOF }}/safe/projected.json
+          if-no-files-found: error
+          retention-days: 7
