@@ -1,0 +1,142 @@
+name: Installed Fineract single seeded office read
+on:
+  push:
+    branches: [codex/proof-fineract-office-installed-117]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  single-office:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      PRODUCT: a2ba7f8228890842721341ceb5856d7bf82919f4
+      TREE: f22276a38d6d8a15ad5a8a2f72a737d5db99de23
+      BASE: 181ddef7e88dcab9f86021552425b09b25131344
+      PATCH: 0408eb59589c0bf1e1223490ac4cdd9b1d18f536168e76f04d2a9c1e3a54484a
+      XCAMP_PLATFORM: linux/amd64
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Admit exact product, wrapper and previously passed helper
+        id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HELPER_RUN: '45846187982'
+          HELPER_WRAPPER: 'e46824c9c7be3b8b70b42c1900d7a048680b83aa'
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REPOSITORY" = Legend101Zz/X-trace
+          test "$GITHUB_REF" = refs/heads/codex/proof-fineract-office-installed-117
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT"
+          test "$(git show -s --format=%P "$PRODUCT")" = "$BASE"
+          test "$(git rev-parse "$PRODUCT^{tree}")" = "$TREE"
+          test "$(git diff --full-index --binary "$BASE" "$PRODUCT" | sha256sum | cut -d' ' -f1)" = "$PATCH"
+          root="$RUNNER_TEMP/fineract-office"
+          mkdir -m 700 "$root" "$root/tools" "$root/public" "$root/logs"
+          python3 -B - "$root" <<'ADMIT'
+          import hashlib, json, os, pathlib, re, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          names = {'driver.py':'f4dc0a9de1e79efd3bc08723fdb1b2f68cf3b51e6f6d87968e7a869a64e90245', 'receipt.py':'4ef8e9e41c6359ddb7b4e705d57010ae5d77a0a291b33b55b4ca342073738839', 'transport.py':'cb2926281482aa71584dd931bba1e8b6b66d7536353b7ee3e86c978fc26da365'}
+          folder = 'tools/qa/fineract-single-office-proof/'
+          expected = {folder + name for name in names} | {'.github/workflows/fineract-single-office.yml'}
+          changes = subprocess.check_output(['git','diff','--name-status',os.environ['PRODUCT'],'HEAD'], text=True)
+          assert set(changes.splitlines()) == {'A\t' + path for path in expected}
+          for path in expected:
+              assert subprocess.check_output(['git','ls-tree','HEAD','--',path]).startswith(b'100644 blob ')
+          for name, digest in names.items():
+              payload = subprocess.check_output(['git','show','HEAD:' + folder + name])
+              assert hashlib.sha256(payload).hexdigest() == digest
+              (root/'tools'/name).write_bytes(payload)
+          repo = 'repos/Legend101Zz/X-trace'
+          def api(path):
+              return json.loads(subprocess.check_output(['gh','api','--hostname','github.com', repo+path], timeout=60))
+          number = os.environ['HELPER_RUN']
+          head = os.environ['HELPER_WRAPPER']
+          assert re.fullmatch(r'[1-9][0-9]{0,18}', number) and re.fullmatch(r'[0-9a-f]{40}',head)
+          for suffix in ('','/attempts/1'):
+              item = api('/actions/runs/'+number+suffix)
+              assert (item['id'], item['run_attempt'], item['event'], item['status'],item['conclusion']) == (
+                  int(number),1,'push','completed','success')
+              assert item['repository']['full_name'] == item['head_repository']['full_name'] == 'Legend101Zz/X-trace'
+              assert item['head_sha'] == head and item['head_branch'] == 'codex/proof-reduced-office-source-117'
+              assert item['path'] == '.github/workflows/fineract-reduced-office-source.yml'
+          commit = api('/git/commits/'+head)
+          assert [p['sha'] for p in commit['parents']] == [os.environ['PRODUCT']]
+          data = api('/actions/runs/'+number+'/attempts/1/jobs?per_page=100')
+          assert data['total_count'] == len(data['jobs']) == 1
+          job = data['jobs'][0]
+          assert job['name'] == 'source' and job['head_sha'] == head and job['conclusion'] == 'success'
+          for name in ('Admit exact diagnostic source and prepare private scratch','reduced-office-observations (12 source cases)'):
+              hits = [s for s in job['steps'] if s['name'] == name]
+              assert len(hits) == 1 and hits[0]['status'] == 'completed' and hits[0]['conclusion'] == 'success'
+          ADMIT
+          git checkout --quiet --detach "$PRODUCT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          PROOF="$root" python3 -B "$root/tools/receipt.py" init
+          echo "PROOF=$root" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Build one official development package and bind its private archive
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH="$PROOF/tools" python3 -B - <<'PACKAGE' >"$PROOF/logs/package.stdout" 2>"$PROOF/logs/package.stderr"
+          import hashlib,json,os,pathlib,subprocess
+          from receipt import checkpoint, valid
+          root=pathlib.Path(os.environ['PROOF'])
+          doc=valid(json.loads((root/'checkpoint.json').read_bytes()))
+          doc['phases']['package']='started'
+          checkpoint(root,doc)
+          try:
+              subprocess.run(['python3','-B','packaging/build.py','--platform','linux-x86_64',
+                              '--out',root/'dist','--work',root/'package-work'],check=True)
+              archive=root/'dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz'
+              with archive.open('rb') as f:
+                  digest=hashlib.file_digest(f,'sha256').hexdigest()
+              with (root/'package.sha256').open('x') as f:
+                  f.write(digest+'\n')
+          except BaseException:
+              doc['phases']['package']='failed'
+              raise
+          else:
+              doc['phases']['package']='passed'
+          finally:
+              checkpoint(root,doc)
+          PACKAGE
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Install, build pinned Fineract and observe one ordinary seeded office read
+        id: fixture
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B "$PROOF/tools/driver.py" >"$PROOF/logs/runtime.stdout" 2>"$PROOF/logs/runtime.stderr"
+      - name: Validate and export only bounded checkpoint fields
+        id: receipt
+        if: ${{ !cancelled() && steps.admit.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B "$PROOF/tools/receipt.py" public >"$PROOF/logs/public.stdout" 2>"$PROOF/logs/public.stderr"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() && steps.receipt.outcome == 'success' }}
+        with:
+          name: fineract-single-office-counts
+          path: ${{ env.PROOF }}/public/summary.json
+          if-no-files-found: error
+          retention-days: 14
