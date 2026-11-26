@@ -1,5 +1,6 @@
 """Same-archive, ordinary loopback Jersey version-control fixture for hosted development proof."""
 import argparse
+from contextlib import contextmanager
 import http.client
 import json
 import os
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from urllib.parse import urlsplit
 
 from observation import api_reader, cli_reader, compare_inventory, judge
@@ -24,13 +26,43 @@ import xcamp
 import xinstr
 
 
-def workload(proc, root, canaries):
+def failure_site(error):
+    # Source is pinned by the hosted wrapper. Only a reviewed file label and line number
+    # leave the private traceback; exception text and frame locals can contain fixture input.
+    files = {HERE / name: name for name in ("installed_journey.py", "observation.py", "pages.py", "verify_fixture.py")}
+    files[REPO / "campaigns/lib/xinstr.py"] = "xinstr.py"
+    site = None
+    for frame, line in traceback.walk_tb(error.__traceback__):
+        label = files.get(Path(frame.f_code.co_filename))
+        if label and frame.f_code is not require.__code__:
+            site = {"file": label, "line": line}
+    return site
+
+
+@contextmanager
+def cleanup(progress, phase):
+    # Capture the primary operation even when releasing its process also fails.
+    unwinding = sys.exc_info()[1] is not None
+    if not unwinding:
+        progress["phase"] = phase
+    try:
+        yield
+    except Exception:
+        if not unwinding:
+            raise
+        progress["cleanupFailure"] = phase
+
+
+def workload(proc, root, canaries, progress):
+    progress["phase"] = "fixture-readiness"
     deadline = time.monotonic() + 90
     while not (root / "port").is_file():
-        require(proc.poll() is None and time.monotonic() < deadline, "fixture readiness")
+        require(proc.poll() is None, "fixture exited before readiness")
+        require(time.monotonic() < deadline, "fixture readiness deadline")
         time.sleep(0.05)
     text = (root / "port").read_text()
     require(re.fullmatch(r"[1-9][0-9]{0,4}", text) and 1 <= int(text) <= 65535, "fixture listen port")
+    progress["phase"] = "http-workload"
     group, query, header = canaries
     prefix = f"/scope/effective/groups/{group}"
     for method, path, status, content in (
@@ -46,14 +78,18 @@ def workload(proc, root, canaries):
             connection.request(method, path + "?q=" + query, headers={"X-Fixture-Marker": header})
             response = connection.getresponse()
             body = response.read(65537)
-            require(response.status == status and len(body) <= 65536, "fixture HTTP response")
+            if response.status != status:
+                progress["differentHttpStatus"] = response.status if 100 <= response.status <= 599 else None
+                raise ValueError("fixture HTTP status")
+            require(len(body) <= 65536, "fixture HTTP response size")
             if content is not None:
                 require(body == content, "fixture resource response body")
         finally:
             connection.close()
+        progress["responsesVerified"] += 1
 
 
-def leg(root, jar, version, cli, agent, java):
+def leg(root, jar, version, cli, agent, java, progress):
     root.mkdir(mode=0o700)
     project, control = root / "project", root / "control"
     project.mkdir(mode=0o700)
@@ -67,11 +103,13 @@ def leg(root, jar, version, cli, agent, java):
         path = root / folder
         path.mkdir(mode=0o700)
         env[name] = str(path)
+    progress["phase"] = "project-init"
     init = subprocess.run([cli, "init", "--project-dir", str(project), "--display-name", "Jersey fixture"],
                    env=env, check=True, capture_output=True, timeout=120)
     project_id = json.loads(init.stdout)["project_id"]
     canaries = tuple(secrets.token_hex(16) for _ in range(3))
     read_cli = cli_reader(cli, project, env, canaries)
+    progress["phase"] = "empty-cli-inventory"
     require(list_pages(lambda cursor: read_cli(None, cursor), False, project_id) == ({}, 1),
             "fresh installed fixture project")
     cmd = [cli, "run", "--project-dir", str(project), "--java-agent", agent, "--capture-depth", "standard",
@@ -79,20 +117,23 @@ def leg(root, jar, version, cli, agent, java):
            str(java), "-Dxtrace.jersey.probeEvidence=true", "-Dfixture.control=" + str(control), "-jar", str(fixture),
            "--server.address=127.0.0.1", "--server.port=0", "--server.servlet.context-path=/scope",
            "--spring.jersey.application-path=/effective"]
+    progress["phase"] = "installed-launch"
     with (root / "launch.log").open("xb") as log:
         proc = subprocess.Popen(cmd, cwd=project, env=env, stdout=log, stderr=log)
         try:
-            workload(proc, control, canaries)
+            workload(proc, control, canaries, progress)
         finally:
-            (control / "stop").touch(exist_ok=False)
-            try:
-                proc.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                proc.terminate()
-                proc.wait(timeout=30)
-                raise
-        require(proc.returncode == 0, "installed recording shutdown")
+            with cleanup(progress, "recording-shutdown"):
+                (control / "stop").touch(exist_ok=False)
+                try:
+                    proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    proc.wait(timeout=30)
+                    raise
+                require(proc.returncode == 0, "installed recording shutdown")
 
+    progress["phase"] = "probe-inputs"
     messages = {
         "observationNotices": "Jersey dispatch identity or route observation unavailable",
         "unqualifiedNotices": "Jersey framework class image or bundle identity did not qualify",
@@ -106,7 +147,7 @@ def leg(root, jar, version, cli, agent, java):
     expected_decisions = (dict.fromkeys(probe_inputs, "qualified") if supported else
                           {"service": "version-excluded", "component": "image-and-version-excluded",
                            "invoker": "version-excluded"})
-    decisions = {}
+    decisions = progress["probeDecisions"]
     with (root / "launch.log").open("rb") as stream:
         for line in stream:
             line = line.rstrip(b"\r\n")
@@ -117,12 +158,18 @@ def leg(root, jar, version, cli, agent, java):
                 _, target, decision, image, manifest = line.decode("ascii").split()
                 require(target in probe_inputs and target not in decisions
                         and (image, manifest) == probe_inputs[target], "actual target image and origin manifest")
+                require(decision in {"qualified", "version-excluded", "image-excluded", "image-and-version-excluded"},
+                        "unexpected Jersey decision label")
                 decisions[target] = decision
+    progress["phase"] = "probe-decisions"
     require(decisions == expected_decisions, "individual Jersey probe version decisions")
+    progress["phase"] = "probe-notices"
     require(notices == {"observationNotices": int(supported), "unqualifiedNotices": int(not supported),
                         "probeFailureNotices": 0, "applicationProbeNotices": 0}, "process-level probe notices")
+    progress["phase"] = "viewer-readiness"
     viewer, ready = xinstr.start_viewer(cli, project, env, root / "viewer.log")
     try:
+        progress["phase"] = "viewer-auth"
         url = urlsplit(ready["origin"])
         require(url.scheme == "http" and url.hostname == "127.0.0.1" and url.port
                 and ready["url"].startswith(ready["origin"] + "/"), "viewer loopback origin")
@@ -130,12 +177,17 @@ def leg(root, jar, version, cli, agent, java):
         require(token, "viewer credential missing")
         client = xinstr.ViewerClient(ready["origin"])
         client.exchange(token)
+        progress["phase"] = "recording-inventory"
         details, counts = compare_inventory(read_cli, api_reader(client, canaries), project_id, supported)
     finally:
-        if viewer.poll() is None:
-            viewer.terminate()
-        viewer.wait(timeout=30)
-    return {"httpResponses": 5, "recordings": judge(details, version), "probeDecisions": decisions, **notices, **counts}
+        with cleanup(progress, "viewer-shutdown"):
+            if viewer.poll() is None:
+                viewer.terminate()
+            viewer.wait(timeout=30)
+    progress["phase"] = "recording-judgment"
+    recordings = judge(details, version)
+    return {"httpResponses": progress["responsesVerified"], "recordings": recordings, "probeDecisions": decisions,
+            **notices, **counts}
 
 
 def main():
@@ -149,7 +201,7 @@ def main():
     root = installed_java.private_dir(args.root)
     require(not any(root.iterdir()), "fixture evidence directory must be fresh")
     stage = "package"
-    report = {"status": "failed", "releaseAcceptance": False, "legs": {}}
+    report = {"status": "failed", "releaseAcceptance": False, "legs": {}, "legProgress": {}}
     try:
         installed_java.clean_checkout(REPO, args.source_sha)
         installed_java.java_identity(args.java, 21)
@@ -161,11 +213,18 @@ def main():
                 "application class bytes differ between the two real fixtures")
         for jar, version in ((args.supported, "3.1.11"), (args.unsupported, "3.1.10")):
             stage = "installed-jersey-" + version
-            report["legs"][version] = leg(root / version, jar, version, cli, agent, args.java)
+            progress = {"phase": "fixture-setup", "responsesVerified": 0, "differentHttpStatus": None,
+                        "probeDecisions": {}, "failureSite": None, "cleanupFailure": None}
+            report["legProgress"][version] = progress
+            try:
+                report["legs"][version] = leg(root / version, jar, version, cli, agent, args.java, progress)
+            except Exception as error:
+                progress["failureSite"] = failure_site(error)
+                raise
+            progress["phase"] = "complete"
         stage, report["status"] = "complete", "passed"
     except Exception:
         # Keep exception text, command output and any bootstrap material out of the public receipt.
-        import traceback
         with (root / "private-error.log").open("x") as stream:
             traceback.print_exc(file=stream)
     report["stage"] = stage
