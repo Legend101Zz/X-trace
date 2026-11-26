@@ -1,5 +1,6 @@
 import { createContext, useContext, useId, useLayoutEffect, useRef } from 'react';
 import type { Pane } from '../../types';
+import { stepScrollOwner } from '../events/useStepWindow';
 
 const steps = [
   {
@@ -35,9 +36,21 @@ export function ViewerTour({ index, selectedRecording, onStep, onClose }: {
 }) {
   const title = useRef<HTMLHeadingElement>(null);
   const prefix = useId();
-  useLayoutEffect(() => { title.current?.focus({ preventScroll: true }); }, [index]);
-
   const step = steps[index];
+  useLayoutEffect(() => { title.current?.focus({ preventScroll: true }); }, [index]);
+  useLayoutEffect(() => {
+    if (step.pane !== 'events' || !selectedRecording) return;
+
+    // Entering the tour keeps the current selection, so StepsList's selection-change
+    // effect will not run. Reveal the row in its pane while focus stays on the guide.
+    const row = title.current?.closest('.viewer-shell')
+      ?.querySelector<HTMLElement>('#replay-view-steps-panel .event[aria-current="true"]');
+    const owner = row && stepScrollOwner(row);
+    if (row && owner && owner.clientHeight > 0) {
+      owner.scrollTop += row.getBoundingClientRect().top - owner.getBoundingClientRect().top - owner.clientTop;
+    }
+  }, [step, selectedRecording]);
+
   const final = index === steps.length - 1;
   return <section className={`viewer-tour viewer-tour--${step.pane}`} role="dialog" aria-modal="false"
     aria-labelledby={`${prefix}-title`} aria-describedby={`${prefix}-position ${prefix}-text`}>
