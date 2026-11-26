@@ -40,6 +40,18 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
             events.push(pending.shift()!);
           }
           await assembler.handleEvents(events, credit);
+        } else if (message.type === "route") {
+          let folded = 0;
+          await assembler.handle(message, {
+            peek: (offset) => pending[offset],
+            take(count) {
+              pending.splice(0, count);
+              folded += count;
+            },
+          });
+          // The route and any folded events are still charged until the
+          // combined wire batch is acknowledged.
+          credit(1 + folded);
         } else {
           await assembler.handle(message);
           credit(1);

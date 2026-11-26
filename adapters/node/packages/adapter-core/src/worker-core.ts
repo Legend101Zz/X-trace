@@ -254,6 +254,11 @@ export function adjacentEvents(previous: InputMessage, next: InputMessage): bool
 
 type Credit = (count: number) => void;
 
+interface RouteLookahead {
+  peek(offset: number): InputMessage | undefined;
+  take(count: number): void;
+}
+
 interface BatchLimits {
   maxBatchEvents: number;
   fitsEnvelope(messageId: string, payload: AgentEnvelope["payload"], correlationToken: string): boolean;
@@ -265,7 +270,7 @@ function eventBatchLimit(limits?: BatchLimits): number {
 }
 
 export interface RecordingAssembler {
-  handle(message: InputMessage): Promise<boolean>;
+  handle(message: InputMessage, followingRoute?: RouteLookahead): Promise<boolean>;
   /** Handles an adjacent same-recording run selected by the delivery queue. */
   handleEvents(messages: readonly InputMessage[], credit?: Credit): Promise<boolean>;
   /** Sends held starts and their events for recordings that never finished (worker closing). */
@@ -300,11 +305,17 @@ export function createRecordingAssembler(
     state.started = true;
   }
 
+  function batchEnvelope(recordingId: string, state: RecordingState, events: RecordingEvent[]) {
+    return {
+      id: `node-http-${recordingId}-event-${events[0]!.recordingSeq}`,
+      payload: { case: "eventBatch", value: create(EventBatchSchema, { recordingId: state.bytes, events }) } as const,
+    };
+  }
+
   async function sendBatch(
     recordingId: string, state: RecordingState, events: RecordingEvent[], credit?: Credit,
   ): Promise<void> {
-    const id = `node-http-${recordingId}-event-${events[0]!.recordingSeq}`;
-    const payload = { case: "eventBatch", value: create(EventBatchSchema, { recordingId: state.bytes, events }) } as const;
+    const { id, payload } = batchEnvelope(recordingId, state, events);
     if (events.length > 1 && batch && !batch.fitsEnvelope(id, payload, recordingId)) {
       // Split in wire order. A singleton follows the original encoder and failure path.
       const middle = Math.floor(events.length / 2);
@@ -317,8 +328,36 @@ export function createRecordingAssembler(
     credit?.(events.length);
   }
 
+  function encodeMessage(message: InputMessage): RecordingEvent {
+    return encodeEvent({ ...message, monotonicNs: message.monotonicNs ?? now() });
+  }
+
+  function foldRouteTail(
+    recordingId: string,
+    state: RecordingState,
+    previous: InputMessage,
+    held: RecordingEvent[],
+    following: RouteLookahead,
+  ): RecordingEvent[] {
+    if (!batch || held.length >= eventBatchLimit(batch)) return held;
+    const combined = [...held];
+    let next = following.peek(0);
+    while (next && typeof next.monotonicNs === "bigint" && combined.length < eventBatchLimit(batch) &&
+           adjacentEvents(previous, next)) {
+      combined.push(encodeMessage(next));
+      previous = next;
+      next = following.peek(combined.length - held.length);
+    }
+    if (combined.length === held.length) return held;
+    const { id, payload } = batchEnvelope(recordingId, state, combined);
+    if (!batch.fitsEnvelope(id, payload, recordingId)) return held;
+    following.take(combined.length - held.length);
+    return combined;
+  }
+
   async function sendEvents(
     recordingId: string, state: RecordingState, messages: readonly InputMessage[], credit?: Credit,
+    followingRoute?: RouteLookahead,
   ): Promise<void> {
     const limit = eventBatchLimit(batch);
     let index = 0;
@@ -330,12 +369,19 @@ export function createRecordingAssembler(
         continue;
       }
       while (index < messages.length && index - first < limit && adjacentEvents(messages[index - 1]!, messages[index]!)) index += 1;
-      const events = messages.slice(first, index).map((item) => encodeEvent({ ...item, monotonicNs: item.monotonicNs ?? now() }));
+      let events = messages.slice(first, index).map(encodeMessage);
+      // A matched route only changes RecordingStarted. Once that start has
+      // staged, the queued tail can follow the held prefix in wire order.
+      if (followingRoute && index === messages.length) {
+        events = foldRouteTail(recordingId, state, messages[index - 1]!, events, followingRoute);
+      }
       await sendBatch(recordingId, state, events, credit);
     }
   }
 
-  function release(recordingId: string, state: RecordingState, summary?: RecordingSummary): Promise<void> {
+  function release(
+    recordingId: string, state: RecordingState, summary?: RecordingSummary, followingRoute?: RouteLookahead,
+  ): Promise<void> {
     if (state.timer) clearTimeout(state.timer);
     // The expiry timer can run while delivery is waiting on a staged ACK.
     // Later messages must wait for both the start and its held prefix.
@@ -344,7 +390,7 @@ export function createRecordingAssembler(
         state.routeLost = summary === undefined;
         await sendStart(recordingId, state, summary);
       }
-      await sendEvents(recordingId, state, state.held.splice(0));
+      await sendEvents(recordingId, state, state.held.splice(0), undefined, followingRoute);
     })();
   }
 
@@ -384,7 +430,7 @@ export function createRecordingAssembler(
   }
 
   return {
-    async handle(message) {
+    async handle(message, followingRoute) {
       if (message.type === "event") return handleEvents([message]);
       const { id: recordingId, bytes } = recordingIdentity(message);
 
@@ -420,7 +466,7 @@ export function createRecordingAssembler(
         // with its template. Only the first announcement counts, and only before the start went out.
         if (typeof message.route === "string" && message.route !== "" && !state.started && state.route === undefined) {
           state.route = message.route.slice(0, 1024);
-          await release(recordingId, state, { route: state.route });
+          await release(recordingId, state, { route: state.route }, followingRoute);
         }
         return true;
       }

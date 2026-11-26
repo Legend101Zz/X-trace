@@ -231,3 +231,72 @@ test("timed release keeps held events before later same-recording events and cre
     ["recordingStarted", [2n, 3n], [4n, 5n], "recordingFinished"]);
   assert.equal(credited, 4);
 });
+
+test("route release combines the staged held prefix with consecutive queued handler events", async () => {
+  const startAck = deferred();
+  const eventAck = deferred();
+  const startSent = deferred();
+  const eventsSent = deferred();
+  const sent: Payload[] = [];
+  const h = createHarness(async (_, payload) => {
+    sent.push(payload);
+    if (payload.case === "recordingStarted") { startSent.resolve(); await startAck.promise; }
+    if (payload.case === "eventBatch") { eventsSent.resolve(); await eventAck.promise; }
+  });
+  for (const message of [start(A, true), event(2), event(3),
+    { type: "route", recordingId: A, route: "/items" } as const]) h.delivery.enqueue(message);
+  await startSent.promise;
+  assert.equal(h.credits(), 3, "previously held events retain their original local credits");
+  for (const message of [event(4), event(5), finish(5), close]) h.delivery.enqueue(message);
+  startAck.resolve();
+  await eventsSent.promise;
+  const [routed, batch] = sent;
+  assert.equal(routed?.case, "recordingStarted");
+  assert.equal(routed.value.matchedRouteTemplate, "/items");
+  assert.deepEqual(wireEvents(batch!), [2n, 3n, 4n, 5n]);
+  assert.equal(h.credits(), 3, "neither the route nor the folded events credit before the batch ACK");
+  eventAck.resolve();
+  await Promise.race([h.done, h.failed.then(() => assert.fail("delivery failed"))]);
+  assert.equal(h.credits(), 7, "exactly the original seven logical messages are credited");
+  assert.deepEqual(sent.map(({ case: kind }) => kind), ["recordingStarted", "eventBatch", "recordingFinished"]);
+  const sealed = sent[2]!;
+  assert.equal(sealed.case, "recordingFinished");
+  const ids = [2, 3, 4, 5].map((sequence) => event(sequence).eventId).join("");
+  assert.equal(Buffer.from(sealed.value.eventDigest).toString("hex"), await blake3(Buffer.from(ids)));
+});
+
+test("route release preserves a control boundary and falls back at the negotiated byte limit", async () => {
+  for (const constrained of [false, true]) {
+    const startAck = deferred();
+    const batches: bigint[][] = [];
+    const h = createHarness(async (_, payload, recording) => {
+      if (payload.case === "recordingStarted" && recording === A) await startAck.promise;
+      if (payload.case === "eventBatch") batches.push(wireEvents(payload));
+    }, 64, (_, payload) => !constrained || payload.case !== "eventBatch" || payload.value.events.length === 1);
+    const messages = [start(A, true), event(2), { type: "route", recordingId: A, route: "/items" } as const];
+    if (!constrained) messages.push(start(B), finish(1, B));
+    messages.push(event(3), finish(3), close);
+    for (const message of messages) h.delivery.enqueue(message);
+    startAck.resolve();
+    await Promise.race([h.done, h.failed.then(() => assert.fail("delivery failed"))]);
+    assert.deepEqual(batches, [[2n], [3n]]);
+    assert.equal(h.credits(), messages.length - 1);
+  }
+});
+
+test("a rejected folded route batch refunds neither the route nor its queued events", async () => {
+  const startAck = deferred();
+  const sent: Payload[] = [];
+  const h = createHarness(async (_, payload) => {
+    sent.push(payload);
+    if (payload.case === "recordingStarted") await startAck.promise;
+    if (payload.case === "eventBatch") throw new Error("fixture ACK refused");
+  });
+  for (const message of [start(A, true), event(2), { type: "route", recordingId: A, route: "/items" } as const,
+    event(3), finish(3), close]) h.delivery.enqueue(message);
+  startAck.resolve();
+  await h.failed;
+  assert.equal(h.credits(), 2);
+  assert.deepEqual(sent.map((payload) => payload.case === "eventBatch" ? wireEvents(payload) : payload.case),
+    ["recordingStarted", [2n, 3n]]);
+});
