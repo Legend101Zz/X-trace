@@ -67,6 +67,35 @@ async function stopViewer(child) {
   });
 }
 
+// Install before the first page in every timed context. Allowed HTTP requests
+// go to the real viewer; no response or product selection is supplied here.
+async function guardTimedTraffic(context, readyUrl, recordingId, counts) {
+  const { origin, hash } = new URL(readyUrl);
+  const reads = new Set(['/', '/app.js', '/index.css', '/favicon.ico',
+    '/assets/fonts/chivo-latin-400-normal.woff2', '/assets/fonts/chivo-latin-600-normal.woff2',
+    '/assets/fonts/azeret-mono-latin-400-normal.woff2', '/api/v1/endpoints', '/api/v1/recordings',
+    '/api/v1/recordings/' + recordingId]);
+  await context.route('**/*', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.origin === origin && request.method() === 'GET' && reads.has(url.pathname)) return route.continue();
+    if (url.origin === origin && request.method() === 'POST' && url.pathname === '/api/v1/auth/exchange'
+        && !url.search && counts.authExchanges === 0) {
+      const token = new URLSearchParams(hash.slice(1)).get('token');
+      if (token && request.postData() === JSON.stringify({ token })) {
+        counts.authExchanges++;
+        return route.continue();
+      }
+    }
+    counts.refused++;
+    await route.abort();
+  });
+  await context.routeWebSocket('**/*', (socket) => {
+    counts.refused++;
+    return socket.close();
+  });
+}
+
 // This runs before application scripts. The start and finish use the same browser clock.
 // A second rAF means a rendering opportunity intervened; it cannot prove physical display.
 function installClickClock({ recordingId }) {
@@ -79,18 +108,59 @@ function installClickClock({ recordingId }) {
     if (rect.width <= 0 || rect.height <= 0 || x < 0 || x >= innerWidth || y < 0 || y >= innerHeight) return false;
     return node.contains(document.elementFromPoint(x, y));
   };
+  // The value is a single plain ASCII text node in the real Details panel.
+  // Its containing block can be on screen even when the text is clipped.
+  const identityReadability = (field) => {
+    const text = field?.firstChild;
+    if (field?.childNodes.length !== 1 || text.nodeType !== Node.TEXT_NODE
+        || text.data !== 'synthetic-scale-00002') return 'identity-unavailable';
+    const port = field.closest('.evidence-content');
+    if (!port || !field.checkVisibility({ opacityProperty: true, visibilityProperty: true })) return 'hidden';
+    const portBox = port.getBoundingClientRect();
+    const left = portBox.left + port.clientLeft;
+    const top = portBox.top + port.clientTop;
+    const right = Math.min(innerWidth, left + port.clientWidth);
+    const bottom = Math.min(innerHeight, top + port.clientHeight);
+    const range = document.createRange();
+    for (let i = 0; i < text.length; i++) {
+      range.setStart(text, i);
+      range.setEnd(text, i + 1);
+      const rects = range.getClientRects();
+      if (rects.length !== 1) return 'unmeasurable';
+      const rect = rects[0];
+      if (rect.width <= 0 || rect.height <= 0) return 'unmeasurable';
+      if (rect.left < Math.max(0, left) || rect.right > right
+          || rect.top < Math.max(0, top) || rect.bottom > bottom) return 'clipped';
+      const dx = Math.min(0.5, rect.width / 2);
+      const dy = Math.min(0.5, rect.height / 2);
+      const exposed = (x, y) => document.elementFromPoint(x, y) === field;
+      if (!exposed(rect.left + dx, rect.top + dy) || !exposed(rect.right - dx, rect.top + dy)
+          || !exposed(rect.left + dx, rect.bottom - dy) || !exposed(rect.right - dx, rect.bottom - dy)
+          || !exposed(rect.left + rect.width / 2, rect.top + rect.height / 2)) return 'obstructed';
+    }
+    return 'readable';
+  };
   const selected = () => {
+    window.__xtraceScale.identityReadability = 'selection-unavailable';
     if (document.querySelector('#events-panel h1')?.textContent !== recordingId) return null;
     const current = document.querySelector('.recording[aria-current="true"] .recording-title');
     if (current?.textContent !== recordingId) return null;
     const row = document.querySelector('.event-rail .event[aria-current="true"]');
     if (row?.querySelector('.event-seq')?.textContent !== '2' || !visible(row)) return null;
-    const section = Array.from(document.querySelectorAll('.inspector-section')).find((node) =>
+    const section = Array.from(document.querySelectorAll('#evidence-panel [role="tabpanel"]:not([hidden]) .inspector-section')).find((node) =>
       node.querySelector('.inspector-label')?.textContent === 'Event identity');
-    if (section?.querySelector('.inspector-value.mono')?.textContent !== 'synthetic-scale-00002') return null;
+    const field = section?.querySelector('.inspector-value.mono[data-event-field="event-id"]');
+    window.__xtraceScale.identityReadability = identityReadability(field);
+    if (window.__xtraceScale.identityReadability !== 'readable') return null;
     return row;
   };
   window.addEventListener('click', (event) => {
+    const state = window.__xtraceScale;
+    const details = event.target.closest?.('[role="tab"]');
+    if (event.isTrusted && state.started && !state.completed && details?.textContent === 'Details'
+        && details.closest('[role="tablist"]')?.getAttribute('aria-label') === 'Inspector evidence') {
+      state.detailsClickMs = performance.now() - state.startMs;
+    }
     const button = event.target.closest?.('button.recording');
     if (!event.isTrusted || button?.querySelector('.recording-title')?.textContent !== recordingId) return;
     if (window.__xtraceScale.started) return;
@@ -110,7 +180,13 @@ function installClickClock({ recordingId }) {
   }, { capture: true });
 }
 
-async function waitSelection(page, mode, event, recordingId, { requireInspectorIdentity = true } = {}) {
+function remainingTimeout(deadline) {
+  const timeout = Math.ceil(deadline - performance.now());
+  check(timeout > 0);
+  return timeout;
+}
+
+async function waitSelection(page, mode, event, recordingId, { requireInspectorIdentity = true, timeout = ACTION_TIMEOUT } = {}) {
   await page.waitForFunction(({ mode, sequence, frameId, eventId, recordingId, requireInspectorIdentity }) => {
     if (document.querySelector('#events-panel h1')?.textContent !== recordingId) return false;
     if (document.querySelector('.recording[aria-current="true"] .recording-title')?.textContent !== recordingId) return false;
@@ -130,7 +206,42 @@ async function waitSelection(page, mode, event, recordingId, { requireInspectorI
     const y = (Math.max(rect.top, 0) + Math.min(rect.bottom, innerHeight)) / 2;
     return rect.width > 0 && rect.height > 0 && x >= 0 && x < innerWidth && y >= 0 && y < innerHeight
       && row.contains(document.elementFromPoint(x, y));
-  }, { mode, sequence: event.sequence, frameId: event.frameId, eventId: event.eventId, recordingId, requireInspectorIdentity });
+  }, { mode, sequence: event.sequence, frameId: event.frameId, eventId: event.eventId, recordingId, requireInspectorIdentity }, { timeout });
+}
+
+// Browse the real scrollport only. Mounted list positions and spacer geometry locate
+// an unmounted row in this fixture's verified contiguous sequence. The later click
+// still targets the real button by its exact displayed sequence, with normal hit testing.
+async function clickLoadedStep(page, sequence) {
+  const deadline = performance.now() + ACTION_TIMEOUT;
+  await page.waitForFunction((sequence) => {
+    const list = document.querySelector('.event-rail .steps-list');
+    if (!list || document.querySelector('.replay-window-count > span:first-child')?.getAttribute('aria-hidden') !== 'false') return false;
+    if (list.querySelector(`[data-step-sequence="${sequence}"]`)) return true;
+    const anchor = list.querySelector('[data-step-sequence]');
+    if (!anchor) return false;
+    const size = Number(anchor.getAttribute('aria-setsize'));
+    const position = Number(anchor.getAttribute('aria-posinset')) + Number(sequence) - Number(anchor.dataset.stepSequence);
+    if (!Number.isSafeInteger(position) || position < 1 || position > size) return false;
+    const content = list.closest('.steps-content');
+    const owner = content && getComputedStyle(content).overflowY === 'auto' ? content : list.closest('#events-panel');
+    if (!owner || !owner.clientHeight) return false;
+    for (const spacer of list.querySelectorAll('.steps-spacer')) {
+      const first = Number(spacer.previousElementSibling?.getAttribute('aria-posinset') ?? 0) + 1;
+      const last = Number(spacer.nextElementSibling?.getAttribute('aria-posinset') ?? size + 1) - 1;
+      if (position < first || position > last) continue;
+      const box = spacer.getBoundingClientRect();
+      const targetY = box.top + box.height * (position - first + 0.5) / (last - first + 1);
+      const centerY = owner.getBoundingClientRect().top + owner.clientTop + owner.clientHeight / 2;
+      owner.scrollTop += targetY - centerY;
+      break;
+    }
+    return false;
+  }, sequence, { timeout: remainingTimeout(deadline) });
+  const row = page.locator('.event-rail .event').filter({
+    has: page.locator('.event-seq').filter({ hasText: new RegExp(`^${sequence}$`) }),
+  });
+  await row.click({ timeout: remainingTimeout(deadline) });
 }
 
 async function domSample(page, phase, apiState, heap) {
@@ -235,6 +346,8 @@ async function selectionDiagnostic(page, mode, event, recordingId) {
       recordingHeaderMatches: document.querySelector('#events-panel h1')?.textContent === recordingId,
       recordingCatalogMatches: document.querySelector('.recording[aria-current="true"] .recording-title')?.textContent === recordingId,
       inspectorIdentitySectionCount: sections.length,
+      ...(window.__xtraceScale?.started && !window.__xtraceScale.completed
+        ? { lastTimedIdentityReadability: window.__xtraceScale.identityReadability ?? 'not-observed' } : {}),
       inspectorIdentityMatchCount: sections.filter((node) => node.querySelector('.inspector-value.mono')?.textContent === eventId).length,
       selectedStepRowCount: steps.length, selectedStepSequenceMatchCount: selectedStepMatches.length,
       selectedStepOwnsFocus: steps[0] === document.activeElement,
@@ -307,8 +420,14 @@ async function measureSample(index, options, manifest, chromium) {
     setStage('browser_start');
     browser = await chromium.launch({ headless: true });
     result.browserVersion = browser.version();
+    const functionalMapOnly = options['one-map-tree-sample'];
     context = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: 1, locale: 'en-US',
-      timezoneId: 'UTC', colorScheme: 'light', reducedMotion: 'no-preference' });
+      timezoneId: 'UTC', colorScheme: 'light', reducedMotion: 'no-preference',
+      ...(functionalMapOnly ? {} : { serviceWorkers: 'block' }) });
+    if (!functionalMapOnly) {
+      result.timedTraffic = { authExchanges: 0, refused: 0 };
+      await guardTimedTraffic(context, url, manifest.recording_id, result.timedTraffic);
+    }
     page = await context.newPage();
     page.setDefaultTimeout(ACTION_TIMEOUT);
     page.setDefaultNavigationTimeout(30_000);
@@ -316,17 +435,14 @@ async function measureSample(index, options, manifest, chromium) {
     externalRequests = 0;
     page.on('pageerror', () => { pageErrors += 1; });
     page.on('request', (request) => { if (new URL(request.url()).origin !== new URL(url).origin) externalRequests += 1; });
-    const functionalMapOnly = options['one-map-tree-sample'];
     let totalRequests = 0;
     let detailRequests = 0;
-    if (functionalMapOnly) {
-      const origin = new URL(url).origin;
-      page.on('request', (request) => {
-        const destination = new URL(request.url());
-        totalRequests += 1;
-        if (destination.origin === origin && destination.pathname === `/api/v1/recordings/${manifest.recording_id}`) detailRequests += 1;
-      });
-    }
+    const origin = new URL(url).origin;
+    page.on('request', (request) => {
+      const destination = new URL(request.url());
+      totalRequests += 1;
+      if (destination.origin === origin && destination.pathname === `/api/v1/recordings/${manifest.recording_id}`) detailRequests += 1;
+    });
     const jumpToLoadedSequence = functionalMapOnly
       ? (await import('../../web/app/scripts/replay-window-journey.mjs')).jumpToLoadedSequence
       : null;
@@ -344,25 +460,47 @@ async function measureSample(index, options, manifest, chromium) {
     let selected = detail.events[0];
     expectedSelection = selected;
     cumulative = detail.events.length;
+    const inspector = page.getByRole('tablist', { name: 'Inspector evidence', exact: true });
+    const details = inspector.getByRole('tab', { name: 'Details', exact: true });
     if (functionalMapOnly) {
       setStage('initial_steps_visible', 'default_inspector');
       await waitSelection(page, 'steps', selected, manifest.recording_id, { requireInspectorIdentity: false });
       setStage('initial_steps_visible', 'details_identity');
-      const inspector = page.getByRole('tablist', { name: 'Inspector evidence', exact: true });
-      const details = inspector.getByRole('tab', { name: 'Details', exact: true });
       await details.click();
       check(await details.getAttribute('aria-selected') === 'true');
       await waitSelection(page, 'steps', selected, manifest.recording_id);
       result.actions.push('initial_steps_and_details_identity_matched');
     } else {
-      setStage('initial_visible_paint_opportunity');
-      await page.waitForFunction(() => window.__xtraceScale?.completed === true);
+      const deadline = performance.now() + ACTION_TIMEOUT;
+      setStage('initial_visible_paint_opportunity', 'default_inspector');
+      // Before any Details interaction the genuine default view must already expose
+      // the selected first row. Keep the browser's original click clock running.
+      await waitSelection(page, 'steps', selected, manifest.recording_id,
+        { requireInspectorIdentity: false, timeout: remainingTimeout(deadline) });
+      result.substage = 'details_identity';
+      const wasSelected = await details.getAttribute('aria-selected', { timeout: remainingTimeout(deadline) });
+      check(wasSelected === 'true' || wasSelected === 'false');
+      if (wasSelected === 'false') {
+        await details.click({ timeout: remainingTimeout(deadline) });
+        check(await details.getAttribute('aria-selected', { timeout: remainingTimeout(deadline) }) === 'true');
+      }
+      result.substage = 'identity_paint';
+      await page.waitForFunction(() => window.__xtraceScale?.completed === true, null, { timeout: remainingTimeout(deadline) });
       const clock = await page.evaluate(() => ({ ...window.__xtraceScale }));
-      check(clock.trusted && clock.sequence === selected.sequence && Number.isFinite(clock.elapsedMs));
+      check(clock.trusted && clock.sequence === selected.sequence && Number.isFinite(clock.elapsedMs)
+        && clock.identityReadability === 'readable');
+      check(result.timedTraffic.authExchanges === 1 && result.timedTraffic.refused === 0);
+      if (wasSelected === 'false') {
+        check(Number.isFinite(clock.detailsClickMs) && clock.detailsClickMs >= 0 && clock.detailsClickMs <= clock.elapsedMs);
+      } else {
+        check(clock.detailsClickMs === undefined);
+      }
       await waitSelection(page, 'steps', selected, manifest.recording_id);
       result.initial = { elapsedMs: clock.elapsedMs, over1500Ms: clock.elapsedMs > 1500,
+        detailsTabClickIncluded: wasSelected === 'false', detailsTabClickOffsetMs: clock.detailsClickMs ?? null,
         apiFirstPageEvents: detail.events.length, selectedIdentitySha256: identity(selected),
-        responseAndUiIdentityMatched: true, trustedClickCaptured: true, paintOpportunityObserved: true };
+        responseAndUiIdentityMatched: true, trustedClickCaptured: true, paintOpportunityObserved: true,
+        fullInspectorIdentityReadableAtBothFrames: true };
     }
     const mapWindowFrames = new Map(options['verify-map-tree-window'] ? detail.events.map((event) => [event.frameId, event]) : []);
     const mapPages = options['verify-map-tree-window'] ? [detail.events] : [];
@@ -456,10 +594,8 @@ async function measureSample(index, options, manifest, chromium) {
     for (let later = 1; later <= options['later-pages']; later += 1) {
       setStage(`load_later_${later}`, 'detail_response');
       check(typeof detail.nextCursor === 'string');
-      const loadLater = functionalMapOnly
-        ? page.getByRole('region', { name: 'Loaded event window', exact: true })
-          .getByRole('button', { name: 'Load later', exact: true })
-        : page.getByRole('button', { name: 'Load next window', exact: true });
+      const loadLater = page.getByRole('region', { name: 'Loaded event window', exact: true })
+        .getByRole('button', { name: 'Load later', exact: true });
       const beforePage = detailRequests;
       detail = await detailFromAction(page, manifest, detail.nextCursor, () => loadLater.click());
       for (const event of detail.events) { check(BigInt(event.sequence) === lastSequence + 1n); lastSequence += 1n; }
@@ -480,13 +616,12 @@ async function measureSample(index, options, manifest, chromium) {
         await waitSelection(page, 'steps', selected, manifest.recording_id);
         check(detailRequests === beforePage + 1 && totalRequests === beforeJump);
       } else {
-        const row = page.locator('.event-rail .event').filter({
-          has: page.locator('.event-seq').filter({ hasText: new RegExp(`^${selected.sequence}$`) }),
-        });
+        const beforeBrowse = totalRequests;
         result.substage = 'row_click';
-        await row.click();
+        await clickLoadedStep(page, selected.sequence);
         result.substage = 'selection_wait';
         await waitSelection(page, 'steps', selected, manifest.recording_id);
+        check(detailRequests === beforePage + 1 && totalRequests === beforeBrowse);
       }
       result.actions.push(`load_later_${later}`);
     }
@@ -608,6 +743,9 @@ async function measureSample(index, options, manifest, chromium) {
     result.externalRequests = externalRequests;
     try { if (context) await context.close(); if (browser) await browser.close(); }
     catch { result.failures.push({ stage: 'browser_cleanup', code: 'cleanup_failed' }); }
+    if (result.timedTraffic && (result.timedTraffic.authExchanges !== 1 || result.timedTraffic.refused !== 0)) {
+      result.failures.push({ stage: 'timed_viewer_traffic', code: 'unexpected_traffic_or_missing_exchange' });
+    }
     try { if (viewer) await stopViewer(viewer.child); }
     catch { result.failures.push({ stage: 'viewer_cleanup', code: 'cleanup_failed' }); }
     if (result.failures.length) result.status = 'failed';
@@ -654,8 +792,9 @@ async function main() {
       freshBrowserProcessContextAndViewerPerSample: true, cpuOrNetworkThrottling: 'none',
       osAndFilesystemCaches: 'uncontrolled; may be warm', fixtureFrames: 10_000, laterPages: options['later-pages'],
       verifyMapTreeWindow: options['verify-map-tree-window'],
+      ...(options['one-map-tree-sample'] ? {} : { browserNetworking: 'read-only route allowlist with one viewer bootstrap exchange; Playwright routing disables HTTP cache; service workers blocked' }),
       timing: options['one-map-tree-sample'] ? 'not measured in the functional Map journey'
-        : 'trusted recording-click capture to visible selected first row after intervening rAF paint opportunity; no physical-display claim',
+        : 'trusted recording click to visible first selection and fully readable Inspector event identity across two rAF callbacks; includes opening Details when initially closed; no physical-display claim',
       excludedFromTiming: options['one-map-tree-sample'] ? [] : ['fixture seeding', 'viewer startup', 'catalog loading'],
       domScope: 'mounted current document; visible counts require viewport hit-test; Map SVG and accessible tree counted separately',
       runner: { platform: os.platform(), release: os.release(), arch: os.arch(), cpuModel: os.cpus()[0]?.model ?? 'unavailable', cpuCount: os.cpus().length },

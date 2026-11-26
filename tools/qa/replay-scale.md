@@ -123,6 +123,29 @@ identity across two requestAnimationFrame callbacks. This observes an intervenin
 not physical display completion. No scroll, forced click, CSS alteration or DOM replacement is
 used to make the initial row visible. A layout that hides it fails; #97 may need integration.
 
+At desktop width the Inspector can open on Values. The timed journey first verifies that the
+default view already exposes the selected row, then clicks the actual Details tab if needed,
+leaving the original browser clock running. Both callbacks require the exact Event ID in
+the active Inspector panel. For each character in the fixture's plain-text ID, Chromium must
+report a nonempty text rectangle fully inside the Inspector scrollport and the viewport,
+with the four inset corners and center hit-testing to the visible ID field. The selected
+row must also pass its existing hit test in both callbacks. The driver leaves the Inspector
+at its normal scroll position. A clipped or covered ID at the deadline gives no initial
+timing sample. The failure diagnostic can retain the last timed readability verdict.
+Each valid initial observation records whether this trusted
+Details click occurred and its offset in milliseconds from the trusted recording click.
+When included, the total covers the real interaction and driver coordination leading to it.
+Earlier measurements checked the ID string in the DOM. Those samples lack this per-character
+geometry check and may also use fewer interactions. Report their measurement contract
+separately when comparing elapsed times.
+
+Each timed context routes HTTP requests through Playwright from its first navigation.
+It allows the embedded viewer assets, catalog and this fixture's recording reads at the
+observed origin, and a single exchange of the viewer's bootstrap token. Other requests
+are refused, including WebSockets. The report counts exchanges and refusals without
+recording credentials or addresses. Service workers are blocked. Playwright routing
+disables the browser HTTP cache, and its per-request handling contributes to elapsed time.
+
 The exact successful detail response is checked against the manifest project/recording,
 cursor, completion, capacity and synthetic event identities. The visible selected sequence
 and inspector identity match its first event; the Map's selected frame subsequently matches
@@ -130,6 +153,10 @@ that same response frame. Identity digests bind private events without serializi
 After the initial measurement, actual Steps/Map buttons and Next/Back navigation must work
 in both modes. Later pages are loaded through the real button and each newly returned window
 is selected through an actual row click, then navigation and both mode switches are repeated.
+For a virtualized row the driver scrolls the existing Steps viewport using its mounted list
+positions and rendered spacers, waits for the exact sequence to mount, and clicks that row.
+The row lookup and click share one action deadline. The journey checks that this browsing
+and selection generated no additional requests beyond the deliberate page load.
 Playwright may scroll normal controls into view for these untimed actions. No API fixture or
 fallback to another recording replaces an unreachable action.
 
