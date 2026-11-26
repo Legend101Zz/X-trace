@@ -1,0 +1,146 @@
+name: Node queued-port batch proof
+on:
+  push:
+    branches: [codex/proof-medusa-port-adjacent-batch-120]
+permissions:
+  contents: read
+concurrency:
+  group: medusa-installed-120
+  cancel-in-progress: false
+jobs:
+  ownership:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MEDUSA_PRODUCT_SHA: dfd4edf22c24a9592a3ddf0ad91533ac085a803a
+      MEDUSA_PRODUCT_TREE: 05d08514b9a600912543408f09e949a70fc01fbc
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.21.0
+      - name: Admit source and private directories
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$MEDUSA_PRODUCT_SHA"
+          git checkout --detach "$MEDUSA_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$MEDUSA_PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          owner="$(mktemp -d "$RUNNER_TEMP/medusa-owned-proof.XXXXXXXX")"
+          root="$owner/proof"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/outer" "$root/safe"
+          printf '%s\n' "MEDUSA_ROOT=$root" >> "$GITHUB_ENV"
+          printf '%s\n' 'admitted=true' >> "$GITHUB_OUTPUT"
+      - name: Run only the ten named worker batching cases
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          cat >"$MEDUSA_ROOT/outer/controller.py" <<'MEDUSA_CONTROLLER'
+          """Run the existing worker-batch fixture and emit finite evidence."""
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          from tools.release.private_roots import admit_directory, atomic_write_private
+
+          root = Path(os.environ["MEDUSA_ROOT"])
+          admit_directory(root)
+          sys.path.insert(0, str(Path("campaigns/node/medusa/harness").resolve()))
+          from installed_process import contain_children, verify_children_gone
+
+          commands = {
+              "locked-dependencies": (["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], 300),
+              "protocol-compile": (["npm", "run", "build:protocol"], 120),
+              "adapter-compile": (["npm", "run", "build:core"], 120),
+              "worker-batch-cases": (
+                  ["node", "--test", "--test-reporter=tap", "packages/adapter-core/dist/test/worker-event-batch.test.js"], 30),
+          }
+          receipt = {
+              "schemaVersion": 1, "kind": "medusa-port-adjacent-batch-120", "status": "failed",
+              "sourceSha": os.environ["MEDUSA_PRODUCT_SHA"], "sourceTree": os.environ["MEDUSA_PRODUCT_TREE"],
+              "wrapperSha": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "counts": None,
+              "stages": {stage: {"command": "unreached", "exitCode": None, "cleanup": "unreached"}
+                         for stage in commands},
+          }
+
+
+          def save():
+              atomic_write_private(root / "safe/receipt.json", (json.dumps(receipt, sort_keys=True) + "\n").encode())
+
+
+          def command(stage, argv, seconds):
+              row = receipt["stages"][stage]
+              out = root / "outer" / (stage + ".stdout")
+              with out.open("xb") as stdout, out.with_suffix(".stderr").open("xb") as stderr:
+                  try:
+                      env = dict(os.environ, npm_config_cache=str(root / "npm-cache"))
+                      child = subprocess.Popen(argv, cwd="adapters/node", env=env, stdin=subprocess.DEVNULL,
+                                               stdout=stdout, stderr=stderr)
+                      try:
+                          row["exitCode"] = child.wait(timeout=seconds)
+                          row["command"] = "exited"
+                      except subprocess.TimeoutExpired:
+                          row["command"] = "deadline"
+                          if child.poll() is None:
+                              child.kill()
+                          try:
+                              child.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              row["command"] = "unreaped"
+                  except OSError:
+                      row["command"] = "spawn-or-io"
+                  finally:
+                      row["cleanup"] = "failed"
+                      save()
+                      try:
+                          verify_children_gone()
+                      except TimeoutError:
+                          pass
+                      else:
+                          row["cleanup"] = "passed"
+                          save()
+              return row == {"command": "exited", "exitCode": 0, "cleanup": "passed"}
+
+
+          save()
+          contain_children()
+          for step, (argv, seconds) in commands.items():
+              if not command(step, argv, seconds):
+                  sys.exit(1)
+          output = root / "outer/worker-batch-cases.stdout"
+          assert 0 < output.stat().st_size <= 65536
+          tap = output.read_text()
+          names = [('1', 'queued adjacent events batch in wire order across interleaved recordings and route, gap and finish boundaries'), ('2', 'count and full-envelope byte limits split batches without changing event order'), ('3', 'a split batch returns credits only for acknowledged constituents and stops at a rejection'), ('4', 'an empty event identity cannot make its valid neighbor part of a rejected batch'), ('5', 'app thread still charges all 64 logical messages and preserves the reserved finish'), ('6', 'timed release keeps held events before later same-recording events and credits them once'), ('7', 'route release combines the staged held prefix with consecutive queued handler events'), ('8', 'route release preserves a control boundary and falls back at the negotiated byte limit'), ('9', 'a rejected folded route batch refunds neither the route nor its queued events'), ('10', 'the worker batches adjacent port messages without crossing gaps, finish or close')]
+          assert re.findall(r"^ok ([0-9]+) - ([^\n]+)$", tap, re.M) == names
+          expected = {"tests": 10, "pass": 10, "fail": 0, "cancelled": 0, "skipped": 0, "todo": 0}
+          counts = {}
+          for key in expected:
+              value, = re.findall(rf"^# {key} ([0-9]{{1,3}})$", tap, re.M)
+              counts[key] = int(value)
+          assert counts == expected
+          receipt["counts"] = counts
+          receipt["status"] = "passed"
+          save()
+          MEDUSA_CONTROLLER
+          printf '%s  %s\n' '805545a669d5becfc8ed3ad77ff28efe60db67f5f6c171b49e8fb5423ece56fe' "$MEDUSA_ROOT/outer/controller.py" | sha256sum --check --status
+          PYTHONPATH="$PWD" python3 -B "$MEDUSA_ROOT/outer/controller.py" >"$MEDUSA_ROOT/outer/controller.log" 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && steps.root.outputs.admitted == 'true'
+        with:
+          name: medusa-120-port-adjacent-batch-counts
+          path: ${{ env.MEDUSA_ROOT }}/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
