@@ -238,7 +238,7 @@ class Process:
                 time.sleep(0.05)
         raise TimeoutError("process readiness deadline")
 
-    def stop(self):
+    def stop(self, *, grace_only=False):
         if self.stopped:
             return self.child.returncode
         self.stopped = True
@@ -257,6 +257,8 @@ class Process:
                 code = self.child.wait(timeout=max(0, grace_deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 recovery_reasons.append("launcher-wait-deadline")
+                if grace_only:
+                    raise
                 if self.child.poll() is None:
                     self.child.kill()
                 code = self.child.wait(timeout=max(0, recovery_deadline - time.monotonic()))
@@ -528,7 +530,7 @@ class Proof:
             time.sleep(0.1)
         raise TimeoutError("readiness recording deadline")
 
-    def leg(self, name):
+    def leg(self, name, *, readiness_only=False):
         notes = self.root / name
         notes.mkdir(mode=0o700)
         process, cid, ready_id = None, None, None
@@ -613,6 +615,8 @@ class Proof:
                         ready_id = self.ready_recording()
                 except Exception:
                     traceback.print_exc()
+            if readiness_only:
+                return ready_id, None
             with self.stage(f"{name}:workload"):
                 require(self.database_port(cid) == db_port)
                 config = notes / "workload-input.json"
@@ -632,7 +636,7 @@ class Proof:
                         live = process.child.poll() is None
                         with self.phase(name, "stop-process"):
                             try:
-                                require_code = process.stop()
+                                require_code = process.stop(grace_only=True) if readiness_only else process.stop()
                             finally:
                                 self.summary["reapedAdoptedGroupExits"][name] = process.reaped_group_exits
                                 self.summary["stopRecoveryReasons"][name] = process.stop_recovery_reasons
@@ -733,7 +737,7 @@ class Proof:
             self.summary["capture"] = capture(cli_details, readiness, expected_statuses)
             require(self.summary["capture"]["passed"])
 
-    def run(self):
+    def prepare_project(self):
         try:
             self.install()
         finally:
@@ -741,6 +745,38 @@ class Proof:
         self.project.mkdir(mode=0o700)
         with self.stage("init"):
             self.command([str(self.cli), "init", "--project-dir", str(self.project)])
+
+    def run_native_shutdown_probe(self):
+        self.summary["kind"] = "installed-medusa-native-shutdown-120"
+        self.save()
+        self.prepare_project()
+        with self.stage("native-source"):
+            cli = self.entry.resolve(strict=True)
+            medusa = Path(self.packages["@medusajs/medusa"]["manifest"]).parent
+            members = (
+                (cli, "35b2e332a085bf3c95eb23340fe691947fb2f1e2155e6d59d033c9dd8c49a2d4"),
+                (cli.parent / "dist/create-cli.js", "966586c70d198b669c9e52102daebce68f61464deb782b41146d561ceb869928"),
+                (medusa / "dist/commands/start.js", "51c374a60fa673315d9ee5cf6c0811f4febcc016aec975d26bc2582b2ee5b565"),
+            )
+            require(all(path.resolve(strict=True).is_relative_to(self.starter) and sha(path) == expected
+                        for path, expected in members))
+        ready_id, _ = self.leg("installed", readiness_only=True)
+        with self.stage("native-shutdown"):
+            require(ready_id is not None and all(self.summary["stages"].get(f"installed:{phase}") == "passed"
+                    for phase in ("inputs", "database", "startup", "readiness-recording", "shutdown", "cleanup")))
+            require(self.summary["stages"]["installed:workload"] == "unreached")
+            node = self.summary["nodeCaptureDiagnostic"]
+            require(node is not None and node["status"] == "observed" and node["exitCode"] == 0
+                    and node["beforeExitSeen"] is False and node["closeRequested"] is False
+                    and node["counts"]["startAttempts"] == 1 and node["counts"]["finishPosted"] == 1)
+            daemon = self.summary["daemonFinishDiagnostic"]
+            require(daemon is not None and daemon["status"] == "observed" and daemon["sessions"] == 1)
+            require(self.summary["stopRecoveryReasons"]["installed"] == [])
+        self.summary["status"] = "passed"
+        self.save()
+
+    def run(self):
+        self.prepare_project()
         _, baseline = self.leg("baseline")
         require(self.summary["stages"].get("baseline:cleanup") == "passed")
         ready_id, installed = self.leg("installed")
@@ -835,7 +871,10 @@ def main():
     proof.save()
     try:
         try:
-            proof.run()
+            if os.environ.get("MEDUSA_NATIVE_SHUTDOWN_PROBE") == "1":
+                proof.run_native_shutdown_probe()
+            else:
+                proof.run()
         finally:
             verify_children_gone()
     except (Exception, KeyboardInterrupt):

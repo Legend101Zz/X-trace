@@ -53,13 +53,15 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
   let express: ExpressState = "not-observed";
   let transportFailed = false;
   let closeRequested = false;
+  let beforeExitSeen = false;
+  process.once("beforeExit", () => { beforeExitSeen = true; });
   process.once("exit", (exitCode) => {
     // Do not schedule work or keep the worker alive. This is a snapshot, not a drain barrier.
     // The nonce only authenticates this finite line from the proof's private stream.
     try {
       const folded = Atomics.load(routeFolds, 0);
       const finishProgress = readFinishProgress(finishBoundaries);
-      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V7 " + JSON.stringify({
+      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V8 " + JSON.stringify({
         nonce, exitCode, scope, express, patchedLayers: expressPatchStatus().patched, counts,
         expressEvidence: { ...expressEvidence, anyLayerStaged: Atomics.load(worker, workerCounters.expressHandlerStaged) },
         routeFoldEvidence: { batches: Number(folded >> 32n), events: Number(folded & 0xffff_ffffn) },
@@ -67,7 +69,7 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
         finishProgress,
         finishStaged: finishProgress?.staged ?? Atomics.load(worker, workerCounters.finishStaged),
         workerFailed: Atomics.load(worker, workerCounters.failed) === 1,
-        transportFailed, closeRequested,
+        transportFailed, closeRequested, beforeExitSeen,
       }) + "\n");
     } catch { /* A missing diagnostic cannot change application exit. */ }
   });

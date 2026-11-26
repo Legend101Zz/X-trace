@@ -52,6 +52,18 @@ class InstalledStopRecovery(unittest.TestCase):
         self.assertEqual(close.call_args_list, [call(30), call(31)])
         reap.assert_called_once_with(246)
 
+    def test_grace_only_probe_fails_on_deadline_without_forcing_the_child(self):
+        process = self.process()
+        process.child.wait.side_effect = subprocess.TimeoutExpired(["owned fixture"], 25)
+        with patch("installed.time.monotonic", side_effect=[100, 100]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                process.stop(grace_only=True)
+        process.child.terminate.assert_called_once_with()
+        process.child.wait.assert_called_once_with(timeout=25)
+        process.child.kill.assert_not_called()
+        self.assertEqual(process.stop_recovery_reasons, ["launcher-wait-deadline"])
+        self.assertFalse(process.cleaned)
+
     def test_descendants_share_the_original_grace_deadline_after_launcher_exit(self):
         process = self.process((30, 31))
         with (patch("installed.time.monotonic", side_effect=[100, 101, 110, 119]),

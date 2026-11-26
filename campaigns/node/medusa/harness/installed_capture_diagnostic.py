@@ -5,7 +5,7 @@ import re
 
 from installed_evidence import require
 
-PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V7 "
+PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V8 "
 DAEMON_PREFIX = b"XTR-MEDUSA-DAEMON-FINISH-V1 "
 DAEMON_FIELDS = ("sessions", "decoded", "admitted", "ackReady", "ackQueued", "ackFlushed")
 ACTIVE_WORK = frozenset(("idle", "start", "event", "route", "finish", "close", "route-start", "route-held-events"))
@@ -17,7 +17,7 @@ COUNTERS = frozenset({
 SCOPES = frozenset({"same-package", "different-package", "transitive-only", "entry-only", "neither"})
 EXPRESS = frozenset({"not-observed", "installed", "express-not-found", "unsupported-express",
                     "unsupported-node", "install-failed", "disabled-other"})
-SWITCHES = frozenset({"workerFailed", "transportFailed", "closeRequested"})
+SWITCHES = frozenset({"workerFailed", "transportFailed", "closeRequested", "beforeExitSeen"})
 HANDLER_COUNTS = frozenset({"invoked", "withContext", "posted", "anyLayerStaged"})
 FIELDS = frozenset({"nonce", "exitCode", "scope", "express", "patchedLayers", "counts",
                     "startStaged", "finishStaged", "expressEvidence", "routeFoldEvidence", "finishProgress"}) | SWITCHES

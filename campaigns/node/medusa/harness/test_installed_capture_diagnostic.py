@@ -19,7 +19,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
                     routeFoldEvidence=dict(batches=2, events=3),
                     finishProgress=dict(received=12, dispatched=10, submitted=9, written=9, staged=8, active="route"),
                     startStaged=9, finishStaged=8, workerFailed=False, transportFailed=False,
-                    closeRequested=False) | overrides
+                    closeRequested=False, beforeExitSeen=False) | overrides
 
     def line(self, **overrides):
         return PREFIX + json.dumps(self.snapshot(**overrides)).encode() + b"\n"
@@ -28,6 +28,8 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
         result = project_capture_diagnostic(b"private example path\n" + self.line(), self.nonce)
         self.assertEqual(result["status"], "observed")
         self.assertEqual(result["scope"], "transitive-only")
+        self.assertIs(result["beforeExitSeen"], False)
+        self.assertIs(project_capture_diagnostic(self.line(beforeExitSeen=True), self.nonce)["beforeExitSeen"], True)
         self.assertEqual(result["startStaged"], 9)
         self.assertEqual(result["counts"]["startCapacityRejected"], 35)
         self.assertEqual(result["counts"]["startBeforeCreditNotification"], 1)
@@ -61,7 +63,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
 
     def test_records_with_extra_values_or_impossible_counts_are_invalid(self):
         progress = self.snapshot()["finishProgress"]
-        for overrides in ({"finishProgress": None},
+        for overrides in ({"beforeExitSeen": "false"}, {"finishProgress": None},
                           {"finishProgress": progress | {"staged": 9}},
                           {"finishProgress": progress | {"written": 10}},
                           {"finishProgress": progress | {"received": 13}},
