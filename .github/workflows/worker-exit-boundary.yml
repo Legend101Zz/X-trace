@@ -1,0 +1,130 @@
+name: Node capture route release batch proof
+on:
+  push:
+    branches: [codex/proof-medusa-route-release-batch-120]
+permissions:
+  contents: read
+jobs:
+  worker-boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PRODUCT_SHA: 32366fbb6f50e5a5e557c1c54ad4d8c5b27728a5
+      PRODUCT_TREE: 84f9055898539658248fe323867d3ed20e1bbb9f
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.21.0
+      - name: Verify product and prepare private paths
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root=$(mktemp -d "$RUNNER_TEMP/worker-boundary.XXXXXX")
+          mkdir -m 700 "$root/private" "$root/safe"
+          printf 'WORKER_PROOF_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+          printf 'admitted=true\n' >> "$GITHUB_OUTPUT"
+      - name: Run only the named worker boundary checks
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import signal
+          import subprocess
+
+          root = Path(os.environ["WORKER_PROOF_ROOT"])
+          node = Path("adapters/node")
+          stages = ("install-locked-node", "compile-protocol", "compile-adapter", "worker-fixture", "verify-tap")
+          receipt = {
+              "schemaVersion": 1, "kind": "medusa-worker-route-release-batch-120",
+              "sourceSha": os.environ["PRODUCT_SHA"], "sourceTree": os.environ["PRODUCT_TREE"],
+              "wrapperSha": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "status": "failed",
+              "stages": dict.fromkeys(stages, "unreached"), "counts": None,
+          }
+
+          def save():
+              temp = root / "safe/receipt.tmp"
+              temp.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+              temp.replace(root / "safe/receipt.json")
+
+          def require(condition):
+              if not condition:
+                  raise SystemExit(1)
+
+          def command(stage, args, timeout):
+              receipt["stages"][stage] = "failed"
+              save()
+              with (root / "private" / (stage + ".stdout")).open("xb") as out, \
+                   (root / "private" / (stage + ".stderr")).open("xb") as err:
+                  with subprocess.Popen(args, cwd=node, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                        start_new_session=True) as process:
+                      try:
+                          status = process.wait(timeout=timeout)
+                      except subprocess.TimeoutExpired:
+                          try:
+                              os.killpg(process.pid, signal.SIGKILL)
+                          except ProcessLookupError:
+                              pass
+                          process.wait()
+                          raise SystemExit(1) from None
+              require(status == 0)
+              receipt["stages"][stage] = "passed"
+              save()
+
+          save()
+          command("install-locked-node", ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], 300)
+          command("compile-protocol", ["npm", "run", "build:protocol"], 120)
+          command("compile-adapter", ["npm", "run", "build:core"], 120)
+          command("worker-fixture", ["node", "--test", "--test-reporter=tap",
+                                     "packages/adapter-core/dist/test/worker-event-batch.test.js"], 30)
+          receipt["stages"]["verify-tap"] = "failed"
+          save()
+          tap = root / "private/worker-fixture.stdout"
+          require(tap.stat().st_size <= 65_536)
+          raw = tap.read_text()
+          names = [
+              ("1", "queued adjacent events batch in wire order across interleaved recordings and route, gap and finish boundaries"),
+              ("2", "count and full-envelope byte limits split batches without changing event order"),
+              ("3", "a split batch returns credits only for acknowledged constituents and stops at a rejection"),
+              ("4", "an empty event identity cannot make its valid neighbor part of a rejected batch"),
+              ("5", "app thread still charges all 64 logical messages and preserves the reserved finish"),
+              ("6", "timed release keeps held events before later same-recording events and credits them once"),
+              ("7", "route release combines the staged held prefix with consecutive queued handler events"),
+              ("8", "route release preserves a control boundary and falls back at the negotiated byte limit"),
+              ("9", "a rejected folded route batch refunds neither the route nor its queued events"),
+          ]
+          require(re.findall(r"^ok ([1-9]) - ([^\n]+)$", raw, re.M) == names)
+          expected = dict(tests=9, pass_=9, fail=0, cancelled=0, skipped=0, todo=0)
+          expected["pass"] = expected.pop("pass_")
+          counts = {}
+          for name in expected:
+              found = re.findall(rf"^# {name} ([0-9]{{1,3}})$", raw, re.M)
+              require(len(found) == 1)
+              counts[name] = int(found[0])
+          receipt["counts"] = counts
+          save()
+          require(counts == expected)
+          receipt["stages"]["verify-tap"] = "passed"
+          receipt["status"] = "passed"
+          save()
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        with:
+          name: medusa-120-worker-route-release-batch-counts
+          path: ${{ env.WORKER_PROOF_ROOT }}/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
