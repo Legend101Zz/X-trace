@@ -142,7 +142,25 @@ classify_version_stderr() {
     *"symbol lookup error:"*) category=symbol_lookup_error ;;
     *"panicked at "*) category=panic_reported ;;
     "") category=no_text_in_prefix ;;
-    *) category=other_diagnostic ;;
+    *)
+      # Match the last printable prefix line to this invocation and a fixed message.
+      # The message reports a symptom; it cannot identify the OS or packaging cause.
+      nl='
+'
+      line=${prefix_text##*"$nl"}
+      case "$line" in
+        "$prefix/bin/xtrace: "*) message=${line#"$prefix/bin/xtrace: "} ;;
+        *": $prefix/bin/xtrace: "*) message=${line##*": $prefix/bin/xtrace: "} ;;
+        *) message= ;;
+      esac
+      case "$message" in
+        "Permission denied") category=exec_permission_reported ;;
+        "Operation not permitted") category=exec_operation_refused_reported ;;
+        "Exec format error"|"cannot execute binary file: Exec format error") category=exec_format_reported ;;
+        "not found"|"No such file or directory"|"cannot execute: required file not found") category=exec_file_missing_reported ;;
+        "Text file busy") category=exec_file_busy_reported ;;
+        *) category=other_diagnostic ;;
+      esac ;;
   esac
   printf '%s' "$category"
 }
@@ -156,7 +174,12 @@ version_check=$(
 )
 version_status=${version_check%% *}
 if [ "$version_status" != 0 ]; then
-  printf 'install.sh: version check: status=%s category=%s\n' "$version_status" "${version_check#* }" >&2
+  category=${version_check#* }
+  case "$version_status:$category" in
+    126:*|127:*) ;;
+    *:exec_*) category=other_diagnostic ;;
+  esac
+  printf 'install.sh: version check: status=%s category=%s\n' "$version_status" "$category" >&2
   die "installed binary failed to run"
 fi
 say "installed X-trace $version into $prefix"
