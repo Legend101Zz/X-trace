@@ -1,0 +1,114 @@
+name: focused-paired-provenance-105
+on:
+  push:
+    branches: [codex/proof-jhipster-paired-provenance-105]
+permissions:
+  contents: read
+concurrency:
+  group: focused-paired-provenance-105-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  focused-fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PRODUCT_SHA: ff1da67c0f5997246e6cf7b62616a1d9ca4387d1
+      PRODUCT_TREE: b5d3e9e063c18cac3e7c1dbdd4d92e5ee80111c7
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Admit private proof root and verify exact source
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$RUNNER_TEMP/xfb"
+          mkdir -m 700 "$RUNNER_TEMP/xfb/outer" "$RUNNER_TEMP/xfb/public"
+      - name: Run exact named regressions and full campaign-library discovery privately
+        run: |
+          set -euo pipefail
+          umask 077
+          export PYTHONPATH="$GITHUB_WORKSPACE/campaigns/lib"
+          named_rc=0
+          python3 -B -m tools.qa.unittest_run --result "$RUNNER_TEMP/xfb/outer/named.json" \
+            test_jhipster_boundary_diagnostics.JHipsterBoundaryDiagnostics \
+            test_jhipster_partial_provenance test_jhipster_public_result.CollectSinks test_jhipster_focused_fixture.FocusedFixture \
+            > "$RUNNER_TEMP/xfb/outer/named.stdout" 2> "$RUNNER_TEMP/xfb/outer/named.stderr" || named_rc=$?
+          discovery_rc=0
+          python3 -B -m tools.qa.unittest_run --result "$RUNNER_TEMP/xfb/outer/library.json" \
+            discover -s campaigns/lib -p 'test_*.py' \
+            > "$RUNNER_TEMP/xfb/outer/library.stdout" 2> "$RUNNER_TEMP/xfb/outer/library.stderr" || discovery_rc=$?
+          guard_rc=0
+          python3 -B - <<'GUARD' > "$RUNNER_TEMP/xfb/outer/guard.stdout" 2> "$RUNNER_TEMP/xfb/outer/guard.stderr" || guard_rc=$?
+          import json, os, pathlib
+          from tools.qa.unittest_summary import read_result, summarize
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'xfb'
+          counts = {}
+          passed = True
+          for name, file, expected in (('named', 'named.json', 39), ('discovery', 'library.json', 247)):
+              result = read_result(root / 'outer' / file)
+              summarize(result)
+              observed = result['counts']
+              counts[name] = observed
+              passed = passed and observed['testsRun'] == expected and all(
+                  value == 0 for key, value in observed.items() if key != 'testsRun')
+          (root / 'public/source-counts.json').write_text(json.dumps({'counts': counts, 'passed': passed}) + '\n')
+          raise SystemExit(0 if passed else 1)
+          GUARD
+          if [ -f "$RUNNER_TEMP/xfb/public/source-counts.json" ]; then
+            cat "$RUNNER_TEMP/xfb/public/source-counts.json"
+          fi
+          test "$named_rc" -eq 0
+          test "$discovery_rc" -eq 0
+          test "$guard_rc" -eq 0
+      - name: Build one exact unsigned package and real fixture privately
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          python3 -B packaging/build.py --out dist --platform linux-x86_64 --work "$RUNNER_TEMP/xfb/package-work" \
+            > "$RUNNER_TEMP/xfb/outer/package.stdout" 2> "$RUNNER_TEMP/xfb/outer/package.stderr" || rc=$?
+          echo "Package build exit $rc"
+          test "$rc" -eq 0
+          rc=0
+          (cd adapters/java && ./gradlew --no-daemon --dependency-verification strict fixtureBootJar) \
+            > "$RUNNER_TEMP/xfb/outer/fixture.stdout" 2> "$RUNNER_TEMP/xfb/outer/fixture.stderr" || rc=$?
+          echo "Fixture build exit $rc"
+          exit "$rc"
+      - name: Fresh-install and observe the real Spring fixture
+        env:
+          SERVER_ADDRESS: 127.0.0.1
+        run: |
+          set -euo pipefail
+          umask 077
+          package="$GITHUB_WORKSPACE/dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz"
+          digest="$(sha256sum "$package" | cut -d ' ' -f 1)"
+          rc=0
+          python3 -B campaigns/java/jhipster/harness/focused_fixture.py \
+            --private-root "$RUNNER_TEMP/xfb/run" --archive "$package" \
+            --package-sha256 "$digest" --source-sha "$PRODUCT_SHA" --java "$JAVA_HOME/bin/java" \
+            --fixture "$GITHUB_WORKSPACE/adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar" \
+            --public-out "$RUNNER_TEMP/xfb/public/fixture" \
+            > "$RUNNER_TEMP/xfb/outer/driver.stdout" 2> "$RUNNER_TEMP/xfb/outer/driver.stderr" || rc=$?
+          echo "Focused installed fixture exit $rc"
+          exit "$rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1' }}
+        with:
+          name: focused-paired-provenance-counts
+          path: |
+            ${{ runner.temp }}/xfb/public/source-counts.json
+            ${{ runner.temp }}/xfb/public/fixture/summary.json
+          if-no-files-found: error
+          retention-days: 14
