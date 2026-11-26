@@ -56,7 +56,24 @@ export function EventsPanel({ active, phone, selectedRecording, detail, detailBu
   const steps = useMemo(() => filteredSteps(detail?.events ?? [], filter, selectedEvent), [detail, filter, selectedEvent]);
   const timing = useMemo(() => loadedTiming(detail?.events ?? []), [detail]);
   const phoneLayout = useViewport('(max-width: 699px)');
-  const toolbar = detail?.events.length ? <ReplayToolbar phone={phone} backReason={backReason} nextReason={nextReason} frameControls={frameControls} onMove={onMove} onNavigate={onNavigateKey}
+  const tabletLayout = useViewport('(min-width: 700px) and (max-width: 860px)');
+  const viewTabs = detail?.events.length ? <div className="mode-switch" role="tablist" aria-label="Replay view" onKeyDown={(event) => {
+    let next: ReplayMode;
+    switch (event.key) {
+      case 'Home': next = 'linear'; break;
+      case 'End': next = 'canvas'; break;
+      case 'ArrowLeft':
+      case 'ArrowRight': next = mode === 'linear' ? 'canvas' : 'linear'; break;
+      default: return;
+    }
+    event.preventDefault();
+    onMode(next, false);
+    event.currentTarget.querySelector<HTMLElement>(next === 'linear' ? '[data-mode="linear"]' : '[data-mode="canvas"]')?.focus();
+  }}>
+    <button className="button" role="tab" id="replay-view-steps-tab" aria-controls="replay-view-steps-panel" data-mode="linear" aria-selected={mode === 'linear'} tabIndex={mode === 'linear' ? 0 : -1} onClick={() => onMode('linear', true)}>Steps</button>
+    <button className="button" role="tab" id="replay-view-map-tab" aria-controls="replay-view-map-panel" data-mode="canvas" aria-selected={mode === 'canvas'} tabIndex={mode === 'canvas' ? 0 : -1} onClick={() => onMode('canvas', true)}>Map</button>
+  </div> : null;
+  const toolbar = detail?.events.length ? <ReplayToolbar viewTabs={tabletLayout ? viewTabs : null} phone={phone} backReason={backReason} nextReason={nextReason} frameControls={frameControls} onMove={onMove} onNavigate={onNavigateKey}
           tools={<ReplayTools key={detail.recordingId} events={detail.events} selected={selectedEvent} filter={filter} busy={detailBusy}
             onFilter={onFilter} onGo={onJumpToSequence} onActivate={onActivate} onAnnounce={onAnnounce} controlRef={windowControl} />} /> : null;
   return <section className="pane" role="tabpanel" id="events-panel" aria-labelledby="events-tab" data-active={active} aria-label="Ordered event window">
@@ -66,23 +83,7 @@ export function EventsPanel({ active, phone, selectedRecording, detail, detailBu
           {detailError ? <ErrorState message={detailError} onRetry={onRetry} /> : null}
           {!selectedRecording && !detailError ? <div className="empty"><strong>No recording selected</strong><p>Choose a linked or unmatched recording in Requests.</p></div> : null}
           {selectionUnavailable ? <p className="window-retention">{selectionUnavailable}</p> : null}
-          {detail && detail.events.length ? <div className="mode-switch" role="tablist" aria-label="Replay view" onKeyDown={(event) => {
-            let next: ReplayMode;
-            switch (event.key) {
-              case 'Home': next = 'linear'; break;
-              case 'End': next = 'canvas'; break;
-              case 'ArrowLeft':
-              case 'ArrowRight': next = mode === 'linear' ? 'canvas' : 'linear'; break;
-              default: return;
-            }
-            event.preventDefault();
-            onMode(next, false);
-            event.currentTarget.querySelector<HTMLElement>(next === 'linear' ? '[data-mode="linear"]' : '[data-mode="canvas"]')?.focus();
-          }}>
-            <button className="button" role="tab" id="replay-view-steps-tab" aria-controls="replay-view-steps-panel" data-mode="linear" aria-selected={mode === 'linear'} tabIndex={mode === 'linear' ? 0 : -1} onClick={() => onMode('linear', true)}>Steps</button>
-            <button className="button" role="tab" id="replay-view-map-tab" aria-controls="replay-view-map-panel" data-mode="canvas" aria-selected={mode === 'canvas'} tabIndex={mode === 'canvas' ? 0 : -1} onClick={() => onMode('canvas', true)}>Map</button>
-          </div> : null}
-          {detail ? <OutcomeBanner detail={detail} /> : null}
+          {!tabletLayout ? viewTabs : null}
           {detail ? <ReplayWindows key={detail.recordingId} prevCursor={detail.prevCursor ?? null} nextCursor={detail.nextCursor ?? null}
             count={detail.events.length} busy={detailBusy} startKnown={startKnown} released={releasedEvents}
             onChange={onChangeWindow} /> : null}
@@ -111,6 +112,7 @@ export function EventsPanel({ active, phone, selectedRecording, detail, detailBu
               }} /> : null}
             </div>
           </> : null}
+          {detail ? <OutcomeBanner detail={detail} /> : null}
         </div>
         {phoneLayout ? toolbar : null}
       </section>;

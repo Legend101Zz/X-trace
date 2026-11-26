@@ -21,13 +21,14 @@ export interface PhoneReplayControls {
   inspect: () => void;
 }
 
-export function ReplayToolbar({ backReason, nextReason, frameControls, onMove, onNavigate, tools, phone }: {
+export function ReplayToolbar({ backReason, nextReason, frameControls, onMove, onNavigate, tools, phone, viewTabs }: {
   backReason: string | null;
   nextReason: string | null;
   frameControls: readonly NavControl[];
   onMove: (direction: -1 | 1) => void;
   onNavigate: (action: NavAction) => void;
   tools?: ReactNode;
+  viewTabs?: ReactNode;
   phone: PhoneReplayControls;
 }) {
   const id = useId();
@@ -92,6 +93,7 @@ export function ReplayToolbar({ backReason, nextReason, frameControls, onMove, o
   }
   return <div className="replay-toolbar" role="group" aria-label="Replay navigation">
     <div className="button-row">
+      {viewTabs}
       {controls.map(stepButton)}
       {tools}
     </div>

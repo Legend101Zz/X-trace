@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium, expect } from '@playwright/test';
+import { assertReadableTourStep } from './replay-tools-journey.mjs';
 
 const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
@@ -39,6 +40,7 @@ try {
       const guide = page.locator('.viewer-tour');
       for (const title of ['Find a recording', 'Read Steps in order', 'Check what was recorded']) {
         await expect(guide.getByRole('heading', { name: title })).toBeFocused();
+        if (width === 736 && title === 'Read Steps in order') await assertReadableTourStep(page);
         if (screenshotDirectory) await page.screenshot({ path: join(screenshotDirectory, `tour-${width}-${title.split(' ')[0]}.png`) });
         const next = guide.getByRole('button', { name: 'Next', exact: true });
         if (await next.isVisible()) await next.press('Enter');

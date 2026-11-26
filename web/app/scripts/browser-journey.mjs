@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium, expect } from '@playwright/test';
-import { verifyLoadedReplayTools } from './replay-tools-journey.mjs';
+import { assertReadableTourStep, verifyLoadedReplayTools } from './replay-tools-journey.mjs';
 import { createReplayToolsReport } from './replay-tools-report.mjs';
 import { verifyReplayPlayback } from './replay-playback-journey.mjs';
 
@@ -662,6 +662,8 @@ try {
     const guide = page.locator('.viewer-tour');
     await expect(guide.getByRole('heading')).toHaveText('Find a recording');
     await guide.getByRole('button', { name: 'Next', exact: true }).press('Enter');
+    await expect(guide.getByRole('heading')).toHaveText('Read Steps in order');
+    if (width === 736) await assertReadableTourStep(page);
     await guide.getByRole('button', { name: 'Next', exact: true }).press('Enter');
     await expect(guide.getByRole('heading')).toHaveText('Check what was recorded');
     assert.equal(await page.locator('#events-panel .event[aria-current="true"] .event-seq').textContent(), selected,

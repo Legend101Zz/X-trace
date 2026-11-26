@@ -76,6 +76,20 @@ export async function verifyReplayPlayback(page, { events, pointer, openCapture,
       await speed(1);
       await activate(replay());
       await expect(pause()).toHaveAttribute('aria-pressed', 'true');
+      if (width === 736) {
+        // Measure at the native playback position before any locator action can reveal the tabs.
+        for (const name of ['Steps', 'Map']) {
+          const tab = mode(name);
+          await expect(tab).toBeInViewport({ ratio: 1 });
+          assert.ok(await tab.evaluate((button) => {
+            const box = button.getBoundingClientRect();
+            const x = box.left + box.width / 2;
+            return box.width >= 44 && box.height >= 44 && [box.top + 1, box.top + box.height / 2, box.bottom - 1]
+              .every((y) => button.contains(document.elementFromPoint(x, y)));
+          }), `the entire ${name} control is available during playback at 736px ${pointer}`);
+        }
+        await expect(selected).toBeInViewport({ ratio: 1 });
+      }
       await saveScreenshot(`viewer-replay-playback-${pointer}-${width}.png`, `real-Spring-display-playback-clock-controlled-${pointer}`, width, height, page);
       await activate(pause());
       await page.clock.runFor(2001);

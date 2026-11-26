@@ -409,6 +409,16 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
         }
       }
     }
+    if (width === 736) {
+      await expect(page.locator('#events-panel .recording-why')).toHaveJSProperty('open', true);
+      const readableRow = await page.locator('.steps-list .event').evaluateAll((rows) => rows.some((row) => {
+        const box = row.getBoundingClientRect();
+        const x = box.left + box.width / 2;
+        return box.width > 0 && box.height > 0 && [box.top + 1, box.top + box.height / 2, box.bottom - 1]
+          .every((y) => row.contains(document.elementFromPoint(x, y)));
+      }));
+      assert.ok(readableRow, `at least one complete recorded event is exposed with Why expanded at 736px ${pointer}`);
+    }
     await saveScreenshot(`viewer-replay-tools-${pointer}-${width}.png`, `loaded-tools-real-Spring-${pointer}`, width, height, page);
     await ensureMore();
     if (width < 1280) {
@@ -449,4 +459,20 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
   await goto(events[0].sequence);
   process.stdout.write(`Replay Tools scope: real Spring fixture, ${events.length} loaded events; scale/performance and installed-package provenance require their separate host receipts.\n`);
   process.stdout.write(`Spring fixture replay tools checked at 320/736/1024/1280/1440 ${pointer}; native Alt+Q/J/G, input exclusion, Escape focus return, exact selected sequence, loaded kinds, timing, DOM bound; enabled coarse controls used touch taps; opened-panel width/height targets checked\n`);
+}
+
+export async function assertReadableTourStep(page) {
+  await expect(page.locator('#events-panel .recording-why')).toHaveJSProperty('open', true);
+  const row = page.locator('#events-panel .event[aria-current="true"]');
+  await expect(row).toBeInViewport({ ratio: 1 });
+  const readable = await row.locator('.event-kind').evaluate((sentence) => {
+    const text = document.createRange();
+    text.selectNodeContents(sentence);
+    const lines = [...text.getClientRects()].filter((line) => line.width && line.height);
+    return lines.length > 0 && lines.every((line) => {
+      const y = line.top + line.height / 2;
+      return [line.left + 1, line.right - 1].every((x) => sentence.contains(document.elementFromPoint(x, y)));
+    });
+  });
+  assert.ok(readable, 'the recorded step sentence remains readable alongside the open disclosure and tour');
 }
