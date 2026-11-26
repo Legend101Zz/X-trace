@@ -177,7 +177,43 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     const modeEvidence = explanation.getByText(standard ?
       'Focused capture was not armed; relaunch with focused capture to record this.' :
       'Capture mode unavailable for this recording.', { exact: true });
-    await assertLabelUncovered(modeEvidence);
+    try {
+      await assertLabelUncovered(modeEvidence);
+    } catch (failure) {
+      // Diagnose the original hit-test without publishing text, selectors or DOM content.
+      try {
+        const surfaces = await modeEvidence.evaluate((element) => {
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          const labels = new Set();
+          for (const rect of [...range.getClientRects()].filter(rect => rect.width && rect.height).slice(0, 32)) {
+            const y = rect.top + rect.height / 2;
+            for (const x of [rect.left + 1, rect.left + rect.width / 2, rect.right - 1]) {
+              if (x < 0 || x >= innerWidth || y < 0 || y >= innerHeight) {
+                labels.add('outside-viewport');
+                continue;
+              }
+              const hit = document.elementFromPoint(x, y);
+              if (element.contains(hit)) continue;
+              const known = [
+                ['.replay-toolbar', 'replay-toolbar'],
+                ['.panel-splitter', 'panel-splitter'],
+                ['.replay-speed-panel', 'speed-panel'],
+                ['.replay-tool-panel', 'tool-panel'],
+                ['.recording-more-options', 'recording-more'],
+                ['.replay-context-explanation', 'recording-explanation'],
+                ['.replay-context', 'recording-context'],
+                ['.viewer-workspace', 'workspace'],
+              ];
+              labels.add(hit ? known.find(([selector]) => hit.closest(selector))?.[1] ?? 'other' : 'no-hit');
+            }
+          }
+          return [...labels].sort();
+        });
+        for (const surface of surfaces) console.error(`Recording disclosure hit after failure: ${surface}`);
+      } catch { /* Preserve the first assertion when the page is unavailable. */ }
+      throw failure;
+    }
     assert.deepEqual(await explanation.locator('[aria-label="Recorded capture limitations"] li').allTextContents(), detail.limitations);
     if (width < 700) await expect(explanation).toContainText(ns === null ?
       'Duration unavailable for this capture' : `Adapter-observed duration ${duration} (measured by the adapter, not verified by X-trace)`);

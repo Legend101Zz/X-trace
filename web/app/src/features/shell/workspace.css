@@ -124,7 +124,8 @@
 .replay-context-event > :first-child { flex-shrink: 0; color: var(--amber); }
 .replay-context-why summary { display: flex; min-width: 44px; min-height: 32px; align-items: center; justify-content: center; color: var(--text); text-decoration: underline; cursor: pointer; }
 .replay-context-why summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
-.replay-context-explanation { position: absolute; z-index: 3; inset: 100% 8px auto; max-height: min(52dvh, 22rem); overflow: auto; padding: 12px; background: var(--panel-raised); border: 1px solid var(--line-strong); border-radius: var(--radius); overflow-wrap: anywhere; }
+/* Disclosure text must paint above the later workspace toolbar (layer 3). */
+.replay-context-explanation { position: absolute; z-index: 4; inset: 100% 8px auto; max-height: min(52dvh, 22rem); overflow: auto; padding: 12px; background: var(--panel-raised); border: 1px solid var(--line-strong); border-radius: var(--radius); overflow-wrap: anywhere; }
 .replay-context-explanation ul { margin: 6px 0 0; padding-inline-start: 18px; }
 .replay-context-explanation li + li { margin-block-start: 3px; }
 
