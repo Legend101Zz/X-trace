@@ -90,10 +90,15 @@ def s_denied(c):
     c.check("db untouched by denied write", c.db["no-denied-rows"] == [["0"]])
 
 
-def s_seed_read(c):
+def read_seeded_office_list(c):
+    """Ordinary first read shared by the full seed scenario and the one-office diagnostic."""
     r = c.http("GET", f"{BASE}/offices", headers=H)
     offices = jbody(r) or []
     c.check("authenticated office list contains seeded head office", r["status"] == 200 and any(o.get("id") == 1 for o in offices))
+
+
+def s_seed_read(c):
+    read_seeded_office_list(c)
     r = c.http("GET", f"{BASE}/offices/1", headers=H)
     c.check("office 1 readable", r["status"] == 200 and (jbody(r) or {}).get("id") == 1)
     r = c.http("GET", f"{BASE}/clients?limit=5", headers=H, label="client list (empty tenant)")
