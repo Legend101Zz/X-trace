@@ -1,0 +1,260 @@
+name: gates-io-diagnostic-temporary
+on:
+  push:
+    branches: [codex/gates-io-diagnostic-78]
+permissions:
+  contents: read
+jobs:
+  store-io:
+    runs-on: ubuntu-latest
+    # Recent run took 49 minutes; leave room for runner and download variance.
+    timeout-minutes: 90
+    env:
+      NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prepare restricted diagnostic output
+        run: |
+          set -euo pipefail
+          umask 077
+          diagnostic="${RUNNER_TEMP:?}/gates-io-evidence"
+          mkdir -m 700 "$diagnostic"
+          echo "XTRACE_GATES_IO_EVIDENCE=$diagnostic" >> "$GITHUB_ENV"
+      - name: Test dev tools, command guard and full QA suite
+        run: |
+          exec > "$XTRACE_GATES_IO_EVIDENCE/qa.log" 2>&1
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/xd"
+          mkdir -m 700 "$root"
+          # The env tests also need an owner-only ancestor within the 24-byte scratch cap.
+          chmod 700 "$RUNNER_TEMP"
+          XTRACE_DEV_TEST_ROOT="$root" XTRACE_DEV_SCRATCH="$RUNNER_TEMP" TMPDIR="$root" \
+            python3 -B -m unittest tools.dev.test_dev_tools tools.dev.test_guard tools.qa.test_release_floor
+          # Match lane/campaign discovery without the dev tests' private TMPDIR override.
+          python3 -B -m unittest discover -s tools/qa -p 'test_*.py'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - id: gradle-cache
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+          cache-dependency-path: |
+            adapters/java/build.gradle.kts
+            adapters/java/settings.gradle.kts
+            adapters/java/gradle.lockfile
+            adapters/java/*/build.gradle.kts
+            adapters/java/*/gradle.lockfile
+            adapters/java/gradle/verification-metadata.xml
+            adapters/java/gradle/wrapper/gradle-wrapper.properties
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Install and validate Node protocol workspace
+        run: |
+          exec > "$XTRACE_GATES_IO_EVIDENCE/node.log" 2>&1
+          npm ci --prefix adapters/node
+          npm run generate:check --prefix adapters/node
+          npm test --prefix adapters/node
+      - name: Install and verify embedded browser viewer
+        run: |
+          exec > "$XTRACE_GATES_IO_EVIDENCE/web.log" 2>&1
+          npm ci --prefix web/app
+          cd web/app
+          npx playwright install --with-deps chromium
+          cd ../..
+          npm run typecheck --prefix web/app
+          npm test --prefix web/app
+          npm run check:api --prefix web/app
+          npm run check:embedded --prefix web/app
+      - name: Verify Java protocol, agent, and fixture workspace
+        working-directory: adapters/java
+        run: |
+          exec > "$XTRACE_GATES_IO_EVIDENCE/gradle.log" 2>&1
+          ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
+      - name: Cache cargo registry and target
+        id: cargo-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Admit private test scratch before cargo tests
+        # Product storage refuses a data directory under a world-writable ancestor such as /tmp, so
+        # Rust tests that run `init` need a TMPDIR below the runner's private temp directory. This is
+        # the same shape the release floor uses (TMPDIR and XTRACE_TEST_PRIVATE_SCRATCH inside an
+        # admitted 0700 root). It is placed after the Node/Gradle steps so only cargo steps see it.
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/frag" "$root/frag/ci-diag"
+          mkdir -m 700 "$root/c"
+          echo "XTRACE_TEST_CARDINALITY_SCRATCH=$root/c" >> "$GITHUB_ENV"
+          mkdir -m 700 "$root/private-io" "$root/private-io/direct" "$root/private-io/umask" "$root/private-io/held-request" "$root/private-io/catalog"
+          mkdir -m 700 "$root/private-io/first-attach" "$root/private-io/long-path-init"
+          echo "XTRACE_TEST_PRIVATE_IO_ROOT=$root/private-io" >> "$GITHUB_ENV"
+          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
+      - name: Format gate (stable rustfmt, no nightly-only keys)
+        run: |
+          exec > "$XTRACE_GATES_IO_EVIDENCE/format.log" 2>&1
+          cargo fmt --all --check
+      - name: Strict clippy
+        run: |
+          exec > "$XTRACE_GATES_IO_EVIDENCE/clippy.log" 2>&1
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Reject release CI diagnostic channel
+        run: |
+          exec > "$XTRACE_GATES_IO_EVIDENCE/negative-ci-channel.log" 2>&1
+          set -euo pipefail
+          umask 077
+          log="$XTRACE_GATES_IO_EVIDENCE/ci-diagnostics-release.log"
+          if cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic feature was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release all-features diagnostic channel was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic channel with debug assertions was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics is forbidden in release profiles even with debug assertions' "$log" >/dev/null
+          if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release diagnostic channel with debug assertions was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics is forbidden in release profiles even with debug assertions' "$log" >/dev/null
+      - name: Record runner and restored cache status
+        if: always() && env.XTRACE_GATES_IO_EVIDENCE != ''
+        env:
+          JAVA_CACHE_HIT: ${{ steps.gradle-cache.outputs.cache-hit }}
+          RUST_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          os="${ImageOS:-unavailable}"
+          version="${ImageVersion:-unavailable}"
+          [[ "$os" =~ ^[a-zA-Z0-9._-]{1,40}$ ]] || os=unavailable
+          [[ "$version" =~ ^[a-zA-Z0-9._-]{1,40}$ ]] || version=unavailable
+          cache_status() {
+            case "$1" in true|false) printf '%s' "$1";; *) printf 'unavailable';; esac
+          }
+          {
+            printf 'runner_os=%s runner_image_version=%s\n' "$os" "$version"
+            printf 'gradle_exact_cache_hit=%s cargo_exact_cache_hit=%s\n' \
+              "$(cache_status "$JAVA_CACHE_HIT")" "$(cache_status "$RUST_CACHE_HIT")"
+          } | tee "$XTRACE_GATES_IO_EVIDENCE/runner.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Compile workspace test executables once without running them
+        run: |
+          set -euo pipefail
+          export XTRACE_CI_DIAG_DIR="${RUNNER_TEMP:?}/xt/frag/ci-diag"
+          command_log="$XTRACE_GATES_IO_EVIDENCE/workspace-compile.log"
+          {
+            stat -f -c 'phase=before_workspace_compile resource=scratch available_blocks=%a free_inodes=%d block_size=%S' "$RUNNER_TEMP/xt/c" 2>/dev/null ||
+              echo 'phase=before_workspace_compile resource=scratch capacity=unavailable'
+            stat -f -c 'phase=before_workspace_compile resource=checkout available_blocks=%a free_inodes=%d block_size=%S' "$GITHUB_WORKSPACE" 2>/dev/null ||
+              echo 'phase=before_workspace_compile resource=checkout capacity=unavailable'
+          } > "$XTRACE_GATES_IO_EVIDENCE/workspace-compile-capacity.txt"
+          if ! cargo test --locked --workspace --all-features --no-run > "$command_log" 2>&1; then
+            echo "Workspace test executable compilation failed"
+            exit 1
+          fi
+      - name: Run only xtrace-store library at default concurrency
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/xt"
+          export XTRACE_CI_DIAG_DIR="$root/frag/ci-diag"
+          capacity="$XTRACE_GATES_IO_EVIDENCE/capacity.txt"
+          sample() {
+            local phase="$1" label path facts
+            for label in scratch target; do
+              case "$label" in scratch) path="$root/c";; target) path="$GITHUB_WORKSPACE/target";; esac
+              if facts=$(stat -f -c 'available_blocks=%a free_inodes=%d block_size=%S' "$path" 2>/dev/null); then
+                printf 'phase=%s resource=%s elapsed_seconds=%d %s\n' "$phase" "$label" "$SECONDS" "$facts"
+              else
+                printf 'phase=%s resource=%s elapsed_seconds=%d capacity=unavailable\n' "$phase" "$label" "$SECONDS"
+              fi
+            done
+          }
+          monitor() {
+            local sleeper= index
+            stop_sleep() {
+              if [[ -n "$sleeper" ]]; then
+                kill -TERM "$sleeper" 2>/dev/null || true
+                wait "$sleeper" 2>/dev/null || true
+              fi
+              exit 0
+            }
+            trap stop_sleep TERM INT
+            for ((index = 0; index < 270; index += 1)); do
+              sleep 20 &
+              sleeper=$!
+              wait "$sleeper" || break
+              sleeper=
+              sample periodic
+            done
+          }
+          sample start > "$capacity"
+          monitor >> "$capacity" &
+          monitor_pid=$!
+          cleanup() {
+            kill -TERM "$monitor_pid" 2>/dev/null || true
+            wait "$monitor_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          log="$XTRACE_GATES_IO_EVIDENCE/store-lib.log"
+          status=0
+          cargo test --locked -p xtrace-store --lib --all-features --no-fail-fast > "$log" 2>&1 || status=$?
+          cleanup
+          trap - EXIT
+          sample end >> "$capacity"
+          if [[ "$status" -eq 0 ]]; then
+            grep -Fxq 'test recording_port::tests::journal_sync_errors_prevent_acknowledgement_and_report_original_io_facts ... ok' "$log"
+            grep -Fq 'test recording_store::object_diagnostic::tests::' "$log"
+            grep -Fxq 'test recording_port::tests::singleton_acknowledgements_at_focused_cap_recover_with_bounded_segments_and_pages ... ok' "$log"
+          fi
+          {
+            printf 'Concurrent store-library exit: %d.\n' "$status"
+            echo 'Workspace test binaries were compiled. Earlier workspace binaries did not execute.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Encrypt raw diagnostics
+        if: always() && env.XTRACE_GATES_IO_EVIDENCE != ''
+        env:
+          EVIDENCE_CERT: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVOVENDQXAyZ0F3SUJBZ0lVZkxxMVlkSWI5OVZQa1lFSUJwVUw2RVpUL2RVd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0tqRW9NQ1lHQTFVRUF3d2ZXQzEwY21GalpTQndjbWwyWVhSbElIWnBaWGRsY2lCbGRtbGtaVzVqWlRBZQpGdzB5TmpFeE1qVXhOVEV6TWpaYUZ3MHlOakV5TURreE5URXpNalphTUNveEtEQW1CZ05WQkFNTUgxZ3RkSEpoClkyVWdjSEpwZG1GMFpTQjJhV1YzWlhJZ1pYWnBaR1Z1WTJVd2dnR2lNQTBHQ1NxR1NJYjNEUUVCQVFVQUE0SUIKandBd2dnR0tBb0lCZ1FDMkJ3Mi9QdURTZWFQeWNZby9HblhUNjhKMVpVWmhvM285U2dhQ3NjR0UvdXZrRXNyTQo0OUtvcVNKeExaSmdrbUcwODRvUEs1SXhKQVkzd29jcGRBL3dUVW5UYWZTWTc1N0JBZ0dFbGVjQTh1T2lpcHZyCm9XTFloUS9YVUxOaUNaVTUrRHB3OGs5cmxWQ3lNa1FNa2NJNWRkTE1JL0MyTDFzSnExSWx3Ulo3dzBmV3MzVXoKc1hwaUxjb2VJejdGalphV2tPUzdwMHVvREowMkQ0alFaR2p1WUl2a0xwL3c3b3JtdHFYOW5tazhmWDdOK0JXeQowTnpjYlFvV1B5QzlTalYzaUNNMkNDMCtxRzBINDB2Uy9zU2s3c0RhQVVDTFVrTHFCTHduY2tWNGJ4Sk1mdE9BClZ3VUpNUSt1aUhpUUsyNnVCcXovUDNOcFBqRGFZT3BCK1ppZlN2Y0V6TjFQWndLTlM5d2JzZm1WdjlCTjg2UkYKK1VYSzdHdURSUHpKdDkrckc5RHZneHZJWG4ydWxrNXhlYStuRGR5d3k1TGRZSFNMZ1NRekZWWXpCLzVXaXA5VQpSTmdDekRPU01FTXZ4SFBibXpaSzF4QWtlbjZHK1hpbG1MMW9XNmlTU01kOUpTNU1jbXZ3bWN6RmtLU293SWQvCnFydVdVV0VmNUUzck9Gc0NBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmMKVmxpK01COEdBMVVkSXdRWU1CYUFGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmNWbGkrTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dHQkFCa0ZsN3Znc05TN0tMVWp3bDFnSFlKL1BYMDEydnlpCi9VNExVM0g3eHZHZFZBSUpXejIvYjdZaHg0OFh6SWFyb0RoQ1lYNzY5ZStBODM1Si9pQ042cExmeTYyM3R1WU8KWUhVMEZUSFZqdUZ0OFVxRDVYdExpdGVmMHJuN0luam9HWmJvR3lLbXBrTWs3TkgydmFCcDY3SHA3UnV5anBTTQp6UmY3LzNPOFN3U1FxK1RxNENvaVh6OWgwdzBjV3AxRytqRGtBR2pOMXNUeU45amNrM0VnSkpia2trR2lENC9wCkw5eE5WbUFqZmhrRExqc2t0VmZaQ1hNcDVlbVZmWkJqZW9wUHpDS3YwN1NrOERTeWFNcnRFTFJhbU9JMXZUM08KSWkzNTFoaTVuNnpiamVCTUM4dmt4T0pCckxsc2FVUHV6V0M4OEpQQzRCUGk0SXVFanA3eHVFdUlLSTR3YTVuUApZVC81SDAzWUwrajJ2V3pUa2Z3UVUvS0wrMEx3NkIwNVByTC9ZRFY4dXcrU3crK1A4bG5TK2ZsaisxUi9iY0tTClg3NFVnY2g0c0tESXd2clBzemRUZXh4cVBrajlHYXpPbzk4RHRlTys5RUdvWDZKcU9ZWmVCU3VIUndoTGNqNXYKK0c5blVacDc1R1djYmlzYk1udUpIQkVOV3RQVzhFUTZQZz09Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_GATES_IO_EVIDENCE"
+          cert="$root/evidence.crt"
+          printf '%s' "$EVIDENCE_CERT" | base64 -d > "$cert"
+          evidence=( -C "$root" --exclude=evidence.crt . )
+          if [[ -d "${RUNNER_TEMP:?}/xt/frag/ci-diag" ]]; then
+            evidence+=( -C "$RUNNER_TEMP/xt/frag" ci-diag )
+          fi
+          tar -cf - "${evidence[@]}" | openssl cms -encrypt -binary -aes-256-cbc \
+            -outform DER -out "$RUNNER_TEMP/gates-io-diagnostic.enc" "$cert"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && env.XTRACE_GATES_IO_EVIDENCE != ''
+        with:
+          name: encrypted-gates-io-diagnostic
+          path: ${{ runner.temp }}/gates-io-diagnostic.enc
+          if-no-files-found: error
+          retention-days: 1

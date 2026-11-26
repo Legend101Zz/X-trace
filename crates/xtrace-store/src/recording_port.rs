@@ -2176,7 +2176,39 @@ mod tests {
 
     #[cfg(all(unix, debug_assertions))]
     #[allow(clippy::panic, reason = "failed test reports only bounded acknowledgement facts")]
-    fn fail_singleton_acknowledgement(label: &'static str, diagnostic: String) {
+    fn fail_singleton_acknowledgement(
+        label: &'static str,
+        diagnostic: String,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            allow(unused_variables, reason = "Linux capacity probe only")
+        )]
+        fixture: &std::path::Path,
+    ) {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags, StatVfsMountFlags, fstatvfs, open};
+            let capacity = open(
+                fixture,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .and_then(fstatvfs);
+            match capacity {
+                Ok(facts) => panic!(
+                    "acknowledgement {label} {diagnostic} fixture_available_blocks={} fixture_available_inodes={} fixture_block_size={} fixture_readonly={}",
+                    facts.f_bavail,
+                    facts.f_favail,
+                    facts.f_frsize,
+                    u8::from(facts.f_flag.contains(StatVfsMountFlags::RDONLY))
+                ),
+                Err(error) => panic!(
+                    "acknowledgement {label} {diagnostic} fixture_capacity_errno={}",
+                    error.raw_os_error()
+                ),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         panic!("acknowledgement {label} {diagnostic}");
     }
 
@@ -2397,7 +2429,7 @@ mod tests {
             let receipt = crate::recording_store::object_diagnostic::observe_acknowledgement(
                 index as u64 + 1,
                 record,
-                fail_singleton_acknowledgement,
+                |label, facts| fail_singleton_acknowledgement(label, facts, directory.path()),
             );
             #[cfg(not(all(unix, debug_assertions)))]
             let receipt = record();
