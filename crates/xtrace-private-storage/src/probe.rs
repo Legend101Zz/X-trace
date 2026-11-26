@@ -890,12 +890,11 @@ fn recheck_linux_directory_acl(
 
 #[cfg(target_os = "linux")]
 fn read_acl_attribute(directory: &File, name: &str) -> Result<Option<Vec<u8>>, rustix::io::Errno> {
-    let mut value = vec![0_u8; 16 * 1024];
-    match rustix::fs::fgetxattr(directory, name, value.as_mut_slice()) {
-        Ok(length) => {
-            value.truncate(length);
-            Ok(Some(value))
-        }
+    // Rustix exposes only the bytes initialized by the kernel. An absent
+    // attribute needs no heap allocation, and the syscall still has 16 KiB.
+    let mut value = [std::mem::MaybeUninit::<u8>::uninit(); 16 * 1024];
+    match rustix::fs::fgetxattr(directory, name, &mut value) {
+        Ok((initialized, _)) => Ok(Some(initialized.to_vec())),
         Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA => {
             Ok(None)
         }
@@ -1971,6 +1970,57 @@ mod tests {
             assert_linux_hooks_consumed();
             assert_eq!(directory_probe_count() - before, probes, "{point:?}");
             assert!(operation.judged.borrow().is_empty(), "Linux never caches verdicts");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_directory_attribute_read_distinguishes_absent_empty_bytes_and_errors() {
+        use rustix::fs::{Mode, OFlags, XattrFlags, fsetxattr};
+        use rustix::io::Errno;
+
+        let root = fixture();
+        let directory = open(root.path());
+        let name = "user.xtrace-read-fixture";
+        assert_eq!(read_acl_attribute(&directory, name), Ok(None));
+
+        fsetxattr(&directory, name, &[], XattrFlags::CREATE).expect("create empty attribute");
+        assert_eq!(read_acl_attribute(&directory, name), Ok(Some(Vec::new())));
+
+        let bytes = [0_u8, 0xff, 0x20, 0, 0x7f];
+        fsetxattr(&directory, name, &bytes, XattrFlags::REPLACE).expect("replace attribute");
+        assert_eq!(read_acl_attribute(&directory, name), Ok(Some(bytes.to_vec())));
+
+        let metadata_only = File::from(
+            rustix::fs::open(
+                root.path(),
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .expect("metadata-only descriptor"),
+        );
+        assert_eq!(read_acl_attribute(&metadata_only, name), Err(Errno::BADF));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_directory_attribute_read_preserves_oversized_error_when_supported() {
+        use rustix::fs::{XattrFlags, fsetxattr};
+        use rustix::io::Errno;
+
+        let root = fixture();
+        let directory = open(root.path());
+        let name = "user.xtrace-oversized-fixture";
+        match fsetxattr(&directory, name, &vec![0xff; 16 * 1024 + 1], XattrFlags::CREATE) {
+            Ok(()) => {
+                assert_eq!(read_acl_attribute(&directory, name), Err(Errno::RANGE));
+                println!("oversized_attribute=observed");
+            }
+            // Some filesystems store xattrs in a single block or cap their size.
+            Err(Errno::NOSPC | Errno::TOOBIG | Errno::NOTSUP) => {
+                println!("oversized_attribute=unavailable");
+            }
+            Err(error) => panic!("oversized attribute setup failed: {error}"),
         }
     }
 
