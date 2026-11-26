@@ -14,9 +14,11 @@ export function createCaptureCredits(): Uint32Array<SharedArrayBuffer> {
   return new Uint32Array(new SharedArrayBuffer(2 * Uint32Array.BYTES_PER_ELEMENT));
 }
 
-/** Called once by the worker at the existing handoff-credit boundary. */
-export function returnCaptureCredit(credits: Uint32Array<SharedArrayBuffer>, notify?: () => void): void {
-  Atomics.add(credits, COMPLETED, 1);
+/** Publishes the full group of credits earned at one existing worker handoff boundary. */
+export function returnCaptureCredits(
+  credits: Uint32Array<SharedArrayBuffer>, count: number, notify?: () => void,
+): void {
+  Atomics.add(credits, COMPLETED, count);
   if (notify && Atomics.exchange(credits, NOTIFICATION_PENDING, 1) === 0) notify();
 }
 

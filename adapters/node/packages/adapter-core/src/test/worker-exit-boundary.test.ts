@@ -9,7 +9,7 @@ import { createCaptureCredits, createHttpCaptureTransport } from "../runtime/tra
 
 const fixture = fileURLToPath(new URL("./worker-exit-boundary-fixture.js", import.meta.url));
 
-type Mode = "capacity" | "natural" | "explicit" | "cooperative" | "aborted";
+type Mode = "capacity" | "natural" | "explicit" | "cooperative" | "aborted" | "queued-explicit" | "queued-cooperative";
 
 async function run(mode: Mode, expectedCode = 0): Promise<unknown> {
   let code = 0;
@@ -69,4 +69,15 @@ test("an already exited worker cannot start or confirm a cooperative drain", asy
   assert.equal(transport.start("fixture", "GET", 1n), false);
   assert.equal(await transport.drain?.(new AbortController().signal), false);
   assert.equal(calls, 0);
+});
+
+
+test("owned close drains a second finish queued behind an outstanding ACK", async () => {
+  const shared = { capacityRefusals: 0, finishPosted: true, eventsStaged: 0, bothFinishesReceived: true };
+  assert.deepEqual(await run("queued-explicit"), {
+    ...shared, startEntered: 1, startStaged: 1, finishEntered: 1, finishStaged: 0, closeSeen: 0,
+  });
+  assert.deepEqual(await run("queued-cooperative", 37), {
+    ...shared, drainResult: true, startEntered: 2, startStaged: 2, finishEntered: 2, finishStaged: 2, closeSeen: 1,
+  });
 });

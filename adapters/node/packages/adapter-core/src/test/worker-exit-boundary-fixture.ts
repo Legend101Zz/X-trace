@@ -4,14 +4,14 @@ import { isMainThread, parentPort, Worker, workerData } from "node:worker_thread
 import { OutcomeKind } from "@xtrace/protocol";
 import { installHttpCapture } from "../http-capture.cjs";
 import { drainCapture } from "../index.js";
-import { createCaptureCredits, createHttpCaptureTransport, returnCaptureCredit } from "../runtime/transport.cjs";
+import { createCaptureCredits, createHttpCaptureTransport, returnCaptureCredits } from "../runtime/transport.cjs";
 import { createRecordingAssembler, type InputMessage } from "../worker-core.js";
 import { createWorkerDelivery } from "../worker-delivery.js";
 
-type Mode = "capacity" | "natural" | "explicit" | "cooperative" | "aborted";
+type Mode = "capacity" | "natural" | "explicit" | "cooperative" | "aborted" | "queued-explicit" | "queued-cooperative";
 const FIRST = "01900000-0000-7000-8000-000000000001";
 const SECOND = "01900000-0000-7000-8000-000000000002";
-const slot = { startEntered: 0, startStaged: 1, eventsStaged: 2, finishEntered: 3, finishStaged: 4, closeSeen: 5 } as const;
+const slot = { startEntered: 0, startStaged: 1, eventsStaged: 2, finishEntered: 3, finishStaged: 4, closeSeen: 5, bothFinishesReceived: 6 } as const;
 
 interface FixtureData {
   mode: Mode;
@@ -45,8 +45,12 @@ function runWorker({ mode, credits, state }: FixtureData): void {
       Atomics.add(state, slot.finishStaged, 1);
     }
   }, undefined, undefined, { maxBatchEvents: 64, fitsEnvelope: () => true });
+  let finishReceipts = 0;
   const delivery = createWorkerDelivery(assembler, {
-    staged: () => returnCaptureCredit(credits),
+    finishProgress(boundary) {
+      if (boundary === "received" && ++finishReceipts === 2) entered(slot.bothFinishesReceived);
+    },
+    staged: (count) => returnCaptureCredits(credits, count),
     async close() {
       port.postMessage({ type: "drained" });
       port.close();
@@ -106,6 +110,15 @@ async function runChild(mode: Mode): Promise<void> {
     assert.equal(load(slot.closeSeen), 0);
   }
 
+  const queued = mode === "queued-explicit" || mode === "queued-cooperative";
+  if (queued) {
+    assert.equal(transport.start(SECOND, "GET", 1n), true);
+    assert.equal(transport.finish(SECOND, 1n, 1n, 0, { outcome: "responded", httpStatus: 200 }), true);
+    waitFor(slot.bothFinishesReceived);
+    assert.equal(load(slot.finishEntered), 1, "the second finish remains behind the first ACK");
+    assert.equal(load(slot.finishStaged), 0);
+  }
+
   let drainResult: boolean | undefined;
   process.once("exit", () => {
     // Exit only emits fixed fixture counters. The explicit leg cannot queue a drain here.
@@ -115,10 +128,11 @@ async function runChild(mode: Mode): Promise<void> {
       startEntered: load(slot.startEntered), startStaged: load(slot.startStaged),
       eventsStaged: load(slot.eventsStaged), finishEntered: load(slot.finishEntered),
       finishStaged: load(slot.finishStaged), closeSeen: load(slot.closeSeen),
+      ...(queued ? { bothFinishesReceived: load(slot.bothFinishesReceived) === 1 } : {}),
     }) + "\n");
   });
-  if (mode === "explicit") process.exit(0);
-  if (mode === "cooperative" || mode === "aborted") {
+  if (mode === "explicit" || mode === "queued-explicit") process.exit(0);
+  if (mode === "cooperative" || mode === "aborted" || mode === "queued-cooperative") {
     const deadline = new AbortController();
     if (mode === "aborted") {
       worker.on("message", (message: { type: string }) => {
@@ -126,14 +140,14 @@ async function runChild(mode: Mode): Promise<void> {
       });
     }
     drainResult = await drainCapture(deadline.signal);
-    process.exit(mode === "cooperative" ? 37 : 38);
+    process.exit(mode === "aborted" ? 38 : 37);
   }
 }
 
 if (isMainThread) {
   const mode = process.argv[2];
   assert.ok(mode === "capacity" || mode === "natural" || mode === "explicit" ||
-    mode === "cooperative" || mode === "aborted");
+    mode === "cooperative" || mode === "aborted" || mode === "queued-explicit" || mode === "queued-cooperative");
   await runChild(mode);
 } else {
   runWorker(workerData as FixtureData);

@@ -1,6 +1,6 @@
 import { RecordingEventKind } from "@xtrace/protocol";
 import { parentPort, receiveMessageOnPort, workerData } from "node:worker_threads";
-import { returnCaptureCredit, routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
+import { returnCaptureCredits, routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
 import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
 import { finishProgressDiagnosticOffset, noteFinishProgress, noteFinishWork,
@@ -88,7 +88,7 @@ async function initialize(): Promise<void> {
     receivePending: () => parentPort
       ? receiveMessageOnPort(parentPort)?.message as InputMessage | undefined
       : undefined,
-    staged: () => returnCaptureCredit(data.credits, notify),
+    staged: (count) => returnCaptureCredits(data.credits, count, notify),
     ...(finishProgress ? {
       finishProgress: (boundary: "received" | "dispatched") => noteFinishProgress(finishProgress, boundary),
       activeWork: (type: FinishWork) => noteFinishWork(finishProgress, type),

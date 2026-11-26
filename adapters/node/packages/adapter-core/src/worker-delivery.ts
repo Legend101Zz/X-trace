@@ -7,7 +7,7 @@ interface DeliveryHooks {
   receivePending?(): InputMessage | undefined;
   finishProgress?(boundary: "received" | "dispatched"): void;
   activeWork?(type: FinishWork): void;
-  staged(): void;
+  staged(count: number): void;
   routeFoldStaged?(events: number): void;
   close(): Promise<void>;
   fail(): void;
@@ -27,7 +27,7 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
 
   function credit(count: number): void {
     if (stopped) return;
-    for (let index = 0; index < count; index += 1) hooks.staged();
+    hooks.staged(count);
   }
 
   function append(message: InputMessage): void {

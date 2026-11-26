@@ -47,17 +47,18 @@ function createHarness(
   const done = deferred();
   const failed = deferred();
   let credits = 0;
+  const creditGroups: number[] = [];
   const stagedFolds: number[] = [];
   const delivery = createWorkerDelivery(assembler, {
     ...(receivePending ? { receivePending } : {}),
     ...(finishProgress ? { finishProgress } : {}),
     ...(activeWork ? { activeWork } : {}),
-    staged: () => { credits += 1; },
+    staged: (count) => { credits += count; creditGroups.push(count); },
     routeFoldStaged: (events) => { stagedFolds.push(events); },
     close: async () => done.resolve(),
     fail: failed.resolve,
   });
-  return { assembler, delivery, done: done.promise, failed: failed.promise, credits: () => credits, stagedFolds };
+  return { assembler, delivery, done: done.promise, failed: failed.promise, credits: () => credits, creditGroups, stagedFolds };
 }
 
 test("queued adjacent events batch in wire order across interleaved recordings and route, gap and finish boundaries", async () => {
@@ -194,7 +195,7 @@ test("app thread still charges all 64 logical messages and preserves the reserve
   }, () => 5n, undefined, { maxBatchEvents: 64, fitsEnvelope: () => true });
   const credits = createCaptureCredits();
   const delivery = createWorkerDelivery(assembler, {
-    staged: () => { Atomics.add(credits, 0, 1); },
+    staged: (count) => { Atomics.add(credits, 0, count); },
     close: async () => done.resolve(),
     fail: () => done.reject(new Error("fixture delivery failed")),
   });
@@ -376,6 +377,7 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
   assert.deepEqual(payloads.map((p) => p.case === "eventBatch" ? wireEvents(p) : p.case),
     ["recordingStarted", [2n, 3n, 4n], [5n], [6n, 7n], "recordingFinished"]);
   assert.equal(h.credits(), 9);
+  assert.deepEqual(h.creditGroups, [1, 1, 3, 1, 2, 1]);
   assert.deepEqual(h.stagedFolds, [2]);
   assert.deepEqual(readFinishProgress(progress),
     { received: 1, dispatched: 1, submitted: 1, written: 1, staged: 0, active: "idle" });

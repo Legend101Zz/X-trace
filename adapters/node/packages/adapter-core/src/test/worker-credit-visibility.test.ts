@@ -4,14 +4,14 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
 import type { CaptureDiagnostic } from "../capture-diagnostics.cjs";
-import { createCaptureCredits, createHttpCaptureTransport } from "../runtime/transport.cjs";
+import { createCaptureCredits, createHttpCaptureTransport, returnCaptureCredits } from "../runtime/transport.cjs";
 
 test("a real worker returns charged capacity before main-thread credit notifications run", async (t) => {
   const credits = createCaptureCredits();
   const signal = new Int32Array(new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT));
   const worker = new Worker(`
     const { parentPort, workerData } = require("node:worker_threads");
-    const { returnCaptureCredit } = require(workerData.transport);
+    const { returnCaptureCredits } = require(workerData.transport);
     const notify = () => {
       Atomics.add(workerData.signal, 1, 1);
       parentPort.postMessage({ type: "staged" });
@@ -20,7 +20,7 @@ test("a real worker returns charged capacity before main-thread credit notificat
     parentPort.on("message", (message) => {
       if (message.type !== "fixture-stage") { handled += 1; return; }
       if (handled !== 63) throw new Error("fixture did not receive its admitted messages");
-      for (let i = 0; i < 4; i += 1) returnCaptureCredit(workerData.credits, notify);
+      returnCaptureCredits(workerData.credits, 4, notify);
       Atomics.store(workerData.signal, 0, 1);
       Atomics.notify(workerData.signal, 0);
     });
@@ -70,7 +70,7 @@ test("a notification alone cannot refund capacity and unsigned credit wrap still
   for (let i = 0; i < 64; i += 1) assert.equal(transport.route?.("fixture", "/fixture"), true);
   worker.emit("message", { type: "staged" });
   assert.equal(transport.route?.("fixture", "/fixture"), false);
-  Atomics.add(credits, 0, 1);
+  returnCaptureCredits(credits, 1);
   assert.equal(Atomics.load(credits, 0), 0);
   assert.equal(transport.route?.("fixture", "/fixture"), true);
   assert.equal(transport.start("fixture", "GET", 1n), false);
