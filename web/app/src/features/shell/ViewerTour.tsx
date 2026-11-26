@@ -21,6 +21,7 @@ const steps = [
 ] as const satisfies readonly { pane: Pane; title: string; description: string }[];
 
 export const tourPanes = steps.map(({ pane }) => pane);
+export const TourPane = createContext<Pane | null>(null);
 export const TourLauncher = createContext<(button: HTMLButtonElement) => void>(() => undefined);
 
 export function StartTourButton() {

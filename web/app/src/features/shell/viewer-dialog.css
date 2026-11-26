@@ -57,20 +57,42 @@
   background: var(--panel-raised);
   color: var(--text);
 }
+@media (min-width: 861px) {
+  /* Leave the Inspector visible while the guide points to its Missing tab. */
+  .viewer-shell:has(.viewer-workspace[data-dock='bottom']) .viewer-tour--evidence { inset-block: 56px auto; }
+  .viewer-shell:has(.viewer-workspace[data-dock='right']) .viewer-tour--evidence { inset-inline: 12px auto; }
+}
 .viewer-tour--recordings { inset-inline: 12px auto; }
 .viewer-tour h2 { margin: 4px 0; }
 .viewer-tour-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: 6px; margin-top: 10px; }
 :is(.viewer-tour, .first-recording) .button { min-height: 44px; }
-.empty.first-recording { box-sizing: border-box; width: 100%; min-width: 0; overflow-wrap: anywhere; }
-.first-recording-command { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
-.first-recording-command code { overflow-wrap: anywhere; }
-/* The intermediate Requests drawer is only 240px wide by default. Keep the
-   command, its result and the tour action together inside its scroll port. */
-@media (min-width: 861px) and (max-width: 1199px) {
-  .workspace-requests > .pane:has(> .first-recording) { overflow-y: auto; }
-  .workspace-requests > .pane:has(> .first-recording) > * { flex-shrink: 0; }
-  .workspace-requests .first-recording { padding: 12px; }
+.first-recording {
+  display: grid;
+  justify-items: start;
+  gap: 12px;
+  width: min(100%, 34rem);
+  margin-inline: auto;
+  padding: 20px 16px;
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
+.first-recording h2 { font-size: 18px; color: var(--text); }
+.first-recording-command {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.first-recording-command code { font: 13px/1.5 var(--mono); color: var(--text); }
+.workspace-requests > .pane:has(> .first-recording) { overflow-y: auto; }
+.workspace-requests > .pane:has(> .first-recording) > * { flex-shrink: 0; }
 @media (max-width: 860px) {
   .viewer-tour { inset-block-end: 104px; }
 }

@@ -1,4 +1,5 @@
-import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useContext, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { TourPane } from '../shell/ViewerTour';
 import { useViewport } from '../shell/viewport';
 import type { NavAction } from '../../replay/navigation';
 import { missingEvidence } from '../../replay/missing';
@@ -27,11 +28,19 @@ export interface EvidencePanelProps {
 }
 
 export function EvidencePanel({ active, currentStatus, detail, event, selectionUnavailable, onBackToEvent, onNavigate, onGoToMissing }: EvidencePanelProps) {
+  const tourPane = useContext(TourPane);
   const hasCodePane = useViewport('(min-width: 861px)');
   const readingViewport = useViewport('(max-width: 860px)');
   const tabs = readingViewport ? READING_TABS : DESKTOP_TABS;
   const [choice, setChoice] = useState<Tab>(() => hasCodePane ? 'Values' : 'Details');
-  const tab = !readingViewport && choice === 'Code' ? (hasCodePane ? 'Values' : 'Details') : choice;
+  const checksEvidence = tourPane === 'evidence';
+  const [tourChoice, setTourChoice] = useState<Tab | null>(null);
+  const requested = checksEvidence ? tourChoice ?? (event ? 'Missing' : choice) : choice;
+  const tab = !readingViewport && requested === 'Code' ? (hasCodePane ? 'Values' : 'Details') : requested;
+  function chooseTab(label: Tab) {
+    setChoice(label);
+    if (checksEvidence) setTourChoice(label);
+  }
   const content = useRef<HTMLDivElement>(null);
   const prefix = useId();
   const reports = useMemo(() => detail ? missingEvidence(detail) : null, [detail]);
@@ -40,6 +49,10 @@ export function EvidencePanel({ active, currentStatus, detail, event, selectionU
   useLayoutEffect(() => {
     if (readingViewport && active && event?.sequence !== undefined) setChoice('Code');
   }, [active, detail?.recordingId, event?.sequence, readingViewport]);
+
+  // Each visit to the last guide step starts at Missing. During that visit the
+  // reader owns the tab, even as normal pane and event updates select defaults.
+  useLayoutEffect(() => { if (!checksEvidence) setTourChoice(null); }, [checksEvidence]);
 
   useLayoutEffect(() => { if (content.current) content.current.scrollTop = 0; }, [tab, event?.sequence, detail?.recordingId, active]);
 
@@ -60,12 +73,12 @@ export function EvidencePanel({ active, currentStatus, detail, event, selectionU
       if (next === null || event.altKey || event.ctrlKey || event.metaKey) return;
       event.preventDefault();
       const label = tabs[next];
-      setChoice(label);
+      chooseTab(label);
       document.getElementById(`${prefix}-tab-${label}`)?.focus();
     }}>
       {tabs.map((label) => <button type="button" className="button" key={label}
         id={`${prefix}-tab-${label}`} role="tab" aria-selected={tab === label} tabIndex={tab === label ? 0 : -1}
-        aria-controls={`${prefix}-panel-${label}`} onClick={() => setChoice(label)}>
+        aria-controls={`${prefix}-panel-${label}`} onClick={() => chooseTab(label)}>
         {label}{label === 'Values' && event ? ` (${event.bindings?.length ?? 0})` : null}
         {label === 'Missing' ? ` (${reports.window.length})` : null}
       </button>)}

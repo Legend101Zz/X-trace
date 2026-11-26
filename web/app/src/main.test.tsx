@@ -127,6 +127,34 @@ describe('endpoint-first recording viewer', () => {
     }
   });
 
+  it('offers the command before browsing an empty project and retires it when a recording arrives', async () => {
+    let hasEndpoint = false;
+    vi.mocked(fetch).mockImplementation((input) => {
+      const path = route(input);
+      if (path.startsWith('/api/v1/endpoints?') && !hasEndpoint) return Promise.resolve(response({ items: [], nextCursor: null }));
+      if (path === '/api/v1/recordings?limit=1') return Promise.resolve(response({ schemaVersion: 3, recordings: [], nextAfter: null }));
+      return defaultFetch(input);
+    });
+    render(<App />);
+    const guide = await screen.findByRole('region', { name: 'No recordings yet' });
+    const requests = within(screen.getByRole('tabpanel', { name: 'Requests' }));
+    const exportButton = requests.getByRole('button', { name: 'Export endpoints…' });
+    expect(guide.compareDocumentPosition(exportButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(requests.queryByText('Operator-selected policy')).not.toBeInTheDocument();
+    fireEvent.click(requests.getByRole('button', { name: 'Not linked to an endpoint' }));
+    expect(await requests.findByRole('button', { name: new RegExp(recordingB) })).toBeInTheDocument();
+    fireEvent.click(requests.getByRole('button', { name: 'Observed endpoints' }));
+    expect(requests.getByText('No observed endpoints')).toBeInTheDocument();
+    expect(requests.queryByRole('region', { name: 'No recordings yet' })).not.toBeInTheDocument();
+
+    hasEndpoint = true;
+    fireEvent.click(requests.getByRole('button', { name: 'Refresh' }));
+    expect(await requests.findByRole('button', { name: /POST \/orders Component:/ })).toBeInTheDocument();
+    expect(requests.getByRole('searchbox')).toBeInTheDocument();
+    expect(requests.getByText('Operator-selected policy')).toBeInTheDocument();
+    expect(requests.queryByRole('region', { name: 'No recordings yet' })).not.toBeInTheDocument();
+  });
+
   it('confirms an empty project after an existing-session bootstrap', async () => {
     window.history.replaceState(null, '', '/viewer');
     vi.mocked(fetch).mockImplementation((input) => {

@@ -11,7 +11,7 @@ it('gives Export the active tour and replay handoff and returns focus to the exp
     const appearance = useAppearancePreferences();
     return <AppShell activePane="recordings" onPane={() => undefined} announcement="" auth="ready" authError=""
       openRecordings={[]} selectedRecording="" onSelectRecording={() => undefined} onCloseRecording={() => undefined}
-      sourceEvent={undefined} detail={null} endpoint={null} appearance={appearance} playbackControls={null} onPausePlayback={pause}>
+      sourceEvent={undefined} detail={null} endpoint={null} appearance={appearance} playbackControls={null} onPausePlayback={pause} onTourSteps={() => undefined}>
       <><StartTourButton /><ExportAction endpoint={null} label="Export endpoints…" /></>
       {null}
       {null}

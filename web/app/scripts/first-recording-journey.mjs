@@ -34,12 +34,27 @@ try {
       const current = page.locator('#events-panel .event[aria-current="true"] .event-seq');
       await expect(current).toBeVisible();
       const sequence = await current.textContent();
+      const views = page.getByRole('tablist', { name: 'Replay view' });
+      const map = views.getByRole('tab', { name: 'Map', exact: true });
+      await map.press('Enter');
+      await expect(map).toHaveAttribute('aria-selected', 'true');
       const help = page.getByRole('button', { name: 'Help', exact: true });
       await help.press('Enter');
       await page.getByRole('dialog', { name: 'Help' }).getByRole('button', { name: 'Take the 3-step tour' }).press('Enter');
       const guide = page.locator('.viewer-tour');
       for (const title of ['Find a recording', 'Read Steps in order', 'Check what was recorded']) {
         await expect(guide.getByRole('heading', { name: title })).toBeFocused();
+        if (title === 'Read Steps in order') {
+          await expect(views.getByRole('tab', { name: 'Steps', exact: true })).toHaveAttribute('aria-selected', 'true');
+          await expect(current).toHaveText(sequence);
+        }
+        if (title === 'Check what was recorded') {
+          const missing = page.getByRole('tablist', { name: 'Inspector evidence' }).getByRole('tab', { name: /^Missing/ });
+          await expect(missing).toHaveAttribute('aria-selected', 'true');
+          const heading = page.getByRole('region', { name: 'Loaded window missing evidence' }).getByRole('heading');
+          await expect(heading).toBeInViewport({ ratio: 1 });
+          await assertTextIsReadable(heading, 'the Missing panel heading is readable beside the tour');
+        }
         if (width === 736 && title === 'Read Steps in order') await assertReadableTourStep(page);
         if (screenshotDirectory) await page.screenshot({ path: join(screenshotDirectory, `tour-${width}-${title.split(' ')[0]}.png`) });
         const next = guide.getByRole('button', { name: 'Next', exact: true });
@@ -57,6 +72,18 @@ try {
     await expect(empty).toBeVisible();
     await expect(page.getByRole('tablist', { name: 'Open recordings' })).toHaveCount(0);
     const copy = empty.getByRole('button', { name: 'Copy example command' });
+    const panel = page.locator('#recordings-panel');
+    const guideBounds = await empty.boundingBox();
+    const exportBounds = await panel.getByRole('button', { name: 'Export endpoints…' }).boundingBox();
+    assert.ok(guideBounds && exportBounds && guideBounds.y + guideBounds.height <= exportBounds.y,
+      'first-run instructions precede the catalog actions');
+    if (width >= 1024) assert.ok(guideBounds.width >= width * 0.30, 'first use has room for the command beside Steps');
+    const command = empty.locator('code');
+    await expect(command).toBeInViewport({ ratio: 1 });
+    await assertTextIsReadable(command, 'the full example command can be read before scrolling or focusing it');
+    await panel.getByRole('button', { name: 'Refresh' }).focus();
+    await page.keyboard.press('Tab');
+    await expect(copy).toBeFocused();
     assert.ok((await copy.boundingBox())?.height >= 44, 'copy has a full touch target');
     await copy.press('Enter');
     const feedback = empty.getByText('Example command copied.');
@@ -142,4 +169,14 @@ try {
   process.exitCode = 1;
 } finally {
   await browser.close();
+}
+
+async function assertTextIsReadable(locator, message) {
+  assert.ok(await locator.evaluate((element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    const lines = [...range.getClientRects()].filter((line) => line.width && line.height);
+    return lines.length > 0 && lines.every((line) => [line.left + 1, line.right - 1].every((x) =>
+      element.contains(document.elementFromPoint(x, line.top + line.height / 2))));
+  }), message);
 }

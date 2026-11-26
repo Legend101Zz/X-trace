@@ -15,7 +15,7 @@ import { ViewerHelp } from './features/shell/ViewerHelp';
 import { ViewerSettings } from './features/shell/ViewerSettings';
 import { ViewerPreferencesContext, ViewerPreferencesUpdateContext } from './features/shell/viewer-preferences';
 import type { useAppearancePreferences } from './features/shell/viewer-preferences';
-import { TourLauncher, tourPanes, ViewerTour } from './features/shell/ViewerTour';
+import { TourLauncher, TourPane, tourPanes, ViewerTour } from './features/shell/ViewerTour';
 import './features/shell/viewer-dialog.css';
 
 const INSPECTOR_DOCK_KEY = 'xtrace.viewer.inspector-dock';
@@ -47,11 +47,12 @@ export interface AppShellProps {
   appearance: ReturnType<typeof useAppearancePreferences>;
   playbackControls: ReactNode;
   onPausePlayback: () => void;
+  onTourSteps: () => void;
   children: [ReactNode, ReactNode, ReactNode];
 }
 
 /** Page chrome: header, pane tabs, live region and authentication overlays. */
-export function AppShell({ activePane, onPane, announcement, auth, authError, openRecordings, selectedRecording, onSelectRecording, onCloseRecording, sourceEvent, detail, endpoint, appearance, playbackControls, onPausePlayback, children }: AppShellProps) {
+export function AppShell({ activePane, onPane, announcement, auth, authError, openRecordings, selectedRecording, onSelectRecording, onCloseRecording, sourceEvent, detail, endpoint, appearance, playbackControls, onPausePlayback, onTourSteps, children }: AppShellProps) {
   const [dock, setDock] = useState(readInspectorDock);
   const theme = useThemePreference();
   const [modal, setModal] = useState<{ title: 'Settings' | 'Help'; opener: HTMLElement } | null>(null);
@@ -142,7 +143,9 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
     </nav>
     <RecordingTabs recordings={openRecordings} selected={selectedRecording} onSelect={onSelectRecording} onClose={onCloseRecording} />
     {detail ? <RecordingContext key={detail.recordingId} detail={detail} endpoint={endpoint} event={sourceEvent} playback={playbackControls} /> : null}
-    <ResizableWorkspace requests={children[0]} steps={children[1]} inspector={children[2]} sourceEvent={sourceEvent} activePane={activePane} dock={dock} />
+    <TourPane.Provider value={tour ? tourPanes[tour.index] : null}>
+      <ResizableWorkspace requests={children[0]} steps={children[1]} inspector={children[2]} sourceEvent={sourceEvent} activePane={activePane} dock={dock} />
+    </TourPane.Provider>
     <footer className="viewer-preferences">
       <span>{auth === 'ready' ? 'Local viewer connected' : auth === 'checking' ? 'Connecting to local viewer' : 'Local viewer unavailable'}</span>
       <div className="viewer-dialog-actions">
@@ -155,6 +158,7 @@ export function AppShell({ activePane, onPane, announcement, auth, authError, op
     </footer>
     {tour ? <ViewerTour index={tour.index} selectedRecording={selectedRecording !== ''}
       onStep={(index) => {
+        if (tourPanes[index] === 'events' && sourceEvent && detail?.recordingId === selectedRecording) onTourSteps();
         setTour({ ...tour, index });
         onPane(tourPanes[index]);
       }} onClose={closeTour} /> : null}

@@ -93,7 +93,12 @@ describe('replay wiring in the app', () => {
       throw new Error(`Unexpected request ${path}`);
     }));
   });
-  afterEach(() => { cleanup(); vi.unstubAllGlobals(); localStorage.removeItem('xtrace.viewer.appearance'); });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    localStorage.removeItem('xtrace.viewer.appearance');
+    localStorage.removeItem('xtrace.viewer.panels');
+  });
 
   it('uses explicit Replay/Pause shortcuts while preserving native inputs and dialog keys', async () => {
     await openRecording();
@@ -127,6 +132,135 @@ describe('replay wiring in the app', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     expect(screen.getByRole('combobox', { name: 'Default speed' })).toBeInTheDocument();
   });
+
+  it.each(['desktop', 'phone'])('shows the selected Steps row and Missing evidence during the %s tour', async (viewport) => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: viewport === 'desktop' ? query === '(min-width: 861px)' : ['(max-width: 860px)', '(max-width: 699px)'].includes(query),
+      addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    }));
+    await openRecording();
+    const views = within(screen.getByRole('tablist', { name: 'Replay view' }));
+    fireEvent.click(views.getByRole('tab', { name: 'Map' }));
+    const inspectorSize = viewport === 'desktop' ? screen.getByRole('separator', { name: 'Resize Inspector' }) : null;
+    if (inspectorSize) fireEvent.keyDown(inspectorSize, { key: 'Enter' });
+    const savedPanels = localStorage.getItem('xtrace.viewer.panels');
+    const help = screen.getByRole('button', { name: 'Help' });
+    fireEvent.click(help);
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Help' })).getByRole('button', { name: 'Take the 3-step tour' }));
+    const calls = vi.mocked(fetch).mock.calls.length;
+    const guide = () => within(screen.getByRole('dialog'));
+    fireEvent.click(guide().getByRole('button', { name: 'Next' }));
+    expect(views.getByRole('tab', { name: 'Steps' })).toHaveAttribute('aria-selected', 'true');
+    expect(document.querySelector('#events-panel .event[aria-current="true"]')).toHaveTextContent('Controller.create');
+    expect(guide().getByRole('heading')).toHaveFocus();
+    fireEvent.click(guide().getByRole('button', { name: 'Next' }));
+    if (inspectorSize) expect(inspectorSize).not.toHaveAttribute('aria-valuenow', '0');
+    const tabs = within(screen.getByRole('tablist', { name: 'Inspector evidence' }));
+    expect(tabs.getByRole('tab', { name: /^Missing/ })).toHaveAttribute('aria-selected', 'true');
+    expect(guide().getByRole('heading')).toHaveFocus();
+    fireEvent.click(tabs.getByRole('tab', { name: 'Details' }));
+    expect(tabs.getByRole('tab', { name: 'Details' })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(guide().getByRole('button', { name: 'Previous' }));
+    fireEvent.click(guide().getByRole('button', { name: 'Next' }));
+    expect(tabs.getByRole('tab', { name: /^Missing/ })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(guide().getByRole('button', { name: 'Finish' }));
+    await waitFor(() => expect(help).toHaveFocus());
+    if (inspectorSize) expect(inspectorSize).toHaveAttribute('aria-valuenow', '0');
+    expect(localStorage.getItem('xtrace.viewer.panels')).toBe(savedPanels);
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(calls);
+  });
+
+  it('keeps a manual Inspector tab through event, pane and viewport changes during one tour step', async () => {
+    let phone = true;
+    const listeners = new Set<() => void>();
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: phone ? ['(max-width: 860px)', '(max-width: 699px)'].includes(query) : query === '(min-width: 861px)',
+      addEventListener: (_name: string, notify: () => void) => listeners.add(notify),
+      removeEventListener: (_name: string, notify: () => void) => listeners.delete(notify),
+    }));
+    const resize = (toPhone: boolean) => act(() => {
+      phone = toPhone;
+      for (const notify of [...listeners]) notify();
+    });
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: 'Help' }));
+    const guide = () => within(screen.getByRole('dialog'));
+    fireEvent.click(guide().getByRole('button', { name: 'Take the 3-step tour' }));
+    fireEvent.click(guide().getByRole('button', { name: 'Next' }));
+    fireEvent.click(guide().getByRole('button', { name: 'Next' }));
+    const tabs = within(screen.getByRole('tablist', { name: 'Inspector evidence' }));
+    expect(tabs.getByRole('tab', { name: /^Missing/ })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.keyDown(tabs.getByRole('tab', { name: /^Missing/ }), { key: 'End' });
+    expect(tabs.getByRole('tab', { name: 'Details' })).toHaveFocus();
+
+    const panes = within(screen.getByRole('tablist', { name: 'Viewer panes' }));
+    fireEvent.click(panes.getByRole('tab', { name: 'Steps' }));
+    fireEvent.click(screen.getByRole('button', { name: /Repo\.save/ }));
+    expect(tabs.getByRole('tab', { name: 'Details' })).toHaveAttribute('aria-selected', 'true');
+    resize(false);
+    expect(tabs.queryByRole('tab', { name: 'Code' })).not.toBeInTheDocument();
+    expect(tabs.getByRole('tab', { name: 'Details' })).toHaveAttribute('aria-selected', 'true');
+    resize(true);
+    expect(tabs.getByRole('tab', { name: 'Code' })).toBeInTheDocument();
+    expect(tabs.getByRole('tab', { name: 'Details' })).toHaveAttribute('aria-selected', 'true');
+
+    fireEvent.click(guide().getByRole('button', { name: 'Previous' }));
+    fireEvent.click(guide().getByRole('button', { name: 'Next' }));
+    expect(tabs.getByRole('tab', { name: /^Missing/ })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(guide().getByRole('button', { name: 'Finish' }));
+    fireEvent.click(panes.getByRole('tab', { name: 'Steps' }));
+    fireEvent.click(screen.getByRole('button', { name: /Audit\.log/ }));
+    expect(tabs.getByRole('tab', { name: 'Code' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  async function verifyInterruptedInspectorDrag(cancelEvent: 'pointercancel' | 'lostpointercapture') {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query === '(min-width: 861px)', addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    }));
+    await openRecording();
+    const handle = screen.getByRole('separator', { name: 'Resize Inspector' });
+    const requests = screen.getByRole('separator', { name: 'Resize Requests' });
+    const openSize = handle.getAttribute('aria-valuenow');
+    fireEvent.keyDown(handle, { key: 'Enter' });
+    expect(handle).toHaveAttribute('aria-valuenow', '0');
+    fireEvent.click(screen.getByRole('button', { name: 'Help' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Take the 3-step tour' }));
+    const guide = () => within(screen.getByRole('dialog'));
+    fireEvent.click(guide().getByRole('button', { name: 'Next' }));
+    fireEvent.click(guide().getByRole('button', { name: 'Next' }));
+    expect(handle).toHaveAttribute('aria-valuenow', openSize);
+
+    // jsdom lacks layout and native pointer capture. Dispatch the real React
+    // handlers with an explicit workspace extent and matching pointer IDs.
+    Object.defineProperty(screen.getByRole('main'), 'clientHeight', { value: 600 });
+    Object.defineProperty(handle, 'setPointerCapture', { value: vi.fn() });
+    const pointer = (type: string, clientY: number) => {
+      const event = new MouseEvent(type, { bubbles: true, button: 0, clientY });
+      Object.defineProperty(event, 'pointerId', { value: 1 });
+      fireEvent(handle, event);
+    };
+    for (const move of [false, true]) {
+      pointer('pointerdown', 300);
+      if (move) {
+        pointer('pointermove', 240);
+        expect(handle.getAttribute('aria-valuenow')).not.toBe(openSize);
+        fireEvent.keyDown(requests, { key: 'ArrowRight' });
+        expect(JSON.parse(localStorage.getItem('xtrace.viewer.panels')!).inspector).toBe(0);
+      }
+      pointer(cancelEvent, move ? 240 : 300);
+      expect(handle).toHaveAttribute('aria-valuenow', openSize);
+      fireEvent.keyDown(requests, { key: 'ArrowRight' });
+      expect(JSON.parse(localStorage.getItem('xtrace.viewer.panels')!).inspector).toBe(0);
+    }
+    fireEvent.click(guide().getByRole('button', { name: 'Finish' }));
+    expect(handle).toHaveAttribute('aria-valuenow', '0');
+  }
+
+  it('keeps a tour-revealed Inspector transient when its pointer drag is cancelled', () =>
+    verifyInterruptedInspectorDrag('pointercancel'));
+
+  it('restores a tour-revealed Inspector and accepts another drag after pointer capture is lost', () =>
+    verifyInterruptedInspectorDrag('lostpointercapture'));
 
   it('focuses the selected row on click or Alt+M, and keeps arrow navigation on the view tab', async () => {
     await openRecording();

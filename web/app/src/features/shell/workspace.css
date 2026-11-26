@@ -4,7 +4,7 @@
 .shell > .replay-context { grid-row: 3; }
 .shell > .viewer-workspace { grid-row: 4; }
 .shell > .viewer-preferences { grid-row: 5; }
-.viewer-workspace { position: relative; }
+.viewer-workspace { position: relative; --requests-extent: var(--requests-size); }
 .workspace-requests, .workspace-inspector, .workspace-code, .steps-and-code,
 .viewer-workspace .pane, .workspace-code-body { min-width: 0; min-height: 0; }
 .workspace-requests, .workspace-inspector { display: flex; flex-direction: column; }
@@ -32,7 +32,12 @@
 .replay-view-panel { min-width: 0; }
 
 @media (min-width: 861px) {
-  .workspace.viewer-workspace { grid-template-columns: minmax(0, var(--requests-size)) 8px minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); grid-template-rows: minmax(0, 1fr) auto; }
+  /* Give first-run instructions more of the unused replay area while keeping
+     keyboard and pointer adjustments proportional to the Requests preference. */
+  .viewer-workspace:has(> .workspace-requests[data-collapsed='false'] .first-recording) {
+    --requests-extent: calc(var(--requests-size) + 12%);
+  }
+  .workspace.viewer-workspace { grid-template-columns: minmax(0, var(--requests-extent)) 8px minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); grid-template-rows: minmax(0, 1fr) auto; }
   .steps-and-code { display: grid; grid-template-columns: minmax(152px, 1fr) 8px minmax(0, min(var(--code-size), calc(100% - 160px))); }
   .viewer-workspace :is(.mode-switch, .catalog-actions, .page-controls) { flex-wrap: wrap; }
   /* A narrow split can wrap the navigation onto several lines. Its controls
@@ -172,7 +177,7 @@
 
 @media (min-width: 861px) {
   .viewer-workspace[data-dock='bottom'] {
-    grid-template-columns: minmax(0, var(--requests-size)) 8px minmax(0, 1fr);
+    grid-template-columns: minmax(0, var(--requests-extent)) 8px minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) 8px minmax(0, var(--inspector-size)) auto;
   }
   .viewer-workspace[data-dock='bottom'] > :is(.workspace-requests, .panel-splitter--requests) { grid-row: 1 / 4; }
@@ -180,6 +185,10 @@
   .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector { grid-area: 2 / 3; cursor: row-resize; }
   .viewer-workspace[data-dock='bottom'] > .workspace-inspector { grid-area: 3 / 3; }
   .viewer-workspace[data-dock='bottom'] > .workspace-inspector > .collapsed-panel { writing-mode: horizontal-tb; align-self: start; }
+  .viewer-workspace[data-tour-pane='evidence'][data-dock='bottom'] .evidence-pane > .pane-head {
+    min-height: 0;
+    padding-block: 4px;
+  }
   .viewer-workspace[data-dock='bottom'] > .reset-panels { grid-row: 4; }
 }
 
@@ -189,17 +198,17 @@
   .viewer-workspace[data-dock='right'] { grid-template-columns: minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); }
   .viewer-workspace[data-dock='bottom'] > :is(.steps-and-code, .panel-splitter--inspector, .workspace-inspector) { grid-column: 1; }
   .viewer-workspace > .workspace-requests {
-    position: absolute; z-index: 4; inset: 0 auto 0 0; width: max(240px, var(--requests-size));
+    position: absolute; z-index: 4; inset: 0 auto 0 0; width: max(240px, var(--requests-extent));
     overflow: auto; background: var(--bg); border-right: 1px solid var(--line-strong);
   }
   .viewer-workspace > .panel-splitter--requests {
-    position: absolute; z-index: 5; inset: 0 auto 0 max(240px, var(--requests-size)); width: 8px;
+    position: absolute; z-index: 5; inset: 0 auto 0 max(240px, var(--requests-extent)); width: 8px;
   }
   .viewer-workspace:not([data-pane='recordings']) > :is(.workspace-requests, .panel-splitter--requests) { display: none; }
   /* On first use both the command and the Steps guidance must be readable.
      Reserve the open drawer's width before laying out the empty panes. */
   .viewer-workspace[data-pane='recordings']:has(.first-recording) {
-    padding-inline-start: calc(max(240px, var(--requests-size)) + 8px);
+    padding-inline-start: calc(max(240px, var(--requests-extent)) + 8px);
   }
   .viewer-workspace[data-pane='recordings']:has(.workspace-requests[data-collapsed='true'] .first-recording) {
     padding-inline-start: 52px;

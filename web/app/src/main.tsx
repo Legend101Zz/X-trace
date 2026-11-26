@@ -200,6 +200,8 @@ export default function App() {
         const observed = recentlyObserved(unmatchedRef.current, page.items);
         setArrivals((current) => new Set(page.items.filter((item) => current.has(item.recordingId) || observed.has(item.recordingId)).map((item) => item.recordingId)));
       }
+      // A recording can arrive after the initial empty-project read.
+      if (page.items.length > 0 || page.nextCursor !== null) setProjectEmpty(false);
       unmatchedFirstPage.current = !append;
       const result = retainPage(append ? unmatchedRef.current : [], page.items, MAX_RETAINED_ROWS, page.nextCursor);
       unmatchedRef.current = result.items;
@@ -667,7 +669,7 @@ export default function App() {
   const phoneLayout = useViewport('(max-width: 699px)');
   return <AppShell activePane={activePane} onPane={setActivePane} announcement={announcement} auth={auth} authError={authError}
     openRecordings={openRecordings} selectedRecording={selectedRecording} onSelectRecording={activateRecording} onCloseRecording={closeRecording}
-    appearance={appearance} onPausePlayback={playback.pause}
+    appearance={appearance} onPausePlayback={playback.pause} onTourSteps={() => changeReplayMode('linear', false)}
     playbackControls={!phoneLayout ? <ReplayControls playback={replay.playback} reason={playback.reason} pacing={playback.pacing}
       onToggle={playback.toggle} onPause={playback.pause} onSpeed={changeSpeed} /> : null}
     sourceEvent={event} detail={detail} endpoint={activeRecordingTab?.endpoint ?? null}>

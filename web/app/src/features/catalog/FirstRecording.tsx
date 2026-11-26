@@ -17,14 +17,15 @@ export function FirstRecording({ onAnnounce }: { onAnnounce: (message: string) =
     onAnnounce(result);
   }
 
-  return <section className="empty first-recording" aria-labelledby="first-recording-title">
+  return <section className="first-recording" aria-labelledby="first-recording-title">
     <h2 id="first-recording-title">No recordings yet</h2>
     <p>Start a supported Java application with X-trace, send it a request, then refresh Requests.</p>
-    <p>Replace the example paths with your initialized project, built Java agent and application JAR.</p>
-    <div className="first-recording-command"><code>{command}</code>
+    <div className="first-recording-command">
+      <p>Replace the example paths with your initialized project, built Java agent and application JAR.</p>
+      <code>{command}</code>
       <button type="button" className="button" onClick={() => void copy()}>Copy example command</button>
+      {feedback ? <p>{feedback}</p> : null}
     </div>
-    {feedback ? <p>{feedback}</p> : null}
     <StartTourButton />
   </section>;
 }

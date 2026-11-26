@@ -1,7 +1,8 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useContext, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, PointerEvent, ReactNode } from 'react';
 import { clampPanel, DEFAULT_LAYOUT, PANEL_LIMITS, readPanelLayout, savePanelLayout } from './panel-layout';
 import type { Panel, PanelLayout } from './panel-layout';
+import { TourPane } from './ViewerTour';
 import { useViewport } from './viewport';
 import { CodeEvidence } from '../code/CodeEvidence';
 import type { Pane, ReplayEvent } from '../../types';
@@ -14,15 +15,16 @@ const DESKTOP = '(min-width: 861px)';
 
 export type InspectorDock = 'bottom' | 'right';
 
-function Splitter({ panel, value, lastOpen, stacked, onResize, onCommit }: {
+function Splitter({ panel, value, lastOpen, stacked, onResize, onCancel, onCommit }: {
   panel: Panel;
   value: number;
   lastOpen: number;
   stacked: boolean;
   onResize: (value: number) => void;
+  onCancel: () => void;
   onCommit: (value: number) => void;
 }) {
-  const drag = useRef<{ pointer: number; from: number; startSize: number; originalSize: number; extent: number; stacked: boolean; moved: boolean } | null>(null);
+  const drag = useRef<{ pointer: number; from: number; startSize: number; extent: number; stacked: boolean; moved: boolean } | null>(null);
   const [min, max] = PANEL_LIMITS[panel];
   const axis = (event: PointerEvent, stacked: boolean) => stacked ? event.clientY : event.clientX;
   function resizeByKey(event: KeyboardEvent<HTMLDivElement>) {
@@ -42,7 +44,7 @@ function Splitter({ panel, value, lastOpen, stacked, onResize, onCommit }: {
   }
 
   function startDrag(event: PointerEvent<HTMLDivElement>) {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || drag.current) return;
     const workspace = event.currentTarget.closest('.workspace');
     const group = panel === 'code' ? event.currentTarget.closest('.steps-and-code') : workspace;
     const extent = stacked ? workspace?.clientHeight : group?.clientWidth;
@@ -52,7 +54,7 @@ function Splitter({ panel, value, lastOpen, stacked, onResize, onCommit }: {
     event.currentTarget.setPointerCapture(event.pointerId);
     drag.current = {
       pointer: event.pointerId, from: axis(event, stacked), startSize: value || lastOpen,
-      originalSize: value, extent, stacked, moved: false,
+      extent, stacked, moved: false,
     };
   }
 
@@ -66,6 +68,12 @@ function Splitter({ panel, value, lastOpen, stacked, onResize, onCommit }: {
     return clampPanel(panel, start.startSize + sign * 100 * distance / start.extent);
   }
 
+  function cancelDrag(event: PointerEvent<HTMLDivElement>) {
+    if (drag.current?.pointer !== event.pointerId) return;
+    drag.current = null;
+    onCancel();
+  }
+
   return <div role="separator" tabIndex={0} className={`panel-splitter panel-splitter--${panel}`}
     aria-label={`Resize ${LABELS[panel]}`} aria-controls={IDS[panel]} aria-orientation={stacked ? 'horizontal' : 'vertical'}
     aria-valuenow={value} aria-valuemin={0} aria-valuemax={max}
@@ -74,13 +82,11 @@ function Splitter({ panel, value, lastOpen, stacked, onResize, onCommit }: {
       const next = dragValue(event);
       if (next !== undefined) onResize(next);
     }} onPointerUp={(event) => {
+      if (drag.current?.pointer !== event.pointerId) return;
       const next = dragValue(event);
       drag.current = null;
       if (next !== undefined) onCommit(next);
-    }} onPointerCancel={() => {
-      if (drag.current) onResize(drag.current.originalSize);
-      drag.current = null;
-    }}
+    }} onPointerCancel={cancelDrag} onLostPointerCapture={cancelDrag}
     onDoubleClick={() => onCommit(value ? 0 : lastOpen)} />;
 }
 
@@ -94,19 +100,41 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
 }) {
   const [layout, setLayout] = useState(readPanelLayout);
   const layoutRef = useRef(layout);
-  const { sizes, lastOpen } = layout;
+  const { lastOpen } = layout;
+  const [dragSizes, setDragSizes] = useState<Partial<Record<Panel, number>>>({});
+  const tourPane = useContext(TourPane);
+  const [revealed, setRevealed] = useState<Panel | null>(null);
+  useLayoutEffect(() => {
+    setRevealed(tourPane === 'recordings' ? 'requests' : tourPane === 'evidence' ? 'inspector' : null);
+  }, [tourPane]);
+  // A tour may show a collapsed panel without overwriting the saved layout.
+  const sizes = { ...layout.sizes };
+  if (revealed && sizes[revealed] === 0) sizes[revealed] = lastOpen[revealed];
+  Object.assign(sizes, dragSizes);
 
-  function resize(panel: Panel, value: number, persist = false) {
+  function discardDrag(panel: Panel) {
+    setDragSizes((current) => {
+      if (current[panel] === undefined) return current;
+      const next = { ...current };
+      delete next[panel];
+      return next;
+    });
+  }
+
+  function commitSize(panel: Panel, value: number) {
+    discardDrag(panel);
+    if (revealed === panel) setRevealed(null);
     const current = layoutRef.current;
     const next: PanelLayout = {
       sizes: { ...current.sizes, [panel]: value },
-      lastOpen: persist ? { ...current.lastOpen, [panel]: value || current.lastOpen[panel] } : current.lastOpen,
+      lastOpen: { ...current.lastOpen, [panel]: value || current.lastOpen[panel] },
     };
     layoutRef.current = next;
     setLayout(next);
-    if (persist) savePanelLayout(next);
+    savePanelLayout(next);
   }
   function reset() {
+    setDragSizes({});
     layoutRef.current = DEFAULT_LAYOUT;
     setLayout(DEFAULT_LAYOUT);
     savePanelLayout(DEFAULT_LAYOUT);
@@ -115,10 +143,11 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
   const tablet = useViewport(TABLET);
   const inspectorStacked = tablet || (showSourcePane && dock === 'bottom');
   const splitter = (panel: Panel) => <Splitter panel={panel} value={sizes[panel]} lastOpen={lastOpen[panel]} stacked={panel === 'inspector' && inspectorStacked}
-    onResize={(value) => resize(panel, value)} onCommit={(value) => resize(panel, value, true)} />;
+    onResize={(value) => setDragSizes((current) => ({ ...current, [panel]: value }))}
+    onCancel={() => discardDrag(panel)} onCommit={(value) => commitSize(panel, value)} />;
   const restore = (panel: Panel) => <button className={`button collapsed-panel collapsed-panel--${panel}`}
     type="button" onClick={() => {
-      resize(panel, lastOpen[panel], true);
+      commitSize(panel, lastOpen[panel]);
       document.querySelector<HTMLElement>(`.panel-splitter--${panel}`)?.focus();
     }}>{LABELS[panel]}</button>;
   const style = {
@@ -129,7 +158,7 @@ export function ResizableWorkspace({ requests, steps, inspector, sourceEvent, ac
   const codePane = useRef<HTMLElement>(null);
   useLayoutEffect(() => { if (codePane.current) codePane.current.scrollTop = 0; }, [sourceEvent, showSourcePane]);
 
-  return <main className="workspace viewer-workspace" data-pane={activePane} data-dock={dock} style={style}>
+  return <main className="workspace viewer-workspace" data-pane={activePane} data-dock={dock} data-tour-pane={tourPane ?? undefined} style={style}>
     <div className="workspace-requests" data-collapsed={sizes.requests === 0}>
       {requests}{sizes.requests === 0 ? restore('requests') : null}
     </div>
