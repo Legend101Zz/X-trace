@@ -1,0 +1,126 @@
+name: Node capture cooperative shutdown proof
+on:
+  push:
+    branches: [codex/proof-medusa-cooperative-drain-v2-120]
+permissions:
+  contents: read
+jobs:
+  worker-boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PRODUCT_SHA: a4dabc0f07d31c6de668489cbaae41e85c4f0a6f
+      PRODUCT_TREE: f8ca36a49ef47484d7e804d11c301400bd2772f7
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.21.0
+      - name: Verify product and prepare private paths
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root=$(mktemp -d "$RUNNER_TEMP/worker-boundary.XXXXXX")
+          mkdir -m 700 "$root/private" "$root/safe"
+          printf 'WORKER_PROOF_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+          printf 'admitted=true\n' >> "$GITHUB_OUTPUT"
+      - name: Run only the named worker boundary checks
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import signal
+          import subprocess
+
+          root = Path(os.environ["WORKER_PROOF_ROOT"])
+          node = Path("adapters/node")
+          stages = ("install-locked-node", "compile-protocol", "compile-adapter", "worker-fixture", "verify-tap")
+          receipt = {
+              "schemaVersion": 1, "kind": "medusa-worker-cooperative-drain-120",
+              "sourceSha": os.environ["PRODUCT_SHA"], "sourceTree": os.environ["PRODUCT_TREE"],
+              "wrapperSha": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "status": "failed",
+              "stages": dict.fromkeys(stages, "unreached"), "counts": None,
+          }
+
+          def save():
+              temp = root / "safe/receipt.tmp"
+              temp.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+              temp.replace(root / "safe/receipt.json")
+
+          def require(condition):
+              if not condition:
+                  raise SystemExit(1)
+
+          def command(stage, args, timeout):
+              receipt["stages"][stage] = "failed"
+              save()
+              with (root / "private" / (stage + ".stdout")).open("xb") as out, \
+                   (root / "private" / (stage + ".stderr")).open("xb") as err:
+                  with subprocess.Popen(args, cwd=node, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                        start_new_session=True) as process:
+                      try:
+                          status = process.wait(timeout=timeout)
+                      except subprocess.TimeoutExpired:
+                          try:
+                              os.killpg(process.pid, signal.SIGKILL)
+                          except ProcessLookupError:
+                              pass
+                          process.wait()
+                          raise SystemExit(1) from None
+              require(status == 0)
+              receipt["stages"][stage] = "passed"
+              save()
+
+          save()
+          command("install-locked-node", ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], 300)
+          command("compile-protocol", ["npm", "run", "build:protocol"], 120)
+          command("compile-adapter", ["npm", "run", "build:core"], 120)
+          command("worker-fixture", ["node", "--test", "--test-reporter=tap",
+                                     "packages/adapter-core/dist/test/worker-exit-boundary.test.js"], 30)
+          receipt["stages"]["verify-tap"] = "failed"
+          save()
+          tap = root / "private/worker-fixture.stdout"
+          require(tap.stat().st_size <= 65_536)
+          raw = tap.read_text()
+          names = [
+              ("1", "an admission refusal never enters the worker while the reserved finish still drains"),
+              ("2", "explicit exit can leave an admitted finish unstaged while natural exit drains it"),
+              ("3", "cooperative drain stages the finish before explicit exit and preserves the requested exit code"),
+              ("4", "the caller's abort releases an outstanding cooperative drain without claiming staging"),
+              ("5", "an already exited worker cannot start or confirm a cooperative drain"),
+          ]
+          require(re.findall(r"^ok ([1-5]) - ([^\n]+)$", raw, re.M) == names)
+          expected = dict(tests=5, pass_=5, fail=0, cancelled=0, skipped=0, todo=0)
+          expected["pass"] = expected.pop("pass_")
+          counts = {}
+          for name in expected:
+              found = re.findall(rf"^# {name} ([0-9]{{1,3}})$", raw, re.M)
+              require(len(found) == 1)
+              counts[name] = int(found[0])
+          receipt["counts"] = counts
+          save()
+          require(counts == expected)
+          receipt["stages"]["verify-tap"] = "passed"
+          receipt["status"] = "passed"
+          save()
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        with:
+          name: medusa-120-worker-cooperative-drain-counts
+          path: ${{ env.WORKER_PROOF_ROOT }}/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
