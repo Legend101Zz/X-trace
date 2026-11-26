@@ -1,0 +1,166 @@
+name: Installed ordinary pgjdbc qualification
+on:
+  push:
+    branches: ['codex/proof-pgjdbc-owned-127']
+permissions:
+  contents: read
+env:
+  PRODUCT: 'ae9cf54eadd8b319c28fe28c86d60e0c8d282c7d'
+  FIXTURE: 'df00d95ad5b914819619d65c94648998ad0f42ae'
+  PRODUCT_TREE: '23e57e0cf8d254cd1a68fb15a78a5b0c7f918513'
+  FIXTURE_TREE: 'aa43ad4509d3b1a4f4edf759582ce0bfd2e8dba7'
+jobs:
+  installed:
+    if: github.repository == 'Legend101Zz/X-trace' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: fixture
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 'ae9cf54eadd8b319c28fe28c86d60e0c8d282c7d'
+          path: product
+          fetch-depth: 0
+          persist-credentials: false
+      - id: source
+        name: Verify distinct product, fixture and workflow revisions
+        env:
+          HOST_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$HOST_KIND" = github-hosted
+          test "$GITHUB_REF" = 'refs/heads/codex/proof-pgjdbc-owned-127'
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse HEAD^{tree})" = "$PRODUCT_TREE"
+          f="$GITHUB_WORKSPACE/fixture"
+          test "$(git -C "$f" rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C "$f" show -s --format=%P "$GITHUB_SHA")" = "$FIXTURE"
+          test "$(git -C "$f" show -s --format=%P "$FIXTURE")" = "$PRODUCT"
+          test "$(git -C "$f" rev-parse "$FIXTURE^{tree}")" = "$FIXTURE_TREE"
+          test "$(git -C "$f" diff --name-status "$FIXTURE" "$GITHUB_SHA")" = $'A\t.github/workflows/pgjdbc-ordinary-owned.yml'
+          git -C "$f" checkout --quiet --detach "$FIXTURE"
+          test -z "$(git -C "$f" status --porcelain --untracked-files=all)"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/xjava"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/extract"
+          echo "ROOT=$root" >> "$GITHUB_ENV"
+          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
+          echo "PG_FIXTURE=$f/campaigns/java/pgjdbc/qualification" >> "$GITHUB_ENV"
+      - id: fixtureTests
+        name: Check fixture ownership and evidence contracts
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B "$PG_FIXTURE/test_fixture.py" >"$ROOT/fixture-tests.log" 2>&1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+          cache: gradle
+          cache-dependency-path: |
+            product/adapters/java/build.gradle.kts
+            product/adapters/java/settings.gradle.kts
+            product/adapters/java/gradle.lockfile
+            product/adapters/java/*/build.gradle.kts
+            product/adapters/java/*/gradle.lockfile
+            product/adapters/java/gradle/verification-metadata.xml
+            product/adapters/java/gradle/wrapper/gradle-wrapper.properties
+      - id: buildInstall
+        name: Build and verify official unsigned Linux installation
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B packaging/build.py --out "$ROOT/dist" --work "$ROOT/package-work" --platform linux-x86_64 >"$ROOT/build.log" 2>&1
+          dist="$ROOT/dist/linux-x86_64"
+          sh packaging/install.sh verify-dist "$dist" >"$ROOT/verify-dist.log" 2>&1
+          archives=("$dist"/xtrace-*-linux-x86_64.tar.gz)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          test -f "$archive"
+          python3 -B packaging/verify_package.py "$archive" --run-binary --repo . --out "$ROOT/verify-package.json" >"$ROOT/verify-package.log" 2>&1
+          tar -xzf "$archive" -C "$ROOT/extract" >"$ROOT/extract.log" 2>&1
+          prefix="$ROOT/installed X-trace"
+          sh "$ROOT/extract/xtrace-0.0.1-linux-x86_64/install.sh" --prefix "$prefix" --data-home "$ROOT/journey/data" >"$ROOT/install.log" 2>&1
+          sh "$prefix/current/install.sh" verify --prefix "$prefix" >"$ROOT/verify-install.log" 2>&1
+      - id: javaPrerequisites
+        name: Build the Spring fixture and verify both Java test suites
+        run: |
+          set -euo pipefail
+          umask 077
+          adapters/java/gradlew -p adapters/java --dependency-verification strict --no-daemon \
+            "-Porg.gradle.java.installations.paths=$JAVA_HOME_17_X64" \
+            fixtureBootJar :agent-bootstrap:test :agent-runtime:test >"$ROOT/java.log" 2>&1
+          python3 -B "$PG_FIXTURE/check_prerequisites.py" "$PWD" >"$ROOT/java-counts.log" 2>&1
+      - id: servletPrerequisites
+        name: Verify the installed Spring servlet journeys
+        env:
+          SERVER_ADDRESS: 127.0.0.1
+        run: |
+          set -euo pipefail
+          umask 077
+          export XTRACE_TEST_JAVA_INSTALLED_PREFIX="$ROOT/installed X-trace"
+          cargo fmt --all --check >"$ROOT/fmt.log" 2>&1
+          git diff --check HEAD^ HEAD >"$ROOT/diff.log" 2>&1
+          cargo test --locked -p xtrace-cli --test java_redirect_source_journey -- --test-threads=1 >"$ROOT/servlet.log" 2>&1
+          for name in filter_refusal_with_servlet_and_completed_async_controls_keeps_one_route_less_recording filter_send_error_remains_provisional_through_container_redispatch; do
+            test "$(grep -Fxc "test $name ... ok" "$ROOT/servlet.log")" = 1
+          done
+      - id: pgjdbc
+        name: Run three ordinary Spring requests and inspect installed readback
+        timeout-minutes: 25
+        env:
+          HOST_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$ROOT/pg" "$ROOT/classes" "$ROOT/lib"
+          curl --silent --show-error --fail --location --max-time 60 -o "$ROOT/postgresql.jar" https://jdbc.postgresql.org/download/postgresql-42.7.13.jar >"$ROOT/pg-fetch.log" 2>&1
+          cd "$ROOT"
+          echo '6e0e4cc2d8cae902084f8a2b18728b073a6fd9d1f87c9d8bff8f298c18185b93  postgresql.jar' | sha256sum --check --status
+          cd "$ROOT/lib"
+          jar -xf "$GITHUB_WORKSPACE/product/adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar" BOOT-INF/lib >"$ROOT/pg-jar.log" 2>&1
+          cp "$ROOT/postgresql.jar" BOOT-INF/lib/postgresql.jar
+          javac --release 17 -cp 'BOOT-INF/lib/*' -d "$ROOT/classes" "$PG_FIXTURE/PgJdbcFixture.java" >"$ROOT/fixture-build.log" 2>&1
+          python3 -B "$PG_FIXTURE/probe.py" "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/fixture" \
+            "$ROOT/pg" "$ROOT/installed X-trace" "$ROOT/classes:$ROOT/lib/BOOT-INF/lib/*" >"$ROOT/pg-journey.log" 2>&1
+      - id: projection
+        if: always() && steps.source.outcome == 'success'
+        name: Project bounded stage and readback counters
+        env:
+          FTESTS: ${{ steps.fixtureTests.outcome }}
+          INSTALL: ${{ steps.buildInstall.outcome }}
+          JAVA: ${{ steps.javaPrerequisites.outcome }}
+          SERVLET: ${{ steps.servletPrerequisites.outcome }}
+          PG: ${{ steps.pgjdbc.outcome }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B "$PG_FIXTURE/project.py" "$ROOT/pg/receipt.json" "$ROOT/pgjdbc-ordinary.json" \
+            success "$FTESTS" "$INSTALL" "$JAVA" "$SERVLET" "$PG"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && steps.projection.outcome == 'success'
+        with:
+          name: pgjdbc-ordinary-bounded
+          path: ${{ runner.temp }}/xjava/pgjdbc-ordinary.json
+          if-no-files-found: error
+          retention-days: 1
