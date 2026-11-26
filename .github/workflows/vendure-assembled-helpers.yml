@@ -1,0 +1,466 @@
+name: Vendure installed assembly source helper checks
+on:
+  push:
+    branches: [codex/proof-vendure-assembled-helpers-125]
+permissions:
+  contents: read
+jobs:
+  helpers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PRODUCT: '0b34e21ee318b3e46f3d1a81317a1f6478b34866'
+      PRODUCT_TREE: 'c398e5cbd8a49a7778cd10fda14703506a9293e7'
+      PRODUCT_PARENT: 'bf043bc5d2590b9d0b0cece31a5f1f45663b33b0'
+      PATCH_SHA256: 'cabc6b9e40e3ba14ac8c95fed9c8fda842ec2970dfaedfe9193125c77822df3d'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Verify wrapper and exact source before selecting the product
+        id: admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REPOSITORY" = 'Legend101Zz/X-trace'
+          test "$GITHUB_REF" = 'refs/heads/codex/proof-vendure-assembled-helpers-125'
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT"
+          test "$(git show -s --format=%P "$PRODUCT")" = "$PRODUCT_PARENT"
+          test "$(git rev-parse "$PRODUCT^{tree}")" = "$PRODUCT_TREE"
+          workflow='.github/workflows/vendure-assembled-helpers.yml'
+          test "$(git diff --name-status --no-renames "$PRODUCT" HEAD)" = $'A\t'"$workflow"
+          test "$(git ls-tree HEAD -- "$workflow" | cut -d' ' -f1)" = 100644
+          test "$(git diff --no-ext-diff --no-textconv --no-color --binary --full-index "$PRODUCT_PARENT" "$PRODUCT" | sha256sum | cut -d' ' -f1)" = "$PATCH_SHA256"
+          test "$(git rev-parse "$PRODUCT:packaging/build.py")" = '1b9b190b727257b0703b43c0a019a66d7e48a91f'
+          test "$(git rev-parse "$PRODUCT:packaging/test/test_node_pack.py")" = 'b8d31170e043846ca195338c054751d6e3bf2652'
+          test "$(git rev-parse "$PRODUCT:packaging/test/test_verify_package.py")" = '5a0843f61dba8b63881b59be4d58f5044169fcbc'
+          test "$(git rev-parse "$PRODUCT:packaging/verify_package.py")" = '9771db631701c46713d96c7cba70b77bdb94fa47'
+          git checkout --detach --quiet "$PRODUCT"
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          proof="$RUNNER_TEMP/vendure-assembly-helpers-125"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$proof"
+          mkdir -m 700 "$proof/logs" "$proof/private" "$proof/safe"
+          printf '%s\n' "PROOF=$proof" "TMPDIR=$proof/tmp" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        id: node_setup
+        with:
+          node-version: 24.21.0
+      - name: Check all 27 ordinary preparation helper cases
+        id: preparation_cases
+        if: ${{ always() && steps.admission.outcome == 'success' && steps.node_setup.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(node -p process.versions.node)" = '24.21.0'
+          python3 -B - <<'PY' >"$PROOF/logs/preparation-driver.stdout" 2>"$PROOF/logs/preparation-driver.stderr"
+          import json, os, pathlib, re, subprocess
+          from tools.release.private_roots import atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          expected = [
+              'staging uses the tracked adapted lock without changing private scaffold inputs',
+              'staging replaces a shared scaffold entry without modifying its other link or mode',
+              'seed output requires a fresh destination and preserves existing bytes',
+              'changed dependencies and source bytes fail without being repaired',
+              'extra compiled sources and linked inputs are rejected',
+              'a completed workspace cannot be restaged over its build identity',
+              'alternate CLI build configurations fail without removing their contents',
+              'compilation claims a fresh dist and refuses stale output before either compiler writes',
+              'a redirected compiler output or application root cannot change another directory',
+              'normal three-file output identity excludes migrations and every other dist artifact',
+              'linked, directory and special dist entries are refused without following them',
+              'only the exact unchanged seed helper is admitted after the build phase',
+              'rechecking a sealed build refuses later migrations despite unchanged entry hashes',
+              'all declared build provenance must survive through seed admission',
+              'seed metadata is a fresh closed digest-only projection',
+              'added top-level and nested private seed fields cannot enter baseline metadata',
+              'seed projection refuses malformed digests, counts, identities and bindings',
+              'well-formed asset counts and tree hashes must match the independent archive observation',
+              'database restore consumes the exact admitted dump bound to both baseline hashes',
+              'a restore diagnostic cannot serialize private dump data into a failed baseline receipt',
+              'changed preparation before startup rejects both the start and the restore',
+              "seed admission requires the campaign's private regular dump and receipt",
+              'the fresh workspace is separate from an existing checkout and cannot be reused or redirected',
+              'only a zero generator exit lets preparation continue',
+              'private errors during initial seed admission are reported with fixed categories',
+              'private verifier and parsing errors during revalidation reach neither startup nor restore',
+              'database restore refuses a missing or name-only startup identity',
+          ]
+          assert len(expected) == len(set(expected)) == 27
+          out = root/'logs/preparation.tap'
+          with out.open('xb') as stdout, (root/'logs/preparation.stderr').open('xb') as stderr:
+              code = subprocess.run(['node','--test','--test-reporter=tap','campaigns/node/vendure/harness/preparation.test.mjs'],
+                                    stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,check=False).returncode
+          counts = None
+          exact = False
+          if out.stat().st_size <= 4 * 1024 * 1024:
+              tap = out.read_text(encoding='utf8', errors='replace')
+              fields = ('tests','pass','fail','cancelled','skipped','todo')
+              matched = {key: re.findall(r'(?m)^# ' + key + r' ([0-9]{1,5})[ \t]*$',tap) for key in fields}
+              if all(len(values)==1 for values in matched.values()):
+                  counts = {key:int(values[0]) for key,values in matched.items()}
+              rows = re.findall(r'(?m)^(ok|not ok) ([0-9]{1,5}) - ([^\r\n]+)$',tap)
+              exact = rows == [('ok',str(i),name) for i,name in enumerate(expected,1)]
+          passed = code==0 and exact and counts=={'tests':27,'pass':27,'fail':0,'cancelled':0,'skipped':0,'todo':0}
+          row = dict(status='passed' if passed else 'failed', exitCode=code, counts=counts, exactPassingCaseInventory=exact)
+          atomic_write_private(root/'private/preparation.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all 20 ordinary fixture helper cases
+        id: fixture_cases
+        if: ${{ always() && steps.admission.outcome == 'success' && steps.node_setup.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(node -p process.versions.node)" = '24.21.0'
+          python3 -B - <<'PY' >"$PROOF/logs/fixture-driver.stdout" 2>"$PROOF/logs/fixture-driver.stderr"
+          import json, os, pathlib, re, subprocess
+          from tools.release.private_roots import atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          expected = [
+              'the image comes only from the private build receipt',
+              'a colliding network creation grants no lookup or removal',
+              'unreached container roles cannot be observed or removed',
+              'failed container creation without a cidfile grants no ownership',
+              'a private cidfile survives nonzero or thrown creation for cleanup',
+              'malformed or conflicting receipts grant no collection or cleanup',
+              'a created but unstarted container is released by ID',
+              'database operations, readiness and logs use only recorded IDs',
+              'a failed cleanup still attempts later handles and retains only failed identities',
+              'only a precisely matching already-absent identity discharges a tracked handle',
+              "foreground completion checks the created container's terminal exit",
+              'nonzero and signalled attached commands cannot gain success from a later state read',
+              'a partial baseline startup emits a bounded failure and never samples uncreated roles',
+              'a failed app log read still collects its owned worker before teardown',
+              'a failed baseline finalizer cannot preserve a successful scenario verdict',
+              'the reached PostgreSQL readiness path uses its exact created database and network',
+              'a database command failure exposes a finite reason and honors explicit readiness status checks',
+              'collection distinguishes an active app from an observed exit',
+              'a kept successful fixture transfers only its creation handles to a private exclusive receipt',
+              'a failed keep receipt falls back to owned cleanup',
+          ]
+          assert len(expected) == len(set(expected)) == 20
+          out = root/'logs/fixture.tap'
+          with out.open('xb') as stdout, (root/'logs/fixture.stderr').open('xb') as stderr:
+              code = subprocess.run(['node','--test','--test-reporter=tap','campaigns/node/vendure/harness/fixture.test.mjs'],
+                                    stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,check=False).returncode
+          counts = None
+          exact = False
+          if out.stat().st_size <= 4 * 1024 * 1024:
+              tap = out.read_text(encoding='utf8', errors='replace')
+              fields = ('tests','pass','fail','cancelled','skipped','todo')
+              matched = {key: re.findall(r'(?m)^# ' + key + r' ([0-9]{1,5})[ \t]*$',tap) for key in fields}
+              if all(len(values)==1 for values in matched.values()):
+                  counts = {key:int(values[0]) for key,values in matched.items()}
+              rows = re.findall(r'(?m)^(ok|not ok) ([0-9]{1,5}) - ([^\r\n]+)$',tap)
+              exact = rows == [('ok',str(i),name) for i,name in enumerate(expected,1)]
+          passed = code==0 and exact and counts=={'tests':20,'pass':20,'fail':0,'cancelled':0,'skipped':0,'todo':0}
+          row = dict(status='passed' if passed else 'failed', exitCode=code, counts=counts, exactPassingCaseInventory=exact)
+          atomic_write_private(root/'private/fixture.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all seven Python archive-helper cases in private scratch
+        id: python_cases
+        if: ${{ always() && steps.admission.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY' >"$PROOF/logs/python-driver.stdout" 2>"$PROOF/logs/python-driver.stderr"
+          import json, os, pathlib, sys, unittest
+          from tools.release.private_roots import atomic_write_private
+          from tools.qa.unittest_run import StructuredRunner
+          root = pathlib.Path(os.environ['PROOF'])
+          sys.path.insert(0, str(pathlib.Path('campaigns/node/vendure/harness').resolve()))
+          import test_seed_assets
+          expected = ['test_retention_requires_a_fresh_regular_destination_and_preserves_its_bytes', 'test_wrong_source_pin_leaves_no_retained_archive', 'test_exact_regular_inputs_are_verified_with_hashes_only', 'test_changed_missing_extra_and_linked_inputs_fail', 'test_changed_archive_fails_before_extraction', 'test_unsafe_and_duplicate_archive_names_fail', 'test_links_in_archive_and_existing_destination_are_not_followed']
+          assert len(set(expected)) == len(expected) == 7
+          observed = unittest.defaultTestLoader.getTestCaseNames(test_seed_assets.SeedAssets)
+          suite = unittest.defaultTestLoader.loadTestsFromModule(test_seed_assets)
+          exact = sorted(expected)==observed and suite.countTestCases()==7
+          counts = None
+          passed = False
+          if exact:
+              with (root/'logs/python-suite.private').open('x') as log:
+                  result = StructuredRunner(stream=log,verbosity=2).run(suite)
+              counts = result.summary()['counts']
+              passed = result.wasSuccessful() and counts==dict(testsRun=7,failures=0,errors=0,skipped=0,expectedFailures=0,unexpectedSuccesses=0)
+          row = dict(status='passed' if passed else 'failed', counts=counts, exactCaseInventory=exact)
+          atomic_write_private(root/'private/python.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all 5 evidence helper cases
+        id: evidence_cases
+        if: ${{ always() && steps.admission.outcome == 'success' && steps.node_setup.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(node -p process.versions.node)" = '24.21.0'
+          node -e "const assert = require('node:assert/strict'); assert.equal(typeof require('node:sqlite').DatabaseSync, 'function'); assert.equal(typeof require('node:zlib').zstdDecompressSync, 'function')" >"$PROOF/logs/evidence-runtime.stdout" 2>"$PROOF/logs/evidence-runtime.stderr"
+          python3 -B - <<'PY' >"$PROOF/logs/evidence-driver.stdout" 2>"$PROOF/logs/evidence-driver.stderr"
+          import json, os, pathlib, re, subprocess
+          from tools.release.private_roots import atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          expected = ['a repeated continuation is rejected without requesting an unbounded next page', 'empty continuations and unreached final pages cannot pass', 'detail rejects repeated event sequence across windows', 'projection parity compares nested values rather than JSON object insertion order', 'privacy checks private persisted bytes and excludes expected auth readiness transport']
+          assert len(expected) == len(set(expected)) == 5
+          out = root/'logs/evidence.tap'
+          with out.open('xb') as stdout, (root/'logs/evidence.stderr').open('xb') as stderr:
+              code = subprocess.run(['node','--test','--test-reporter=tap','campaigns/node/vendure/harness/installed-evidence.test.mjs'],
+                                    stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,check=False).returncode
+          counts = None
+          exact = False
+          if out.stat().st_size <= 4 * 1024 * 1024:
+              tap = out.read_text(encoding='utf8', errors='replace')
+              fields = ('tests','pass','fail','cancelled','skipped','todo')
+              matched = {key: re.findall(r'(?m)^# ' + key + r' ([0-9]{1,5})[ \t]*$',tap) for key in fields}
+              if all(len(values)==1 for values in matched.values()):
+                  counts = {key:int(values[0]) for key,values in matched.items()}
+              rows = re.findall(r'(?m)^(ok|not ok) ([0-9]{1,5}) - ([^\r\n]+)$',tap)
+              exact = rows == [('ok',str(i),name) for i,name in enumerate(expected,1)]
+          passed = code==0 and exact and counts=={'tests':5,'pass':5,'fail':0,'cancelled':0,'skipped':0,'todo':0}
+          row = dict(status='passed' if passed else 'failed', exitCode=code, counts=counts, exactPassingCaseInventory=exact)
+          atomic_write_private(root/'private/evidence.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all 4 server helper cases
+        id: server_cases
+        if: ${{ always() && steps.admission.outcome == 'success' && steps.node_setup.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(node -p process.versions.node)" = '24.21.0'
+          python3 -B - <<'PY' >"$PROOF/logs/server-driver.stdout" 2>"$PROOF/logs/server-driver.stderr"
+          import json, os, pathlib, re, subprocess
+          from tools.release.private_roots import atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          expected = ['normal direct-child exit', 'nonzero direct-child exit', 'incomplete capture notice remains visible', 'oversized diagnostic leaves capture notice unknown after normal shutdown']
+          assert len(expected) == len(set(expected)) == 4
+          out = root/'logs/server.tap'
+          with out.open('xb') as stdout, (root/'logs/server.stderr').open('xb') as stderr:
+              code = subprocess.run(['node','--test','--test-reporter=tap','campaigns/node/vendure/harness/installed-server.test.mjs'],
+                                    stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,check=False).returncode
+          counts = None
+          exact = False
+          if out.stat().st_size <= 4 * 1024 * 1024:
+              tap = out.read_text(encoding='utf8', errors='replace')
+              fields = ('tests','pass','fail','cancelled','skipped','todo')
+              matched = {key: re.findall(r'(?m)^# ' + key + r' ([0-9]{1,5})[ \t]*$',tap) for key in fields}
+              if all(len(values)==1 for values in matched.values()):
+                  counts = {key:int(values[0]) for key,values in matched.items()}
+              rows = re.findall(r'(?m)^(ok|not ok) ([0-9]{1,5}) - ([^\r\n]+)$',tap)
+              exact = rows == [('ok',str(i),name) for i,name in enumerate(expected,1)]
+          passed = code==0 and exact and counts=={'tests':4,'pass':4,'fail':0,'cancelled':0,'skipped':0,'todo':0}
+          row = dict(status='passed' if passed else 'failed', exitCode=code, counts=counts, exactPassingCaseInventory=exact)
+          atomic_write_private(root/'private/server.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all 13 lifecycle helper cases
+        id: lifecycle_cases
+        if: ${{ always() && steps.admission.outcome == 'success' && steps.node_setup.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(node -p process.versions.node)" = '24.21.0'
+          python3 -B - <<'PY' >"$PROOF/logs/lifecycle-driver.stdout" 2>"$PROOF/logs/lifecycle-driver.stderr"
+          import json, os, pathlib, re, subprocess
+          from tools.release.private_roots import atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          expected = ['A1 retains exact fixture handles when app removal is live', 'A1 retains exact fixture handles when app removal is unavailable', 'A1 app is removed without force before ordinary other-resource cleanup', 'A2 passed document cannot override unsuccessful process 1', 'A2 passed document cannot override unsuccessful process null', 'A2 passed document cannot override unsuccessful process undefined', 'A2 process success cannot override a failed document', 'A3 scenario logs use the private callback rather than global stdout', 'B1 actual already-exited viewer receives no new signal and remains failed', 'B1 actual exit racing the timeout is reconciled without a stale recovery signal', 'B1 recovery is explicitly failed even when its own still-live child is killed', "B1 the app supervisor's shared signal guard also rejects an exited handle", 'A1 a live readback helper is retained rather than force-cleaned after the app stops']
+          assert len(expected) == len(set(expected)) == 13
+          out = root/'logs/lifecycle.tap'
+          with out.open('xb') as stdout, (root/'logs/lifecycle.stderr').open('xb') as stderr:
+              code = subprocess.run(['node','--test','--test-reporter=tap','campaigns/node/vendure/harness/installed-lifecycle.test.mjs'],
+                                    stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,check=False).returncode
+          counts = None
+          exact = False
+          if out.stat().st_size <= 4 * 1024 * 1024:
+              tap = out.read_text(encoding='utf8', errors='replace')
+              fields = ('tests','pass','fail','cancelled','skipped','todo')
+              matched = {key: re.findall(r'(?m)^# ' + key + r' ([0-9]{1,5})[ \t]*$',tap) for key in fields}
+              if all(len(values)==1 for values in matched.values()):
+                  counts = {key:int(values[0]) for key,values in matched.items()}
+              rows = re.findall(r'(?m)^(ok|not ok) ([0-9]{1,5}) - ([^\r\n]+)$',tap)
+              exact = rows == [('ok',str(i),name) for i,name in enumerate(expected,1)]
+          passed = code==0 and exact and counts=={'tests':13,'pass':13,'fail':0,'cancelled':0,'skipped':0,'todo':0}
+          row = dict(status='passed' if passed else 'failed', exitCode=code, counts=counts, exactPassingCaseInventory=exact)
+          atomic_write_private(root/'private/lifecycle.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all 12 cohort helper cases
+        id: cohort_cases
+        if: ${{ always() && steps.admission.outcome == 'success' && steps.node_setup.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(node -p process.versions.node)" = '24.21.0'
+          node -e "const assert = require('node:assert/strict'); assert.equal(typeof require('node:sqlite').DatabaseSync, 'function'); assert.equal(typeof require('node:zlib').zstdDecompressSync, 'function'); assert.equal(typeof require('node:zlib').zstdCompressSync, 'function')" >"$PROOF/logs/cohort-runtime.stdout" 2>"$PROOF/logs/cohort-runtime.stderr"
+          python3 -B - <<'PY' >"$PROOF/logs/cohort-driver.stdout" 2>"$PROOF/logs/cohort-driver.stderr"
+          import json, os, pathlib, re, subprocess
+          from tools.release.private_roots import atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          expected = ['shared truncated CLI and API detail cannot satisfy the independent list count and range', 'each actual list and detail page must echo project, bound and cursor', "an async parent cannot be resolved using another request's events", 'an uncertain service stop retains its exact handle and cannot invoke forced disposal', 'persisted privacy requires exact project DB, segment inventory, and decoded XTF witnesses', 'failed readback retains observed counters and the exact process exit', 'verified private store inventory survives a later recording semantics failure', 'equal event counts and sequences cannot hide a lifecycle or window-specific gap disagreement', 'complete recording credit requires the durable terminal and clean gap evidence on both reads', 'normal launcher shutdown preserves worker and readback eligibility across all capture notice observations', 'readback distinguishes the attached command from the exact owned container exit', 'identical events and ordinal reasons must cover the same ranges in both readers']
+          assert len(expected) == len(set(expected)) == 12
+          out = root/'logs/cohort.tap'
+          with out.open('xb') as stdout, (root/'logs/cohort.stderr').open('xb') as stderr:
+              code = subprocess.run(['node','--test','--test-reporter=tap','campaigns/node/vendure/harness/installed-cohort.test.mjs'],
+                                    stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,check=False).returncode
+          counts = None
+          exact = False
+          if out.stat().st_size <= 4 * 1024 * 1024:
+              tap = out.read_text(encoding='utf8', errors='replace')
+              fields = ('tests','pass','fail','cancelled','skipped','todo')
+              matched = {key: re.findall(r'(?m)^# ' + key + r' ([0-9]{1,5})[ \t]*$',tap) for key in fields}
+              if all(len(values)==1 for values in matched.values()):
+                  counts = {key:int(values[0]) for key,values in matched.items()}
+              rows = re.findall(r'(?m)^(ok|not ok) ([0-9]{1,5}) - ([^\r\n]+)$',tap)
+              exact = rows == [('ok',str(i),name) for i,name in enumerate(expected,1)]
+          passed = code==0 and exact and counts=={'tests':12,'pass':12,'fail':0,'cancelled':0,'skipped':0,'todo':0}
+          row = dict(status='passed' if passed else 'failed', exitCode=code, counts=counts, exactPassingCaseInventory=exact)
+          atomic_write_private(root/'private/cohort.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all 1 nodepack packaging helper cases
+        id: nodepack_cases
+        if: ${{ always() && steps.admission.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY' >"$PROOF/logs/nodepack-driver.stdout" 2>"$PROOF/logs/nodepack-driver.stderr"
+          import json, os, pathlib, sys, unittest
+          from tools.release.private_roots import atomic_write_private
+          from tools.qa.unittest_run import StructuredRunner
+          root = pathlib.Path(os.environ['PROOF'])
+          sys.path.insert(0, str(pathlib.Path('packaging/test').resolve()))
+          import test_node_pack
+          expected = ['test_runtime_manifest_covers_exact_packaged_dist']
+          assert len(set(expected)) == len(expected) == 1
+          observed = unittest.defaultTestLoader.getTestCaseNames(test_node_pack.NodePack)
+          suite = unittest.defaultTestLoader.loadTestsFromModule(test_node_pack)
+          exact = sorted(expected)==observed and suite.countTestCases()==1
+          counts = None
+          passed = False
+          if exact:
+              with (root/'logs/nodepack-suite.private').open('x') as log:
+                  result = StructuredRunner(stream=log,verbosity=2).run(suite)
+              counts = result.summary()['counts']
+              passed = result.wasSuccessful() and counts==dict(testsRun=1,failures=0,errors=0,skipped=0,expectedFailures=0,unexpectedSuccesses=0)
+          row = dict(status='passed' if passed else 'failed', counts=counts, exactCaseInventory=exact)
+          atomic_write_private(root/'private/nodepack.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all 12 verifier packaging helper cases
+        id: verifier_cases
+        if: ${{ always() && steps.admission.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY' >"$PROOF/logs/verifier-driver.stdout" 2>"$PROOF/logs/verifier-driver.stderr"
+          import json, os, pathlib, sys, unittest
+          from tools.release.private_roots import atomic_write_private
+          from tools.qa.unittest_run import StructuredRunner
+          root = pathlib.Path(os.environ['PROOF'])
+          sys.path.insert(0, str(pathlib.Path('packaging/test').resolve()))
+          import test_verify_package
+          expected = ['test_manifest_lists_every_required_component', 'test_version_matches_package_name', 'test_release_trust_claim_is_rejected', 'test_modified_and_unlisted_files_are_detected', 'test_payload_sums_drift_is_detected', 'test_payload_row_drift_is_caught_by_payload_hashes_even_when_the_manifest_agrees', 'test_archive_with_a_fifo_member_is_rejected', 'test_binary_without_xtp_protocol_line_fails', 'test_archive_input_and_unsafe_members', 'test_schema_version_reported_equals_migrations_latest', 'test_tui_stub_binary_fails_tui_implemented_but_registers_the_subcommand', 'test_binary_that_does_not_report_schema_version_fails']
+          assert len(set(expected)) == len(expected) == 12
+          observed = unittest.defaultTestLoader.getTestCaseNames(test_verify_package.VerifyPackage)
+          suite = unittest.defaultTestLoader.loadTestsFromModule(test_verify_package)
+          exact = sorted(expected)==observed and suite.countTestCases()==12
+          counts = None
+          passed = False
+          if exact:
+              with (root/'logs/verifier-suite.private').open('x') as log:
+                  result = StructuredRunner(stream=log,verbosity=2).run(suite)
+              counts = result.summary()['counts']
+              passed = result.wasSuccessful() and counts==dict(testsRun=12,failures=0,errors=0,skipped=0,expectedFailures=0,unexpectedSuccesses=0)
+          row = dict(status='passed' if passed else 'failed', counts=counts, exactCaseInventory=exact)
+          atomic_write_private(root/'private/verifier.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Publish counts from reached stages
+        id: counts
+        if: ${{ always() && steps.admission.outcome == 'success' }}
+        env:
+          PREPARATION_OUTCOME: ${{ steps.preparation_cases.outcome }}
+          FIXTURE_OUTCOME: ${{ steps.fixture_cases.outcome }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence_cases.outcome }}
+          SERVER_OUTCOME: ${{ steps.server_cases.outcome }}
+          LIFECYCLE_OUTCOME: ${{ steps.lifecycle_cases.outcome }}
+          COHORT_OUTCOME: ${{ steps.cohort_cases.outcome }}
+          NODEPACK_OUTCOME: ${{ steps.nodepack_cases.outcome }}
+          VERIFIER_OUTCOME: ${{ steps.verifier_cases.outcome }}
+          PYTHON_OUTCOME: ${{ steps.python_cases.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import json,os,pathlib,subprocess
+          from tools.release.private_roots import atomic_write_private, read_private_json
+          root = pathlib.Path(os.environ['PROOF'])
+          def stage(label,outcome,expected_fields):
+              if outcome == 'skipped':
+                  return dict(status='not-reached',counts=None)
+              if outcome not in ('success','failure','cancelled'):
+                  raise ValueError('unrecognized outcome')
+              file = root/'private'/(label+'.json')
+              if not file.exists():
+                  if outcome == 'success': raise ValueError('missing passing receipt')
+                  return dict(status='receipt-unavailable',counts=None)
+              row = read_private_json(file,maximum_bytes=16*1024)
+              keys = ({'status','counts','exactPassingCaseInventory','exitCode'} if label in ('preparation', 'fixture', 'evidence', 'server', 'lifecycle', 'cohort')
+                      else {'status','counts','exactCaseInventory'})
+              if set(row)!=keys or row['status'] not in ('passed','failed'): raise ValueError('invalid receipt')
+              exact = row['exactPassingCaseInventory' if label in ('preparation', 'fixture', 'evidence', 'server', 'lifecycle', 'cohort') else 'exactCaseInventory']
+              if type(exact) is not bool: raise ValueError('invalid census')
+              if label in ('preparation', 'fixture', 'evidence', 'server', 'lifecycle', 'cohort') and (type(row['exitCode']) is not int or not -255<=row['exitCode']<=255): raise ValueError('invalid exit')
+              counts = row['counts']
+              if counts is not None and (not isinstance(counts,dict) or set(counts)!=set(expected_fields)
+                   or any(type(x) is not int or not 0<=x<=99999 for x in counts.values())): raise ValueError('invalid counts')
+              if row['status']=='passed' and (not exact or counts!=expected_fields or (label in ('preparation', 'fixture', 'evidence', 'server', 'lifecycle', 'cohort') and row['exitCode']!=0)):
+                  raise ValueError('passing census mismatch')
+              if (outcome=='success')!=(row['status']=='passed'): raise ValueError('stage outcome mismatch')
+              return row
+          preparation = stage('preparation',os.environ['PREPARATION_OUTCOME'],{'tests':27,'pass':27,'fail':0,'cancelled':0,'skipped':0,'todo':0})
+          fixture = stage('fixture',os.environ['FIXTURE_OUTCOME'],{'tests':20,'pass':20,'fail':0,'cancelled':0,'skipped':0,'todo':0})
+          python = stage('python',os.environ['PYTHON_OUTCOME'],dict(testsRun=7,failures=0,errors=0,skipped=0,expectedFailures=0,unexpectedSuccesses=0))
+          evidence = stage('evidence',os.environ['EVIDENCE_OUTCOME'],{'tests': 5, 'pass': 5, 'fail': 0, 'cancelled': 0, 'skipped': 0, 'todo': 0})
+          server = stage('server',os.environ['SERVER_OUTCOME'],{'tests': 4, 'pass': 4, 'fail': 0, 'cancelled': 0, 'skipped': 0, 'todo': 0})
+          lifecycle = stage('lifecycle',os.environ['LIFECYCLE_OUTCOME'],{'tests': 13, 'pass': 13, 'fail': 0, 'cancelled': 0, 'skipped': 0, 'todo': 0})
+          cohort = stage('cohort',os.environ['COHORT_OUTCOME'],{'tests': 12, 'pass': 12, 'fail': 0, 'cancelled': 0, 'skipped': 0, 'todo': 0})
+          nodepack = stage('nodepack',os.environ['NODEPACK_OUTCOME'],dict(testsRun=1,failures=0,errors=0,skipped=0,expectedFailures=0,unexpectedSuccesses=0))
+          verifier = stage('verifier',os.environ['VERIFIER_OUTCOME'],dict(testsRun=12,failures=0,errors=0,skipped=0,expectedFailures=0,unexpectedSuccesses=0))
+          clean = not subprocess.check_output(['git','status','--porcelain','--untracked-files=all'])
+          passed = all(s['status']=='passed' for s in (preparation,fixture,python,evidence,server,lifecycle,cohort,nodepack,verifier)) and clean
+          receipt = dict(schemaVersion=1,kind='vendure-installed-assembly-helpers',status='passed' if passed else 'failed',
+              releaseAcceptance=False,sourceSha=os.environ['PRODUCT'],sourceTree=os.environ['PRODUCT_TREE'],sourceParent=os.environ['PRODUCT_PARENT'],
+              sourcePatchSha256=os.environ['PATCH_SHA256'],wrapperSha=os.environ['GITHUB_SHA'],runId=int(os.environ['GITHUB_RUN_ID']),
+              attempt=int(os.environ['GITHUB_RUN_ATTEMPT']),sourceClean=clean,preparation=preparation,fixture=fixture,python=python,
+              evidence=evidence,server=server,lifecycle=lifecycle,cohort=cohort,nodepack=nodepack,verifier=verifier,
+              applicationBuild='not-run',applicationSeed='not-run',installedApplication='not-run',campaign='not-run')
+          atomic_write_private(root/'safe/counts.json',(json.dumps(receipt,sort_keys=True)+'\n').encode())
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out: print('ready=true',file=out)
+          raise SystemExit(0 if passed else 1)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.counts.outputs.ready == 'true' }}
+        with:
+          name: vendure-assembled-helper-counts
+          path: ${{ env.PROOF }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 7
