@@ -1,0 +1,249 @@
+name: Direct-child native installed Vendure lifecycle
+on:
+  push:
+    branches: ['codex/proof-vendure-native-direct-child-125']
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: fixture
+    env:
+      PRODUCT: '3bc74469d586ab1cb421c85e98eff8e3a9d515a9'
+      PRODUCT_TREE: '1a6d23aaec700b8d39871304fc7e7a51d2e26d79'
+      FIXTURE: '93e47e77aab808e33e152ed391c22c8096ddc677'
+      FIXTURE_TREE: '8262c1b27202a8c58afe90e107d72981439a5d57'
+      FIXTURE_PARENT: 'eca0fef629256ed149db534c64cb75acc8a7cd50'
+      PATCH_SHA256: '140a17c9099c54b2f119d4b06861cc3681de2843558dbb25350ccecaf05e2b50'
+      VENDURE_REVIEWED_CORE_BOOTSTRAP_SHA256: '671b6a69e49b5c236cce44aa7a56730dbb958dce23355bab8bf72a3d078b26b1'
+      XCAMP_PLATFORM: linux/amd64
+      XTRACE_CAMP_DOCKER_HOST: unix:///var/run/docker.sock
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out exact review wrapper
+        id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: fixture
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Check out reviewed direct-child package source
+        id: product_checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PRODUCT }}
+          path: product
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Admit immutable product and private fixture helpers
+        id: admission
+        env:
+          HOST_KIND: ${{ runner.environment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - 2>/dev/null <<'ADMIT'
+          from pathlib import Path
+          import hashlib, os, subprocess
+          e = os.environ
+          def need(value):
+              if not value: raise SystemExit('source admission failed')
+          def git(root,*args):
+              return subprocess.check_output(['git','-C',str(root),*args], stderr=subprocess.DEVNULL)
+          def text(root,*args):
+              return git(root,*args).decode().strip()
+          work = Path(e['GITHUB_WORKSPACE'])
+          fixture, product = work/'fixture', work/'product'
+          need(e['HOST_KIND']=='github-hosted' and e['GITHUB_EVENT_NAME']=='push' and e['GITHUB_RUN_ATTEMPT']=='1')
+          need(e['GITHUB_REPOSITORY']=='Legend101Zz/X-trace' and e['GITHUB_REF']=='refs/heads/codex/proof-vendure-native-direct-child-125')
+          for root in (fixture,product):
+              need(root==root.resolve(strict=True) and text(root,'rev-parse','--show-toplevel')==str(root))
+              need(git(root,'status','--porcelain','--untracked-files=all')==b'')
+          need(Path.cwd()==fixture)
+          need(text(product,'rev-parse','HEAD')==e['PRODUCT'] and text(product,'rev-parse','HEAD^{tree}')==e['PRODUCT_TREE'])
+          need(text(fixture,'rev-parse','HEAD')==e['GITHUB_SHA'] and text(fixture,'show','-s','--format=%P','HEAD')==e['FIXTURE'])
+          need(text(fixture,'show','-s','--format=%P',e['FIXTURE'])==e['FIXTURE_PARENT'] and text(fixture,'rev-parse',e['FIXTURE']+'^{tree}')==e['FIXTURE_TREE'])
+          patch=git(fixture,'diff','--no-ext-diff','--no-textconv','--no-color','--binary','--full-index',e['FIXTURE_PARENT'],e['FIXTURE'])
+          need(hashlib.sha256(patch).hexdigest()==e['PATCH_SHA256'])
+          paths=('.github/proof/vendure-native/check_projection.py','.github/proof/vendure-native/project.py','.github/workflows/vendure-native-direct-child.yml')
+          need(text(fixture,'diff','--name-status','--no-renames',e['FIXTURE'],'HEAD').splitlines()==['A\t'+p for p in paths])
+          for p in paths: need(git(fixture,'ls-tree','HEAD','--',p).startswith(b'100644 blob '))
+          ADMIT
+          git checkout --detach --quiet "$FIXTURE"
+          status=$(git status --porcelain --untracked-files=all)
+          test -z "$status"
+          proof="$RUNNER_TEMP/xvn"
+          GITHUB_ENV=/dev/null python3 -B -m tools.release.ci_floor prepare-private-root --root "$proof" >/dev/null 2>&1
+          mkdir -m 700 "$proof/logs" "$proof/safe" "$proof/stages" "$proof/preparation-parent" "$proof/image-context" "$proof/npm-pack" "$proof/helpers" 2>/dev/null
+          for helper in check_projection.py project.py; do
+            git show "$GITHUB_SHA:.github/proof/vendure-native/$helper" > "$proof/helpers/$helper"
+          done
+          cd "$proof/helpers"
+          sha256sum --check --status <<'PINS'
+          00aabf760cabfa11867b06a366671114a9235773260a30aa9a3ee8beb020ae39  check_projection.py
+          18bad5a4c44ebfc757e414b511550ac4145c47da8cb684870cc610dab99f2728  project.py
+          PINS
+      - name: Set up package Node 22
+        id: node22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Set up package JDK 17
+        id: java17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Build candidate package privately
+        id: package
+        working-directory: product
+        timeout-minutes: 90
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export PROOF="$RUNNER_TEMP/xvn" TMPDIR="$RUNNER_TEMP/xvn/tmp"
+          mark() {
+            local destination="$PROOF/stages/$1"
+            printf '%s\n' "$2" > "$destination.next" || return 1
+            mv -fT -- "$destination.next" "$destination" || return 1
+          }
+          mark "package-toolchain" running
+          if rustup show active-toolchain >"$PROOF/logs/rust-toolchain" 2>&1 || rustup toolchain install stable --profile minimal >>"$PROOF/logs/rust-toolchain" 2>&1; then
+            mark "package-toolchain" success
+          else
+            rc=$?; mark "package-toolchain" failure; exit "$rc"
+          fi
+          mark "package-build" running
+          if python3 -B packaging/build.py --out "$PROOF/dist" --platform linux-x86_64 >"$PROOF/logs/package.stdout" 2>"$PROOF/logs/package.stderr"; then
+            mark "package-build" success
+          else
+            rc=$?; mark "package-build" failure; exit "$rc"
+          fi
+      - name: Set up campaign Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        id: node24
+        if: ${{ steps.package.outcome == 'success' }}
+        with:
+          node-version: 24.21.0
+      - name: Run bounded source regressions
+        id: regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export PROOF="$RUNNER_TEMP/xvn" TMPDIR="$RUNNER_TEMP/xvn/tmp"
+          test "$(node -p process.versions.node)" = '24.21.0'
+          node --test --test-reporter=tap campaigns/node/vendure/harness/installed-preflight-observation.test.mjs >"$PROOF/logs/node-tests" 2>&1
+          python3 -B campaigns/node/vendure/harness/test_installed_preflight_project.py -v >"$PROOF/logs/python-tests" 2>&1
+          python3 -B - <<'PYCASE'
+          import os, re
+          from pathlib import Path
+          logs = Path(os.environ['PROOF']) / 'logs'
+          tap = (logs / 'node-tests').read_text().splitlines()
+          expected = ['preflight observations distinguish running, failed and passed boundaries', 'preflight observation reader rejects extra, duplicate, malformed and oversized fields', "container attach and process failures cannot borrow one another's success", 'only closed signal classes are reported', 'receipt reader requires exact private keys and a UUIDv7 identity']
+          assert [line for line in tap if re.match(r'^(not )?ok ', line)] == [f'ok {i} - {name}' for i, name in enumerate(expected, 1)]
+          for label, value in dict(tests=len(expected), pass_count=len(expected), fail=0, cancelled=0, skipped=0, todo=0).items():
+              label = 'pass' if label == 'pass_count' else label
+              assert [line for line in tap if line.startswith(f'# {label} ')] == [f'# {label} {value}']
+          unittest = (logs / 'python-tests').read_text().splitlines()
+          names = ['test_complete_success_requires_both_process_observations', 'test_extra_or_nonstructural_values_are_rejected', 'test_failed_phase_and_signal_remain_distinct', 'test_partial_documents_cannot_claim_unreached_work']
+          # Python 3.12 unittest includes the qualified method in its verbose case label.
+          rows = [line for line in unittest if line.startswith('test_')]
+          assert len(rows) == len(names)
+          for line, name in zip(rows, names):
+              assert re.fullmatch(re.escape(name) + r' \(__main__\.ProjectTest(?:\.' + re.escape(name) + r')?\) \.\.\. ok', line)
+          assert sum(bool(re.fullmatch(r'Ran ' + str(len(names)) + r' tests in [0-9.]+s', line)) for line in unittest) == 1 and unittest.count('OK') == 1
+          print(f'{len(expected)} Node and {len(names)} Python named cases passed')
+          PYCASE
+          python3 -B "$PROOF/helpers/check_projection.py" >"$PROOF/logs/native-projection-tests" 2>&1
+          node --check campaigns/node/vendure/harness/native-ordinary.mjs
+          node --check campaigns/node/vendure/harness/native-process.mjs
+          node --check campaigns/node/vendure/harness/native-starter.mjs
+      - name: Prepare pinned starter and run one native installed lifecycle
+        id: campaign
+        timeout-minutes: 90
+        if: ${{ steps.package.outcome == 'success' && steps.node24.outcome == 'success' && steps.regressions.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export PROOF="$RUNNER_TEMP/xvn" TMPDIR="$RUNNER_TEMP/xvn/tmp"
+          mark() {
+            local destination="$PROOF/stages/$1"
+            printf '%s\n' "$2" > "$destination.next" || return 1
+            mv -fT -- "$destination.next" "$destination" || return 1
+          }
+          test "$(node -p process.versions.node)" = '24.21.0'
+          status=$(git status --porcelain --untracked-files=all)
+          test -z "$status"
+          export XTRACE_VENDURE_PREPARATION_PARENT="$PROOF/preparation-parent"
+          stage() {
+            local name="$1"; shift
+            mark "$name" running
+            if "$@" >"$PROOF/logs/$name.stdout" 2>"$PROOF/logs/$name.stderr"; then
+              mark "$name" success
+            else
+              local rc=$?
+              mark "$name" failure
+              return "$rc"
+            fi
+          }
+          image() {
+            cp campaigns/node/vendure/harness/paired-image.Dockerfile "$PROOF/image-context/Dockerfile" || return $?
+            cp web/app/package.json web/app/package-lock.json "$PROOF/image-context/" || return $?
+            docker build --platform linux/amd64 --build-arg NODE_VERSION=24.21.0 --iidfile "$XTRACE_VENDURE_PREPARATION_PARENT/vendure-image.id" "$PROOF/image-context"
+          }
+          assets() {
+            local version
+            version=$(python3 -B -c 'import json;print(json.load(open("campaigns/node/vendure/campaign.json"))["starter"]["package"]["version"])') || return $?
+            (
+              cd "$PROOF/npm-pack" || exit 1
+              npm pack "@vendure/create@$version" --silent || exit $?
+            ) || return $?
+            python3 -B campaigns/node/vendure/harness/seed_assets.py retain "$PROOF/npm-pack/vendure-create-$version.tgz" "$XTRACE_VENDURE_PREPARATION_PARENT/preparation/create-assets.tgz" || return $?
+            python3 -B campaigns/node/vendure/harness/seed_assets.py prepare "$XTRACE_VENDURE_PREPARATION_PARENT/preparation/create-assets.tgz" "$XTRACE_VENDURE_PREPARATION_PARENT/preparation/create-assets"
+          }
+          stage image image
+          stage create node campaigns/node/vendure/harness/run.mjs create
+          stage assets assets
+          stage build node campaigns/node/vendure/harness/run.mjs build
+          stage seed node campaigns/node/vendure/harness/run.mjs seed
+          stage native node campaigns/node/vendure/harness/native-ordinary.mjs installed
+      - name: Project bounded native lifecycle observations
+        id: projection
+        if: ${{ always() && steps.admission.outcome == 'success' }}
+        env:
+          NODE22: ${{ steps.node22.outcome }}
+          JAVA17: ${{ steps.java17.outcome }}
+          PACKAGE: ${{ steps.package.outcome }}
+          NODE24: ${{ steps.node24.outcome }}
+          REGRESSIONS: ${{ steps.regressions.outcome }}
+          CAMPAIGN: ${{ steps.campaign.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export PROOF="$RUNNER_TEMP/xvn" TMPDIR="$RUNNER_TEMP/xvn/tmp"
+          python3 -B "$PROOF/helpers/project.py"
+      - name: Upload bounded native lifecycle receipt
+        id: upload
+        if: ${{ always() && steps.projection.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: vendure-native-direct-child-bounded
+          path: ${{ runner.temp }}/xvn/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Enforce complete native lifecycle
+        id: enforce
+        if: ${{ always() && steps.projection.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.projection.outputs.complete }}" = true
