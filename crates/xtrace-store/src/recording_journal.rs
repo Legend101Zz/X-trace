@@ -385,19 +385,37 @@ fn prepare_boundary(
 ) -> Result<std::fs::File, RecordingStoreError> {
     #[cfg(unix)]
     let _admission_caller = CallerGuard::enter(Caller::JournalPrepare);
+    #[cfg(all(test, unix))]
+    let mut detail = work_profile::Phase::checkpoint_prepare_detail("checkpoint_prepare_encode");
     let name = boundary_name(recording_id);
     let pending = format!("{name}-next");
     let mut bytes = header.to_vec();
     bytes.extend_from_slice(&length.to_be_bytes());
     bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
+    #[cfg(all(test, unix))]
+    if let Some(phase) = detail.as_mut() {
+        phase.switch("checkpoint_prepare_open");
+    }
     let mut file = object_io!(
         private,
         CheckpointOpenOrCreate,
         id,
         root.open_or_create_private_file(&pending)
     )?;
+    #[cfg(all(test, unix))]
+    if let Some(phase) = detail.as_mut() {
+        phase.switch("checkpoint_prepare_truncate");
+    }
     object_io!(direct, CheckpointTruncate, id, file.set_len(0))?;
+    #[cfg(all(test, unix))]
+    if let Some(phase) = detail.as_mut() {
+        phase.switch("checkpoint_prepare_write");
+    }
     object_io!(direct, CheckpointWrite, id, file.write_all(&bytes))?;
+    #[cfg(all(test, unix))]
+    if let Some(phase) = detail.as_mut() {
+        phase.switch("checkpoint_prepare_sync_dispatch");
+    }
     commit_failpoint("journal-checkpoint-before-sync", id, false)?;
     object_io!(
         direct,
@@ -405,6 +423,10 @@ fn prepare_boundary(
         id,
         durable_sync(SyncKind::Checkpoint, || sync_recording_file(&file, FileSync::Filesystem))
     )?;
+    #[cfg(all(test, unix))]
+    if let Some(phase) = detail.as_mut() {
+        phase.switch("checkpoint_prepare_bind");
+    }
     object_io!(
         private,
         CheckpointPendingBinding,

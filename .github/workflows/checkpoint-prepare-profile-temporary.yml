@@ -1,0 +1,106 @@
+name: checkpoint-prepare-profile-temporary
+on:
+  push:
+    branches: [codex/checkpoint-prepare-profile-78]
+permissions:
+  contents: read
+jobs:
+  jdk17-focused-checkpoint-prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Prepare the admitted floor-depth scratch layout
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP:?}/xf"
+          [ "${#root}" -le 40 ]
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/diag" "$root/diag/frag" "$root/c" "$root/tmp/t" "$root/tmp/p"
+          echo "XTRACE_CHECKPOINT_PREPARE_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Observe checkpoint preparation in one unchanged focused cardinality test
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_CHECKPOINT_PREPARE_ROOT"
+          export CARGO_TARGET_DIR="$root/cargo-target"
+          export TMPDIR="$root/tmp/t" TMP="$root/tmp/t" TEMP="$root/tmp/t"
+          export XTRACE_TEST_SCRATCH_ROOT="$root/tmp/t" XTRACE_TEST_PRIVATE_SCRATCH="$root/tmp/p"
+          export XTRACE_TEST_CARDINALITY_SCRATCH="$root/c"
+          export XTRACE_CI_PRIVATE_ROOT="$root/diag" XTRACE_CHECKPOINT_PREPARE_DETAIL=1
+          unset XTRACE_CHECKPOINT_PROFILE_DETAIL
+          focused=recording_port::tests::singleton_acknowledgements_at_focused_cap_recover_with_bounded_segments_and_pages
+          if ! cargo test --locked -p xtrace-store --lib --all-features "$focused" -- --exact > "$root/diag/test.log" 2>&1; then
+            echo "Focused checkpoint preparation observation failed"
+            exit 1
+          fi
+          grep -Fxq "test $focused ... ok" "$root/diag/test.log"
+          grep -q '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$root/diag/test.log"
+          python3 -B - "$root/diag/frag" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib
+          import sys
+
+          from tools.qa.store_profiles import collect
+
+          profiles = collect(pathlib.Path(sys.argv[1]))
+          assert set(profiles) == {"focused-singletons"}
+          report = profiles["focused-singletons"]
+          assert report["workload"] == {"expected_admissions": 131072, "counted_journal_syncs": 1}
+          complete = report["lastReport"]
+          assert complete["state"] == "returned" and complete["completed"] == 131072
+          assert complete["elapsed_ns"] > 0
+          assert "linuxAclProbes" not in report
+          names = {
+              "checkpoint_prepare_encode": "Filename, header, length and hash",
+              "checkpoint_prepare_open": "Admitted open or create",
+              "checkpoint_prepare_truncate": "Truncate",
+              "checkpoint_prepare_write": "Write",
+              "checkpoint_prepare_sync_dispatch": "Sync wrapper and failpoint check",
+              "checkpoint_sync": "Counted checkpoint sync",
+              "checkpoint_prepare_bind": "Post-sync pending file binding",
+          }
+          phases = report["phases"]
+          assert {name for name in phases if name.startswith("checkpoint_prepare_")} == set(names) - {"checkpoint_sync"}
+          assert "checkpoint_bind_pending" not in phases
+          for name in names:
+              measurement = phases[name]
+              assert 0 < measurement["spans"] <= 131072 * 4
+              assert 0 < measurement["max_ns"] <= measurement["total_ns"] <= complete["elapsed_ns"]
+          print("Focused checkpoint preparation observation (JDK17)")
+          print("- 131,072 admissions; exact existing test passed.")
+          print(f"- Workload profile elapsed: {complete['elapsed_ns'] / 1e9:.3f}s.")
+          for name, label in names.items():
+              phase = phases[name]
+              print(f"- {label}: {phase['total_ns'] / 1e9:.3f}s exclusive, {phase['spans']} spans.")
+          print("- The fixture counts logical checkpoint sync barriers; no physical sync latency was measured.")
+          print("- One instrumented workload observation. No baseline, profiler overhead estimate, "
+                "sparse workload, or release-floor proof.")
+          PY
+      - name: Encrypt private diagnostics
+        if: always() && env.XTRACE_CHECKPOINT_PREPARE_ROOT != ''
+        env:
+          EVIDENCE_CERT: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVOVENDQXAyZ0F3SUJBZ0lVZkxxMVlkSWI5OVZQa1lFSUJwVUw2RVpUL2RVd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0tqRW9NQ1lHQTFVRUF3d2ZXQzEwY21GalpTQndjbWwyWVhSbElIWnBaWGRsY2lCbGRtbGtaVzVqWlRBZQpGdzB5TmpFeE1qVXhOVEV6TWpaYUZ3MHlOakV5TURreE5URXpNalphTUNveEtEQW1CZ05WQkFNTUgxZ3RkSEpoClkyVWdjSEpwZG1GMFpTQjJhV1YzWlhJZ1pYWnBaR1Z1WTJVd2dnR2lNQTBHQ1NxR1NJYjNEUUVCQVFVQUE0SUIKandBd2dnR0tBb0lCZ1FDMkJ3Mi9QdURTZWFQeWNZby9HblhUNjhKMVpVWmhvM285U2dhQ3NjR0UvdXZrRXNyTQo0OUtvcVNKeExaSmdrbUcwODRvUEs1SXhKQVkzd29jcGRBL3dUVW5UYWZTWTc1N0JBZ0dFbGVjQTh1T2lpcHZyCm9XTFloUS9YVUxOaUNaVTUrRHB3OGs5cmxWQ3lNa1FNa2NJNWRkTE1JL0MyTDFzSnExSWx3Ulo3dzBmV3MzVXoKc1hwaUxjb2VJejdGalphV2tPUzdwMHVvREowMkQ0alFaR2p1WUl2a0xwL3c3b3JtdHFYOW5tazhmWDdOK0JXeQowTnpjYlFvV1B5QzlTalYzaUNNMkNDMCtxRzBINDB2Uy9zU2s3c0RhQVVDTFVrTHFCTHduY2tWNGJ4Sk1mdE9BClZ3VUpNUSt1aUhpUUsyNnVCcXovUDNOcFBqRGFZT3BCK1ppZlN2Y0V6TjFQWndLTlM5d2JzZm1WdjlCTjg2UkYKK1VYSzdHdURSUHpKdDkrckc5RHZneHZJWG4ydWxrNXhlYStuRGR5d3k1TGRZSFNMZ1NRekZWWXpCLzVXaXA5VQpSTmdDekRPU01FTXZ4SFBibXpaSzF4QWtlbjZHK1hpbG1MMW9XNmlTU01kOUpTNU1jbXZ3bWN6RmtLU293SWQvCnFydVdVV0VmNUUzck9Gc0NBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmMKVmxpK01COEdBMVVkSXdRWU1CYUFGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmNWbGkrTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dHQkFCa0ZsN3Znc05TN0tMVWp3bDFnSFlKL1BYMDEydnlpCi9VNExVM0g3eHZHZFZBSUpXejIvYjdZaHg0OFh6SWFyb0RoQ1lYNzY5ZStBODM1Si9pQ042cExmeTYyM3R1WU8KWUhVMEZUSFZqdUZ0OFVxRDVYdExpdGVmMHJuN0luam9HWmJvR3lLbXBrTWs3TkgydmFCcDY3SHA3UnV5anBTTQp6UmY3LzNPOFN3U1FxK1RxNENvaVh6OWgwdzBjV3AxRytqRGtBR2pOMXNUeU45amNrM0VnSkpia2trR2lENC9wCkw5eE5WbUFqZmhrRExqc2t0VmZaQ1hNcDVlbVZmWkJqZW9wUHpDS3YwN1NrOERTeWFNcnRFTFJhbU9JMXZUM08KSWkzNTFoaTVuNnpiamVCTUM4dmt4T0pCckxsc2FVUHV6V0M4OEpQQzRCUGk0SXVFanA3eHVFdUlLSTR3YTVuUApZVC81SDAzWUwrajJ2V3pUa2Z3UVUvS0wrMEx3NkIwNVByTC9ZRFY4dXcrU3crK1A4bG5TK2ZsaisxUi9iY0tTClg3NFVnY2g0c0tESXd2clBzemRUZXh4cVBrajlHYXpPbzk4RHRlTys5RUdvWDZKcU9ZWmVCU3VIUndoTGNqNXYKK0c5blVacDc1R1djYmlzYk1udUpIQkVOV3RQVzhFUTZQZz09Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_CHECKPOINT_PREPARE_ROOT"
+          printf '%s' "$EVIDENCE_CERT" | base64 -d > "$root/evidence.crt"
+          tar -C "$root" -cf - diag | openssl cms -encrypt -binary -aes-256-cbc \
+            -outform DER -out "$root/checkpoint-prepare-profile.enc" "$root/evidence.crt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && env.XTRACE_CHECKPOINT_PREPARE_ROOT != ''
+        with:
+          name: encrypted-checkpoint-prepare-profile
+          path: ${{ env.XTRACE_CHECKPOINT_PREPARE_ROOT }}/checkpoint-prepare-profile.enc
+          if-no-files-found: error
+          retention-days: 1

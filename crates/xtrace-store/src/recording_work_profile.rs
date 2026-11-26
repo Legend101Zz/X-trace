@@ -26,6 +26,8 @@ struct Measurement {
 struct Profile {
     #[cfg(unix)]
     checkpoint_detail: bool,
+    #[cfg(unix)]
+    checkpoint_prepare_detail: bool,
     started: Instant,
     changed: Instant,
     probes: u64,
@@ -127,6 +129,9 @@ impl WorkProfile {
             let mut profile = Profile {
                 #[cfg(unix)]
                 checkpoint_detail,
+                #[cfg(unix)]
+                checkpoint_prepare_detail: std::env::var_os("XTRACE_CHECKPOINT_PREPARE_DETAIL")
+                    .is_some_and(|value| value == "1"),
                 started: now,
                 changed: now,
                 probes: ls_spawns_on_this_thread(),
@@ -191,6 +196,14 @@ impl Phase {
     pub(crate) fn checkpoint_detail(name: &'static str) -> Option<Self> {
         let enabled = PROFILE
             .with(|slot| slot.borrow().as_ref().is_some_and(|profile| profile.checkpoint_detail));
+        enabled.then(|| Self::enter(name))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn checkpoint_prepare_detail(name: &'static str) -> Option<Self> {
+        let enabled = PROFILE.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|profile| profile.checkpoint_prepare_detail)
+        });
         enabled.then(|| Self::enter(name))
     }
 
