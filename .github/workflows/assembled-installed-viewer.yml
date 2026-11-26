@@ -1,0 +1,295 @@
+# Private, unexecuted development proof. Fill every reviewed/verified placeholder only after exact source proof and embed verification.
+name: Assembled genuinely installed viewer proof
+on:
+  push:
+    branches: [codex/proof-installed-map-return-118]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  installed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PRODUCT: f21ef4df1089058cae5fe76a3354be4448c14f3b
+      PRODUCT_TREE: 006d874034d75ac729316816576190d8dea897da
+      ASSEMBLED_SOURCE_SHA: aa6a36dbbf5c209906187a5f918eb8dd01ecb8a7
+      ASSEMBLED_SOURCE_TREE: 61457b2b9d428a45fb7a982ad31770ad30acdcfd
+      ASSEMBLED_SOURCE_PARENT_SHA: d0581314cc4ecfc90ec6483ea3809fb0e0e4c2a7
+      VERIFIED_SOURCE_RUN_ID: 45787593317
+      VERIFIED_SOURCE_WRAPPER: 933b3e81badd588e37132c34609322751a855599
+      INSTALLER_FIX_SHA: 1e630befb04c451ca085d3a8b0d3324525271460
+      EXPECTED_UI_MANIFEST_SHA256: e08a047455b1fd561dfb74d53fea96dbbef83bc4bc0f4544c31f98b96c5e51d0
+      INSTALL_SCRIPT_SHA256: 7623373412edeb406deab5bbf672d8d5653b4a363ec4aa8b850380608f2e0425
+      INSTALL_TEST_SHA256: c251607d61e391251eb50e62cb5ca156c89815e31890e2b1276b5f4012d603b8
+      REPLAY_SOURCE_BLOB: 68ea032a08544c8e72f26e0237a997f460939b2b
+      REPLAY_TOOLS_BLOB: 17e748ecef172a0a0f24983291c19a960275e34b
+      REPLAY_PLAYBACK_BLOB: 6fe9ed6edd9cc96fe6a216628d2c36f586e87594
+      REPLAY_REPORT_BLOB: 24466b1e4d57ade43142d028355029f498e471f4
+      TOUR_SOURCE_BLOB: ec51faf4ef09003a5be5fe9680372c3cbf056c5a
+      JOURNEY_BLOB: 3cb043bdaa47b1a88d220d21ff56d3119256c184
+      RECIPIENT_DER_SHA256: 931ca5323fd14a29782acb5f1e52225f5dc5a94f4d680958de3e685514839dc4
+      CARGO_TERM_COLOR: never
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - name: Require the exact completed source qualification
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$VERIFIED_SOURCE_RUN_ID" |
+            jq -e --arg sha "$VERIFIED_SOURCE_WRAPPER" --arg id "$VERIFIED_SOURCE_RUN_ID" '
+              (.id|tostring) == $id and .run_attempt == 1 and .status == "completed" and
+              .conclusion == "success" and .head_sha == $sha and .event == "push" and
+              .head_branch == "codex/proof-map-return-selection-118" and
+              .path == ".github/workflows/source-viewer-clear-mode-tabs.yml"' >/dev/null
+      - name: Check out qualified generated product, source and installer-fix parent
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PRODUCT }}
+          path: product
+          fetch-depth: 6
+          persist-credentials: false
+      - name: Read exact reviewed wrapper helpers
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          fetch-depth: 2
+          sparse-checkout: .github/proof/assembled-installed
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Verify all pins and admit fresh private runner root
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          scripts="$GITHUB_WORKSPACE/wrapper/.github/proof/assembled-installed"
+          test "$(git -C ../wrapper rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C ../wrapper show -s --format=%P HEAD)" = "$PRODUCT"
+          test "$(shasum -a 256 "$scripts/SHA256SUMS" | cut -d' ' -f1)" = c5792fd6beb0e1e37699da070f59a3c07bf796f32713097d791cf91a2eb6f231
+          (cd "$scripts" && sha256sum --check --status SHA256SUMS)
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git rev-parse "$ASSEMBLED_SOURCE_SHA^{tree}")" = "$ASSEMBLED_SOURCE_TREE"
+          test "$(git rev-parse HEAD:web/app/scripts/browser-journey.mjs)" = "$REPLAY_SOURCE_BLOB"
+          test "$(git rev-parse HEAD:web/app/scripts/replay-tools-journey.mjs)" = "$REPLAY_TOOLS_BLOB"
+          test "$(git rev-parse HEAD:web/app/scripts/installed-export-journey.mjs)" = "$JOURNEY_BLOB"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/xai1"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/logs" "$root/private" "$root/safe" "$root/packages" "$root/encrypted"
+          for name in replay tour export; do
+            mkdir -m 700 "$root/$name" "$root/$name/logs" "$root/$name/private" "$root/$name/safe" "$root/$name/shots"
+          done
+          mkdir -m 700 "$root/replay/shots/existing" "$root/replay/shots/compact-open"
+          printf '%s\n' "SHARED_ROOT=$root" "PROOF_SCRIPTS=$scripts" "TMPDIR=$root/tmp" "PLAYWRIGHT_BROWSERS_PATH=$root/chromium" >> "$GITHUB_ENV"
+          printf '%s\n' 'admitted=true' >> "$GITHUB_OUTPUT"
+      - name: Reject cross-stage success and unknown export receipt fields
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/export-receipt-regressions.py" >"$SHARED_ROOT/logs/export-admission.stdout" 2>"$SHARED_ROOT/logs/export-admission.stderr"
+          echo 'exportReceiptAdmissionRegressions=2'
+      - name: Build and independently verify one archive and fresh official install
+        id: package
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/package-driver.py" >"$SHARED_ROOT/logs/outer.stdout" 2>"$SHARED_ROOT/logs/outer.stderr" || rc=$?
+          if [ "$rc" = 0 ]; then printf '%s\n' 'pass=true' >> "$GITHUB_OUTPUT"; fi
+          echo "installedStagePackageExit=$rc"
+          exit "$rc"
+      - name: Preserve bounded encrypted package-stage failure diagnostics
+        id: diagnostic
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        env:
+          RECIPIENT_CERT: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJgaIGZvHvTO1qz7A91QyCXVCBLwwDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCB2aWV3ZXIgdmlzdWFs
+            IHJldmlldzAeFw0yNjExMjUxNzQ1MjdaFw0yNjEyMDkxNzQ1MjdaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgdmlld2VyIHZpc3VhbCByZXZpZXcwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDUCDMtoLNBiFxpd01HnkpFVMon
+            DCZYbJiETXhyeSC/ecpMarzXEZ4ju0nd4LZwjL/A4Mx9T4JBA4pdFAQDPlnOfG6N
+            J+CQToj6WgpXFWUHpJp3yqfWqRRNj2LC10+slMqtzfcMRORiIYzzco9Uavy4a4zL
+            2jtcP3ShaaD6m/AsBFkCJMmZ94cJUeTgHwdDm9ERrPU0Eo1O31CWp0Oc/lmzvLFe
+            LpjJkdXSGZYrfQfc1n+iSNu1OO2ARxd2gkJPyTSE8dS7Zxwzcpm9izZkIyx5Z3Xm
+            l11t8C3QPDcJ4lRiTI9jF81lmxKak9eIl2PmnWNg5D19nynsboEUxfkr9IWQDYt/
+            JJ36+LyBi/mRph2c7jG3IE7GqoViW+7zd6ImzoiQZajii5PPo8ZRyvVNAZ44UbsL
+            E5djCSUrPH7slC5Cu+eV3YePq8+izZDSGcfwlzrzWGQRt2+kojpy4bPX/qxWB/sO
+            F9C85rrfrjsWWczag8SZdrvBgXWm1d0gAofhGYUCAwEAAaNTMFEwHQYDVR0OBBYE
+            FKT8KNtbCqB4oRqvV+kmEM1sK0ghMB8GA1UdIwQYMBaAFKT8KNtbCqB4oRqvV+km
+            EM1sK0ghMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAH2nbGzx
+            vLlE1JVO27hw10iq3kC66kTbvwM2I4MIkaPfRQ3unmLr+f0uZ5JMJpDzQU7DyN9P
+            i8zsBRqGcA8cnvIC26SbNTX77RYzzEELsr7hl1N/Gjv+xls4IARMfrSKg5uZfPa0
+            raN7oFbJsbh45Z0296AWQ4o9uh/DmHvEo+d1frE+LbQcV6GHQwMjHlzgSjgieFfR
+            8MgJ9YxUfYnFUSdSRq2v/M2WVut9k5IaDBpFcphwUsqXbzE+maJqjGrn+wHBgqVQ
+            hLPNyiQExu/6xUExTFyz4meSDRCaK6N4DJHqWa0lRPG6dhv9jAyOC7Freh2FshLk
+            5ZvJRuUHdhKSA3VbAhr2grL/9f3z1QshohE13qgn25XIr1Vx88N0jJDcbgumqSWf
+            KBU//gL8IFFFfL15nOhhDkGgzHnV/IKeaMJVBC7D/aW5tRUWWzESBQHJR7lvu+sR
+            2eYyRl07aS451CmcdJNQg+KnIflBiYQFgPh6dAjNm2QAoH5ROQLW7Ah+TA==
+            -----END CERTIFICATE-----
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/package-diagnostic.py" >"$SHARED_ROOT/logs/diagnostic.stdout" 2>"$SHARED_ROOT/logs/diagnostic.stderr"
+      - name: 72 installed replay and phone frames
+        if: ${{ always() && steps.root.outputs.admitted == 'true' && steps.package.outputs.pass == 'true' }}
+        env:
+          PROOF_ROOT: ${{ env.SHARED_ROOT }}/replay
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/replay-driver.py" >"$PROOF_ROOT/logs/outer.stdout" 2>"$PROOF_ROOT/logs/outer.stderr" || rc=$?
+          echo "installedStagereplayExit=$rc"
+          exit "$rc"
+      - name: Four-width installed fresh and selected tour with real export handoff
+        if: ${{ always() && steps.root.outputs.admitted == 'true' && steps.package.outputs.pass == 'true' }}
+        env:
+          PROOF_ROOT: ${{ env.SHARED_ROOT }}/tour
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/tour-driver.py" >"$PROOF_ROOT/logs/outer.stdout" 2>"$PROOF_ROOT/logs/outer.stderr" || rc=$?
+          echo "installedStagetourExit=$rc"
+          exit "$rc"
+      - name: Ten-viewports installed exports with complete downloads and five privacy surfaces
+        if: ${{ always() && steps.root.outputs.admitted == 'true' && steps.package.outputs.pass == 'true' }}
+        env:
+          PROOF_ROOT: ${{ env.SHARED_ROOT }}/export
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/export-driver.py" >"$PROOF_ROOT/logs/outer.stdout" 2>"$PROOF_ROOT/logs/outer.stderr" || rc=$?
+          echo "installedStageexportExit=$rc"
+          exit "$rc"
+      - name: Preserve the first verified export preverification command failure
+        id: export_diagnostic
+        if: ${{ always() && steps.root.outputs.admitted == 'true' && steps.package.outputs.pass == 'true' }}
+        env:
+          RECIPIENT_CERT: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJgaIGZvHvTO1qz7A91QyCXVCBLwwDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCB2aWV3ZXIgdmlzdWFs
+            IHJldmlldzAeFw0yNjExMjUxNzQ1MjdaFw0yNjEyMDkxNzQ1MjdaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgdmlld2VyIHZpc3VhbCByZXZpZXcwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDUCDMtoLNBiFxpd01HnkpFVMon
+            DCZYbJiETXhyeSC/ecpMarzXEZ4ju0nd4LZwjL/A4Mx9T4JBA4pdFAQDPlnOfG6N
+            J+CQToj6WgpXFWUHpJp3yqfWqRRNj2LC10+slMqtzfcMRORiIYzzco9Uavy4a4zL
+            2jtcP3ShaaD6m/AsBFkCJMmZ94cJUeTgHwdDm9ERrPU0Eo1O31CWp0Oc/lmzvLFe
+            LpjJkdXSGZYrfQfc1n+iSNu1OO2ARxd2gkJPyTSE8dS7Zxwzcpm9izZkIyx5Z3Xm
+            l11t8C3QPDcJ4lRiTI9jF81lmxKak9eIl2PmnWNg5D19nynsboEUxfkr9IWQDYt/
+            JJ36+LyBi/mRph2c7jG3IE7GqoViW+7zd6ImzoiQZajii5PPo8ZRyvVNAZ44UbsL
+            E5djCSUrPH7slC5Cu+eV3YePq8+izZDSGcfwlzrzWGQRt2+kojpy4bPX/qxWB/sO
+            F9C85rrfrjsWWczag8SZdrvBgXWm1d0gAofhGYUCAwEAAaNTMFEwHQYDVR0OBBYE
+            FKT8KNtbCqB4oRqvV+kmEM1sK0ghMB8GA1UdIwQYMBaAFKT8KNtbCqB4oRqvV+km
+            EM1sK0ghMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAH2nbGzx
+            vLlE1JVO27hw10iq3kC66kTbvwM2I4MIkaPfRQ3unmLr+f0uZ5JMJpDzQU7DyN9P
+            i8zsBRqGcA8cnvIC26SbNTX77RYzzEELsr7hl1N/Gjv+xls4IARMfrSKg5uZfPa0
+            raN7oFbJsbh45Z0296AWQ4o9uh/DmHvEo+d1frE+LbQcV6GHQwMjHlzgSjgieFfR
+            8MgJ9YxUfYnFUSdSRq2v/M2WVut9k5IaDBpFcphwUsqXbzE+maJqjGrn+wHBgqVQ
+            hLPNyiQExu/6xUExTFyz4meSDRCaK6N4DJHqWa0lRPG6dhv9jAyOC7Freh2FshLk
+            5ZvJRuUHdhKSA3VbAhr2grL/9f3z1QshohE13qgn25XIr1Vx88N0jJDcbgumqSWf
+            KBU//gL8IFFFfL15nOhhDkGgzHnV/IKeaMJVBC7D/aW5tRUWWzESBQHJR7lvu+sR
+            2eYyRl07aS451CmcdJNQg+KnIflBiYQFgPh6dAjNm2QAoH5ROQLW7Ah+TA==
+            -----END CERTIFICATE-----
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/export-diagnostic.py" >"$SHARED_ROOT/logs/export-diagnostic.stdout" 2>"$SHARED_ROOT/logs/export-diagnostic.stderr"
+      - name: Encrypt the closed 144-frame inventory for private native inspection
+        id: visual
+        if: ${{ always() && steps.root.outputs.admitted == 'true' && steps.package.outputs.pass == 'true' }}
+        env:
+          RECIPIENT_CERT: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJgaIGZvHvTO1qz7A91QyCXVCBLwwDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCB2aWV3ZXIgdmlzdWFs
+            IHJldmlldzAeFw0yNjExMjUxNzQ1MjdaFw0yNjEyMDkxNzQ1MjdaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgdmlld2VyIHZpc3VhbCByZXZpZXcwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDUCDMtoLNBiFxpd01HnkpFVMon
+            DCZYbJiETXhyeSC/ecpMarzXEZ4ju0nd4LZwjL/A4Mx9T4JBA4pdFAQDPlnOfG6N
+            J+CQToj6WgpXFWUHpJp3yqfWqRRNj2LC10+slMqtzfcMRORiIYzzco9Uavy4a4zL
+            2jtcP3ShaaD6m/AsBFkCJMmZ94cJUeTgHwdDm9ERrPU0Eo1O31CWp0Oc/lmzvLFe
+            LpjJkdXSGZYrfQfc1n+iSNu1OO2ARxd2gkJPyTSE8dS7Zxwzcpm9izZkIyx5Z3Xm
+            l11t8C3QPDcJ4lRiTI9jF81lmxKak9eIl2PmnWNg5D19nynsboEUxfkr9IWQDYt/
+            JJ36+LyBi/mRph2c7jG3IE7GqoViW+7zd6ImzoiQZajii5PPo8ZRyvVNAZ44UbsL
+            E5djCSUrPH7slC5Cu+eV3YePq8+izZDSGcfwlzrzWGQRt2+kojpy4bPX/qxWB/sO
+            F9C85rrfrjsWWczag8SZdrvBgXWm1d0gAofhGYUCAwEAAaNTMFEwHQYDVR0OBBYE
+            FKT8KNtbCqB4oRqvV+kmEM1sK0ghMB8GA1UdIwQYMBaAFKT8KNtbCqB4oRqvV+km
+            EM1sK0ghMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAH2nbGzx
+            vLlE1JVO27hw10iq3kC66kTbvwM2I4MIkaPfRQ3unmLr+f0uZ5JMJpDzQU7DyN9P
+            i8zsBRqGcA8cnvIC26SbNTX77RYzzEELsr7hl1N/Gjv+xls4IARMfrSKg5uZfPa0
+            raN7oFbJsbh45Z0296AWQ4o9uh/DmHvEo+d1frE+LbQcV6GHQwMjHlzgSjgieFfR
+            8MgJ9YxUfYnFUSdSRq2v/M2WVut9k5IaDBpFcphwUsqXbzE+maJqjGrn+wHBgqVQ
+            hLPNyiQExu/6xUExTFyz4meSDRCaK6N4DJHqWa0lRPG6dhv9jAyOC7Freh2FshLk
+            5ZvJRuUHdhKSA3VbAhr2grL/9f3z1QshohE13qgn25XIr1Vx88N0jJDcbgumqSWf
+            KBU//gL8IFFFfL15nOhhDkGgzHnV/IKeaMJVBC7D/aW5tRUWWzESBQHJR7lvu+sR
+            2eYyRl07aS451CmcdJNQg+KnIflBiYQFgPh6dAjNm2QAoH5ROQLW7Ah+TA==
+            -----END CERTIFICATE-----
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/visuals.py" >"$SHARED_ROOT/logs/visuals.stdout" 2>"$SHARED_ROOT/logs/visuals.stderr"
+      - name: Verify all 32 real installer journey checks on the same archive
+        if: ${{ always() && steps.root.outputs.admitted == 'true' && steps.package.outputs.pass == 'true' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/installer-journey.py" >"$SHARED_ROOT/logs/installer-outer.stdout" 2>"$SHARED_ROOT/logs/installer-outer.stderr"
+      - name: Validate stage-specific verdicts and same-archive bindings
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH="$PWD:$PROOF_SCRIPTS" python3 -B "$PROOF_SCRIPTS/finalize.py" >"$SHARED_ROOT/logs/finalize.stdout" 2>"$SHARED_ROOT/logs/finalize.stderr"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        with:
+          name: assembled-installed-bounded-counts
+          path: ${{ env.SHARED_ROOT }}/safe/assembled.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.visual.outputs.ready == 'true' }}
+        with:
+          name: assembled-installed-encrypted-native-visuals
+          path: ${{ env.SHARED_ROOT }}/encrypted/visuals.cms
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.diagnostic.outputs.ready == 'true' }}
+        with:
+          name: assembled-installed-encrypted-package-diagnostics
+          path: ${{ env.SHARED_ROOT }}/encrypted/package-diagnostics.cms
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.export_diagnostic.outputs.ready == 'true' }}
+        with:
+          name: assembled-installed-encrypted-export-command-diagnostic
+          path: ${{ env.SHARED_ROOT }}/encrypted/export-command-diagnostic.cms
+          if-no-files-found: error
+          retention-days: 1
