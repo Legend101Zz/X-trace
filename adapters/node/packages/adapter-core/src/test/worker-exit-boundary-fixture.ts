@@ -3,11 +3,12 @@ import { writeSync } from "node:fs";
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
 import { OutcomeKind } from "@xtrace/protocol";
 import { installHttpCapture } from "../http-capture.cjs";
+import { drainCapture } from "../index.js";
 import { createCaptureCredits, createHttpCaptureTransport, returnCaptureCredit } from "../runtime/transport.cjs";
 import { createRecordingAssembler, type InputMessage } from "../worker-core.js";
 import { createWorkerDelivery } from "../worker-delivery.js";
 
-type Mode = "capacity" | "natural" | "explicit";
+type Mode = "capacity" | "natural" | "explicit" | "cooperative" | "aborted";
 const FIRST = "01900000-0000-7000-8000-000000000001";
 const SECOND = "01900000-0000-7000-8000-000000000002";
 const slot = { startEntered: 0, startStaged: 1, eventsStaged: 2, finishEntered: 3, finishStaged: 4, closeSeen: 5 } as const;
@@ -46,7 +47,10 @@ function runWorker({ mode, credits, state }: FixtureData): void {
   }, undefined, undefined, { maxBatchEvents: 64, fitsEnvelope: () => true });
   const delivery = createWorkerDelivery(assembler, {
     staged: () => returnCaptureCredit(credits),
-    close: async () => port.close(),
+    async close() {
+      port.postMessage({ type: "drained" });
+      port.close();
+    },
     fail() {
       port.postMessage({ type: "failure" });
       port.close();
@@ -56,13 +60,14 @@ function runWorker({ mode, credits, state }: FixtureData): void {
   port.on("message", (message: InputMessage) => {
     if (message.type === "close") {
       Atomics.add(state, slot.closeSeen, 1);
-      release();
+      if (mode === "aborted") port.postMessage({ type: "fixture-close" });
+      else release();
     }
     delivery.enqueue(message);
   });
 }
 
-function runChild(mode: Mode): void {
+async function runChild(mode: Mode): Promise<void> {
   const credits = createCaptureCredits();
   const state = new Int32Array(new SharedArrayBuffer(Object.keys(slot).length * Int32Array.BYTES_PER_ELEMENT));
   const worker = new Worker(new URL(import.meta.url), { workerData: { mode, credits, state } satisfies FixtureData });
@@ -101,22 +106,35 @@ function runChild(mode: Mode): void {
     assert.equal(load(slot.closeSeen), 0);
   }
 
+  let drainResult: boolean | undefined;
   process.once("exit", () => {
     // Exit only emits fixed fixture counters. The explicit leg cannot queue a drain here.
     writeSync(1, JSON.stringify({
       capacityRefusals, finishPosted,
+      ...(drainResult === undefined ? {} : { drainResult }),
       startEntered: load(slot.startEntered), startStaged: load(slot.startStaged),
       eventsStaged: load(slot.eventsStaged), finishEntered: load(slot.finishEntered),
       finishStaged: load(slot.finishStaged), closeSeen: load(slot.closeSeen),
     }) + "\n");
   });
   if (mode === "explicit") process.exit(0);
+  if (mode === "cooperative" || mode === "aborted") {
+    const deadline = new AbortController();
+    if (mode === "aborted") {
+      worker.on("message", (message: { type: string }) => {
+        if (message.type === "fixture-close") deadline.abort();
+      });
+    }
+    drainResult = await drainCapture(deadline.signal);
+    process.exit(mode === "cooperative" ? 37 : 38);
+  }
 }
 
 if (isMainThread) {
   const mode = process.argv[2];
-  assert.ok(mode === "capacity" || mode === "natural" || mode === "explicit");
-  runChild(mode);
+  assert.ok(mode === "capacity" || mode === "natural" || mode === "explicit" ||
+    mode === "cooperative" || mode === "aborted");
+  await runChild(mode);
 } else {
   runWorker(workerData as FixtureData);
 }

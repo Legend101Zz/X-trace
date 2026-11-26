@@ -78,6 +78,7 @@ async function initialize(): Promise<void> {
     staged: () => returnCaptureCredit(data.credits, notify),
     async close() {
       await session!.close();
+      parentPort?.postMessage({ type: "drained" });
       parentPort?.close();
       shuttingDown = true;
     },

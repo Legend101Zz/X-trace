@@ -32,6 +32,8 @@ export interface HttpCaptureTransport {
   finish(recordingId: string, finalSequence: bigint, durationNs: bigint, droppedEvents: number, summary?: RecordingSummary): boolean;
   onFailure(callback: () => void): void;
   close(): void;
+  /** Stops capture and awaits worker drain under the application's own abort signal. */
+  drain?(signal: AbortSignal): Promise<boolean>;
 }
 
 /** Facts resolved while the request ran; the worker uses them when it releases the held start. */
@@ -46,7 +48,7 @@ export interface RecordingSummary {
 }
 
 interface WorkerMessage {
-  type: "staged" | "failure";
+  type: "staged" | "failure" | "drained";
 }
 
 interface RecordingMessage {
@@ -66,6 +68,10 @@ export function createHttpCaptureTransport(
   const notificationPending = () => (posted - notified) >>> 0;
   let reservedFinishes = 0;
   let failed = false;
+  let closing = false;
+  let drained = false;
+  let workerExited = false;
+  let resolveDrain: ((complete: boolean) => void) | undefined;
   let failureCallback: (() => void) | undefined;
 
   const fail = () => {
@@ -73,6 +79,7 @@ export function createHttpCaptureTransport(
     failed = true;
     diagnostic?.transportFailed();
     reservedFinishes = 0;
+    resolveDrain?.(false);
     failureCallback?.();
   };
   worker.on("message", (message: WorkerMessage) => {
@@ -82,12 +89,20 @@ export function createHttpCaptureTransport(
       Atomics.store(credits, NOTIFICATION_PENDING, 0);
       notified = Atomics.load(credits, COMPLETED);
     } else if (message?.type === "failure") fail();
+    else if (message?.type === "drained" && closing && !failed) {
+      drained = true;
+      resolveDrain?.(true);
+    }
   });
   worker.on("error", fail);
-  worker.on("exit", (code) => { if (code !== 0) fail(); });
+  worker.on("exit", (code) => {
+    workerExited = true;
+    if (code !== 0) fail();
+    else resolveDrain?.(drained);
+  });
 
   const post = (message: RecordingMessage): boolean => {
-    if (failed) return false;
+    if (failed || closing || workerExited) return false;
     try {
       worker.postMessage(message);
       posted = (posted + 1) >>> 0;
@@ -97,6 +112,19 @@ export function createHttpCaptureTransport(
       return false;
     }
   };
+
+  function close(): void {
+    if (failed || closing || workerExited) return;
+    closing = true;
+    try {
+      worker.ref();
+      worker.postMessage({ type: "close" });
+      diagnostic?.closeRequested();
+    } catch {
+      worker.unref();
+      fail();
+    }
+  }
 
   return {
     start(recordingId, method, startedAtNs, holdStart = false) {
@@ -141,14 +169,25 @@ export function createHttpCaptureTransport(
       return posted;
     },
     onFailure(callback) { failureCallback = callback; },
-    close() {
-      if (!failed) {
-        try {
-          worker.ref();
-          worker.postMessage({ type: "close" });
-          diagnostic?.closeRequested();
-        } catch { fail(); }
-      }
+    close,
+    drain(signal) {
+      if (failed || signal.aborted || closing || workerExited) return Promise.resolve(drained && !failed);
+      return new Promise<boolean>((resolve) => {
+        const finish = (complete: boolean) => {
+          signal.removeEventListener("abort", abort);
+          resolveDrain = undefined;
+          resolve(complete);
+        };
+        const abort = () => {
+          // A requested close can still complete while the application is up.
+          // On abort it must no longer hold the caller's process open.
+          worker.unref();
+          finish(false);
+        };
+        resolveDrain = finish;
+        signal.addEventListener("abort", abort, { once: true });
+        close();
+      });
     },
   };
 }

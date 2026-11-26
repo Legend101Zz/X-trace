@@ -34,6 +34,15 @@ export function installHttpCapture(transport: HttpCaptureTransport): void {
   if (installedNow) process.once("beforeExit", () => activeTransport?.close());
 }
 
+/**
+ * Opt-in for an application that has stopped serving requests and will exit
+ * explicitly. One caller supplies its existing shutdown abort signal; a
+ * concurrent call does not wait on that caller's budget. True means the worker finished its protocol drain, not that readback was verified.
+ */
+export function drainCapture(signal: AbortSignal): Promise<boolean> {
+  return activeTransport?.drain?.(signal) ?? Promise.resolve(false);
+}
+
 function patchEmit(prototype: { emit: Emit }): boolean {
   const original = prototype.emit as Emit & { [PATCHED]?: boolean };
   if (original[PATCHED]) return false;

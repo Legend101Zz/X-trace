@@ -8,3 +8,4 @@ export {
   type AuthenticatedXtpSession,
 } from "./session.js";
 export { XtraceClientError } from "./errors.js";
+export { drainCapture } from "./http-capture.cjs";
