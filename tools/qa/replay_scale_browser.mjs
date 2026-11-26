@@ -438,8 +438,11 @@ async function measureSample(index, options, manifest, chromium) {
     for (let later = 1; later <= options['later-pages']; later += 1) {
       setStage(`load_later_${later}`, 'detail_response');
       check(typeof detail.nextCursor === 'string');
-      detail = await detailFromAction(page, manifest, detail.nextCursor,
-        () => page.getByRole('button', { name: 'Load next window', exact: true }).click());
+      const loadLater = functionalMapOnly
+        ? page.getByRole('region', { name: 'Loaded event window', exact: true })
+          .getByRole('button', { name: 'Load later', exact: true })
+        : page.getByRole('button', { name: 'Load next window', exact: true });
+      detail = await detailFromAction(page, manifest, detail.nextCursor, () => loadLater.click());
       for (const event of detail.events) { check(BigInt(event.sequence) === lastSequence + 1n); lastSequence += 1n; }
       cumulative += detail.events.length;
       if (options['verify-map-tree-window']) {
