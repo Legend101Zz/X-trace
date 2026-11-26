@@ -1,3 +1,4 @@
+import { projectProgress } from "./installed-diagnostic.mjs";
 import { ORDINARY_IDS } from "./installed-ordinary-scope.mjs";
 
 /** The shared scenario runner prints fingerprint fragments; this lane keeps them private. */
@@ -33,6 +34,7 @@ export function projectPublicOutput(raw, exitCode) {
       || values[0] < values[3] || values[4] !== 0)) return failed();
     return { ...expected, result: exitCode === 0 && value.result === "passed" ? "passed" : "failed", projectionValid: true, recordings: values[0], scenarios: values[1],
       passedScenarios: values[2], responses: values[3], missingRecordingsLowerBound: values[4],
-      individuallyAttributed: 0, readbackParity: value.readback.parity };
+      individuallyAttributed: 0, readbackParity: value.readback.parity,
+      ...(Object.hasOwn(value, "progress") ? { progress: projectProgress(value.progress) } : {}) };
   } catch { return failed(); }
 }

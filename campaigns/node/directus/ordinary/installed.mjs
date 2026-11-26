@@ -18,6 +18,8 @@ import { withoutProgressOutput } from "./installed-output.mjs";
 import { createOwned, removeOwned } from "./installed-ownership.mjs";
 import { ORDINARY_IDS, ordinaryScenarios } from "./installed-ordinary-scope.mjs";
 
+import { describeLeg, finishOrdinaryDriver, recordHostFailure, sameInstalledPayload } from "./installed-diagnostic.mjs";
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "../../../..");
 const campaign = JSON.parse(fs.readFileSync(path.join(here, "../campaign.json")));
@@ -109,7 +111,8 @@ async function readyDatabase(id, user, database) {
   }
 }
 
-async function leg({ mode, root, names, upstream, archive, archiveSha256, candidateSha, packagePlatform, runtime, databaseImage, runtimeNode }) {
+async function leg({ mode, note, root, names, upstream, archive, archiveSha256, candidateSha, packagePlatform, runtime, databaseImage, runtimeNode }) {
+  note.phase = "leg-setup";
   const outDir = path.join(root, mode); fs.mkdirSync(outDir, { mode: 0o700 });
   const dataDir = path.join(outDir, "data"); fs.mkdirSync(dataDir, { mode: 0o700 });
   const stages = []; let summary = null;
@@ -121,40 +124,52 @@ async function leg({ mode, root, names, upstream, archive, archiveSha256, candid
     SERVE_APP: "false", NODE_ENV: "production", LOG_LEVEL: "warn", EXTENSIONS_PATH: "/x/extensions", STORAGE_LOCAL_ROOT: "/x/uploads", DO_NOT_TRACK: "1" };
   // Refuse collisions before using the shared lifecycle helpers, which otherwise
   // intentionally replace objects in their own preparation namespace.
+  note.phase = "collision-check";
   requireFact(docker(["network", "inspect", names.net], { allowFail: true }).status !== 0, "network_already_exists");
   for (const key of ["app", "db"]) requireFact(docker(["container", "inspect", names[key]], { allowFail: true }).status !== 0, "container_already_exists");
   const owned = [], ids = {}; let networkId = null, networkAttempted = false;
   try {
+    note.phase = "network-create";
     networkAttempted = true;
     networkId = docker(["network", "create", "--driver", "bridge", "--internal", "--ipv6=false",
       "--opt", "com.docker.network.bridge.gateway_mode_ipv4=isolated", names.net]).stdout.trim();
     requireFact(/^[a-f0-9]{64}$/.test(networkId), "network_identity");
+    note.phase = "network-admission";
     const network = () => JSON.parse(docker(["network", "inspect", networkId]).stdout)[0];
     admitNetwork(network(), networkId, names.net);
     const isolated = ["--network", networkId, "--dns", "127.0.0.1", "--sysctl", "net.ipv6.conf.all.disable_ipv6=1", "--entrypoint", "tail"];
+    note.phase = "database-container";
     ids.db = createOwned(docker, owned, names.db, [...isolated, "--tmpfs", "/var/lib/postgresql",
       "-e", `POSTGRES_USER=${dbUser}`, "-e", `POSTGRES_PASSWORD=${dbPassword}`, "-e", `POSTGRES_DB=${database}`,
       databaseImage.id, "-f", "/dev/null"], PLATFORM);
+    note.phase = "application-container";
     ids.app = createOwned(docker, owned, names.app, [...isolated,
       "--user", `${process.getuid()}:${process.getgid()}`, "--tmpfs", `/x:mode=0700,uid=${process.getuid()},gid=${process.getgid()}`,
       "-v", `${upstream}:/x/project`, "-v", `${outDir}:/x/evidence`, "-v", `${archive}:/x/archive.tar.gz:ro`,
       "-v", `${dataDir}:/x/data`, "-v", `${repo}:/repo:ro`, "-w", "/x/project", runtime.id, "-f", "/dev/null"], PLATFORM);
+    note.phase = "member-admission";
     const objects = JSON.parse(docker(["container", "inspect", ids.db, ids.app]).stdout);
     const topology = network();
     admitNetwork(topology, networkId, names.net);
     const dbIp = admitMembers(topology, objects, ids, { app: runtime.id, db: databaseImage.id });
     for (const id of [ids.db, ids.app]) {
+      note.phase = id === ids.db ? "database-routes" : "application-routes";
       const routes = file => docker(["exec", id, "cat", "/proc/net/" + file]).stdout;
       routeInventory(routes("route"), routes("ipv6_route"), topology.IPAM.Config[0].Subnet);
     }
     stages.push({ name: "network_admitted", status: "passed" });
+    note.phase = "write-config";
     appEnv.DB_HOST = dbIp;
     fs.writeFileSync(path.join(outDir, "config.json"), JSON.stringify({ mode, appEnv, archiveSha256, candidateSha,
       packagePlatform, nodeBinarySha256: runtimeNode.sha256 }), { mode: 0o600, flag: "wx" });
+    note.phase = "database-start";
     docker(["exec", "-d", ids.db, "docker-entrypoint.sh", "postgres", "-c", "fsync=off", "-c", "log_statement=none"]);
+    note.phase = "database-readiness";
     await readyDatabase(ids.db, dbUser, database);
     stages.push({ name: "database_readiness", status: "passed" });
+    note.phase = "driver-start";
     docker(["exec", "-d", ids.app, "node", "/repo/campaigns/node/directus/ordinary/installed-driver.mjs"]);
+    note.phase = "application-readiness";
     await awaitPing(ids.app, () => running(ids.app));
     stages.push({ name: "application_readiness", status: "passed" });
     const sql = text => docker(["exec", ids.db, "psql", "-U", dbUser, "-d", database,
@@ -164,22 +179,25 @@ async function leg({ mode, root, names, upstream, archive, archiveSha256, candid
       return result ? result.split("\n").map(line => line.split("|")) : [];
     };
     const tableCount = () => Number(sql("select count(*) from xtrace_campaign_items"));
+    note.phase = "scenario-workload";
     const scenarios = ordinaryScenarios(workload({ admin, rows, tableCount }));
     summary = await withoutProgressOutput(() => runScenarios({ project: "directus", baseUrl: "", outDir,
       scenarios, transport: appTransport(ids.app) }));
+    if (summary.result !== "passed") recordHostFailure(note, "unsuccessful-result");
     // Correct the inherited preparation label without changing any scenario or
     // fingerprint. These files are private development evidence, not receipts.
+    note.phase = "scenario-evidence";
     summary.kind = mode === "baseline" ? "uninstrumented_baseline_only" : "installed_instrumented_development";
     fs.writeFileSync(path.join(outDir, "scenarios.json"), JSON.stringify(summary, null, 2) + "\n", { mode: 0o600 });
     stages.push({ name: "scenario_workload", status: summary.result === "passed" ? "passed" : "failed" });
-  } catch { stages.push({ name: "leg", status: "failed" }); }
+  } catch (error) {
+    recordHostFailure(note, error?.message);
+    stages.push({ name: "leg", status: "failed" });
+  }
   finally {
-    try {
-      if (running(ids.app)) {
-        const result = docker(["exec", ids.app, "node", "/repo/campaigns/node/directus/ordinary/installed-driver.mjs", "finish"], { allowFail: true });
-        stages.push({ name: "driver_finish", status: result.status === 0 ? "passed" : "failed" });
-      } else stages.push({ name: "driver_finish", status: "unreached" });
-    } catch { stages.push({ name: "driver_finish", status: "failed" }); }
+    stages.push(finishOrdinaryDriver(note, () => running(ids.app), () =>
+      docker(["exec", ids.app, "node", "/repo/campaigns/node/directus/ordinary/installed-driver.mjs", "finish"], { allowFail: true })));
+    note.phase = "cleanup";
     let cleanupPassed = !owned.uncertain && (!networkAttempted || networkId !== null && /^[a-f0-9]{64}$/.test(networkId));
     for (const key of ["app", "db"]) if (ids[key]) {
       try {
@@ -189,6 +207,7 @@ async function leg({ mode, root, names, upstream, archive, archiveSha256, candid
     }
     for (const id of [...owned].reverse()) cleanupPassed = removeOwned(docker, "container", id) && cleanupPassed;
     if (networkId && /^[a-f0-9]{64}$/.test(networkId)) cleanupPassed = removeOwned(docker, "network", networkId) && cleanupPassed;
+    if (!cleanupPassed) recordHostFailure(note, "unsuccessful-result");
     stages.push({ name: "cleanup", status: cleanupPassed ? "passed" : "failed" });
     const expected = ["network_admitted", "database_readiness",
       "application_readiness", "scenario_workload"];
@@ -231,33 +250,46 @@ async function main() {
     runtimeRecipeSha256: sha256Hex(fs.readFileSync(path.join(here, "installed-ordinary-runtime.Dockerfile"))),
     scenarioHarnessSha256: sha256Hex(fs.readFileSync(path.join(here, "scenarios.mjs"))) };
   fs.writeFileSync(path.join(root, "identity.json"), JSON.stringify(metadata, null, 2), { mode: 0o600 });
-  let baseline, instrumented;
+  let baseline, instrumented, activeNote;
+  const notes = { baseline: { phase: "not-started", failure: null }, instrumented: { phase: "not-started", failure: null } };
   const stages = [];
   try {
     for (const mode of ["baseline", "instrumented"]) {
+      activeNote = notes[mode];
+      activeNote.phase = "source-check";
       requireFact(canonicalJson(sourceIdentity(upstream)) === canonicalJson(identity), "same_run_input_drift");
       const prefix = `${PREFIX}directus-${config.runId}-${mode}`;
-      const result = await leg({ mode, root, upstream, archive, archiveSha256: config.archiveSha256,
+      const result = await leg({ mode, note: activeNote, root, upstream, archive, archiveSha256: config.archiveSha256,
         candidateSha: config.candidateSha, packagePlatform, runtime, databaseImage: database, runtimeNode,
         names: { net: prefix + "-net", db: prefix + "-db", app: prefix + "-app" } });
       for (const s of result.stages) stages.push({ ...s, name: mode + ":" + s.name });
       if (mode === "baseline") baseline = result; else instrumented = result;
     }
+    activeNote = null;
     requireFact(canonicalJson(sourceIdentity(upstream)) === canonicalJson(identity), "final_input_drift");
     stages.push({ name: "same_run_inputs", status: "passed" });
-  } catch { stages.push({ name: "same_run_inputs", status: "failed" }); }
+  } catch (error) {
+    if (activeNote) recordHostFailure(activeNote, error?.message);
+    stages.push({ name: "same_run_inputs", status: "failed" });
+  }
   const load = (name) => { try { return JSON.parse(fs.readFileSync(path.join(root, "instrumented", name))); } catch { return null; } };
   const driver = load("driver.json");
   for (const s of driver?.stages || []) stages.push({ ...s, name: "installed:" + s.name });
+  let baselineDriver;
   try {
-    const baselineDriver = JSON.parse(fs.readFileSync(path.join(root, "baseline", "driver.json")));
+    baselineDriver = JSON.parse(fs.readFileSync(path.join(root, "baseline", "driver.json")));
     for (const s of baselineDriver.stages) stages.push({ ...s, name: "baseline-installed:" + s.name });
-    requireFact(canonicalJson(baselineDriver.identity) === canonicalJson(driver?.identity), "same_installed_payload");
+    requireFact(sameInstalledPayload(baselineDriver, driver, { sourceCommit: config.candidateSha, platform: packagePlatform,
+      archiveSha256: config.archiveSha256, nodeVersion: runtimeNode.version, nodeBinarySha256: runtimeNode.sha256 }), "same_installed_payload");
     stages.push({ name: "same_installed_payload", status: "passed" });
   } catch { stages.push({ name: "same_installed_payload", status: "failed" }); }
   const cli = load("cli-readback.json"), api = load("api-readback.json");
   const workload = compareWorkload(baseline?.summary, instrumented?.summary, ORDINARY_IDS);
   const report = boundedSummary({ stages, workload, readback: cli && api ? { cli, api } : null, analyzer: driver?.analyzer });
+  report.progress = { inputCheckStage: stages.find(s => s.name === "same_run_inputs").status,
+    payloadCheckStage: stages.find(s => s.name === "same_installed_payload").status,
+    baseline: describeLeg(notes.baseline, baseline?.summary, baselineDriver),
+    instrumented: describeLeg(notes.instrumented, instrumented?.summary, driver) };
   fs.writeFileSync(path.join(root, "summary.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
   // Only fixed schema, enum, count and boolean fields cross the private boundary.
   console.log(JSON.stringify(report));
