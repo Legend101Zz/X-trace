@@ -1,0 +1,288 @@
+name: Installed Fineract campaign
+on:
+  push:
+    branches: [codex/proof-fineract-full-after-jersey-outcome-117]
+permissions:
+  contents: read
+jobs:
+  qualified-jersey:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    steps:
+      - name: Verify the exact successful installed positive and negative Jersey legs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JERSEY_RUN: '45775447137'
+          JERSEY_ATTEMPT: '1'
+          JERSEY_ARTIFACT: '15096641423'
+          JERSEY_ZIP_SHA256: '8222fa0f6a64699ab317de0374bf85bc38a988ba580cfabb0f60e047afe43baf'
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY_JERSEY'
+          """Authenticate the exact successful two-version prerequisite using read-only GitHub metadata."""
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import subprocess
+          import zipfile
+
+          REPO = "Legend101Zz/X-trace"
+          PRODUCT = "aab6fc2f276d73fb64e1001dd47606b5fd2602db"
+          WRAPPER = "b4ff10a1e32f6b1a742f8bc5eeebf8a76cc06c39"
+          BRANCH = "codex/proof-jersey-installed-outcome-detail-117"
+          WORKFLOW = ".github/workflows/jersey-fixture-proof.yml"
+
+
+          def need(condition, label):
+              if not condition:
+                  raise SystemExit("Jersey prerequisite refused: " + label)
+
+
+          def api(suffix):
+              return subprocess.check_output(
+                  ["gh", "api", "--hostname", "github.com", "repos/" + REPO + "/actions/" + suffix],
+                  stderr=subprocess.DEVNULL, timeout=60)
+
+
+          def numeric_pin(key):
+              value = os.environ[key]
+              need(re.fullmatch(r"[1-9][0-9]{0,18}", value), key)
+              return int(value)
+
+
+          def main():
+              run = numeric_pin("JERSEY_RUN")
+              attempt = numeric_pin("JERSEY_ATTEMPT")
+              artifact = numeric_pin("JERSEY_ARTIFACT")
+              digest = os.environ["JERSEY_ZIP_SHA256"]
+              need(re.fullmatch(r"[a-f0-9]{64}", digest), "artifact digest")
+              route = f"runs/{run}/attempts/{attempt}"
+              for suffix in (f"runs/{run}", route):
+                  row = json.loads(api(suffix))
+                  need(row["id"] == run and row["run_attempt"] == attempt and row["event"] == "push"
+                       and row["head_repository"]["full_name"] == REPO and row["repository"]["full_name"] == REPO
+                       and row["head_sha"] == WRAPPER and row["head_branch"] == BRANCH and row["path"] == WORKFLOW
+                       and row["status"] == "completed" and row["conclusion"] == "success", "run identity and verdict")
+              jobs = json.loads(api(route + "/jobs?per_page=100"))
+              need(jobs["total_count"] == len(jobs["jobs"]) == 1, "job count")
+              job = jobs["jobs"][0]
+              need(job["name"] == "installed-fixture" and job["head_sha"] == WRAPPER
+                   and job["status"] == "completed" and job["conclusion"] == "success", "installed fixture job")
+              stages = (
+                  "Admit exact source and fresh private package roots",
+                  "Verify read, recording, progress, outcome and servlet coverage cases",
+                  "Build and verify one Linux archive and fresh official installation",
+                  "Build two pinned ordinary fixture jars from the same application",
+                  "Verify native package and observe both ordinary loopback legs",
+                  "Admit only the bounded report and cross-check its immutable identity",
+              )
+              for name in stages:
+                  matches = [s for s in job["steps"] if s["name"] == name]
+                  need(len(matches) == 1 and matches[0]["status"] == "completed"
+                       and matches[0]["conclusion"] == "success", "required stage")
+              listing = json.loads(api(f"runs/{run}/artifacts?per_page=100"))
+              need(listing["total_count"] == len(listing["artifacts"]) == 1, "artifact inventory")
+              record = listing["artifacts"][0]
+              need(record["name"] == "jersey-ordinary-installed-counts" and record["id"] == artifact
+                   and record["expired"] is False and record["digest"] == "sha256:" + digest
+                   and 0 < record["size_in_bytes"] <= 65536, "artifact identity")
+              data = api(f"artifacts/{artifact}/zip")
+              need(len(data) == record["size_in_bytes"] and hashlib.sha256(data).hexdigest() == digest, "ZIP bytes")
+              with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                  entries = archive.infolist()
+                  need(len(entries) == 1 and entries[0].filename == "counts.json"
+                       and 0 < entries[0].file_size <= 4096 and archive.testzip() is None, "counts member and CRC")
+                  evidence = json.loads(archive.read(entries[0]))
+              need(evidence["status"] == "passed" and evidence["stage"] == "complete"
+                   and evidence["releaseAcceptance"] is False and evidence["sourceSha"] == PRODUCT
+                   and re.fullmatch(r"[a-f0-9]{64}", evidence["archiveSha256"])
+                   and (evidence["wrapperSha"], evidence["runId"], evidence["attempt"]) == (WRAPPER, run, attempt),
+                   "receipt identity and complete verdict")
+              expected = {"3.1.11", "3.1.10"}
+              need(set(evidence["legs"]) == set(evidence["legProgress"]) == expected, "both versions")
+              for version in sorted(expected):
+                  supported = version == "3.1.11"
+                  decisions = (dict.fromkeys(("service", "component", "invoker"), "qualified") if supported else
+                               {"service": "version-excluded", "component": "image-and-version-excluded", "invoker": "version-excluded"})
+                  progress, leg = evidence["legProgress"][version], evidence["legs"][version]
+                  count = 4 if supported else 1
+                  need(progress == {"phase": "complete", "responsesVerified": 5, "differentHttpStatus": None,
+                                    "failureSite": None, "cleanupFailure": None, "outcomeMismatch": None,
+                                    "probeDecisions": decisions}, "complete version progress")
+                  need(leg["httpResponses"] == 5 and leg["recordings"] == leg["apiListPages"] == leg["cliListPages"] == count
+                       and leg["probeDecisions"] == decisions and leg["probeFailureNotices"] == leg["applicationProbeNotices"] == 0
+                       and leg["observationNotices"] == int(supported) and leg["unqualifiedNotices"] == int(not supported)
+                       and leg["mappedCliDetailPages"] == leg["mappedApiDetailPages"]
+                       and (2 <= leg["mappedApiDetailPages"] <= 64 if supported else leg["mappedApiDetailPages"] == 0)
+                       and 1 <= leg["comparedEvents"] <= count * 128
+                       and all(type(value) is int for key, value in leg.items() if key != "probeDecisions"), "installed version counts")
+              print(f"Verified installed Jersey prerequisite run {run}, attempt {attempt}, artifact {artifact}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY_JERSEY
+  fineract:
+    needs: qualified-jersey
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      PRODUCT: aab6fc2f276d73fb64e1001dd47606b5fd2602db
+      PRODUCT_TREE: c7f964ccbd762c2da3d52cf5e70acd93ba3a575f
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Verify the checkout and reserve private working directories
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/fineract-proof"
+          mkdir -m 700 "$root" "$root/driver" "$root/logs" "$root/checks"
+          echo "PROOF=$root" >> "$GITHUB_ENV"
+      - name: Run all Fineract regressions and existing campaign tests
+        run: |
+          set -euo pipefail
+          umask 077
+          command -v zstd >/dev/null
+          for group in named library; do
+            if [ "$group" = named ]; then
+              set -- test_fineract_installed test_fineract_privacy test_fineract_sink_coverage test_fineract_receipt_diagnostics
+            else
+              set -- discover -s campaigns/lib -p 'test_*.py'
+            fi
+            rc=0
+            PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$PROOF/checks/$group.json" "$@" > "$PROOF/logs/$group.stdout" 2> "$PROOF/logs/$group.stderr" || rc=$?
+            python3 -B -m tools.qa.unittest_summary "$PROOF/checks/$group.json"
+            python3 -B - "$PROOF/checks/$group.json" "$group" <<'PY'
+          import json,sys
+          counts=json.load(open(sys.argv[1]))['counts']
+          if (counts['testsRun'] != (63 if sys.argv[2]=='named' else 267)
+                  or any(n for k,n in counts.items() if k != 'testsRun')):
+              raise SystemExit(1)
+          PY
+            test "$rc" -eq 0
+          done
+      - name: Build the unsigned Linux package and bind its digest
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B packaging/build.py --platform linux-x86_64 --out "$PROOF/dist" --work "$PROOF/package-work" > "$PROOF/logs/package.stdout" 2> "$PROOF/logs/package.stderr"
+          python3 -B - <<'PY'
+          import hashlib,os,pathlib
+          root=pathlib.Path(os.environ['PROOF'])
+          archive=root/'dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz'
+          with archive.open('rb') as f: digest=hashlib.file_digest(f,'sha256').hexdigest()
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write(f'ARCHIVE={archive}\nPACKAGE_SHA256={digest}\n')
+          print('Development package SHA-256',digest)
+          PY
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Verify and install the pinned package and run the original two workload legs
+        id: campaign
+        run: |
+          set -euo pipefail
+          umask 077
+          rc=0
+          python3 -B campaigns/java/fineract/harness/installed.py \
+            --private-root "$PROOF/run" --archive "$ARCHIVE" --package-sha256 "$PACKAGE_SHA256" \
+            --source-sha "$PRODUCT" --java "$JAVA_HOME/bin/java" \
+            > "$PROOF/driver/stdout" 2> "$PROOF/driver/stderr" || rc=$?
+          python3 -B - "$rc" <<'PY'
+          import json,os,pathlib,sys
+          p=pathlib.Path(os.environ['PROOF'])/'driver/status.json'
+          with p.open('x') as f: json.dump({'schema':'xtrace-fineract-driver/1','exitCode':int(sys.argv[1])},f)
+          PY
+          echo "Installed Fineract driver exit $rc"
+          exit "$rc"
+      - name: Verify actual dependency members with the Fineract campaign checker
+        if: ${{ !cancelled() && (steps.campaign.outcome == 'success' || steps.campaign.outcome == 'failure') }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export XTRACE_CAMPAIGN_ROOT="$PROOF/run/campaign"
+          python3 -B - <<'INVENTORY'
+          import json, os, sys
+          from pathlib import Path
+          from campaigns.java.fineract.harness import privacy
+          harness = Path("campaigns/java/fineract/harness").resolve(strict=True)
+          sys.path.insert(0, str(harness))
+          root=Path(os.environ['PROOF'])/'run'
+          if not privacy.admitted(root): raise SystemExit('dependency-inventory-root-unavailable')
+          phases=json.loads((root/'phases.json').read_bytes())
+          if phases.get('upstreamBuild',{}).get('status')!='artifact-present': raise SystemExit('dependency-inventory-unreached')
+          try:
+              from campaigns.java.fineract.harness import run
+              import recording_evidence
+          except (ImportError, OSError, ValueError, SystemExit):
+              raise SystemExit('dependency-checker-import-failed') from None
+          if (Path(run.__file__).resolve() != harness/'run.py' or
+              Path(recording_evidence.__file__).resolve() != harness/'recording_evidence.py' or
+              run.recording_evidence is not recording_evidence):
+              raise SystemExit('dependency-checker-origin-mismatch')
+          if not run.JAR.is_file() or run.JAR.is_symlink():
+              raise SystemExit('dependency-jar-unavailable')
+          try:
+              members=run.runtime_dependencies()
+          except Exception: raise SystemExit('dependency-member-validation-failed') from None
+          if set(members)!={'jersey-server','jersey-common','tomcat-embed-core','postgresql','spring-boot'}:
+              raise SystemExit('dependency-key-set-mismatch')
+          print('Verified five pinned runtime dependencies in the built Fineract JAR')
+          INVENTORY
+      - name: Finalize the bounded summary after driver streams have closed
+        if: ${{ !cancelled() && (steps.campaign.outcome == 'success' || steps.campaign.outcome == 'failure') }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B campaigns/java/fineract/harness/privacy.py \
+            --private-root "$PROOF/run" --public-out "$PROOF/public" > "$PROOF/logs/finalize.stdout" 2> "$PROOF/logs/finalize.stderr"
+      - name: Require terminal diagnosis for the installed instrumented leg
+        if: ${{ !cancelled() && (steps.campaign.outcome == 'success' || steps.campaign.outcome == 'failure') }}
+        run: |
+          set -euo pipefail
+          python3 -B - <<'DIAGNOSTICS'
+          import json, os
+          from pathlib import Path
+          summary = json.loads((Path(os.environ['PROOF'])/'public/summary.json').read_bytes())
+          if summary.get('sourceIdentity') != 'passed':
+              raise SystemExit('source-evidence-unavailable')
+          if not all(row['workload']=='passed' for row in summary['instrumented']) or len(summary['instrumented']) != 8:
+              raise SystemExit('full-workload-unreached')
+          boundary = summary.get('boundaryDiagnostics')
+          if (not isinstance(boundary,dict) or boundary.get('schemaVersion') != 2 or len(boundary['phases']) != 3
+                  or not all({'lastComplete','lastCompletePoll','snapshot','snapshotPoll'} <= set(row)
+                             for row in boundary['phases'])):
+              raise SystemExit('boundary-diagnostics-unavailable')
+          if not isinstance(summary.get('cliDiagnostics'),dict):
+              raise SystemExit('cli-diagnostics-unavailable')
+          rows = summary.get('observationChecks')
+          if not isinstance(rows,list) or len(rows) != 8 or not all(row['checks'] for row in rows):
+              raise SystemExit('inspection-counts-unavailable')
+          print('Validated availability of boundary, CLI and per-scenario inspection counts')
+          DIAGNOSTICS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() && (steps.campaign.outcome == 'success' || steps.campaign.outcome == 'failure') }}
+        with:
+          name: fineract-installed-public-result
+          path: ${{ env.PROOF }}/public/summary.json
+          if-no-files-found: error
+          retention-days: 14
