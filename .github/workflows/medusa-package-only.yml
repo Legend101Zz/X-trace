@@ -1,0 +1,370 @@
+name: Medusa package build diagnostic only
+on:
+  push:
+    branches: [codex/proof-medusa-route-fold-package-only-120]
+permissions:
+  contents: read
+concurrency:
+  group: medusa-installed-120
+  cancel-in-progress: false
+jobs:
+  medusa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      MEDUSA_PRODUCT_SHA: 1995de6d655f4e8d9ed449399e6a98e9d21481c7
+      MEDUSA_PRODUCT_TREE: f9fbc43e60fc056568cef46e94c3fc41d2a9d9f9
+      CARGO_TERM_COLOR: never
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.MEDUSA_PRODUCT_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.21.0
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Admit runner-private proof directories
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$MEDUSA_PRODUCT_SHA" =~ ^[a-f0-9]{40}$ && "$MEDUSA_PRODUCT_TREE" =~ ^[a-f0-9]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$MEDUSA_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$MEDUSA_PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/xm120"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/outer" "$root/safe" "$root/proof"
+          printf '%s\n' "MEDUSA_ROOT=$root" >> "$GITHUB_ENV"
+          printf '%s\n' 'admitted=true' >> "$GITHUB_OUTPUT"
+      - name: Run the package build with fixed phase receipts
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          cat >"$MEDUSA_ROOT/outer/package-build-checkpoints.py" <<'MEDUSA_PACKAGE_BUILD_CHECKPOINTS'
+          """Instrument one exact packaging/build.py invocation without editing the checkout."""
+          import ast
+          from contextlib import contextmanager
+          import hashlib
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          BUILDER_SHA256 = "995ef5136946a0f70b1aead44ac4c9ce4de0074cdc26f121423f8f59d64e2d42"
+          MAIN = (
+              ("arguments", 193, 203),
+              ("platform-and-source", 205, 224),
+              ("prepare-staging", 226, 237),
+              ("rust-cli", 240, 240),
+              ("stage-rust-cli", 241, 242),
+              ("check-web", 244, 248),
+              ("stage-web", 249, 249),
+              ("java-pack", 251, 253),
+              ("stage-java-pack", 254, 255),
+              ("node-pack", 257, 257),
+              ("stage-schemas", 259, 260),
+              ("cargo-metadata", 262, 264),
+              ("stage-sbom-and-licenses", 265, 282),
+              ("stage-installer-and-manifest", 284, 301),
+              ("archive", 303, 304),
+              ("archive-sidecars", 307, 328),
+          )
+          NODE = (
+              ("node-dependencies", 134, 135),
+              ("node-protocol", 136, 136),
+              ("node-core", 137, 137),
+              ("stage-node-pack", 138, 164),
+          )
+          ORDER = tuple(name for name, _, _ in (*MAIN[:10], *NODE, *MAIN[10:]))
+
+
+          def instrument(source, filename):
+              if hashlib.sha256(source).hexdigest() != BUILDER_SHA256:
+                  raise ValueError("package builder digest mismatch")
+              module = ast.parse(source, filename)
+              for function, phases in (("main", MAIN), ("node_pack", NODE)):
+                  (definition,) = [
+                      node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == function
+                  ]
+                  pending = definition.body.copy()
+                  replacement = []
+                  for label, first, last in phases:
+                      selected = []
+                      while pending and pending[0].lineno <= last:
+                          selected.append(pending.pop(0))
+                      if not selected or selected[0].lineno != first or selected[-1].end_lineno != last:
+                          raise ValueError("package phase coverage changed")
+                      guard = ast.Call(func=ast.Name(id="_package_build_phase", ctx=ast.Load()),
+                                       args=[ast.Constant(label)], keywords=[])
+                      wrapper = ast.With(items=[ast.withitem(context_expr=guard)], body=selected)
+                      replacement.append(ast.copy_location(wrapper, selected[0]))
+                  if function == "main":
+                      if len(pending) != 1 or not isinstance(pending[0], ast.Return):
+                          raise ValueError("unexpected package builder terminal code")
+                  elif pending:
+                      raise ValueError("unexpected packaging stage")
+                  definition.body = replacement + pending
+              return compile(ast.fix_missing_locations(module), filename, "exec")
+
+
+          def reason(error):
+              if isinstance(error, subprocess.CalledProcessError):
+                  status = error.returncode
+                  if type(status) is int and 1 <= status <= 255:
+                      return "command-nonzero", status
+                  if type(status) is int and -127 <= status <= -1:
+                      return "command-signal", -status
+                  return "command-error", None
+              if isinstance(error, subprocess.TimeoutExpired):
+                  return "command-timeout", None
+              if isinstance(error, OSError):
+                  return "filesystem-or-spawn", None
+              if isinstance(error, SystemExit):
+                  return "builder-exit", error.code if type(error.code) is int and 1 <= error.code <= 255 else None
+              if isinstance(error, KeyboardInterrupt):
+                  return "interrupted", None
+              return "check-or-internal-error", None
+
+
+          def main():
+              trace = Path(sys.argv[1]).resolve(strict=False)
+              builder = Path("packaging/build.py").resolve(strict=True)
+              args = sys.argv[2:]
+              root = trace.parent.parent
+              if trace != root / "outer" / "package-build-checkpoints.json":
+                  raise ValueError("unexpected package trace destination")
+              if args != ["--out", str(root / "proof" / "dist"), "--work", str(root / "build"),
+                         "--platform", "linux-x86_64"]:
+                  raise ValueError("unexpected installed package builder argv")
+              report = {"firstFailure": None, "steps": dict.fromkeys(ORDER, "unreached")}
+
+              def save():
+                  tmp = trace.with_suffix(".tmp")
+                  tmp.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+                  tmp.replace(trace)
+
+              @contextmanager
+              def phase(name):
+                  if report["steps"].get(name) != "unreached":
+                      raise ValueError("unexpected package stage order")
+                  report["steps"][name] = "running"
+                  save()
+                  try:
+                      yield
+                  except BaseException as error:
+                      run_reason, code = reason(error)
+                      report["steps"][name] = "failed"
+                      if report["firstFailure"] is None:
+                          report["firstFailure"] = {"stage": name, "reason": run_reason, "code": code}
+                      save()
+                      raise
+                  else:
+                      report["steps"][name] = "passed"
+                      save()
+
+              save()
+              code = instrument(builder.read_bytes(), str(builder))
+              sys.argv = [str(builder), *args]
+              exec(code, {"__name__": "__main__", "__file__": str(builder), "_package_build_phase": phase})
+
+
+          if __name__ == "__main__":
+              main()
+          MEDUSA_PACKAGE_BUILD_CHECKPOINTS
+          check=$(sha256sum "$MEDUSA_ROOT/outer/package-build-checkpoints.py")
+          test "${check%% *}" = "4dc70b8f77dcb16f1deb6e592a6d45b81e8067a099fb5a0bce1171ef1d95c86c"
+          cat >"$MEDUSA_ROOT/outer/controller.py" <<'MEDUSA_PACKAGE_ONLY_CONTROLLER'
+          """Run the fixed Medusa package command and project only finite build evidence."""
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import time
+
+          from tools.release.private_roots import admit_directory, atomic_write_private
+
+
+          root = Path(os.environ["MEDUSA_ROOT"])
+          admit_directory(root)
+          sys.path.insert(0, str(Path("campaigns/node/medusa/harness").resolve()))
+          from installed_process import contain_children  # noqa: E402
+
+          contain_children()
+          scope = {"__name__": "static_only"}
+          exec(compile((root / "outer/package-build-checkpoints.py").read_bytes(), "<pinned-build-tracer>", "exec"), scope)
+          order = scope["ORDER"]
+          stages = ("ack-frame-test", "ack-owned-child-cleanup", "ack-frame-counts",
+                    "package-build", "package-owned-child-cleanup", "package-build-trace", "archive-check")
+          receipt = {
+              "schemaVersion": 1, "kind": "medusa-package-build-only-120",
+              "sourceSha": os.environ["MEDUSA_PRODUCT_SHA"], "sourceTree": os.environ["MEDUSA_PRODUCT_TREE"],
+              "wrapperSha": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "status": "failed",
+              "stages": dict.fromkeys(stages, "unreached"), "ackFrameTests": None,
+              "packageBuildTrace": None, "packageBuildExit": None, "archiveSha256": None,
+          }
+
+
+          def save():
+              atomic_write_private(root / "safe/receipt.json", (json.dumps(receipt, sort_keys=True) + "\n").encode())
+
+
+          def set_stage(stage, status):
+              receipt["stages"][stage] = status
+              save()
+
+
+          def observe_children_gone():
+              # Reap already-exited children only. An adopted live process provides no
+              # permission to signal it, irrespective of its current parent or group.
+              deadline = time.monotonic() + 10
+              while time.monotonic() < deadline:
+                  try:
+                      child, _ = os.waitpid(-1, os.WNOHANG)
+                  except ChildProcessError:
+                      return True
+                  if not child:
+                      time.sleep(0.05)
+              return False
+
+
+          def command(stage, cleanup, args, timeout):
+              set_stage(stage, "failed")
+              result = {"reason": "filesystem-or-spawn", "code": None}
+              try:
+                  with (root / "outer" / (stage + ".stdout")).open("xb") as out, \
+                       (root / "outer" / (stage + ".stderr")).open("xb") as err:
+                      process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+                      try:
+                          code = process.wait(timeout=timeout)
+                      except subprocess.TimeoutExpired:
+                          result = {"reason": "deadline", "code": None}
+                          if process.poll() is None:
+                              process.terminate()
+                          try:
+                              process.wait(timeout=10)
+                          except subprocess.TimeoutExpired:
+                              if process.poll() is None:
+                                  process.kill()
+                              try:
+                                  process.wait(timeout=5)
+                              except subprocess.TimeoutExpired:
+                                  result = {"reason": "direct-child-unreaped", "code": None}
+                      else:
+                          if code == 0:
+                              result = {"reason": "zero", "code": 0}
+                          elif 1 <= code <= 255:
+                              result = {"reason": "command-nonzero", "code": code}
+                          elif -127 <= code <= -1:
+                              result = {"reason": "command-signal", "code": -code}
+                          else:
+                              result = {"reason": "unclassified", "code": None}
+              except OSError:
+                  pass
+              finally:
+                  if stage == "package-build":
+                      receipt["packageBuildExit"] = result
+                      save()
+                  set_stage(cleanup, "failed")
+                  if observe_children_gone():
+                      set_stage(cleanup, "passed")
+              if result["reason"] == "zero":
+                  set_stage(stage, "passed")
+              return result["reason"] == "zero" and receipt["stages"][cleanup] == "passed"
+
+
+          def unique(fields):
+              values = dict(fields)
+              assert len(values) == len(fields)
+              return values
+
+
+          def project_trace(path):
+              assert path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 8192
+              trace = json.loads(path.read_bytes(), object_pairs_hook=unique)
+              assert type(trace) is dict and set(trace) == {"steps", "firstFailure"}
+              assert type(trace["steps"]) is dict and set(trace["steps"]) == set(order)
+              assert all(x in ("passed", "running", "failed", "unreached") for x in trace["steps"].values())
+              first = trace["firstFailure"]
+              if first is None:
+                  assert "failed" not in trace["steps"].values()
+              else:
+                  assert type(first) is dict and set(first) == {"stage", "reason", "code"}
+                  assert first["stage"] in order and trace["steps"][first["stage"]] == "failed"
+                  reason, code = first["reason"], first["code"]
+                  if reason == "command-nonzero":
+                      assert type(code) is int and 1 <= code <= 255
+                  elif reason == "command-signal":
+                      assert type(code) is int and 1 <= code <= 127
+                  elif reason == "builder-exit":
+                      assert code is None or type(code) is int and 1 <= code <= 255
+                  else:
+                      assert code is None and reason in ("command-error", "command-timeout", "filesystem-or-spawn",
+                                                         "interrupted", "check-or-internal-error")
+              return trace
+
+
+          save()
+          if not command("ack-frame-test", "ack-owned-child-cleanup",
+                         ["cargo", "test", "--locked", "--target-dir", str(root / "ack-target"),
+                          "-p", "xtrace-daemon", "--lib",
+                          "framing::tests::async_ack_flushes_the_complete_frame_and_propagates_flush_errors",
+                          "--", "--exact"], 900):
+              raise SystemExit(1)
+          set_stage("ack-frame-counts", "failed")
+          ack = root / "outer/ack-frame-test.stdout"
+          assert ack.stat().st_size <= 65536
+          assert re.search(r"^test result: ok[.] 1 passed; 0 failed; 0 ignored; ", ack.read_text(), re.M)
+          receipt["ackFrameTests"] = 1
+          set_stage("ack-frame-counts", "passed")
+
+          trace = root / "outer/package-build-checkpoints.json"
+          built = command("package-build", "package-owned-child-cleanup",
+                          ["python3", "-B", str(root / "outer/package-build-checkpoints.py"), str(trace),
+                           "--out", str(root / "proof/dist"), "--work", str(root / "build"),
+                           "--platform", "linux-x86_64"], 3600)
+          set_stage("package-build-trace", "failed")
+          if trace.exists():
+              receipt["packageBuildTrace"] = projected = project_trace(trace)
+              save()
+              if built:
+                  assert projected["firstFailure"] is None and all(x == "passed" for x in projected["steps"].values())
+              set_stage("package-build-trace", "passed")
+          if not built or receipt["packageBuildTrace"] is None:
+              raise SystemExit(1)
+          set_stage("archive-check", "failed")
+          archives = list((root / "proof/dist/linux-x86_64").glob("xtrace-*-linux-x86_64.tar.gz"))
+          assert len(archives) == 1 and archives[0].is_file() and not archives[0].is_symlink()
+          assert archives[0].stat().st_size > 0
+          import hashlib
+          with archives[0].open("rb") as stream:
+              receipt["archiveSha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+          set_stage("archive-check", "passed")
+          receipt["status"] = "passed"
+          save()
+          MEDUSA_PACKAGE_ONLY_CONTROLLER
+          check=$(sha256sum "$MEDUSA_ROOT/outer/controller.py")
+          test "${check%% *}" = "79dc13bf9b92e15b12577be870e659723fbf48529d3e680179443e49384c616f"
+          rc=0
+          python3 -B - <"$MEDUSA_ROOT/outer/controller.py" >"$MEDUSA_ROOT/outer/controller.stdout" 2>"$MEDUSA_ROOT/outer/controller.stderr" || rc=$?
+          echo "Medusa package-only proof exit $rc"
+          exit "$rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.root.outputs.admitted == 'true' }}
+        with:
+          name: medusa-120-package-only-counts
+          path: ${{ env.MEDUSA_ROOT }}/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
