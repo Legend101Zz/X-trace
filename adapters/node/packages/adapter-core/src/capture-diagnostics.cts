@@ -1,7 +1,6 @@
 import { realpathSync, writeSync } from "node:fs";
-import { createRequire } from "node:module";
 import { expressPatchStatus } from "./express-instrument.cjs";
-import { resolveFromEntry } from "./modules.cjs";
+import { resolveFromEntry, resolveMedusaExpress } from "./modules.cjs";
 import { workerCounters } from "./runtime/transport.cjs";
 import type { ModuleStatus } from "./runtime/registry.cjs";
 
@@ -18,8 +17,7 @@ function expressScope(): ExpressScope {
     try { return realpathSync(find()); } catch { return undefined; }
   };
   const direct = resolution(() => resolveFromEntry("express/package.json"));
-  const transitive = resolution(() =>
-    createRequire(resolveFromEntry("@medusajs/medusa")).resolve("express/package.json"));
+  const transitive = resolution(resolveMedusaExpress);
   if (direct && transitive) return direct === transitive ? "same-package" : "different-package";
   if (transitive) return "transitive-only";
   return direct ? "entry-only" : "neither";

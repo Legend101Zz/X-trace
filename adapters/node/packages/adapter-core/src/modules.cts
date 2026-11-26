@@ -2,6 +2,7 @@ import { BUILTIN_MODULES } from "./manifest.cjs";
 import { installHttpCapture } from "./http-capture.cjs";
 import { installExpressLayerPatch } from "./express-instrument.cjs";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { registerRouteResolver } from "./runtime/context.cjs";
 import type { HttpCaptureTransport } from "./runtime/transport.cjs";
@@ -60,13 +61,24 @@ export function expressModule(
       const node = supportedNode(environment);
       if (!node.supported) return node;
       let located: string;
+      let fromMedusa = false;
       try {
         located = resolve("express/package.json");
-      } catch {
-        return { supported: false, reason: "express_not_found" };
+      } catch (error) {
+        if (!(error instanceof Error) || !("code" in error) || error.code !== "MODULE_NOT_FOUND") {
+          return { supported: false, reason: "express_not_found" };
+        }
+        try {
+          located = resolveMedusaExpress(resolve);
+          fromMedusa = true;
+        } catch {
+          return { supported: false, reason: "express_not_found" };
+        }
       }
-      const major = expressMajor(located);
-      return major !== 0 && major !== 4 && major !== 5 ? { supported: false, reason: "express_version_unsupported" } : { supported: true };
+      const major = expressMajor(located, fromMedusa);
+      return major === 4 || major === 5 || (!fromMedusa && major === 0)
+        ? { supported: true }
+        : { supported: false, reason: "express_version_unsupported" };
     },
     install() {
       // Finish-time resolution stays as the fallback for shapes the Layer patch does not recognize.
@@ -76,11 +88,18 @@ export function expressModule(
   };
 }
 
-/** Major version of the resolved express package, or 0 when it cannot be read (then not gated here). */
-function expressMajor(packageJsonPath: string): number {
+/** Resolve Express as Medusa itself does, without loading either package or altering Node's search paths. */
+export function resolveMedusaExpress(resolve: (specifier: string) => string = resolveFromEntry): string {
+  return createRequire(resolve("@medusajs/medusa")).resolve("express/package.json");
+}
+
+/** A dependency-scope fallback must identify a real supported Express package. */
+function expressMajor(packageJsonPath: string, requireName: boolean): number {
   try {
-    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version?: unknown };
-    return typeof parsed.version === "string" ? Number.parseInt(parsed.version, 10) || 0 : 0;
+    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { name?: unknown; version?: unknown };
+    if (typeof parsed.version !== "string") return 0;
+    if (requireName && (parsed.name !== "express" || !/^(?:4|5)\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)*$/.test(parsed.version))) return 0;
+    return Number.parseInt(parsed.version, 10) || 0;
   } catch {
     return 0;
   }

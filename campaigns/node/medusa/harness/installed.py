@@ -171,6 +171,7 @@ class Process:
         self.stopped = False
         self.cleaned = False
         self.reaped_group_exits = None
+        self.stop_recovery_reasons = None
 
     def observe_children(self):
         if not self.descendants or self.child.poll() is not None:
@@ -241,25 +242,27 @@ class Process:
         if self.stopped:
             return self.child.returncode
         self.stopped = True
-        forced = False
+        recovery_reasons = self.stop_recovery_reasons = []
         try:
             try:
                 self.observe_children()
             except Exception:
                 traceback.print_exc()
-                forced = True
+                recovery_reasons.append("descendant-inventory-failed")
             if self.child.poll() is None:
                 self.child.terminate()
             try:
                 code = self.child.wait(timeout=25)
             except subprocess.TimeoutExpired:
-                forced = True
+                recovery_reasons.append("launcher-wait-deadline")
                 if self.child.poll() is None:
                     os.killpg(self.child.pid, signal.SIGKILL)
                 code = self.child.wait(timeout=5)
             for handle in self.owned_children.values():
                 if not select.select([handle], [], [], 0)[0]:
-                    forced = True
+                    reason = "descendant-exit-not-yet-observed"
+                    if reason not in recovery_reasons:
+                        recovery_reasons.append(reason)
                     try:
                         signal.pidfd_send_signal(handle, signal.SIGKILL)
                     except ProcessLookupError:
@@ -276,7 +279,7 @@ class Process:
             else:
                 raise ProcessStopFailure("process-group-present")
             self.cleaned = True
-            if forced:
+            if recovery_reasons:
                 raise ProcessStopFailure("forced-cleanup")
             return code
         finally:
@@ -314,6 +317,7 @@ class Proof:
             "lifecycle": {"baseline": {}, "installed": {}},
             "medusaReadinessLogStream": {"baseline": None, "installed": None},
             "reapedAdoptedGroupExits": {"baseline": None, "installed": None},
+            "stopRecoveryReasons": {"baseline": None, "installed": None},
             "nodeCaptureDiagnostic": None,
             "perRequestAttribution": "unverified", "concurrentRecordingAttribution": "unverified",
         }
@@ -622,6 +626,7 @@ class Proof:
                                 require_code = process.stop()
                             finally:
                                 self.summary["reapedAdoptedGroupExits"][name] = process.reaped_group_exits
+                                self.summary["stopRecoveryReasons"][name] = process.stop_recovery_reasons
                         with self.phase(name, "check-graceful-exit"):
                             require(live)
                             if require_code != 0:
