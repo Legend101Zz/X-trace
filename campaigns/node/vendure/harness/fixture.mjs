@@ -97,15 +97,33 @@ export class VendureFixture {
   }
 
   async runLogged(name, args, log) {
+    const { attachExit, processExit } = await this.runObserved(name, args, log, false);
+    if (attachExit !== 0) return attachExit;
+    if (processExit === null) throw new Error("Vendure foreground exit unavailable");
+    return processExit;
+  }
+
+  // Readback needs two independent observations. Existing foreground callers
+  // return the failed attach immediately, even if the container later exits.
+  async runObserved(name, args, log, inspectAfterAttachFailure = true) {
     const deadline = Date.now() + 3600000;
     const id = this.create(name, args, Math.min(600000, remaining(deadline)));
-    const code = await this.logged(["start", "--attach", id], log, { timeoutMs: remaining(deadline) });
-    if (code !== 0) return code;
-    const state = this.command(["inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", id],
-      { allowFail: true, timeoutMs: remaining(deadline) });
-    const match = /^exited (0|[1-9][0-9]{0,2})$/.exec(state.stdout.trim());
-    if (state.status !== 0 || !match || Number(match[1]) > 255) throw new Error("Vendure foreground exit unavailable");
-    return Number(match[1]);
+    const observed = { attachExit: null, processExit: null };
+    try {
+      observed.attachExit = await this.logged(["start", "--attach", id], log, { timeoutMs: remaining(deadline) });
+    } catch (error) {
+      if (!inspectAfterAttachFailure) throw error;
+    }
+    if (observed.attachExit !== 0 && !inspectAfterAttachFailure) return observed;
+    try {
+      const state = this.command(["inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", id],
+        { allowFail: true, timeoutMs: remaining(deadline) });
+      const match = /^exited (0|[1-9][0-9]{0,2})$/.exec(state.stdout.trim());
+      if (state.status === 0 && match && Number(match[1]) <= 255) observed.processExit = Number(match[1]);
+    } catch (error) {
+      if (!inspectAfterAttachFailure) throw error;
+    }
+    return observed;
   }
 
   exec(name, args, options = {}) {

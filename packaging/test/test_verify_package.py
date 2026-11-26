@@ -26,6 +26,7 @@ FILES = {
     "share/xtrace/web/assets.sha256": "x",
     "share/xtrace/packs/java/agent/xtrace-agent.jar": "jar",
     "share/xtrace/packs/node/pack.manifest": "m",
+    "share/xtrace/packs/node/dist/manifest.sha256": "d",
     "share/xtrace/packs/node/dist/register.cjs": "c",
     "share/xtrace/schema/proto/xtp-agent/v1.proto": "p",
     "share/xtrace/schema/xtp-client/openapi.yaml": "o",
@@ -71,7 +72,8 @@ class VerifyPackage(unittest.TestCase):
         report = vp.verify(self.root)
         self.assertTrue(report["ok"], report)
         self.assertFalse(report["release_evidence"])
-        for drop in ("share/xtrace/packs/node/pack.manifest", "share/xtrace/web/index.html",
+        for drop in ("share/xtrace/packs/node/pack.manifest",
+                     "share/xtrace/packs/node/dist/manifest.sha256", "share/xtrace/web/index.html",
                      "share/xtrace/schema/xtp-client/openapi.yaml", "bin/xtrace"):
             shutil.rmtree(self.root)
             self.root.mkdir()

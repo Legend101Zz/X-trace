@@ -14,9 +14,11 @@ import { docker, PREFIX, PLATFORM } from "../../lib/docker.mjs";
 import { VendureFixture, builtImage } from "./fixture.mjs";
 import { projectRoot } from "../../lib/paths.mjs";
 import { runBaseline, randomSecret } from "../../lib/baseline.mjs";
-import { sleep, startPostgres } from "../../lib/stack.mjs";
+import { startPostgres } from "../../lib/stack.mjs";
 import { compareRuns } from "../../lib/harness.mjs";
 import { sha256Hex } from "../../lib/canonical.mjs";
+import { OwnedServicesFixture } from "./owned-services.mjs";
+import { createVendureRuntime } from "./runtime.mjs";
 import { vendureScenarios } from "./scenarios.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -27,8 +29,10 @@ const root = path.join(workspaceParent, "preparation");
 const appUser = ["--user", `${process.getuid()}:${process.getgid()}`, "-e", "HOME=/work/.xtrace-home"];
 const appDir = path.join(root, "app");
 const NODE_VERSION = campaign.runtime.nodeImageVersion;
-const fixture = new VendureFixture();
 const image = ["create", "build", "seed", "baseline"].includes(process.argv[2]) ? builtImage(workspaceParent) : null;
+
+const fixture = ["create", "build", "seed"].includes(process.argv[2])
+  ? new OwnedServicesFixture(root, { db: PREFIX + "vendure-seed-db" }, image) : new VendureFixture();
 
 async function create() {
   claimWorkspace(workspaceParent, process.env.RUNNER_TEMP);
@@ -102,54 +106,6 @@ async function seed() {
   console.log("seed.sql bytes", dump.length, "sha256", sha256Hex(dump));
 }
 
-function readEnvFile() {
-  const env = {};
-  for (const line of fs.readFileSync(path.join(appDir, ".env"), "utf8").split("\n")) {
-    const m = /^([A-Z_]+)=(.*)$/.exec(line);
-    if (m) env[m[1]] = m[2].trim();
-  }
-  return env;
-}
-
-async function buildStack({ names }, seed) {
-  const env = readEnvFile();
-  const admin = { identifier: env.SUPERADMIN_USERNAME, password: env.SUPERADMIN_PASSWORD };
-  const dbPassword = randomSecret();
-  await seed.startAndRestore({ username: PG_USER, database: PG_DB }, async () => {
-    await startPostgres({ netName: fixture.network, dbName: names.db, database: PG_DB, user: PG_USER, password: dbPassword }, fixture);
-    return fixture.id(names.db);
-  }, docker);
-  const common = [
-    ...appUser, "--network", fixture.network, "-v", `${root}:/work`, "-w", "/work/app",
-    "-e", "DB_HOST=db", "-e", "DB_PORT=5432", "-e", `DB_NAME=${PG_DB}`, "-e", `DB_USERNAME=${PG_USER}`, "-e", `DB_PASSWORD=${dbPassword}`, "-e", "DB_SCHEMA=public",
-    "-e", "PORT=3000", "-e", "APP_ENV=dev", "-e", "DO_NOT_TRACK=1", "-e", "VENDURE_DISABLE_TELEMETRY=1",
-  ];
-  // The upstream topology: stock server entry and, as a separate process/container, the stock worker entry.
-  fixture.runDetached(names.worker, [...common, image, "node", "./dist/index-worker.js"]);
-  fixture.runDetached(names.app, ["-p", "127.0.0.1::3000", ...common, image, "node", "./dist/index.js"]);
-  const port = fixture.hostPort(names.app, 3000);
-  const baseUrl = `http://127.0.0.1:${port}`;
-  // Readiness (necessary, never sufficient): shop-api answers and the worker logged "ready".
-  const deadline = Date.now() + 300000;
-  for (;;) {
-    if (!fixture.running(names.app)) throw new Error("app container exited before readiness");
-    if (!fixture.running(names.worker)) throw new Error("worker container exited before readiness");
-    try {
-      const r = await fetch(baseUrl + "/shop-api", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query: "{__typename}" }), signal: AbortSignal.timeout(3000) });
-      const w = fixture.logs(names.worker);
-      if (r.status === 200 && /Vendure Worker is ready/.test((w.stdout || "") + (w.stderr || ""))) break;
-    } catch {}
-    if (Date.now() > deadline) throw new Error("readiness deadline exceeded");
-    await sleep(500);
-  }
-  // rows as objects, via PostgreSQL json_agg
-  const sql = (q) => {
-    const out = fixture.exec(names.db, ["psql", "-U", PG_USER, "-d", PG_DB, "-At", "-c", `select coalesce(json_agg(t),'[]'::json) from (${q}) t`]).stdout.trim();
-    return JSON.parse(out);
-  };
-  return { baseUrl, admin, sql, extra: { sql, admin } };
-}
-
 const cmd = process.argv[2];
 if (["create", "build", "seed"].includes(cmd)) {
   try {
@@ -168,7 +124,7 @@ if (["create", "build", "seed"].includes(cmd)) {
     root: campaignRoot,
     fixture,
     keep: process.argv.includes("--keep"),
-    buildStack: args => buildStack(args, seed),
+    buildStack: args => createVendureRuntime({ root, image, fixture }).buildStack(args, seed),
     scenarios: (ctx) => vendureScenarios(ctx),
     meta: {
       ...seed.metadata,
