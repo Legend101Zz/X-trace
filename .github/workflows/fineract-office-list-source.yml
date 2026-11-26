@@ -1,0 +1,130 @@
+name: Fineract office-list diagnostic source qualification
+on:
+  push:
+    branches: [codex/proof-office-list-source-117]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Admit exact diagnostic source and prepare private scratch
+        id: admit
+        env:
+          PRODUCT: '181ddef7e88dcab9f86021552425b09b25131344'
+          TREE: '728d733f27f5441a5249f23dc11fb1da81b9b136'
+          BASE: 'e8a27e863b2f54e7189a47a92a5c3ccb6ed3543f'
+          PATCH: 'f7027d2710263ebcb2d3f2f44aefaa1d7a534b97c52336925de749969a516790'
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_REPOSITORY" = Legend101Zz/X-trace
+          test "$GITHUB_REF" = refs/heads/codex/proof-office-list-source-117
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT"
+          test "$(git diff --name-status "$PRODUCT" HEAD)" = $'A\t.github/workflows/fineract-office-list-source.yml'
+          test "$(git ls-tree HEAD -- .github/workflows/fineract-office-list-source.yml | cut -d' ' -f1)" = 100644
+          test "$(git show -s --format=%P "$PRODUCT")" = "$BASE"
+          test "$(git rev-parse "$PRODUCT^{tree}")" = "$TREE"
+          test "$(git diff --full-index --binary "$BASE" "$PRODUCT" | sha256sum | cut -d' ' -f1)" = "$PATCH"
+          git checkout --quiet --detach "$PRODUCT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/xfo117"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          printf '%s\n' "PRIVATE_ROOT=$root" "TMPDIR=$root/tmp" "XTRACE_TEST_PRIVATE_SCRATCH=$root/tmp" >> "$GITHUB_ENV"
+      - name: first-partial-pair (11 original source cases)
+        if: ${{ !cancelled() && steps.admit.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          report="$PRIVATE_ROOT/first-partial-pair.json"
+          rc=0
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$report" test_fineract_first_partial_pair.FineractFirstPartialPair.test_same_recording_complete_reads_keep_capture_loss_and_scopes_separate test_fineract_first_partial_pair.FineractFirstPartialPair.test_later_cli_page_is_not_whole_and_different_windows_do_not_compare test_fineract_first_partial_pair.FineractFirstPartialPair.test_api_transport_gap_distinguishes_no_read_from_a_bound_prefix test_fineract_first_partial_pair.FineractFirstPartialPair.test_bad_page_binding_and_wrong_project_leave_no_comparison test_fineract_first_partial_pair.FineractFirstPartialPair.test_missing_and_malformed_markers_do_not_become_zero test_fineract_first_partial_pair.FineractFirstPartialPair.test_public_gate_rejects_unclosed_or_ambiguous_pair test_fineract_first_partial_pair.FineractFirstPartialPair.test_list_count_range_identity_and_missing_fields_prevent_whole_api_claim test_fineract_first_partial_pair.FineractFirstPartialPair.test_earlier_complete_api_does_not_fill_later_cli_list_disagreement test_fineract_first_partial_pair.FineractFirstPartialPair.test_wire_counters_preserve_null_missing_malformed_and_decimal_evidence test_fineract_first_partial_pair.FineractFirstPartialPair.test_private_scanner_admits_complete_v3_collection_and_saved_archive test_fineract_first_partial_pair.FineractFirstPartialPair.test_private_scanner_distinguishes_partial_v3_and_rejects_impossible_comparators >"$PRIVATE_ROOT/first-partial-pair.stdout" 2>"$PRIVATE_ROOT/first-partial-pair.stderr" || rc=$?
+          python3 -B - "$report" "$rc" <<'PYCOUNTS'
+          import json,sys
+          from pathlib import Path
+          doc=json.loads(Path(sys.argv[1]).read_bytes())
+          counts=doc['counts']
+          expected=dict(testsRun=11, failures=0, errors=0, skipped=0, expectedFailures=0, unexpectedSuccesses=0)
+          assert counts.keys()==expected.keys() and all(type(value) is int and 0 <= value <= 11 for value in counts.values())
+          print('first-partial-pair', *(key+'='+str(counts[key]) for key in expected))
+          if counts!=expected or sys.argv[2]!='0' or doc['identities']: raise SystemExit(1)
+          PYCOUNTS
+      - name: phase-evidence (16 original source cases)
+        if: ${{ !cancelled() && steps.admit.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          report="$PRIVATE_ROOT/phase-evidence.json"
+          rc=0
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$report" test_fineract_phase_evidence.FineractPhaseEvidence.test_terminal_presence_and_duration_are_separate_and_finite test_fineract_phase_evidence.FineractPhaseEvidence.test_same_recording_live_and_actual_recovery_are_correlated_privately test_fineract_phase_evidence.FineractPhaseEvidence.test_unrelated_record_never_inherits_group_observations test_fineract_phase_evidence.FineractPhaseEvidence.test_wrong_project_and_invalid_selected_identity_never_correlate test_fineract_phase_evidence.FineractPhaseEvidence.test_missing_or_no_complete_live_poll_remains_unknown test_fineract_phase_evidence.FineractPhaseEvidence.test_live_projection_drops_values_and_rejects_noncomplete_or_unbound_reads test_fineract_phase_evidence.FineractPhaseEvidence.test_stop_document_requires_real_shape_identity_and_exit_consistency test_fineract_phase_evidence.FineractPhaseEvidence.test_unsafe_private_files_and_unknown_fields_fail_closed test_fineract_phase_evidence.FineractPhaseEvidence.test_public_phase_schema_rejects_unknown_values_bool_counts_and_extra_fields test_fineract_phase_evidence.FineractPhaseEvidence.test_boundary_diagnostic_save_does_not_add_reads_or_change_verdict test_fineract_phase_evidence.FineractPhaseEvidence.test_installed_collector_requires_closed_phase_projection_without_changing_commands test_fineract_phase_evidence.FineractPhaseEvidence.test_missing_wire_identity_cannot_be_replaced_by_collector_default test_fineract_phase_evidence.FineractPhaseEvidence.test_not_running_retains_actual_stale_record_identity_and_rejects_mixed_shapes test_fineract_phase_evidence.FineractPhaseEvidence.test_failed_recovery_keeps_real_exit_precedence_and_failed_result test_fineract_phase_evidence.FineractPhaseEvidence.test_only_first_serial_boundary_receives_the_one_snapshot_holder test_fineract_phase_evidence.FineractPhaseEvidence.test_diagnostic_projection_and_writes_follow_stop_api_judgment_and_receipt_measurements >"$PRIVATE_ROOT/phase-evidence.stdout" 2>"$PRIVATE_ROOT/phase-evidence.stderr" || rc=$?
+          python3 -B - "$report" "$rc" <<'PYCOUNTS'
+          import json,sys
+          from pathlib import Path
+          doc=json.loads(Path(sys.argv[1]).read_bytes())
+          counts=doc['counts']
+          expected=dict(testsRun=16, failures=0, errors=0, skipped=0, expectedFailures=0, unexpectedSuccesses=0)
+          assert counts.keys()==expected.keys() and all(type(value) is int and 0 <= value <= 16 for value in counts.values())
+          print('phase-evidence', *(key+'='+str(counts[key]) for key in expected))
+          if counts!=expected or sys.argv[2]!='0' or doc['identities']: raise SystemExit(1)
+          PYCOUNTS
+      - name: receipt-diagnostics (6 original source cases)
+        if: ${{ !cancelled() && steps.admit.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          report="$PRIVATE_ROOT/receipt-diagnostics.json"
+          rc=0
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$report" test_fineract_receipt_diagnostics.FineractDiagnostics.test_first_failed_poll_is_bound_to_its_observation_and_later_phases_are_unreached test_fineract_receipt_diagnostics.FineractDiagnostics.test_partial_detail_poll_preserves_the_separate_fineract_complete_on_time_poll test_fineract_receipt_diagnostics.FineractDiagnostics.test_saved_v1_fineract_poll_is_read_without_supplying_unobserved_v2_fields test_fineract_receipt_diagnostics.FineractDiagnostics.test_serial_unread_absent_and_checked_seams_remain_distinct test_fineract_receipt_diagnostics.FineractDiagnostics.test_malformed_or_legacy_projections_do_not_credit_checks test_fineract_receipt_diagnostics.FineractDiagnostics.test_burst_group_checked_jdbc_and_missing_sql_operation_stay_separate_from_individual_attribution >"$PRIVATE_ROOT/receipt-diagnostics.stdout" 2>"$PRIVATE_ROOT/receipt-diagnostics.stderr" || rc=$?
+          python3 -B - "$report" "$rc" <<'PYCOUNTS'
+          import json,sys
+          from pathlib import Path
+          doc=json.loads(Path(sys.argv[1]).read_bytes())
+          counts=doc['counts']
+          expected=dict(testsRun=6, failures=0, errors=0, skipped=0, expectedFailures=0, unexpectedSuccesses=0)
+          assert counts.keys()==expected.keys() and all(type(value) is int and 0 <= value <= 6 for value in counts.values())
+          print('receipt-diagnostics', *(key+'='+str(counts[key]) for key in expected))
+          if counts!=expected or sys.argv[2]!='0' or doc['identities']: raise SystemExit(1)
+          PYCOUNTS
+      - name: privacy (2 original source cases)
+        if: ${{ !cancelled() && steps.admit.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          report="$PRIVATE_ROOT/privacy.json"
+          rc=0
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$report" test_fineract_privacy.FineractPrivacy.test_public_projection_ignores_free_form_paths_and_preserves_prior_red test_fineract_privacy.FineractPrivacy.test_final_public_bytes_are_scanned_and_withheld_on_hit >"$PRIVATE_ROOT/privacy.stdout" 2>"$PRIVATE_ROOT/privacy.stderr" || rc=$?
+          python3 -B - "$report" "$rc" <<'PYCOUNTS'
+          import json,sys
+          from pathlib import Path
+          doc=json.loads(Path(sys.argv[1]).read_bytes())
+          counts=doc['counts']
+          expected=dict(testsRun=2, failures=0, errors=0, skipped=0, expectedFailures=0, unexpectedSuccesses=0)
+          assert counts.keys()==expected.keys() and all(type(value) is int and 0 <= value <= 2 for value in counts.values())
+          print('privacy', *(key+'='+str(counts[key]) for key in expected))
+          if counts!=expected or sys.argv[2]!='0' or doc['identities']: raise SystemExit(1)
+          PYCOUNTS
+      - name: office-read-partial (15 original source cases)
+        if: ${{ !cancelled() && steps.admit.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          report="$PRIVATE_ROOT/office-read-partial.json"
+          rc=0
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$report" test_fineract_office_read_partial.FineractOfficeReadPartial.test_live_named_read_joins_only_its_saved_response_gap_and_actual_stop test_fineract_office_read_partial.FineractOfficeReadPartial.test_unique_partial_root_required_without_selecting_a_replacement test_fineract_office_read_partial.FineractOfficeReadPartial.test_missing_post_stop_detail_and_mismatched_final_project_are_explicit test_fineract_office_read_partial.FineractOfficeReadPartial.test_rejects_different_poll_and_private_selector_fields test_fineract_office_read_partial.FineractOfficeReadPartial.test_final_api_window_without_matching_list_range_keeps_its_original_scope test_fineract_office_read_partial.FineractOfficeReadPartial.test_final_detail_without_exact_expected_root_is_rejected test_fineract_office_read_partial.FineractOfficeReadPartial.test_bound_live_page_counts_stay_separate_from_changed_saved_terminal test_fineract_office_read_partial.FineractOfficeReadPartial.test_missing_live_page_header_preserves_selection_and_unavailable_window test_fineract_office_read_partial.FineractOfficeReadPartial.test_inconsistent_live_range_is_rejected_without_affecting_recovery_join test_fineract_office_read_partial.FineractOfficeReadPartial.test_multi_page_live_event_counts_end_at_first_wire_range_and_withhold_merged_markers test_fineract_office_read_partial.FineractOfficeReadPartial.test_live_window_admission_rejects_raw_fields_and_impossible_window_scope test_fineract_office_read_partial.FineractOfficeReadPartial.test_header_endpoint_found_only_in_continuation_cannot_qualify_the_first_wire_page test_fineract_office_read_partial.FineractOfficeReadPartial.test_first_wire_metadata_and_marker_occurrences_exclude_continuation_payload test_fineract_office_read_partial.FineractOfficeReadPartial.test_flattened_detail_with_all_wire_looking_fields_cannot_stand_in_for_missing_first_reply test_fineract_office_read_partial.FineractOfficeReadPartial.test_unbound_first_response_cursor_and_raw_marker_fields_are_rejected >"$PRIVATE_ROOT/office-read-partial.stdout" 2>"$PRIVATE_ROOT/office-read-partial.stderr" || rc=$?
+          python3 -B - "$report" "$rc" <<'PYCOUNTS'
+          import json,sys
+          from pathlib import Path
+          doc=json.loads(Path(sys.argv[1]).read_bytes())
+          counts=doc['counts']
+          expected=dict(testsRun=15, failures=0, errors=0, skipped=0, expectedFailures=0, unexpectedSuccesses=0)
+          assert counts.keys()==expected.keys() and all(type(value) is int and 0 <= value <= 15 for value in counts.values())
+          print('office-read-partial', *(key+'='+str(counts[key]) for key in expected))
+          if counts!=expected or sys.argv[2]!='0' or doc['identities']: raise SystemExit(1)
+          PYCOUNTS
