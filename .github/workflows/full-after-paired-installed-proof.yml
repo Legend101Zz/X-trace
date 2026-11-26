@@ -1,0 +1,378 @@
+name: jhipster-installed
+
+# Scoped development proof for #105. It never invokes the six-project wrapper,
+# publishes a release, uploads raw receipts/logs, or accepts a release-ledger row.
+on:
+  push:
+    branches:
+      - codex/proof-jhipster-full-after-paired-105
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jhipster-installed-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  PRODUCT: 0f9d4a39b3a920ef7e1eee6a8d23d31fbc8fe1cd
+  PRODUCT_TREE: c3eac39cea92d76e4511b234e9e3738a4003520e
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  jhipster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.PRODUCT }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Verify product identity and campaign module origins
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          export XTRACE_CAMPAIGN_ROOT="$RUNNER_TEMP/jhipster-proof-private/run/campaign"
+          rc=0
+          python3 -B - > "$RUNNER_TEMP/jhipster-import-check.stdout" 2> "$RUNNER_TEMP/jhipster-import-check.stderr" <<'IMPORTS' || rc=$?
+          from pathlib import Path
+          import sys
+
+          root = Path.cwd().resolve()
+          harness = root / "campaigns/java/jhipster/harness"
+          library = root / "campaigns/lib"
+          sys.path[:0] = [str(harness), str(library)]
+          import detail_pages
+          import evidence
+          import run
+          import xinstr
+          from campaigns.java.jhipster.harness import collect_sinks, public_result
+
+          from campaigns.lib import detail_pages as packaged_pages
+          from campaigns.java.jhipster.harness import partial_provenance
+
+          modules = ((run, harness / "run.py"), (evidence, harness / "evidence.py"),
+                     (xinstr, library / "xinstr.py"), (collect_sinks, harness / "collect_sinks.py"),
+                     (public_result, harness / "public_result.py"),
+                     (detail_pages, library / "detail_pages.py"), (packaged_pages, library / "detail_pages.py"),
+                     (partial_provenance, harness / "partial_provenance.py"),
+                     (xinstr.boundary_diagnostics, library / "boundary_diagnostics.py"),
+                     (public_result.boundary_diagnostics, library / "boundary_diagnostics.py"))
+          if (any(Path(module.__file__).resolve() != path for module, path in modules)
+                  or run.evidence is not evidence or run.xinstr is not xinstr
+                  or public_result.collect_sinks is not collect_sinks
+                  or collect_sinks.partial_provenance is not partial_provenance
+                  or collect_sinks.bound_page_end is not packaged_pages.bound_page_end
+                  or xinstr.bound_page_end is not detail_pages.bound_page_end):
+              raise SystemExit(1)
+          IMPORTS
+          if [ "$rc" -ne 0 ]; then
+            echo 'JHipster module-origin verification failed'
+            exit "$rc"
+          fi
+      - name: Verify 14 named historical and first-incomplete regressions
+        run: |
+          set -euo pipefail
+          umask 077
+          named="$RUNNER_TEMP/jhipster-named-checks"
+          mkdir -m 700 "$named"
+          rc=0
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$named/result.json" test_jhipster_evidence.JHipsterEvidence.test_route_less_filter_root_cannot_be_allocated_to_an_expected_route \
+            test_jhipster_evidence.JHipsterEvidence.test_normal_source_less_throw_uses_direct_entry_event_for_both_controller_cases \
+            test_jhipster_evidence.JHipsterEvidence.test_controller_exception_type_requires_the_pinned_qualified_name \
+            test_jhipster_evidence.JHipsterEvidence.test_controller_exception_rejects_invalid_or_conflicting_direct_links \
+            test_jhipster_evidence.JHipsterEvidence.test_controller_exception_rejects_unrelated_nested_or_ambiguous_events \
+            test_jhipster_evidence.JHipsterEvidence.test_controller_exception_cannot_credit_an_unbound_recording_detail \
+            test_jhipster_evidence.JHipsterEvidence.test_controller_exception_rejects_wrong_route_source_and_gaps \
+            test_jhipster_recording_projection.RecordingProjection.test_controller_exception_public_counts_distinguish_type_and_linkage \
+            test_jhipster_boundary_diagnostics.JHipsterBoundaryDiagnostics.test_late_complete_read_only_updates_the_attempt_snapshot \
+            test_jhipster_boundary_diagnostics.JHipsterBoundaryDiagnostics.test_saved_v1_boundary_projects_original_evidence_with_no_new_fields \
+            test_jhipster_public_result.CollectSinks.test_first_incomplete_pairs_only_matching_saved_api_and_discards_raw_markers \
+            test_jhipster_public_result.CollectSinks.test_private_api_pair_distinguishes_missing_rejected_and_partial_reads \
+            test_jhipster_public_result.CollectSinks.test_api_read_error_before_first_page_has_no_capture_marker_counts \
+            test_jhipster_public_result.CollectSinks.test_malformed_cli_capture_field_stays_red_with_no_capture_marker_counts > "$named/stdout" 2> "$named/stderr" || rc=$?
+          python3 -B -m tools.qa.unittest_summary "$named/result.json"
+          python3 -B - "$named/result.json" <<'CHECK'
+          import json, sys
+          counts = json.load(open(sys.argv[1]))['counts']
+          if counts['testsRun'] != 14 or any(value for key, value in counts.items() if key != 'testsRun'):
+              raise SystemExit(1)
+          CHECK
+          exit "$rc"
+      - name: Verify 42 paired-provenance and focused-fixture source regressions
+        run: |
+          set -euo pipefail
+          umask 077
+          named="$RUNNER_TEMP/jhipster-paired-named"
+          mkdir -m 700 "$named"
+          rc=0
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$named/result.json" \
+            test_jhipster_boundary_diagnostics.JHipsterBoundaryDiagnostics \
+            test_jhipster_partial_provenance test_jhipster_public_result.CollectSinks test_jhipster_focused_fixture.FocusedFixture \
+            > "$named/stdout" 2> "$named/stderr" || rc=$?
+          python3 -B -m tools.qa.unittest_summary "$named/result.json"
+          python3 -B - "$named/result.json" <<'CHECK'
+          import json, sys
+          counts = json.load(open(sys.argv[1]))['counts']
+          if counts['testsRun'] != 42 or any(value for key, value in counts.items() if key != 'testsRun'):
+              raise SystemExit(1)
+          CHECK
+          exit "$rc"
+      - name: Build the exact unsigned Linux archive privately
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private"
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private/package-build"
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private/run" "$RUNNER_TEMP/jhipster-proof-private/run/console"
+          export JHIPSTER_BUILD_STATUS="$RUNNER_TEMP/jhipster-proof-private/run/build-status.json"
+          export JHIPSTER_OUTER_BUILD_STATUS="$RUNNER_TEMP/jhipster-proof-private/package-build/status.json"
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          for key in ('JHIPSTER_BUILD_STATUS', 'JHIPSTER_OUTER_BUILD_STATUS'):
+              pathlib.Path(os.environ[key]).write_text(json.dumps({
+                  'schema': 'xtrace-jhipster-build/1', 'exitCode': None}) + '\n')
+          PY
+          rc=0
+          python3 -B packaging/build.py --out dist --platform linux-x86_64 \
+            > "$RUNNER_TEMP/jhipster-proof-private/run/console/package-build.stdout" \
+            2> "$RUNNER_TEMP/jhipster-proof-private/run/console/package-build.stderr" || rc=$?
+          BUILD_EXIT="$rc" python3 -B - <<'PY'
+          import json, os, pathlib
+          for key in ('JHIPSTER_BUILD_STATUS', 'JHIPSTER_OUTER_BUILD_STATUS'):
+              pathlib.Path(os.environ[key]).write_text(json.dumps({
+                  'schema': 'xtrace-jhipster-build/1', 'exitCode': int(os.environ['BUILD_EXIT'])}) + '\n')
+          PY
+          if [ "$rc" -ne 0 ]; then
+            cp "$RUNNER_TEMP/jhipster-proof-private/run/console/package-build.stderr" \
+              "$RUNNER_TEMP/jhipster-proof-private/package-build/stderr"
+          fi
+          echo "Candidate archive build exit $rc; raw streams retained privately"
+          exit "$rc"
+      - name: Campaign regression checks with private diagnostics
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private/checks"
+          rc=0
+          python3 -B -m tools.qa.unittest_run \
+            --result "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.json" \
+            discover -s campaigns/lib -p 'test_*.py' \
+            > "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.stdout" \
+            2> "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.stderr" || rc=$?
+          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.json"
+          python3 -B - "$RUNNER_TEMP/jhipster-proof-private/checks/campaign-library.json" <<'CHECK'
+          import json, sys
+          counts = json.load(open(sys.argv[1]))['counts']
+          if counts['testsRun'] != 250 or any(value for key, value in counts.items() if key != 'testsRun'):
+              raise SystemExit(1)
+          CHECK
+          exit "$rc"
+      - name: Bind the exact archive bytes and build revision
+        id: identity
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, os, pathlib, subprocess
+          archive = pathlib.Path('dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz')
+          digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
+          source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'source-sha={source}\npackage-sha256={digest}\n')
+          PY
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Verify, fresh-install and run only pinned JHipster
+        id: campaign
+        env:
+          PACKAGE_SHA256: ${{ steps.identity.outputs.package-sha256 }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source-sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$RUNNER_TEMP/jhipster-proof-private/driver"
+          export JHIPSTER_DRIVER_STATUS="$RUNNER_TEMP/jhipster-proof-private/driver/status.json"
+          export XTRACE_PRIVATE_DRIVER_DIAGNOSTIC=1
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          pathlib.Path(os.environ['JHIPSTER_DRIVER_STATUS']).write_text(json.dumps({
+              'schema': 'xtrace-jhipster-driver/1', 'exitCode': None}) + '\n')
+          PY
+          rc=0
+          python3 -B campaigns/java/jhipster/harness/installed.py \
+            --private-root "$RUNNER_TEMP/jhipster-proof-private/run" \
+            --archive "$GITHUB_WORKSPACE/dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz" \
+            --package-sha256 "$PACKAGE_SHA256" --source-sha "$SOURCE_SHA" --java "$JAVA_HOME/bin/java" \
+            > "$RUNNER_TEMP/jhipster-proof-private/driver/stdout" \
+            2> "$RUNNER_TEMP/jhipster-proof-private/driver/stderr" || rc=$?
+          DRIVER_EXIT="$rc" python3 -B - <<'PY'
+          import json, os, pathlib
+          pathlib.Path(os.environ['JHIPSTER_DRIVER_STATUS']).write_text(json.dumps({
+              'schema': 'xtrace-jhipster-driver/1', 'exitCode': int(os.environ['DRIVER_EXIT'])}) + '\n')
+          PY
+          echo "Installed campaign driver exit $rc; raw streams retained privately"
+          exit "$rc"
+      - name: Retain identified pre-receipt stderr as recipient-only ciphertext
+        id: diagnostic
+        env:
+          XTRACE_DIAGNOSTIC_CERT_PEM: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJUwyDQ+9vO7xAPtW6/AiQDiLem8wDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCBkaWFnbm9zdGljIHJl
+            Y2lwaWVudDAeFw0yNjExMjUxNzEwMjZaFw0yNjEyMDkxNzEwMjZaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgZGlhZ25vc3RpYyByZWNpcGllbnQwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDagbD2rPLoVyTA7+JETGkeoV+g
+            aeX8nH/waU5Nbd0ddYewY5o11niUoiNB5mAWTHo//CePeCT0u+t8szQsSPjpkSxi
+            QGMfvmHhr/2/TWpJuEx5zg0+ZgSCiKa7/gNmq843mywVJS00E3hFJrsRtSF/P5b7
+            i511cb3XjP14GW7kGiOltNrdzaY00dQZ1OmEFvp7xvYcp5iNckzsM46GUF9ANmjv
+            8P/cQKA8m4RvuAU+PHcYbN75uGfRvU60NJoSTFVocz5SXkae6LA7k+tDyyMp1s83
+            QEz99eWuB5VU1JzFGYpSq7Uuy3N4YhhzqhLw20cN6EdThmJmqa81b4O1394i49Zs
+            IG3yGED0sCLC3jwVeHFqBY0eKbmhgIdCuJjUkq8uRDtGeTettWXhtJN8K/2hXLaO
+            j4f/X5I/cA610eaFBFNpIK8k3PNbd/cWBi1x4qe9yx/OPLZm+/H3xfJLYbgmP1R0
+            UHZtw7yhdLdTg68FirgVFsEDlzd9neqgVxD1rakCAwEAAaNTMFEwHQYDVR0OBBYE
+            FGeVjUCYACKgYX2S3YdIjMzTtlZEMB8GA1UdIwQYMBaAFGeVjUCYACKgYX2S3YdI
+            jMzTtlZEMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAMDsepFD
+            mI4DRG3Qf7/BPgmzOPDHWpMvBXEfMpusS+4fZRdqQECuEHW+wSoCR1iJLrZDpKqn
+            75DL8gJTqfoKIdFB9W6Q9Fzh2sTUBSsHmfCAHs9RfMTSxae6Wm9us73GyZvawg3h
+            XA860/O98Mb3uR8NR0OQA1PrCc/uH9fA5EsdHgsp+YpB1yj8D0blbweXRYAAZb44
+            9zPHIrkfduzmeqBodJUg2XbXKYDg1PC+tFva5NWTYrp7CPY1xYcffaYb/RpPc2C1
+            O1PP7MpyuY/LH4bxtMd5Mjcz2qNw295S7RZAnoP9lU3R8af99OuSkhPgHz/x/jCW
+            7J5+uR/ZKMNP+o/7mPe55yXNuuyVH2v6mnf9nONqeHZPLxJWzAgqkF4zrUrA66YO
+            qwt3G2O2KErAwo5wT7n5u1BiJzTrU1oIvEoCR43oyiFlOHIJ3WxBLCgDb6frqMAt
+            XM0u/CD69DpfF4vMEsgraAxrGCQ81Qgj5knjCWPYZuT/bCjYa7zdX9ARDw==
+            -----END CERTIFICATE-----
+        if: always()
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B campaigns/java/jhipster/harness/encrypt_diagnostic.py \
+            --private-root "$RUNNER_TEMP/jhipster-proof-private/run" \
+            --encrypted-out "$RUNNER_TEMP/jhipster-proof-private/encrypted"
+      - name: Scan observed sinks and write the bounded public result
+        if: always()
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B campaigns/java/jhipster/harness/public_result.py \
+            --private-root "$RUNNER_TEMP/jhipster-proof-private/run" \
+            --public-out "$RUNNER_TEMP/jhipster-proof-public"
+      - name: Verify reached installed workloads and terminal diagnostics
+        if: ${{ !cancelled() && (steps.campaign.outcome == 'success' || steps.campaign.outcome == 'failure') }}
+        env:
+          PACKAGE_SHA256: ${{ steps.identity.outputs.package-sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          helper="$RUNNER_TEMP/jhipster-proof-private/verify-terminal.py"
+          cat > "$helper" <<'DIAGNOSTICS'
+          """Verify the pinned campaign's public summary against its private CLI inventory."""
+          import os
+          from pathlib import Path
+
+          from campaigns.java.jhipster.harness import public_result as result
+
+
+          def verify():
+              root = Path(os.environ["RUNNER_TEMP"])
+              private = root / "jhipster-proof-private/run"
+              summary, status = result.read_object(root / "jhipster-proof-public/summary.json")
+              if status != "present" or not isinstance(summary, dict):
+                  raise SystemExit("bounded-receipt-unavailable")
+              if (summary.get("schema") != "xtrace-jhipster-installed-public/1"
+                      or summary.get("project") != "jhipster" or summary.get("nonRelease") is not True
+                      or summary.get("releaseAcceptance") is not False or summary.get("publication") != "passed"
+                      or summary.get("sourceCommit") != os.environ["PRODUCT"]
+                      or summary.get("packageSha256") != os.environ["PACKAGE_SHA256"]
+                      or summary.get("packageVerification") != "passed"
+                      or summary.get("privateRoot") != "available" or not result.root_admitted(private)):
+                  raise SystemExit("installed-proof-identity-or-publication-unavailable")
+              expected = list(result.SCENARIOS)
+              for leg in ("baseline", "instrumented"):
+                  receipt = summary[leg]
+                  rows = receipt["scenarios"]
+                  if (receipt["status"] != "present" or len(rows) != 8
+                          or [(r["id"], r["expectedRequests"], r["expectedChecks"]) for r in rows] != expected
+                          or any(r["workload"] != "passed" or r["observedRequests"] != r["expectedRequests"]
+                                 or r["checksPassed"] != r["observedChecks"] or r["observedChecks"] != r["expectedChecks"]
+                                 for r in rows)):
+                      raise SystemExit("full-workload-unreached-or-failed")
+                  if sum(r["observedRequests"] for r in rows) != 77 or sum(r["observedChecks"] for r in rows) != 39:
+                      raise SystemExit("workload-total-mismatch")
+              rows = summary["instrumented"]["scenarios"]
+              if any(r["fingerprintMatchesBaseline"] != "passed" for r in rows):
+                  raise SystemExit("instrumented-baseline-fingerprint-mismatch")
+              boundary = summary.get("boundaryDiagnostics")
+              if (not isinstance(boundary, dict) or boundary.get("schemaVersion") != 2
+                      or len(boundary["phases"]) != 3
+                      or result.boundary_diagnostics.projection(
+                          {k: v for k, v in boundary.items() if k != "firstUnverifiedPhase"}) != boundary):
+                  raise SystemExit("boundary-v2-diagnostics-unavailable")
+              phases = {phase["name"]: phase["status"] for phase in summary["phases"]}
+              if phases.get("collect-sinks") not in ("passed", "failed"):
+                  raise SystemExit("cli-collection-unreached")
+              raw, status = result.read_object(private / "sinks/cli-status.json")
+              cli = summary["cli"].get("diagnostics")
+              if (status != "present" or not isinstance(raw, dict) or raw.get("schema") != "xtrace-jhipster-cli-sinks/3"
+                      or not isinstance(cli, dict) or result.cli_diagnostics(raw) != cli):
+                  raise SystemExit("current-cli-diagnostics-unavailable")
+              failure = cli["firstFailure"]
+              incomplete = isinstance(failure, dict) and failure["stage"] == "detail" and failure["reason"] == "incomplete-evidence"
+              if incomplete:
+                  comparison = cli.get("firstIncomplete")
+                  if not isinstance(comparison, dict) or set(comparison) != {
+                          "cli", "api", "apiRead", "cliReadScope", "observationPhases", "sameReadScope",
+                          "sharedKnownCategories", "provenance"}:
+                      raise SystemExit("first-incomplete-diagnostics-unavailable")
+                  pair = comparison["provenance"]
+                  if (set(pair) != {"cli", "api"} or not result.collect_sinks.partial_provenance.valid(pair["cli"])
+                          or comparison["apiRead"] != "complete-read"
+                          or not result.collect_sinks.partial_provenance.valid(pair["api"])):
+                      raise SystemExit("paired-detail-provenance-unavailable")
+              elif "firstIncomplete" in cli:
+                  raise SystemExit("first-incomplete-diagnostics-without-failure")
+              evidence = summary["recordingEvidence"]["scenarios"]
+              if (summary.get("recordingJudgement") != "observed"
+                      or [r["id"] for r in evidence] != [r["id"] for r in rows]
+                      or any(r["recordingVerdict"] not in ("passed", "failed") or r["recordingVerdict"] != s["recording"]
+                             for r, s in zip(evidence, rows))):
+                  raise SystemExit("per-scenario-recording-judgments-incomplete")
+              if any(r["recordingVerdict"] != "passed" for r in evidence):
+                  raise SystemExit("scenario-recording-failures-observed")
+              print("Verified both full workloads, eight recording verdicts and current terminal diagnostics")
+
+
+          if __name__ == "__main__":
+              try:
+                  verify()
+              except (KeyError, OSError, TypeError, ValueError, AttributeError, RecursionError):
+                  raise SystemExit("installed-diagnostic-shape-invalid") from None
+          DIAGNOSTICS
+          test "$(sha256sum "$helper" | cut -d ' ' -f 1)" = 'aa028098d10a87764583d7fb58e4812609b415495394be193580023dd014d422'
+          PYTHONPATH="$GITHUB_WORKSPACE" python3 -B "$helper"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: jhipster-installed-public-result
+          path: ${{ runner.temp }}/jhipster-proof-public/summary.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() && steps.diagnostic.outputs.ready == 'true' }}
+        with:
+          name: jhipster-pre-receipt-encrypted-stderr
+          path: ${{ runner.temp }}/jhipster-proof-private/encrypted/failure-stderr.cms
+          if-no-files-found: error
+          retention-days: 1
