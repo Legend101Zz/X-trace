@@ -8,7 +8,10 @@ import { AgentEnvelopeSchema, RecordingEventKind, type AgentEnvelope } from "@xt
 import { createCaptureCredits, createHttpCaptureTransport } from "../runtime/transport.cjs";
 import { createRecordingAssembler, HOLD_START_MS, type InputMessage, type SendFn } from "../worker-core.js";
 import { createWorkerDelivery } from "../worker-delivery.js";
-import { noteFinishProgress, noteFinishWork, readFinishProgress, type FinishBoundary, type FinishWork } from "../runtime/finish-progress.cjs";
+import {
+  FINISH_PROGRESS_WORDS, noteFinishPreparation, noteFinishProgress, noteFinishWork, readFinishProgress,
+  type FinishBoundary, type FinishPreparation, type FinishWork,
+} from "../runtime/finish-progress.cjs";
 
 const A = "01900000-0000-7000-8000-000000000001";
 const B = "01900000-0000-7000-8000-000000000002";
@@ -42,8 +45,11 @@ function createHarness(
   receivePending?: () => InputMessage | undefined,
   finishProgress?: (boundary: "received" | "dispatched") => void,
   activeWork?: (type: FinishWork) => void,
+  onFinishPreparation?: (type: FinishPreparation) => void,
 ) {
-  const assembler = createRecordingAssembler(send, () => 5n, undefined, { maxBatchEvents, fitsEnvelope });
+  const assembler = createRecordingAssembler(
+    send, () => 5n, undefined, { maxBatchEvents, fitsEnvelope }, undefined, onFinishPreparation,
+  );
   const done = deferred();
   const failed = deferred();
   let credits = 0;
@@ -328,7 +334,7 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
   const firstBatchAck = deferred();
   const finishReceived = deferred();
   const payloads: Payload[] = [];
-  const progress = new BigUint64Array(new SharedArrayBuffer(BigUint64Array.BYTES_PER_ELEMENT));
+  const progress = new BigUint64Array(new SharedArrayBuffer(FINISH_PROGRESS_WORDS * BigUint64Array.BYTES_PER_ELEMENT));
   const note = (boundary: FinishBoundary) => noteFinishProgress(progress, boundary);
   const h = createHarness(async (_, payload) => {
     payloads.push(payload);
@@ -386,4 +392,81 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
   Atomics.store(progress, 0, 4095n);
   note("received");
   assert.equal(readFinishProgress(progress), null, "counter overflow is unavailable rather than wrapped");
+});
+
+
+test("a finish waiting for a held start and event ACK is distinct from digest preparation", async () => {
+  const progress = new BigUint64Array(new SharedArrayBuffer(FINISH_PROGRESS_WORDS * BigUint64Array.BYTES_PER_ELEMENT));
+  const note = (boundary: FinishBoundary) => noteFinishProgress(progress, boundary);
+  const startEntered = deferred();
+  const startAck = deferred();
+  const eventEntered = deferred();
+  const eventAck = deferred();
+  const finishEntered = deferred();
+  const finishAck = deferred();
+  const snapshots: Array<ReturnType<typeof readFinishProgress>> = [];
+  const sent: Payload[] = [];
+  const h = createHarness(async (_, payload) => {
+    sent.push(payload);
+    switch (payload.case) {
+      case "recordingStarted":
+        startEntered.resolve();
+        await startAck.promise;
+        break;
+      case "eventBatch":
+        eventEntered.resolve();
+        await eventAck.promise;
+        break;
+      case "recordingFinished":
+        noteFinishPreparation(progress, null);
+        note("submitted");
+        note("written");
+        finishEntered.resolve();
+        await finishAck.promise;
+        note("staged");
+        break;
+    }
+  }, 64, undefined, undefined, note, (work) => noteFinishWork(progress, work), (phase) => {
+    noteFinishPreparation(progress, phase);
+    snapshots.push(readFinishProgress(progress));
+  });
+  const failed = h.failed.then(() => assert.fail("delivery failed"));
+  for (const message of [start(A, true), event(2), finish(2), close]) h.delivery.enqueue(message);
+  await Promise.race([startEntered.promise, failed]);
+  assert.deepEqual(readFinishProgress(progress),
+    { received: 1, dispatched: 1, submitted: 0, written: 0, staged: 0, active: "finish-release" });
+  assert.equal(h.credits(), 2);
+  startAck.resolve();
+  await Promise.race([eventEntered.promise, failed]);
+  assert.equal(readFinishProgress(progress)?.active, "finish-release");
+  assert.equal(h.credits(), 2);
+  eventAck.resolve();
+  await Promise.race([finishEntered.promise, failed]);
+  assert.deepEqual(snapshots.map((sample) => [sample?.active, sample?.submitted]), [
+    ["finish-release", 0], ["finish-digest", 0], ["finish-envelope", 0],
+  ]);
+  assert.deepEqual(readFinishProgress(progress),
+    { received: 1, dispatched: 1, submitted: 1, written: 1, staged: 0, active: "finish" });
+  assert.equal(h.credits(), 2);
+  finishAck.resolve();
+  await Promise.race([h.done, failed]);
+  assert.equal(h.credits(), 3);
+  const terminal = sent[2]!;
+  assert.equal(terminal.case, "recordingFinished");
+  assert.equal(Buffer.from(terminal.value.eventDigest).toString("hex"), await blake3(event(2).eventId!));
+});
+
+test("finish preparation from a previous dispatch cannot be attached to a new finish", () => {
+  const progress = new BigUint64Array(new SharedArrayBuffer(FINISH_PROGRESS_WORDS * BigUint64Array.BYTES_PER_ELEMENT));
+  noteFinishWork(progress, "finish");
+  noteFinishProgress(progress, "received");
+  noteFinishProgress(progress, "dispatched");
+  noteFinishPreparation(progress, "finish-digest");
+  assert.equal(readFinishProgress(progress)?.active, "finish-digest");
+  noteFinishProgress(progress, "submitted");
+  assert.equal(readFinishProgress(progress)?.active, "finish");
+  noteFinishProgress(progress, "received");
+  noteFinishProgress(progress, "dispatched");
+  assert.deepEqual(readFinishProgress(progress),
+    { received: 2, dispatched: 2, submitted: 1, written: 0, staged: 0, active: "finish" });
 });

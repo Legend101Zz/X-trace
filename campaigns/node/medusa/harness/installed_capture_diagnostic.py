@@ -5,10 +5,11 @@ import re
 
 from installed_evidence import require
 
-PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V8 "
+PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V9 "
 DAEMON_PREFIX = b"XTR-MEDUSA-DAEMON-FINISH-V1 "
 DAEMON_FIELDS = ("sessions", "decoded", "admitted", "ackReady", "ackQueued", "ackFlushed")
-ACTIVE_WORK = frozenset(("idle", "start", "event", "route", "finish", "close", "route-start", "route-held-events"))
+FINISH_PREPARATION = frozenset(("finish-release", "finish-digest", "finish-envelope"))
+ACTIVE_WORK = frozenset(("idle", "start", "event", "route", "finish", "close", "route-start", "route-held-events")) | FINISH_PREPARATION
 COUNTERS = frozenset({
     "startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
     "finishPosted", "finishRejected", "eventRejected", "routeRejected",
@@ -104,6 +105,8 @@ def project_capture_diagnostic(log, nonce):
             require(all(bounded(value, 4095) for key, value in progress.items() if key != "active"))
             require(obj["finishStaged"] == progress["staged"] <= progress["written"] <= progress["submitted"]
                     <= progress["dispatched"] <= progress["received"] <= counts["finishPosted"])
+            if progress["active"] in FINISH_PREPARATION:
+                require(progress["dispatched"] > progress["submitted"])
     except (TypeError, ValueError, RecursionError):
         return {"status": "invalid"}
     return {"status": "observed", **{key: obj[key] for key in FIELDS - {"nonce"}}}

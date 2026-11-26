@@ -35,7 +35,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
         self.assertEqual(result["counts"]["startBeforeCreditNotification"], 1)
         self.assertEqual(result["routeFoldEvidence"], {"batches": 2, "events": 3})
         self.assertEqual(result["finishProgress"], self.snapshot()["finishProgress"])
-        for active in ("route-start", "route-held-events"):
+        for active in ("route-start", "route-held-events", "finish-release", "finish-digest", "finish-envelope"):
             progress = self.snapshot()["finishProgress"] | {"active": active}
             self.assertEqual(project_capture_diagnostic(self.line(finishProgress=progress), self.nonce)
                              ["finishProgress"], progress)
@@ -71,6 +71,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
                           {"finishProgress": progress | {"received": True}},
                           {"finishProgress": progress | {"private": "example"}},
                           {"finishProgress": progress | {"active": "/private/example"}},
+                          {"finishProgress": progress | {"active": "finish-release", "submitted": 10}},
                           {"examplePath": "/private/example"}, {"scope": "/private/example"},
                           {"finishStaged": 13}, {"startStaged": 13}, {"workerFailed": 1},
                           {"routeFoldEvidence": {"batches": 0, "events": 1}},

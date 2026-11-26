@@ -27,7 +27,7 @@ import {
 } from "@xtrace/protocol";
 import type { CaptureEventKind, ExceptionFacts, GapFacts, InteractionFacts, SourceBindingName, SourceFacts } from "./runtime/events.cjs";
 import { MAX_IN_FLIGHT_MESSAGES, type RecordingSummary } from "./runtime/transport.cjs";
-import type { RouteWork } from "./runtime/finish-progress.cjs";
+import type { FinishPreparation, RouteWork } from "./runtime/finish-progress.cjs";
 
 export interface InputMessage {
   type: "start" | "event" | "finish" | "close" | "route";
@@ -285,6 +285,7 @@ export function createRecordingAssembler(
   holdMs: number = HOLD_START_MS,
   batch?: BatchLimits,
   onFailure?: () => void,
+  onFinishPreparation?: (phase: FinishPreparation) => void,
 ): RecordingAssembler {
   const recordings = new Map<string, RecordingState>();
 
@@ -465,6 +466,7 @@ export function createRecordingAssembler(
       }
       const state = recordings.get(recordingId);
       if (!state) return false;
+      if (message.type === "finish") onFinishPreparation?.("finish-release");
       if (state.releasing) await state.releasing;
       if (message.type === "route") {
         // The route is known at match time: release the held start now so a long request is visible
@@ -478,7 +480,9 @@ export function createRecordingAssembler(
       if (message.type === "finish") {
         const summary = message.summary;
         await release(recordingId, state, summary);
+        onFinishPreparation?.("finish-digest");
         const digest = Buffer.from(await blake3(Buffer.from(state.eventIds.join(""), "utf8")), "hex");
+        onFinishPreparation?.("finish-envelope");
         const dropped = Math.max(0, Math.min(message.droppedEvents ?? 0, 0xffff_ffff));
         const limitations = (summary?.limitations ?? []).filter((code) => /^[a-z][a-z0-9_]{0,127}$/.test(code)).slice(0, 64);
         // The start already went out without the route, so the finished recording must not claim one.

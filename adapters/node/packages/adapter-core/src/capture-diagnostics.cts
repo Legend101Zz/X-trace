@@ -2,7 +2,7 @@ import { realpathSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { expressPatchStatus, observeExpressHandlers } from "./express-instrument.cjs";
 import { resolveFromEntry, resolveMedusaExpress } from "./modules.cjs";
-import { finishProgressDiagnosticOffset, readFinishProgress } from "./runtime/finish-progress.cjs";
+import { FINISH_PROGRESS_WORDS, finishProgressDiagnosticOffset, readFinishProgress } from "./runtime/finish-progress.cjs";
 import { routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import type { ModuleStatus } from "./runtime/registry.cjs";
 
@@ -40,10 +40,10 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
   delete process.env.XTRACE_MEDUSA_CAPTURE_DIAGNOSTIC;
   if (!/^[a-f0-9]{48}$/.test(nonce)) return;
   const counts = Object.fromEntries(counters.map((key) => [key, 0])) as Record<Counter, number>;
-  const workerBuffer = new SharedArrayBuffer(finishProgressDiagnosticOffset + BigUint64Array.BYTES_PER_ELEMENT);
+  const workerBuffer = new SharedArrayBuffer(finishProgressDiagnosticOffset + FINISH_PROGRESS_WORDS * BigUint64Array.BYTES_PER_ELEMENT);
   const routeFolds = new BigUint64Array(workerBuffer, routeFoldDiagnosticOffset, 1);
   const worker = new Uint32Array(workerBuffer);
-  const finishBoundaries = new BigUint64Array(workerBuffer, finishProgressDiagnosticOffset, 1);
+  const finishBoundaries = new BigUint64Array(workerBuffer, finishProgressDiagnosticOffset, FINISH_PROGRESS_WORDS);
   const scope = expressScope();
   const expressEvidence = { invoked: 0, withContext: 0, posted: 0 };
   try {
@@ -61,7 +61,7 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
     try {
       const folded = Atomics.load(routeFolds, 0);
       const finishProgress = readFinishProgress(finishBoundaries);
-      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V8 " + JSON.stringify({
+      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V9 " + JSON.stringify({
         nonce, exitCode, scope, express, patchedLayers: expressPatchStatus().patched, counts,
         expressEvidence: { ...expressEvidence, anyLayerStaged: Atomics.load(worker, workerCounters.expressHandlerStaged) },
         routeFoldEvidence: { batches: Number(folded >> 32n), events: Number(folded & 0xffff_ffffn) },
