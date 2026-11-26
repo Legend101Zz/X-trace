@@ -1,0 +1,93 @@
+name: honesty-query-measurement-temporary
+on:
+  push:
+    branches: [codex/honesty-query-measurement-78]
+permissions:
+  contents: read
+jobs:
+  compare-aggregates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Prepare private synthetic measurement directories
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP:?}/hq"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/fixture" "$root/diagnostic"
+          echo "XTRACE_HONESTY_QUERY_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Compare exact counters, query plans and paired timings
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_HONESTY_QUERY_ROOT"
+          export CARGO_TARGET_DIR="$root/target"
+          export XTRACE_HONESTY_QUERY_SCRATCH="$root/fixture"
+          example=crates/xtrace-store/examples/frame_honesty_query_measurement.rs
+          test ! -e "$example"
+          mkdir -p "$(dirname "$example")"
+          trap 'rm -f -- "$example"' EXIT
+          cp tools/qa/fixtures/frame_honesty_query_measurement.rs "$example"
+          if ! cargo run --locked -p xtrace-store --example frame_honesty_query_measurement \
+            > "$root/diagnostic/measurement.log" 2> "$root/diagnostic/compile-and-plan.log"; then
+            echo "Frame honesty measurement failed"
+            exit 1
+          fi
+          python3 -B - "$root/diagnostic/measurement.log" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib
+          import re
+          import statistics
+          import sys
+
+          rows = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          assert len(rows) == 11
+          assert rows[0] == "fixtures=verified rows=131072"
+          assert rows[-1] == "measurement=complete"
+          plan = re.fullmatch(r"plan_equal=(true|false)", rows[1])
+          assert plan
+          samples = []
+          for pair, line in enumerate(rows[2:-1], 1):
+              row = re.fullmatch(
+                  rf"pair={pair} baseline_ns=([0-9]{{1,20}}) filter_ns=([0-9]{{1,20}}) "
+                  r"baseline_steps=([0-9]{1,10}) filter_steps=([0-9]{1,10})", line,
+              )
+              assert row
+              samples.append(tuple(map(int, row.groups())))
+          delta_ms = [(baseline - candidate) / 1_000_000 for baseline, candidate, _, _ in samples]
+          vm_counts = {(baseline, candidate) for _, _, baseline, candidate in samples}
+          assert len(vm_counts) == 1
+          baseline_steps, filter_steps = vm_counts.pop()
+          print("SQLite frame honesty synthetic measurement")
+          print("- Exact counters and public legacy absence verified on 131,072 target rows "
+                "and on synthetic edge cases.")
+          print(f"- EXPLAIN QUERY PLAN output equal: {plan[1]}.")
+          print(f"- VM instructions per execution: SUM {baseline_steps}, COUNT FILTER {filter_steps}.")
+          print(f"- Median paired SUM minus COUNT FILTER: {statistics.median(delta_ms):.3f} ms "
+                f"(range {min(delta_ms):.3f}–{max(delta_ms):.3f} ms; eight alternating pairs).")
+          print("- Warm synthetic SQLite scans only. Floor wall time and cardinality tests are unmeasured.")
+          PY
+      - name: Encrypt private compile, timing, and query-plan diagnostics
+        if: always() && env.XTRACE_HONESTY_QUERY_ROOT != ''
+        env:
+          EVIDENCE_CERT: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVOVENDQXAyZ0F3SUJBZ0lVZkxxMVlkSWI5OVZQa1lFSUJwVUw2RVpUL2RVd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0tqRW9NQ1lHQTFVRUF3d2ZXQzEwY21GalpTQndjbWwyWVhSbElIWnBaWGRsY2lCbGRtbGtaVzVqWlRBZQpGdzB5TmpFeE1qVXhOVEV6TWpaYUZ3MHlOakV5TURreE5URXpNalphTUNveEtEQW1CZ05WQkFNTUgxZ3RkSEpoClkyVWdjSEpwZG1GMFpTQjJhV1YzWlhJZ1pYWnBaR1Z1WTJVd2dnR2lNQTBHQ1NxR1NJYjNEUUVCQVFVQUE0SUIKandBd2dnR0tBb0lCZ1FDMkJ3Mi9QdURTZWFQeWNZby9HblhUNjhKMVpVWmhvM285U2dhQ3NjR0UvdXZrRXNyTQo0OUtvcVNKeExaSmdrbUcwODRvUEs1SXhKQVkzd29jcGRBL3dUVW5UYWZTWTc1N0JBZ0dFbGVjQTh1T2lpcHZyCm9XTFloUS9YVUxOaUNaVTUrRHB3OGs5cmxWQ3lNa1FNa2NJNWRkTE1JL0MyTDFzSnExSWx3Ulo3dzBmV3MzVXoKc1hwaUxjb2VJejdGalphV2tPUzdwMHVvREowMkQ0alFaR2p1WUl2a0xwL3c3b3JtdHFYOW5tazhmWDdOK0JXeQowTnpjYlFvV1B5QzlTalYzaUNNMkNDMCtxRzBINDB2Uy9zU2s3c0RhQVVDTFVrTHFCTHduY2tWNGJ4Sk1mdE9BClZ3VUpNUSt1aUhpUUsyNnVCcXovUDNOcFBqRGFZT3BCK1ppZlN2Y0V6TjFQWndLTlM5d2JzZm1WdjlCTjg2UkYKK1VYSzdHdURSUHpKdDkrckc5RHZneHZJWG4ydWxrNXhlYStuRGR5d3k1TGRZSFNMZ1NRekZWWXpCLzVXaXA5VQpSTmdDekRPU01FTXZ4SFBibXpaSzF4QWtlbjZHK1hpbG1MMW9XNmlTU01kOUpTNU1jbXZ3bWN6RmtLU293SWQvCnFydVdVV0VmNUUzck9Gc0NBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmMKVmxpK01COEdBMVVkSXdRWU1CYUFGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmNWbGkrTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dHQkFCa0ZsN3Znc05TN0tMVWp3bDFnSFlKL1BYMDEydnlpCi9VNExVM0g3eHZHZFZBSUpXejIvYjdZaHg0OFh6SWFyb0RoQ1lYNzY5ZStBODM1Si9pQ042cExmeTYyM3R1WU8KWUhVMEZUSFZqdUZ0OFVxRDVYdExpdGVmMHJuN0luam9HWmJvR3lLbXBrTWs3TkgydmFCcDY3SHA3UnV5anBTTQp6UmY3LzNPOFN3U1FxK1RxNENvaVh6OWgwdzBjV3AxRytqRGtBR2pOMXNUeU45amNrM0VnSkpia2trR2lENC9wCkw5eE5WbUFqZmhrRExqc2t0VmZaQ1hNcDVlbVZmWkJqZW9wUHpDS3YwN1NrOERTeWFNcnRFTFJhbU9JMXZUM08KSWkzNTFoaTVuNnpiamVCTUM4dmt4T0pCckxsc2FVUHV6V0M4OEpQQzRCUGk0SXVFanA3eHVFdUlLSTR3YTVuUApZVC81SDAzWUwrajJ2V3pUa2Z3UVUvS0wrMEx3NkIwNVByTC9ZRFY4dXcrU3crK1A4bG5TK2ZsaisxUi9iY0tTClg3NFVnY2g0c0tESXd2clBzemRUZXh4cVBrajlHYXpPbzk4RHRlTys5RUdvWDZKcU9ZWmVCU3VIUndoTGNqNXYKK0c5blVacDc1R1djYmlzYk1udUpIQkVOV3RQVzhFUTZQZz09Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_HONESTY_QUERY_ROOT"
+          printf '%s' "$EVIDENCE_CERT" | base64 -d > "$root/evidence.crt"
+          tar -C "$root" -cf - diagnostic | openssl cms -encrypt -binary -aes-256-cbc \
+            -outform DER -out "$root/honesty-query.enc" "$root/evidence.crt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && env.XTRACE_HONESTY_QUERY_ROOT != ''
+        with:
+          name: encrypted-honesty-query
+          path: ${{ env.XTRACE_HONESTY_QUERY_ROOT }}/honesty-query.enc
+          if-no-files-found: error
+          retention-days: 1
