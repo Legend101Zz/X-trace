@@ -258,7 +258,7 @@ class Process:
             except subprocess.TimeoutExpired:
                 recovery_reasons.append("launcher-wait-deadline")
                 if self.child.poll() is None:
-                    os.killpg(self.child.pid, signal.SIGKILL)
+                    self.child.kill()
                 code = self.child.wait(timeout=max(0, recovery_deadline - time.monotonic()))
 
             # The launcher can exit before its children report exit. Observe all
@@ -272,11 +272,8 @@ class Process:
                 pending.difference_update(ready)
             if pending:
                 recovery_reasons.append("descendant-exit-not-yet-observed")
-                for handle in sorted(pending):
-                    try:
-                        signal.pidfd_send_signal(handle, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                # Descendants can outlive the launcher. Observe their exit
+                # through the existing deadline without signaling them.
                 while pending:
                     timeout = max(0, recovery_deadline - time.monotonic())
                     ready, _, _ = select.select(sorted(pending), [], [], timeout)
@@ -378,11 +375,8 @@ class Proof:
                 try:
                     code = process.wait(timeout=timeout)
                 except BaseException:
-                    # The child is still ours and unreaped at this point. Its command group shares this session.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    if process.poll() is None:
+                        process.kill()
                     process.wait(timeout=5)
                     raise
         if fail and code:

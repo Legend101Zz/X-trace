@@ -38,18 +38,31 @@ class InstalledMedusaEvidence(unittest.TestCase):
     def test_supervisor_reaps_an_adopted_child_in_its_own_session(self):
         # Isolate the subreaper from the unittest worker and its other tests.
         source = """
+import os
 import subprocess
 import sys
 from installed_process import contain_children, verify_children_gone
 contain_children()
-launcher = "import subprocess,sys; subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'], start_new_session=True)"
-subprocess.run([sys.executable, '-B', '-c', launcher], check=True)
+read_end, write_end = os.pipe()
+launcher = (
+    "import subprocess,sys; fd=int(sys.argv[1]); "
+    "subprocess.Popen([sys.executable, '-B', '-c', "
+    "'import os,sys; os.read(int(sys.argv[1]), 1)', sys.argv[1]], "
+    "pass_fds=(fd,), start_new_session=True)"
+)
 try:
+    subprocess.run([sys.executable, "-B", "-c", launcher, str(read_end)],
+                   pass_fds=(read_end,), check=True, timeout=5)
+    try:
+        verify_children_gone()
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("adopted live child did not make cleanup fail")
+finally:
+    os.close(write_end)
+    os.close(read_end)
     verify_children_gone()
-except RuntimeError:
-    verify_children_gone()
-else:
-    raise AssertionError("adopted live child did not make cleanup fail")
 """
         subprocess.run([sys.executable, "-B", "-c", source], check=True, timeout=20, cwd=Path(__file__).parent)
 
