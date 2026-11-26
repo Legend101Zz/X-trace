@@ -378,6 +378,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Format gate (stable rustfmt, no nightly-only keys)
+        run: cargo fmt --all --check
       - name: Install and validate Node protocol workspace
         run: |
           npm ci --prefix adapters/node
@@ -422,8 +424,6 @@ jobs:
           echo "XTRACE_TEST_PRIVATE_IO_ROOT=$root/private-io" >> "$GITHUB_ENV"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
-      - name: Format gate (stable rustfmt, no nightly-only keys)
-        run: cargo fmt --all --check
       - name: Strict clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Reject release CI diagnostic channel
