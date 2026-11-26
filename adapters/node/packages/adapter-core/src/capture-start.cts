@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
+import { captureDiagnostic, type CaptureDiagnostic } from "./capture-diagnostics.cjs";
 import { createHttpCaptureTransport } from "./http-capture.cjs";
 import { effectiveLimitations } from "./manifest.cjs";
 import { asyncContextModule, expressModule, nodeHttpModule } from "./modules.cjs";
@@ -27,7 +28,7 @@ export interface CapturePlan {
 }
 
 /** One place for module detection, registry install and capture profile, shared by the CJS and ESM entries. */
-export function planCapture(): CapturePlan {
+export function planCapture(diagnostic?: CaptureDiagnostic): CapturePlan {
   const environment: InstallEnvironment = { nodeVersion: process.version, packageVersion: "" };
   let transport: HttpCaptureTransport | undefined;
   const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule(), expressModule(undefined, () => transport!)];
@@ -37,7 +38,10 @@ export function planCapture(): CapturePlan {
     install(created) {
       transport = created;
       const registry = new ModuleRegistry();
-      for (const module of modules) registry.tryInstall(module, environment);
+      for (const module of modules) {
+        const status = registry.tryInstall(module, environment);
+        diagnostic?.setExpress(status);
+      }
       // Recordings carry the limitations that really hold: the baseline plus every module that did not install.
       setCaptureProfile({
         limitations: effectiveLimitations(new Set(registry.statuses().filter((status) => status.state === "installed").map((status) => status.name))),
@@ -50,13 +54,14 @@ export function planCapture(): CapturePlan {
 
 export function startCaptureFromRequire(): void {
   if (!claimCaptureStart()) return;
+  const diagnostic = captureDiagnostic();
   const bootstrapPath = process.env.XTRACE_BOOTSTRAP_PATH;
   restoreLauncherEnvironment();
   if (!bootstrapPath) {
     warnUnavailable("XTR-NODE-BOOTSTRAP");
     return;
   }
-  const plan = planCapture();
+  const plan = planCapture(diagnostic);
   const startupBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   let worker: Worker;
   try {
@@ -67,6 +72,7 @@ export function startCaptureFromRequire(): void {
         startupBarrier,
         manifestPath: join(__dirname, "node-capabilities.json"),
         capabilities: plan.planned,
+        diagnosticBuffer: diagnostic?.workerBuffer,
       },
     });
   } catch {
@@ -81,7 +87,7 @@ export function startCaptureFromRequire(): void {
     return;
   }
   try {
-    plan.install(createHttpCaptureTransport(worker));
+    plan.install(createHttpCaptureTransport(worker, diagnostic));
     worker.unref();
   } catch {
     void worker.terminate();

@@ -1,3 +1,4 @@
+import type { CaptureDiagnostic } from "../capture-diagnostics.cjs";
 import type { Worker } from "node:worker_threads";
 import type { CaptureEvent } from "./events.cjs";
 
@@ -5,6 +6,8 @@ export type { CaptureEvent };
 
 const MAX_IN_FLIGHT_MESSAGES = 64;
 const MAX_ACTIVE_RECORDINGS = 64;
+
+export const workerCounters = { startStaged: 0, finishStaged: 1, failed: 2 } as const;
 
 /** What the application thread needs from the worker handoff. */
 export interface HttpCaptureTransport {
@@ -39,7 +42,7 @@ interface RecordingMessage {
 }
 
 /** Keeps app-thread handoff bounded and reserves one terminal slot per admitted request. */
-export function createHttpCaptureTransport(worker: Worker): HttpCaptureTransport {
+export function createHttpCaptureTransport(worker: Worker, diagnostic?: CaptureDiagnostic): HttpCaptureTransport {
   let pending = 0;
   let reservedFinishes = 0;
   let failed = false;
@@ -48,6 +51,7 @@ export function createHttpCaptureTransport(worker: Worker): HttpCaptureTransport
   const fail = () => {
     if (failed) return;
     failed = true;
+    diagnostic?.transportFailed();
     pending = 0;
     reservedFinishes = 0;
     failureCallback?.();
@@ -73,24 +77,39 @@ export function createHttpCaptureTransport(worker: Worker): HttpCaptureTransport
 
   return {
     start(recordingId, method, startedAtNs, holdStart = false) {
-      if (pending + reservedFinishes + 2 > MAX_IN_FLIGHT_MESSAGES || reservedFinishes >= MAX_ACTIVE_RECORDINGS) return false;
+      diagnostic?.increment("startAttempts");
+      if (pending + reservedFinishes + 2 > MAX_IN_FLIGHT_MESSAGES || reservedFinishes >= MAX_ACTIVE_RECORDINGS) {
+        diagnostic?.increment("startCapacityRejected");
+        return false;
+      }
       reservedFinishes += 1;
-      if (post({ type: "start", recordingId, method, startedAtNs, holdStart })) return true;
+      if (post({ type: "start", recordingId, method, startedAtNs, holdStart })) {
+        diagnostic?.increment("startAccepted");
+        return true;
+      }
       reservedFinishes = Math.max(0, reservedFinishes - 1);
+      diagnostic?.increment("startOtherRejected");
       return false;
     },
     event(recordingId, event) {
-      if (pending + reservedFinishes >= MAX_IN_FLIGHT_MESSAGES) return false;
-      return post({ type: "event", recordingId, ...event });
+      const posted = pending + reservedFinishes < MAX_IN_FLIGHT_MESSAGES && post({ type: "event", recordingId, ...event });
+      if (!posted) diagnostic?.increment("eventRejected");
+      return posted;
     },
     route(recordingId, route) {
-      if (pending + reservedFinishes >= MAX_IN_FLIGHT_MESSAGES) return false;
-      return post({ type: "route", recordingId, route });
+      const posted = pending + reservedFinishes < MAX_IN_FLIGHT_MESSAGES && post({ type: "route", recordingId, route });
+      if (!posted) diagnostic?.increment("routeRejected");
+      return posted;
     },
     finish(recordingId, finalSequence, durationNs, droppedEvents, summary) {
-      if (reservedFinishes === 0 || failed) return false;
+      if (reservedFinishes === 0 || failed) {
+        diagnostic?.increment("finishRejected");
+        return false;
+      }
       reservedFinishes -= 1;
-      return post({ type: "finish", recordingId, finalSequence, durationNs, droppedEvents, ...(summary ? { summary } : {}) });
+      const posted = post({ type: "finish", recordingId, finalSequence, durationNs, droppedEvents, ...(summary ? { summary } : {}) });
+      diagnostic?.increment(posted ? "finishPosted" : "finishRejected");
+      return posted;
     },
     onFailure(callback) { failureCallback = callback; },
     close() {
@@ -98,6 +117,7 @@ export function createHttpCaptureTransport(worker: Worker): HttpCaptureTransport
         try {
           worker.ref();
           worker.postMessage({ type: "close" });
+          diagnostic?.closeRequested();
         } catch { fail(); }
       }
     },

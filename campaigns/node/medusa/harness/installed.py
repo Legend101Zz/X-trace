@@ -18,6 +18,7 @@ import time
 import traceback
 from urllib.parse import urlencode
 
+from installed_capture_diagnostic import project_capture_diagnostic
 from installed_evidence import EvidenceError, capture, detail, keys, pages, require, workload
 from installed_process import contain_children, reap_exited_group_children, verify_children_gone
 
@@ -313,6 +314,7 @@ class Proof:
             "lifecycle": {"baseline": {}, "installed": {}},
             "medusaReadinessLogStream": {"baseline": None, "installed": None},
             "reapedAdoptedGroupExits": {"baseline": None, "installed": None},
+            "nodeCaptureDiagnostic": None,
             "perRequestAttribution": "unverified", "concurrentRecordingAttribution": "unverified",
         }
 
@@ -518,6 +520,7 @@ class Proof:
         notes = self.root / name
         notes.mkdir(mode=0o700)
         process, cid, ready_id = None, None, None
+        diagnostic_nonce = None
         self.summary["stages"].update({f"{name}:{stage}": "unreached" for stage in
                                        ("inputs", "database", "startup", "readiness-recording", "workload", "shutdown", "cleanup")})
         self.save()
@@ -564,8 +567,13 @@ class Proof:
                         require(not keys(self.list_cli(), "recordings", "recording_id"))
                     command = [str(self.cli), "run", "--project-dir", str(self.project), "--node-adapter",
                                str(self.pack), "--node-mode", "auto", "--", *command]
+                if name == "installed" and os.environ.get("MEDUSA_CAPTURE_DIAGNOSTIC") == "1":
+                    diagnostic_nonce = secret()
+                    env["XTRACE_MEDUSA_CAPTURE_DIAGNOSTIC"] = diagnostic_nonce
+                    self.summary["nodeCaptureDiagnostic"] = {"status": "unreached"}
                 with self.phase(name, "spawn"):
                     process = Process(notes, command, backend, env, descendants=True)
+                env.pop("XTRACE_MEDUSA_CAPTURE_DIAGNOSTIC", None)
                 with self.phase(name, "await-readiness-log"):
                     # Medusa's pinned development reporter uses Ora, whose success line is on stderr.
                     _, stream = process.ready(medusa_ready_line, remaining(deadline), include_stderr=True)
@@ -624,7 +632,9 @@ class Proof:
                             with self.phase(name, "capture-drain"):
                                 log = process.stderr
                                 require(log.stat().st_size <= 16 * 1024 * 1024)
-                                require(b"XTR-RUN-CAPTURE-INCOMPLETE" not in log.read_bytes())
+                                stderr = log.read_bytes()
+                                self.summary["nodeCaptureDiagnostic"] = project_capture_diagnostic(stderr, diagnostic_nonce)
+                                require(b"XTR-RUN-CAPTURE-INCOMPLETE" not in stderr)
             except Exception:
                 traceback.print_exc()
             try:

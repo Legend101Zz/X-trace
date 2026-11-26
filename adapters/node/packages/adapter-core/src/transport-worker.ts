@@ -1,6 +1,7 @@
 import { parentPort, workerData } from "node:worker_threads";
+import { workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
-import { capabilitySetFor, createRecordingAssembler, type InputMessage } from "./worker-core.js";
+import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
 
 interface StartupData {
   bootstrapPath: string;
@@ -8,16 +9,24 @@ interface StartupData {
   manifestPath: string;
   /** Capabilities of the modules that will install; only these are advertised to the daemon. */
   capabilities?: string[];
+  diagnosticBuffer?: SharedArrayBuffer;
 }
 
 const data = workerData as StartupData;
 const startup = new Int32Array(data.startupBarrier);
+const diagnostic = data.diagnosticBuffer && new Uint32Array(data.diagnosticBuffer);
 let session: AuthenticatedXtpSession | undefined;
 let delivery = Promise.resolve();
 let shuttingDown = false;
 let closingRequested = false;
 
-const assembler = createRecordingAssembler((id, payload, token) => session!.send(id, payload, token));
+const send: SendFn = (id, payload, token) => session!.send(id, payload, token);
+const assembler = createRecordingAssembler(diagnostic ? async (id, payload, token) => {
+  const result = await send(id, payload, token);
+  if (payload.case === "recordingStarted") Atomics.add(diagnostic, workerCounters.startStaged, 1);
+  if (payload.case === "recordingFinished") Atomics.add(diagnostic, workerCounters.finishStaged, 1);
+  return result;
+} : send);
 
 function setStartup(state: 1 | 2): void {
   Atomics.store(startup, 0, state);
@@ -26,6 +35,7 @@ function setStartup(state: 1 | 2): void {
 }
 
 function fail(): void {
+  if (diagnostic) Atomics.store(diagnostic, workerCounters.failed, 1);
   setStartup(2);
   parentPort?.postMessage({ type: "failure" });
   shuttingDown = true;

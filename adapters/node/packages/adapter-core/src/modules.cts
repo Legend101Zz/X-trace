@@ -51,7 +51,7 @@ export function resolveExpressRoute(request: unknown): string {
 }
 
 export function expressModule(
-  resolve: (specifier: string) => string = defaultResolve,
+  resolve: (specifier: string) => string = resolveFromEntry,
   transport?: () => HttpCaptureTransport,
 ): InstrumentationModule {
   return {
@@ -86,7 +86,7 @@ function expressMajor(packageJsonPath: string): number {
   }
 }
 
-function defaultResolve(specifier: string): string {
+export function resolveFromEntry(specifier: string): string {
   // Preloads run before the entry module exists, so `require.main` is unset: the entry script's own
   // directory (argv[1]) is where an application's node_modules is found when cwd is elsewhere.
   const entry = process.argv[1];
