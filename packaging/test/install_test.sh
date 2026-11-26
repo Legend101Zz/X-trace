@@ -2,7 +2,7 @@
 # Install / upgrade / uninstall journey for a built archive, in a throwaway HOME (fresh profile).
 #   packaging/test/install_test.sh dist/<platform>
 # Scratch: $XTRACE_TEST_PRIVATE_SCRATCH (a private 0700 dir) when set, else $TMPDIR; only the self-created, marked work dir is removed.
-# Needs only POSIX sh, tar and sha256sum|shasum. Exits non-zero on the first failed assertion (every check is `cmd && ok || fail`; the final count is
+# Uses POSIX sh, tar, sha256sum|shasum and the repository's Python package verifier. Exits non-zero on the first failed assertion (the final count is
 # asserted so a silently skipped check also fails).
 set -eu
 dist=$(cd "${1:?usage: install_test.sh dist/<platform>}" && pwd)
@@ -37,6 +37,7 @@ pass=0
 ok() { pass=$((pass+1)); echo "ok $pass - $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 sums() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+has_mode() { [ "$(find "$1" -prune -type "$2" -perm "$3" -print)" = "$1" ]; }
 
 sh "$(dirname "$0")/../install.sh" verify-dist "$dist" >/dev/null && ok "release SHA256SUMS verify" || fail "release SHA256SUMS verify"
 mkdir "$work/x1" && tar -xzf "$archive" -C "$work/x1"
@@ -54,6 +55,24 @@ case "$(uname -s)" in Darwin) data="$HOME/Library/Application Support/xtrace" ;;
 [ "$("$prefix/bin/xtrace" --version | head -n 1)" = "xtrace $(cat "$v1/share/xtrace/VERSION")" ] && ok "xtrace --version equals the package version" || fail "xtrace --version equals the package version"
 "$prefix/current/install.sh" verify --prefix "$prefix" >/dev/null && ok "installed payload verifies" || fail "installed payload verifies"
 [ -d "$prefix/current/share/xtrace/packs/java/agent" ] && [ -f "$prefix/current/share/xtrace/packs/node/pack.manifest" ] && ok "java and node packs present" || fail "java and node packs present"
+
+# A private caller may have already unpacked the analyzer as 0700 before invoking the installer.
+private_unpack="$work/private extraction"
+private_prefix="$work/private installation"
+mkdir "$private_unpack"
+(umask 077 && tar --no-same-permissions -xzf "$archive" -C "$private_unpack") || fail "private extraction"
+private_src="$private_unpack/$top"
+private_launcher="$private_src/share/xtrace/analyzers/java/bin/xtrace-java-static"
+has_mode "$private_launcher" f 0700 && ok "private extraction masks the analyzer mode" || fail "private extraction mode"
+(umask 077 && sh "$private_src/install.sh" --prefix "$private_prefix" --data-home "$work/private data") \
+  >"$work/private-install.log" 2>&1 || fail "install under private umask"
+python3 -B "$(dirname "$0")/../verify_package.py" "$private_prefix/current" --repo "$(dirname "$0")/../.." --run-binary \
+  >"$work/private-verify.json" || fail "private installation package verification"
+sh "$private_prefix/current/install.sh" verify --prefix "$private_prefix" >/dev/null &&
+  ok "private installation passes package and installed verification" || fail "private installed verify"
+has_mode "$private_launcher" f 0700 && has_mode "$private_prefix" d 0700 &&
+  has_mode "$private_prefix/install-receipt.json" f 0600 && has_mode "$private_prefix/current/share/xtrace/VERSION" f 0600 &&
+  [ ! -e "$work/private data" ] && ok "unrelated private files keep caller permissions" || fail "private caller permissions"
 
 # --- lifecycle on the installed binary: init, record, stop (the daemon is stopped before any upgrade)
 repo="$work/repo"; mkdir -p "$repo"
@@ -123,6 +142,6 @@ if "$v1/install.sh" --prefix "$data/inner" >/dev/null 2>&1; then fail "prefix in
 [ ! -e "$prefix/bin/xtrace" ] && [ ! -e "$prefix/versions" ] && ok "uninstall removed program files" || fail "uninstall removed program files"
 [ "$(cat "$data/projects/p1/rec-1.xtf")" = r1 ] && ok "uninstall left user data untouched" || fail "uninstall left user data untouched"
 [ -d "$prefix/backups" ] && ok "uninstall kept backups" || fail "uninstall kept backups"
-EXPECTED=29
+EXPECTED=32
 [ "$pass" -eq "$EXPECTED" ] || fail "expected $EXPECTED checks, ran $pass"
 echo "all $pass checks passed"
