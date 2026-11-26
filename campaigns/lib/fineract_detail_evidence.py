@@ -82,6 +82,14 @@ def listed_range(page, row, after, *, api):
     return project, rid, count, first, last
 
 
+class LiveDetails(dict):
+    """Keep first wire replies alongside the ordinary flattened JSON mapping in memory only."""
+
+    def __init__(self):
+        super().__init__()
+        self.first_pages = {}
+
+
 class DetailPages:
     """Track provenance separately from the collection's original verdict."""
 
@@ -260,7 +268,7 @@ def capture(doc, markers, scope, *, api, session_in_detail=True):
             "eventScope": scope if len(events) <= PAGE_LIMIT else "bounded-prefix"}
 
 
-def read_api(api, rid, project, maximum):
+def read_api(api, rid, project, maximum, *, expected_request=None):
     """Read one exact earlier saved detail from the admitted final API sink."""
     try:
         installed_java.private_dir(api)
@@ -299,6 +307,10 @@ def read_api(api, rid, project, maximum):
         checked_events(doc["events"], -1)
     except ValueError:
         return "rejected", None
+    if expected_request is not None:
+        roots = [row.get("symbol") for row in doc["events"] if row.get("kind") == "recording_event_kind:request_update"]
+        if roots != [expected_request]:
+            return "rejected", None
     return state, capture(doc, evidence["markers"], state, api=True, session_in_detail=evidence["sessionInDetail"])
 
 

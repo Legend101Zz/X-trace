@@ -377,6 +377,8 @@ def finalize(root, public):
                    outerDriver=dict(status="passed" if driver_code == 0 else "failed" if type(driver_code) is int else "not-observed"),
                    individualIsolation="not-observed", artifactScope="saved-api-json-only", exportBundle="not-exercised",
                    browser="unreached", tui="unreached", restart="unreached", overhead="unreached")
+    summary["firstSerialOfficeListPartial"] = receipt_diagnostics.office_read_partial(
+        evidence.capture, summary["boundaryDiagnostics"])
     problems = receipt.get("problemClasses") if isinstance(receipt, dict) else None
     summary["seamGapCounts"] = {name: min(1_000_000, sum(value for key, value in problems.items()
                                                         if key in labels and type(value) is int and value >= 0))

@@ -1,8 +1,9 @@
 """Finite diagnostic projections from the installed Fineract campaign, independent of acceptance."""
 import boundary_diagnostics
 import fineract_detail_evidence
+import fineract_phase_evidence
 import installed_sinks
-from campaigns.java.fineract.harness.recording_evidence import EXPECT, required_observations
+from campaigns.java.fineract.harness.recording_evidence import EXPECT, OFFICES, required_observations
 
 
 def bounded(value):
@@ -31,6 +32,41 @@ def boundary_manifest(doc):
             return None
     return manifest if doc.get("boundariesVerified") is (
         bool(observed) and manifest["firstUnverifiedPhase"] is None) else None
+
+
+def office_read_partial(capture, boundary):
+    """Correlate one named, already partial live read with saved evidence after stop."""
+    unavailable = {"selection": "not-observed"}
+    rejected = {"selection": "rejected"}
+    if not boundary or not boundary["phases"]:
+        return unavailable
+    first = boundary["phases"][0]
+    last = first.get("lastComplete")
+    if last is None:
+        return unavailable
+    try:
+        selected = fineract_phase_evidence.read_private(capture / "phase-1-api/office-list-partial.json")
+        if (not isinstance(selected, dict) or set(selected) != {"poll", "project", "recording", "window"}
+                or type(selected["poll"]) is not int or selected["poll"] != first["lastCompletePoll"]
+                or not last["namedMatched"] or not last["assignedPartialRecordings"]
+                or not all(fineract_detail_evidence.uuid_value(selected[key]) for key in ("project", "recording"))):
+            return rejected
+        project, rid = selected["project"], selected["recording"]
+        phase = fineract_phase_evidence.correlate(capture, project, rid)
+        if (not fineract_phase_evidence.valid(phase) or phase["liveState"] != "observed"
+                or phase["livePoll"] != selected["poll"] or phase["live"]["completion"] != "partial"
+                or not fineract_phase_evidence.valid_live_window(selected["window"], phase["live"])):
+            return rejected
+        state, after = fineract_detail_evidence.read_api(
+            capture / "api", rid, project, installed_sinks.MAX_OUTPUT, expected_request="http.request GET " + OFFICES)
+        if after is not None and not fineract_detail_evidence.valid_capture(after, state):
+            return rejected
+        return {"selection": "observed", "phaseEvidence": phase, "liveApi": selected["window"],
+                "afterStopCommandApiRead": state, "afterStopCommandApi": after}
+    except FileNotFoundError:
+        return unavailable
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return rejected
 
 
 def cli_diagnostics(doc):

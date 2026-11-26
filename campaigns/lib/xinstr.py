@@ -323,7 +323,7 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
         failed("list", "page-limit")
 
     listing = listing[:max_recordings]
-    details: dict[str, dict] = {}
+    details = fineract_detail_evidence.LiveDetails() if fineract_phase else {}
     first_detail_gap = ""
     for rec in listing:
         if live_timeout:
@@ -363,6 +363,10 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             if evidence is not None:
                 evidence.add(doc, rid, cursor)
             if first is None:
+                if fineract_phase:
+                    # The response dict and its event array remain unmodified by aggregation.
+                    # Retain one reference per recording, outside the serialized mapping.
+                    details.first_pages[rid] = doc
                 first = {k: v for k, v in doc.items() if k != "events"}
             events.extend(rows)
             if isinstance(doc.get("incompleteEvidence"), list):
