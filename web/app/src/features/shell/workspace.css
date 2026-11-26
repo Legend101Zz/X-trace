@@ -185,6 +185,15 @@
   .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector { grid-area: 2 / 3; cursor: row-resize; }
   .viewer-workspace[data-dock='bottom'] > .workspace-inspector { grid-area: 3 / 3; }
   .viewer-workspace[data-dock='bottom'] > .workspace-inspector > .collapsed-panel { writing-mode: horizontal-tb; align-self: start; }
+  /* The shallow bottom dock has room for one control row above its scrolling facts. */
+  .viewer-workspace[data-dock='bottom'] > .workspace-inspector[data-collapsed='false'] > .evidence-pane:has(> .wide-focus-event) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .viewer-workspace[data-dock='bottom'] .wide-focus-event { align-self: center; }
+  .viewer-workspace[data-dock='bottom'] .inspector-tabs { align-items: center; }
+  .viewer-workspace[data-dock='bottom'] .evidence-content { grid-column: 1 / -1; }
   .viewer-workspace[data-tour-pane='evidence'][data-dock='bottom'] .evidence-pane > .pane-head {
     min-height: 0;
     padding-block: 4px;
@@ -223,6 +232,7 @@
   .steps-and-code .replay-toolbar { padding-inline: 18px; }
   .steps-and-code .event-rail { padding-inline: 18px; }
   .viewer-workspace[data-dock='bottom'] .steps-and-code > .pane > .steps-content { margin-block-end: 18px; }
+  .viewer-workspace[data-dock='bottom'] > .workspace-inspector[data-collapsed='false']:has(.wide-focus-event) { padding-block-start: 18px; }
   .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector::before {
     inset: 50% 0 auto; transform: translateY(-50%);
   }
