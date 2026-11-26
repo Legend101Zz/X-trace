@@ -475,39 +475,54 @@ describe('replay wiring in the app', () => {
     expect(await within(inspector()).findByText('event-5')).toBeInTheDocument();
   });
 
-  it('preserves a frame-less event through Canvas and resets selection on an explicit recording change', async () => {
-    const frameLess = { ...ev(5, null, 'Request boundary', nav({})), frameId: null };
+  it.each([0, 100])('preserves the frame-less Canvas boundary and recording reset with %i extra frames', async (extra) => {
+    const auditSequence = 4 + extra;
+    const boundarySequence = auditSequence + 1;
+    const audit = ev(auditSequence, 'f3', 'Audit.write', events[3].navigation);
+    const frameLess = { ...ev(boundarySequence, null, 'Request boundary', nav({})), frameId: null };
+    const added = Array.from({ length: extra }, (_, index) => ev(index + 4, 'f3', `Frame ${index}`, nav({})));
     responseLinked = { ...linked, items: [...linked.items, { ...linked.items[0], recordingId: recordingB }] };
-    responseDetail = { ...detail, events: [...events, frameLess] };
+    responseDetail = { ...detail, events: [...events.slice(0, 3), ...added, audit, frameLess] };
     await openRecording();
 
+    if (extra) {
+      const views = screen.getByRole('tablist', { name: 'Replay view' });
+      fireEvent.click(within(views).getByRole('tab', { name: 'Map' }));
+      const tree = screen.getByRole('tree');
+      expect(within(tree).queryByRole('treeitem', { name: /Audit\.write/ })).not.toBeInTheDocument();
+      fireEvent.keyDown(tree, { key: 'End' });
+      expect(within(tree).getByRole('treeitem', { selected: true })).toHaveAttribute('data-key', audit.frameId);
+      fireEvent.click(within(views).getByRole('tab', { name: 'Steps' }));
+    }
     fireEvent.click(screen.getByRole('button', { name: /Audit\.write/ }));
     fireEvent.keyDown(window, { altKey: true, key: 'ArrowDown' });
-    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
-    expect(live()).toHaveTextContent('Event 5 selected');
+    expect(within(inspector()).getByText(`event-${boundarySequence}`)).toBeInTheDocument();
+    expect(live()).toHaveTextContent(`Event ${boundarySequence} selected`);
     const toolbar = screen.getByRole('group', { name: 'Replay navigation' });
     fireEvent.click(within(toolbar).getByRole('button', { name: 'Back' }));
-    expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
+    expect(within(inspector()).getByText(`event-${auditSequence}`)).toBeInTheDocument();
     fireEvent.click(within(toolbar).getByRole('button', { name: /^Next$/ }));
-    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    expect(within(inspector()).getByText(`event-${boundarySequence}`)).toBeInTheDocument();
     showEvents();
     fireEvent.click(within(screen.getByRole('tablist', { name: 'Replay view' })).getByRole('tab', { name: 'Map' }));
     expect(screen.queryByRole('treeitem', { selected: true })).not.toBeInTheDocument();
     expect(screen.getByText('Frame ID unavailable for the selected event.')).toBeInTheDocument();
-    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
-    const initialTreeItem = screen.getAllByRole('treeitem')[0];
+    expect(within(inspector()).getByText(`event-${boundarySequence}`)).toBeInTheDocument();
+    const treeItems = screen.getAllByRole('treeitem');
+    if (extra) expect(treeItems.length).toBeLessThan(added.length);
+    const initialTreeItem = treeItems[0];
     initialTreeItem.focus();
     expect(initialTreeItem).toHaveFocus();
     fireEvent.keyDown(initialTreeItem, { altKey: true, key: 'ArrowDown' });
-    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    expect(within(inspector()).getByText(`event-${boundarySequence}`)).toBeInTheDocument();
     expect(screen.queryByRole('treeitem', { selected: true })).not.toBeInTheDocument();
     expect(initialTreeItem).toHaveFocus();
     fireEvent.keyDown(initialTreeItem, { altKey: true, key: 'ArrowUp' });
-    expect(within(inspector()).getByText('event-4')).toBeInTheDocument();
+    expect(within(inspector()).getByText(`event-${auditSequence}`)).toBeInTheDocument();
     const selectedTreeItem = screen.getByRole('treeitem', { selected: true });
     expect(selectedTreeItem).toHaveFocus();
     fireEvent.keyDown(selectedTreeItem, { altKey: true, key: 'ArrowDown' });
-    expect(within(inspector()).getByText('event-5')).toBeInTheDocument();
+    expect(within(inspector()).getByText(`event-${boundarySequence}`)).toBeInTheDocument();
     fireEvent.click(within(screen.getByRole('tablist', { name: 'Replay view' })).getByRole('tab', { name: 'Steps' }));
     expect(screen.getByRole('button', { name: /Request boundary/ })).toHaveAttribute('aria-current', 'true');
 

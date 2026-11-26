@@ -1,0 +1,112 @@
+name: map-tree-window-temporary
+on:
+  push:
+    branches: [codex/map-tree-128]
+permissions:
+  contents: read
+jobs:
+  map-tree-window:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Prepare private evidence and scratch
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/diag"
+          echo "XTRACE_MAP_TREE_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Verify web app and regenerate embedded viewer
+        working-directory: web/app
+        run: |
+          set -euo pipefail
+          umask 077
+          exec > "$XTRACE_MAP_TREE_ROOT/diag/web.log" 2>&1
+          npm ci
+          npm run typecheck
+          npm test
+          node scripts/check-contrast.mjs
+          npm run build
+          npm run embed
+          npm run check:embedded
+          npx --no-install playwright install --with-deps chromium
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: generated-map-tree-viewer
+          path: crates/xtrace-daemon/assets/ui/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Seed the verified 10,000-frame synthetic store with the source-built viewer
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_MAP_TREE_ROOT"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv"
+          export XTRACE_SCALE_FIXTURE_MANIFEST="$root/priv/manifest.json"
+          if ! cargo test --locked -p xtrace-cli --test replay_scale \
+            synthetic_ten_thousand_frames_are_complete_ordered_and_navigable -- --exact \
+            > "$root/diag/fixture.log" 2>&1; then
+            echo "Synthetic replay fixture failed"
+            exit 1
+          fi
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$root/diag/fixture.log"
+      - name: Run one persisted synthetic later-window Map check
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_MAP_TREE_ROOT"
+          if ! node tools/qa/replay_scale_browser.mjs --verify-map-tree-window --one-map-tree-sample \
+            --manifest "$root/priv/manifest.json" --xtrace "$GITHUB_WORKSPACE/target/debug/xtrace" \
+            --source-sha "$GITHUB_SHA" --provenance source-built --later-pages 12 \
+            --out "$root/diag/map-tree.json" > "$root/diag/driver.log" 2>&1; then
+            echo "Persisted synthetic Map journey failed"
+            exit 1
+          fi
+          python3 -B - "$root/diag/map-tree.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          report = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+          assert report["synthetic"] is True and report["conditions"]["verifyMapTreeWindow"] is True
+          assert report["provenance"]["distribution"] == "source-built"
+          assert report["provenance"]["declaredSourceSha"] == os.environ["GITHUB_SHA"]
+          sample, = report["samples"]
+          assert sample["status"] == "exercised"
+          assert {
+              "bounded_later_map_keyboard_end", "bounded_later_map_keyboard_up",
+              "bounded_later_map_keyboard_home",
+          } <= set(sample["actions"])
+          end, = (stage for stage in sample["dom"] if stage["phase"] == "bounded_later_map_end")
+          assert 0 < end["visibleMapTreeRows"] <= end["mapTreeRows"] <= 80
+          print("One source-built persisted synthetic later-window Map journey passed.")
+          print(f"At End, {end['mapTreeRows']} tree rows were mounted and "
+                f"{end['visibleMapTreeRows']} were visible.")
+          PY
+      - name: Encrypt raw browser and build evidence
+        if: always() && env.XTRACE_MAP_TREE_ROOT != ''
+        env:
+          EVIDENCE_CERT: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVOVENDQXAyZ0F3SUJBZ0lVZkxxMVlkSWI5OVZQa1lFSUJwVUw2RVpUL2RVd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0tqRW9NQ1lHQTFVRUF3d2ZXQzEwY21GalpTQndjbWwyWVhSbElIWnBaWGRsY2lCbGRtbGtaVzVqWlRBZQpGdzB5TmpFeE1qVXhOVEV6TWpaYUZ3MHlOakV5TURreE5URXpNalphTUNveEtEQW1CZ05WQkFNTUgxZ3RkSEpoClkyVWdjSEpwZG1GMFpTQjJhV1YzWlhJZ1pYWnBaR1Z1WTJVd2dnR2lNQTBHQ1NxR1NJYjNEUUVCQVFVQUE0SUIKandBd2dnR0tBb0lCZ1FDMkJ3Mi9QdURTZWFQeWNZby9HblhUNjhKMVpVWmhvM285U2dhQ3NjR0UvdXZrRXNyTQo0OUtvcVNKeExaSmdrbUcwODRvUEs1SXhKQVkzd29jcGRBL3dUVW5UYWZTWTc1N0JBZ0dFbGVjQTh1T2lpcHZyCm9XTFloUS9YVUxOaUNaVTUrRHB3OGs5cmxWQ3lNa1FNa2NJNWRkTE1JL0MyTDFzSnExSWx3Ulo3dzBmV3MzVXoKc1hwaUxjb2VJejdGalphV2tPUzdwMHVvREowMkQ0alFaR2p1WUl2a0xwL3c3b3JtdHFYOW5tazhmWDdOK0JXeQowTnpjYlFvV1B5QzlTalYzaUNNMkNDMCtxRzBINDB2Uy9zU2s3c0RhQVVDTFVrTHFCTHduY2tWNGJ4Sk1mdE9BClZ3VUpNUSt1aUhpUUsyNnVCcXovUDNOcFBqRGFZT3BCK1ppZlN2Y0V6TjFQWndLTlM5d2JzZm1WdjlCTjg2UkYKK1VYSzdHdURSUHpKdDkrckc5RHZneHZJWG4ydWxrNXhlYStuRGR5d3k1TGRZSFNMZ1NRekZWWXpCLzVXaXA5VQpSTmdDekRPU01FTXZ4SFBibXpaSzF4QWtlbjZHK1hpbG1MMW9XNmlTU01kOUpTNU1jbXZ3bWN6RmtLU293SWQvCnFydVdVV0VmNUUzck9Gc0NBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmMKVmxpK01COEdBMVVkSXdRWU1CYUFGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmNWbGkrTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dHQkFCa0ZsN3Znc05TN0tMVWp3bDFnSFlKL1BYMDEydnlpCi9VNExVM0g3eHZHZFZBSUpXejIvYjdZaHg0OFh6SWFyb0RoQ1lYNzY5ZStBODM1Si9pQ042cExmeTYyM3R1WU8KWUhVMEZUSFZqdUZ0OFVxRDVYdExpdGVmMHJuN0luam9HWmJvR3lLbXBrTWs3TkgydmFCcDY3SHA3UnV5anBTTQp6UmY3LzNPOFN3U1FxK1RxNENvaVh6OWgwdzBjV3AxRytqRGtBR2pOMXNUeU45amNrM0VnSkpia2trR2lENC9wCkw5eE5WbUFqZmhrRExqc2t0VmZaQ1hNcDVlbVZmWkJqZW9wUHpDS3YwN1NrOERTeWFNcnRFTFJhbU9JMXZUM08KSWkzNTFoaTVuNnpiamVCTUM4dmt4T0pCckxsc2FVUHV6V0M4OEpQQzRCUGk0SXVFanA3eHVFdUlLSTR3YTVuUApZVC81SDAzWUwrajJ2V3pUa2Z3UVUvS0wrMEx3NkIwNVByTC9ZRFY4dXcrU3crK1A4bG5TK2ZsaisxUi9iY0tTClg3NFVnY2g0c0tESXd2clBzemRUZXh4cVBrajlHYXpPbzk4RHRlTys5RUdvWDZKcU9ZWmVCU3VIUndoTGNqNXYKK0c5blVacDc1R1djYmlzYk1udUpIQkVOV3RQVzhFUTZQZz09Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_MAP_TREE_ROOT"
+          printf '%s' "$EVIDENCE_CERT" | base64 -d > "$root/evidence.crt"
+          tar -C "$root" -cf - diag | openssl cms -encrypt -binary -aes-256-cbc \
+            -outform DER -out "$root/map-tree.enc" "$root/evidence.crt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && env.XTRACE_MAP_TREE_ROOT != ''
+        with:
+          name: encrypted-map-tree-evidence
+          path: ${{ env.XTRACE_MAP_TREE_ROOT }}/map-tree.enc
+          if-no-files-found: error
+          retention-days: 1

@@ -29,3 +29,18 @@ div.canvas-view {
   overflow: auto;
   overscroll-behavior: contain;
 }
+
+.canvas-view > .canvas-tree {
+  gap: 0;
+  overflow-anchor: none;
+}
+
+.canvas-tree > [role="treeitem"] { margin-bottom: 2px; }
+
+.canvas-tree > .canvas-tree-spacer {
+  display: block;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  pointer-events: none;
+}
