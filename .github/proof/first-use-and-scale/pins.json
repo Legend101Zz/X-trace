@@ -1,0 +1,31 @@
+{
+  "SOURCE_ASSETS": [
+    15132495226,
+    "assembled-viewer-source-generated-assets",
+    163315,
+    "f7133ebddc35a2c17d490127998ddb4c88e5f264969c2ab048000a8c15421125"
+  ],
+  "SOURCE_COUNTS": [
+    15132395236,
+    "assembled-viewer-source-counts",
+    1826,
+    "caca3bbd779e7af460378f76d06142c567f6abca67d85c9691606c49f9c064ca"
+  ],
+  "SOURCE_VISUALS": [
+    15132495219,
+    "assembled-viewer-source-encrypted-visuals",
+    6971576,
+    "f67b87544ba6e31086b0ae8e9740dd9e2a230fa3d8f377895ad48456875cc31a"
+  ],
+  "benchmarkContract": "c4ee15bf85aa0b24f2991fb9edc6c5f9a029c46f7ad1aab3c8146826acecf877",
+  "benchmarkDriver": "7db2ebed6f519709c247349fd9b683de28db1b16313903face23547c6fefa6a5",
+  "benchmarkPatch": "91c666a39352fb025d980730bfabda25864391f84348de7e76571b00a9fd9eec",
+  "ciphertext": "03acff950a47bf967857b76f50191591d4c0f73f974798a9062d4dfce65b45c4",
+  "generated": "8e51f58197a1a3b612c5c9cc13090b76e0f91817",
+  "generatedTree": "46dc41cbdc96af48efec115b9fbd9413b7f6bc4a",
+  "manifest": "f19427ed32e624e655486378cdcc72fe2db936122011240366df02d632757cc3",
+  "product": "9dbb571123215a07de463a3b7e0fac9853e6e0ed",
+  "sourceRun": 45846737406,
+  "sourceWrapper": "644ccc4122c331199bc2985ba82d78327bb8733d",
+  "tree": "320ccc41a298583d2c58f9dd9a0b53faef499dad"
+}
