@@ -1,0 +1,289 @@
+name: Finite Fineract pairing and installed Jersey ordinary observation
+on:
+  push:
+    branches: [codex/proof-fineract-first-pair-v2-117]
+permissions:
+  contents: read
+jobs:
+  installed-fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PRODUCT: 5a3346770ba77481c18969231965cda45e579270
+      PRODUCT_TREE: 8e40b54cbdc80ad09cb3bee52b8cf969e5885700
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Admit exact source and fresh private package roots
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/xj117"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/logs" "$root/cache" "$root/home" "$root/evidence" "$root/safe"
+          PYTHONPATH=campaigns/lib python3 -B - "$root" <<'PY'
+          from installed_java import private_dir
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[1])
+          for name in ('logs', 'cache', 'home', 'tmp', 'evidence', 'safe'):
+              private_dir(root/name)
+          PY
+          printf '%s\n' "PROOF=$root" "TMPDIR=$root/tmp" "GRADLE_USER_HOME=$root/cache/gradle" "npm_config_cache=$root/cache/npm" "CARGO_HOME=$root/cache/cargo" "RUSTUP_HOME=$(rustup show home)" >> "$GITHUB_ENV"
+      - name: Verify read, recording, progress, outcome and servlet coverage cases
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH=campaigns/java/fineract/jersey-fixture python3 -B -m tools.qa.unittest_run --result "$PROOF/logs/pages.json" \
+            test_pages.PagesTest.test_both_shapes_follow_actual_next_values_and_complete_in_order \
+            test_pages.PagesTest.test_list_identity_cursor_limit_and_continuation \
+            test_pages.PagesTest.test_list_rejects_duplicates_time_order_and_noncanonical_identifiers \
+            test_pages.PagesTest.test_detail_project_recording_cursor_and_evidence_bound_on_every_page \
+            test_pages.PagesTest.test_detail_endpoints_must_match_the_independent_listing_even_at_equal_count \
+            test_pages.PagesTest.test_negative_filter_recording_requires_complete_capture \
+            test_pages.PagesTest.test_detail_order_canonical_sequence_and_total \
+            test_pages.PagesTest.test_detail_next_cursor_must_bind_project_id_recording_id_and_last_sequence \
+            test_progress.ProgressTest.test_source_location_identifies_the_fixture_assertion_without_exception_data \
+            test_progress.ProgressTest.test_cleanup_preserves_primary_failure_and_attributes_ordinary_teardown_failure \
+            test_progress.ProgressTest.test_outcome_mismatch_exports_only_the_fixed_comparison \
+            test_progress.ProgressTest.test_failed_first_leg_preserves_its_failure_and_attempts_the_second \
+            > "$PROOF/logs/pages.stdout" 2> "$PROOF/logs/pages.stderr"
+          (cd adapters/java && ./gradlew --no-daemon --dependency-verification strict :agent-bootstrap:test \
+            --tests dev.xtrace.agent.bootstrap.JerseyBridgeTest \
+            --tests dev.xtrace.agent.bootstrap.SpringMvcBridgeTest.mappedJerseyDispatchThrowUsesStatusAtNormalOuterReturn \
+            --tests dev.xtrace.agent.bootstrap.SpringMvcBridgeTest.normalNullJerseyDispatchKeepsOuterStatusProvisional) > "$PROOF/logs/bridge.stdout" 2> "$PROOF/logs/bridge.stderr"
+          python3 -B - <<'PYGATE'
+          import os, pathlib, xml.etree.ElementTree as ET
+          from tools.qa.unittest_summary import read_result, summarize
+          root = pathlib.Path(os.environ['PROOF'])
+          result = read_result(root/'logs/pages.json')
+          summarize(result)
+          assert result['counts']['testsRun'] == 12 and all(n == 0 for k, n in result['counts'].items() if k != 'testsRun')
+          name = 'dev.xtrace.agent.bootstrap.JerseyBridgeTest'
+          suite = ET.parse(pathlib.Path('adapters/java/agent-bootstrap/build/test-results/test')/f'TEST-{name}.xml').getroot()
+          cases = suite.findall('testcase')
+          assert suite.get('name') == name and len(cases) == 4 and all(c.get('classname') == name for c in cases)
+          assert {c.get('name').removesuffix('()') for c in cases} == {
+              'unreadableDispatcherRaisesFixedCoverageNotice', 'unreadableAsyncStateRaisesFixedCoverageNotice',
+              'knownRedispatchKindsDoNotReportAGetterFailure', 'activeAsyncRequestIsDeliberatelyExcluded'}
+          assert suite.get('tests') == '4' and all(suite.get(k) == '0' for k in ('failures', 'errors', 'skipped'))
+          assert all(c.find(k) is None for c in cases for k in ('failure', 'error', 'skipped'))
+          name = 'dev.xtrace.agent.bootstrap.SpringMvcBridgeTest'
+          suite = ET.parse(pathlib.Path('adapters/java/agent-bootstrap/build/test-results/test')/f'TEST-{name}.xml').getroot()
+          cases = suite.findall('testcase')
+          assert suite.get('name') == name and suite.get('tests') == '2' and len(cases) == 2
+          assert all(suite.get(k) == '0' for k in ('failures', 'errors', 'skipped'))
+          assert all(c.get('classname') == name and all(c.find(k) is None for k in ('failure', 'error', 'skipped')) for c in cases)
+          assert {c.get('name').removesuffix('()') for c in cases} == {
+              'mappedJerseyDispatchThrowUsesStatusAtNormalOuterReturn', 'normalNullJerseyDispatchKeepsOuterStatusProvisional'}
+          print('readAndRecordingTests=8 progressTests=4 bridgeTests=4 jerseyOutcomeTests=2')
+          PYGATE
+      - name: Verify the eleven finite Fineract first-incomplete source cases
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$PROOF/logs/first-pair"
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$root.json" \
+            test_fineract_first_partial_pair \
+            > "$root.stdout" 2> "$root.stderr"
+          python3 -B -m tools.qa.unittest_summary "$root.json"
+          python3 -B - "$root.json" <<'PAIR'
+          import json,sys
+          counts=json.load(open(sys.argv[1]))['counts']
+          if counts['testsRun'] != 11 or any(n for k,n in counts.items() if k != 'testsRun'):
+              raise SystemExit(1)
+          PAIR
+      - name: Build and verify one Linux archive and fresh official installation
+        run: |
+          set -euo pipefail
+          umask 077
+          export XTRACE_DATA_HOME="$PROOF/installer-data"
+          (
+            env HOME="$PROOF/home" python3 -B packaging/build.py --platform linux-x86_64 --out "$PROOF/dist" --work "$PROOF/build"
+            PYTHONPATH=campaigns/lib python3 -B - <<'PY'
+          import hashlib, os, pathlib, subprocess
+          import installed_java
+          root = pathlib.Path(os.environ['PROOF'])
+          repo = pathlib.Path.cwd()
+          installed_java.clean_checkout(repo, os.environ['PRODUCT'])
+          archives = list((root/'dist/linux-x86_64').glob('xtrace-*-linux-x86_64.tar.gz'))
+          assert len(archives) == 1 and archives[0].name == 'xtrace-0.0.1-linux-x86_64.tar.gz'
+          archive = archives[0]
+          with archive.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          subprocess.run(['sh', 'packaging/install.sh', 'verify-dist', str(archive.parent)], check=True)
+          verifier = installed_java.verifier()
+          report = verifier.verify(archive, repo=repo, run=True)
+          assert report['ok'] is True and report['package']['sourceCommit'] == os.environ['PRODUCT']
+          assert report['package']['platform'] == 'linux-x86_64'
+          prefix = root/'installed'
+          assert not prefix.exists()
+          unpacked = verifier.resolve_root(archive, root/'unpacked')
+          subprocess.run(['sh', str(unpacked/'install.sh'), '--prefix', str(prefix), '--data-home', str(root/'installer-data')], check=True)
+          subprocess.run(['sh', str(prefix/'current/install.sh'), 'verify', '--prefix', str(prefix)], check=True)
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write(f'ARCHIVE={archive}\nARCHIVE_SHA={digest}\n')
+          PY
+          ) > "$PROOF/logs/package.stdout" 2> "$PROOF/logs/package.stderr"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Build two pinned ordinary fixture jars from the same application
+        run: |
+          set -euo pipefail
+          umask 077
+          for version in 3.1.11 3.1.10; do
+            target="$PROOF/fixture-$version"
+            cp -R campaigns/java/fineract/jersey-fixture "$target"
+            (cd "$target" && env HOME="$PROOF/home" MAVEN_OPTS="-Duser.home=$PROOF/home" mvn --batch-mode --no-transfer-progress \
+              -Dmaven.repo.local="$PROOF/cache/maven" -Djersey.version="$version" clean package) \
+              > "$PROOF/logs/maven-$version.stdout" 2> "$PROOF/logs/maven-$version.stderr"
+            test -s "$target/target/jersey-observation-1.jar"
+          done
+      - name: Verify native package and observe both ordinary loopback legs
+        id: journey
+        run: |
+          set -euo pipefail
+          umask 077
+          env HOME="$PROOF/home" python3 -B campaigns/java/fineract/jersey-fixture/installed_journey.py \
+            --root "$PROOF/evidence" --prefix "$PROOF/installed" --archive "$ARCHIVE" --archive-sha "$ARCHIVE_SHA" \
+            --source-sha "$PRODUCT" --java "$JAVA_HOME/bin/java" \
+            --supported "$PROOF/fixture-3.1.11/target/jersey-observation-1.jar" \
+            --unsupported "$PROOF/fixture-3.1.10/target/jersey-observation-1.jar" \
+            > "$PROOF/logs/journey.stdout" 2> "$PROOF/logs/journey.stderr"
+      - name: Admit only the bounded report and cross-check its immutable identity
+        id: counts
+        if: ${{ always() && (steps.journey.outcome == 'failure' || steps.journey.outcome == 'success') }}
+        env:
+          JOURNEY_OUTCOME: ${{ steps.journey.outcome }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          from tools.release.private_roots import read_private_json, atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          src = read_private_json(root/'evidence/counts.json', maximum_bytes=4096)
+          assert src['releaseAcceptance'] is False and src['status'] in ('failed', 'passed')
+          assert (src['status'] == 'passed') == (os.environ['JOURNEY_OUTCOME'] == 'success')
+          stages = ('package', 'fixture-identity', 'installed-legs', 'complete')
+          assert src['stage'] in stages and set(src['legs']) <= {'3.1.11', '3.1.10'}
+          phases = ('fixture-setup', 'project-init', 'empty-cli-inventory', 'installed-launch', 'fixture-readiness',
+                    'http-workload', 'recording-shutdown', 'probe-inputs', 'probe-decisions', 'probe-notices',
+                    'viewer-readiness', 'viewer-auth', 'recording-inventory', 'viewer-shutdown',
+                    'recording-judgment', 'complete')
+          versions = {'3.1.11', '3.1.10'}
+          progress = src['legProgress']
+          assert set(progress) == (versions if src['stage'] in ('installed-legs', 'complete') else set())
+          assert set(src['legs']) <= set(progress)
+          assert (src['status'] == 'passed') == (src['stage'] == 'complete') == (set(src['legs']) == versions)
+          fixture = pathlib.Path('campaigns/java/fineract/jersey-fixture')
+          files = {name: fixture/name for name in ('installed_journey.py', 'pages.py', 'observation.py', 'verify_fixture.py')}
+          files['xinstr.py'] = pathlib.Path('campaigns/lib/xinstr.py')
+          for version, current in progress.items():
+              assert set(current) == {'phase', 'responsesVerified', 'differentHttpStatus', 'failureSite',
+                                      'cleanupFailure', 'probeDecisions', 'outcomeMismatch'}
+              phase, responses = current['phase'], current['responsesVerified']
+              assert phase in phases and type(responses) is int
+              if phases.index(phase) < phases.index('http-workload'):
+                  assert responses == 0
+              elif phase == 'http-workload':
+                  assert 0 <= responses < 5
+              else:
+                  assert responses == 5
+              observed = current['probeDecisions']
+              expected = ({'service': 'qualified', 'component': 'qualified', 'invoker': 'qualified'} if version == '3.1.11'
+                          else {'service': 'version-excluded', 'component': 'image-and-version-excluded',
+                                'invoker': 'version-excluded'})
+              assert isinstance(observed, dict) and observed.keys() <= expected.keys()
+              assert all(value in ('qualified', 'version-excluded', 'image-excluded', 'image-and-version-excluded')
+                         for value in observed.values())
+              if phases.index(phase) < phases.index('probe-inputs'):
+                  assert not observed
+              if phases.index(phase) > phases.index('probe-decisions'):
+                  assert observed == expected
+              status = current['differentHttpStatus']
+              if status is not None:
+                  assert phase == 'http-workload' and type(status) is int and 100 <= status <= 599
+                  assert status != (200, 404, 200, 403, 200)[responses]
+              assert current['cleanupFailure'] is None or (
+                  current['cleanupFailure'] == 'recording-shutdown' and phase in ('fixture-readiness', 'http-workload')
+                  or current['cleanupFailure'] == 'viewer-shutdown' and phase in ('viewer-auth', 'recording-inventory'))
+              site = current['failureSite']
+              if version in src['legs']:
+                  assert phase == 'complete' and site is None and current['cleanupFailure'] is None
+              else:
+                  assert phase != 'complete' and isinstance(site, dict) and set(site) == {'file', 'line'}
+                  assert site['file'] in files and type(site['line']) is int
+                  assert 1 <= site['line'] <= len(files[site['file']].read_bytes().splitlines())
+              mismatch = current['outcomeMismatch']
+              comparison_failed = bool(site and site['file'] == 'observation.py' and
+                  files[site['file']].read_text().splitlines()[site['line'] - 1].strip().startswith('raise OutcomeMismatch('))
+              assert comparison_failed == (mismatch is not None)
+              if mismatch is not None:
+                  assert phase == 'recording-judgment' and version not in src['legs']
+                  assert set(mismatch) == {'requestClass', 'expectedKind', 'expectedStatus', 'observedKind', 'observedStatus'}
+                  pairs = {'filter-refusal': ('responded', 403)}
+                  if version == '3.1.11':
+                      pairs.update({'mapped-read': ('responded', 200), 'conversion': ('responded', 404),
+                                    'deferred': ('unobserved', None)})
+                  expected_pair = pairs[mismatch['requestClass']]
+                  assert mismatch['expectedKind'] == expected_pair[0]
+                  assert type(mismatch['expectedStatus']) is type(expected_pair[1]) and mismatch['expectedStatus'] == expected_pair[1]
+                  kind, status = mismatch['observedKind'], mismatch['observedStatus']
+                  assert kind in ('responded', 'exception_propagated', 'client_aborted', 'unobserved', 'unavailable')
+                  assert status is None or status == 'unavailable' or type(status) is int and 100 <= status <= 599
+                  assert (kind, status) != expected_pair
+          base = {'status', 'stage', 'legs', 'releaseAcceptance', 'legProgress'}
+          hashes = {'sourceSha', 'archiveSha256'}
+          assert set(src) in (base, base | hashes)
+          assert src['stage'] == 'package' or hashes <= set(src)
+          if hashes <= set(src):
+              assert src['sourceSha'] == os.environ['PRODUCT'] and src['archiveSha256'] == os.environ['ARCHIVE_SHA']
+          for version, row in src['legs'].items():
+              assert set(row) == {'httpResponses', 'recordings', 'observationNotices', 'comparedEvents',
+                                  'cliListPages', 'apiListPages', 'mappedCliDetailPages', 'mappedApiDetailPages',
+                                  'unqualifiedNotices', 'probeFailureNotices', 'applicationProbeNotices', 'probeDecisions'}
+              assert all(type(n) is int for key, n in row.items() if key != 'probeDecisions')
+              supported = version == '3.1.11'
+              expected_recordings = 4 if supported else 1
+              assert row['httpResponses'] == 5 and row['recordings'] == expected_recordings
+              assert row['observationNotices'] == int(supported) and row['unqualifiedNotices'] == int(not supported)
+              assert row['probeFailureNotices'] == row['applicationProbeNotices'] == 0
+              decisions = ({'service': 'qualified', 'component': 'qualified', 'invoker': 'qualified'} if supported
+                           else {'service': 'version-excluded', 'component': 'image-and-version-excluded',
+                                 'invoker': 'version-excluded'})
+              assert row['probeDecisions'] == decisions == progress[version]['probeDecisions']
+              assert row['cliListPages'] == row['apiListPages'] == expected_recordings
+              pages = row['mappedCliDetailPages']
+              assert pages == row['mappedApiDetailPages'] and (2 <= pages <= 64 if supported else pages == 0)
+              assert 1 <= row['comparedEvents'] <= expected_recordings * 128
+          if src['status'] == 'passed':
+              assert src['stage'] == 'complete' and set(src['legs']) == {'3.1.11', '3.1.10'} and hashes <= set(src)
+          src.update(wrapperSha=os.environ['GITHUB_SHA'], runId=int(os.environ['GITHUB_RUN_ID']), attempt=int(os.environ['GITHUB_RUN_ATTEMPT']))
+          atomic_write_private(root/'safe/counts.json', (json.dumps(src, sort_keys=True)+'\n').encode())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('ready=true\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.counts.outputs.ready == 'true' }}
+        with:
+          name: jersey-ordinary-installed-counts
+          path: ${{ env.PROOF }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 7
