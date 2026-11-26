@@ -56,12 +56,13 @@ jobs:
           export TMPDIR="$root/tmp/t" TMP="$root/tmp/t" TEMP="$root/tmp/t"
           export XTRACE_TEST_PRIVATE_SCRATCH="$root/tmp/p" CARGO_TARGET_DIR="$root/cargo-target"
           if ! cargo test --locked -p xtrace-store --lib --all-features \
-            recording_port::tests::frame_honesty_ > "$root/diag/correctness.log" 2>&1; then
+            frame_honesty_ > "$root/diag/correctness.log" 2>&1; then
             echo "Frame honesty store checks failed"
             exit 1
           fi
-          grep -qx 'test recording_port::tests::frame_honesty_aggregate_counts_signed_masks_unknown_bits_and_empty_recordings ... ok' "$root/diag/correctness.log"
+          grep -qx 'test recording_port::tests::frame_honesty_aggregate_counts_known_and_unknown_bits_and_empty_recordings ... ok' "$root/diag/correctness.log"
           grep -qx 'test recording_port::tests::frame_honesty_counts_are_exact_and_unavailable_for_legacy_frames ... ok' "$root/diag/correctness.log"
+          grep -qx 'test recording_store::tests::frame_honesty_aggregate_preserves_signed_sql_masks ... ok' "$root/diag/correctness.log"
       - name: Compare baseline and candidate on the unchanged focused workload
         run: |
           set -euo pipefail

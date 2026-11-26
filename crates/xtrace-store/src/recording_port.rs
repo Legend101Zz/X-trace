@@ -3759,7 +3759,9 @@ mod tests {
     }
 
     #[test]
-    fn frame_honesty_aggregate_counts_signed_masks_unknown_bits_and_empty_recordings() {
+    fn frame_honesty_aggregate_counts_known_and_unknown_bits_and_empty_recordings() {
+        use xtrace_domain::honesty_flags as flags;
+
         let empty = persist(&[], 4, false);
         assert_eq!(
             window(&empty, 1, None).frame_honesty,
@@ -3769,23 +3771,33 @@ mod tests {
         let persisted = persist(&tree(), 4, true);
         {
             let connection = persisted.store.lock().expect("connection");
-            // Include the sign bit, all unmapped bits, and independently varied
-            // known flags in the actual migrated frame index.
-            for (sequence, mask) in [(2_u64, -1_i64), (3, (1_i64 << 61) | 3)] {
+            // Navigation decodes these masks as u32. Exercise an unknown bit
+            // in that range alongside independently varied known flags.
+            let counted = flags::HAS_GAP
+                | flags::HAS_REDACTED
+                | flags::HAS_TRUNCATED
+                | flags::HAS_UNAVAILABLE
+                | flags::HAS_DROPPED
+                | flags::ORPHAN_PARENT;
+            let unknown_and_known = (1 << 30) | flags::HAS_GAP | flags::HAS_REDACTED;
+            for (sequence, mask) in [(2_u64, counted), (3, unknown_and_known)] {
                 assert_eq!(
                     connection
                         .execute(
                             "UPDATE recording_frame_index SET honesty_flags = ?1 \
                              WHERE recording_seq = ?2",
-                            rusqlite::params![mask, sequence.to_be_bytes().as_slice()],
+                            rusqlite::params![i64::from(mask), sequence.to_be_bytes().as_slice()],
                         )
                         .expect("update indexed flags"),
                     1
                 );
             }
         }
+        let page = window(&persisted, 1, None);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].sequence, "2");
         assert_eq!(
-            window(&persisted, 1, None).frame_honesty,
+            page.frame_honesty,
             Some(xtrace_application::FrameHonestyCounts {
                 gap: 2,
                 redacted: 2,
