@@ -1,0 +1,58 @@
+name: Fineract reduced office observation helper
+on:
+  push:
+    branches: [codex/proof-reduced-office-source-117]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Admit exact diagnostic source and prepare private scratch
+        id: admit
+        env:
+          PRODUCT: 'a2ba7f8228890842721341ceb5856d7bf82919f4'
+          TREE: 'f22276a38d6d8a15ad5a8a2f72a737d5db99de23'
+          BASE: '181ddef7e88dcab9f86021552425b09b25131344'
+          PATCH: '0408eb59589c0bf1e1223490ac4cdd9b1d18f536168e76f04d2a9c1e3a54484a'
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_REPOSITORY" = Legend101Zz/X-trace
+          test "$GITHUB_REF" = refs/heads/codex/proof-reduced-office-source-117
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT"
+          test "$(git diff --name-status "$PRODUCT" HEAD)" = $'A\t.github/workflows/fineract-reduced-office-source.yml'
+          test "$(git ls-tree HEAD -- .github/workflows/fineract-reduced-office-source.yml | cut -d' ' -f1)" = 100644
+          test "$(git show -s --format=%P "$PRODUCT")" = "$BASE"
+          test "$(git rev-parse "$PRODUCT^{tree}")" = "$TREE"
+          test "$(git diff --full-index --binary "$BASE" "$PRODUCT" | sha256sum | cut -d' ' -f1)" = "$PATCH"
+          git checkout --quiet --detach "$PRODUCT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="$RUNNER_TEMP/xfo117"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          printf '%s\n' "PRIVATE_ROOT=$root" "TMPDIR=$root/tmp" "XTRACE_TEST_PRIVATE_SCRATCH=$root/tmp" >> "$GITHUB_ENV"
+      - name: reduced-office-observations (12 source cases)
+        if: ${{ !cancelled() && steps.admit.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          report="$PRIVATE_ROOT/reduced-office-observations.json"
+          rc=0
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$report" test_fineract_office_observation.OfficeObservation.test_single_partial_whole_and_first_wire_have_distinct_scopes test_fineract_office_observation.OfficeObservation.test_complete_ordinary_read_is_an_observation test_fineract_office_observation.OfficeObservation.test_open_recording_remains_open test_fineract_office_observation.OfficeObservation.test_preexisting_and_absent_ids_cannot_supply_the_new_read test_fineract_office_observation.OfficeObservation.test_two_matching_ids_and_an_unresolved_root_are_ambiguous test_fineract_office_observation.OfficeObservation.test_whole_census_includes_response_beyond_first_wire_page test_fineract_office_observation.OfficeObservation.test_mismatched_or_missing_first_page_and_list_range_are_rejected test_fineract_office_observation.OfficeObservation.test_empty_wrong_project_truncated_and_extra_list_pages_rejected test_fineract_office_observation.OfficeObservation.test_final_recovery_join_requires_project_and_identity_without_replacement test_fineract_office_observation.OfficeObservation.test_recovered_match_survives_missing_saved_final_read test_fineract_office_observation.OfficeObservation.test_reduced_workload_uses_only_the_original_authenticated_office_get test_fineract_office_observation.OfficeObservation.test_original_seed_scenario_keeps_its_three_reads_and_assertions >"$PRIVATE_ROOT/reduced-office-observations.stdout" 2>"$PRIVATE_ROOT/reduced-office-observations.stderr" || rc=$?
+          python3 -B - "$report" "$rc" <<'PYCOUNTS'
+          import json,sys
+          from pathlib import Path
+          doc=json.loads(Path(sys.argv[1]).read_bytes())
+          counts=doc['counts']
+          expected=dict(testsRun=12, failures=0, errors=0, skipped=0, expectedFailures=0, unexpectedSuccesses=0)
+          assert counts.keys()==expected.keys() and all(type(value) is int and 0 <= value <= 12 for value in counts.values())
+          print('reduced-office-observations', *(key+'='+str(counts[key]) for key in expected))
+          if counts!=expected or sys.argv[2]!='0' or doc['identities']: raise SystemExit(1)
+          PYCOUNTS
