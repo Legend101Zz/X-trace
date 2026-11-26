@@ -198,6 +198,16 @@ pub struct SelectedCatalogOperation {
     pub conflicted: bool,
 }
 
+/// The exact prior private document selected by an edit. Its digest includes the previous phase.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditPredecessor {
+    /// Immutable lifecycle hash of the original.
+    pub plan_hash: String,
+    /// Digest of the canonical private state at the edit boundary.
+    pub state_digest: String,
+}
+
 /// Immutable private plan material. Editing produces a new identity, never a patch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -206,6 +216,9 @@ pub struct ExercisePlanContent {
     pub schema_version: u8,
     /// Unique plan identity; identical re-created input still needs new approval.
     pub plan_id: String,
+    /// Original plan this explicit edit supersedes. Omitted for independently created plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<EditPredecessor>,
     /// Checked observed operation binding.
     pub binding: ExerciseOperationBinding,
     /// Operator input, body and target.
@@ -237,6 +250,15 @@ pub enum ExercisePhase {
         approved_at: u64,
         /// Explicit per-item consent (required for mutating/unknown items).
         item_ids: Vec<String>,
+    },
+    /// Terminal revocation by an explicit edit. The prior state remains available for audit.
+    Superseded {
+        /// Creation time of the replacement draft.
+        replacement_created_at: u64,
+        /// Exact hash of the separately reviewable replacement.
+        replacement_hash: String,
+        /// Last state of the original before its consent was revoked.
+        previous: Box<ExercisePhase>,
     },
     /// Durably reserved before a future send. Delivery is unknown, never success.
     Consumed {
@@ -295,6 +317,9 @@ pub enum ExerciseError {
     /// Credential-like values must use opaque references.
     #[error("exercise credentials must be opaque credential references")]
     CredentialValue,
+    /// An explicit edit revoked the original permanently.
+    #[error("exercise plan was superseded; inspect the original for its replacement")]
+    Superseded,
     /// One-use reservation already made; retry would risk duplicate delivery.
     #[error("exercise approval was already consumed; delivery remains unknown")]
     AlreadyConsumed,
@@ -315,6 +340,13 @@ pub trait ExercisePlanPort {
     /// Insert without replacing an existing hash. Store values only owner-privately.
     /// A durable adapter checks the trusted clock at publication and before returning success.
     fn insert(&self, plan: &StoredExercisePlan) -> Result<(), ExerciseError>;
+    /// Atomically revoke the exact active predecessor and publish its distinct unapproved draft.
+    /// Share the reservation lock, recheck expiry at commit, and recover one outcome after interruption.
+    fn supersede(
+        &self,
+        predecessor: &StoredExercisePlan,
+        replacement: &StoredExercisePlan,
+    ) -> Result<(), ExerciseError>;
     /// Load one exact project/hash. Missing state must never infer approval.
     fn load(&self, project: ProjectId, hash: &str) -> Result<StoredExercisePlan, ExerciseError>;
     /// Compare-and-swap lifecycle state with a durable write barrier. Under the lock,

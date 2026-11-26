@@ -32,6 +32,17 @@ pub struct PlanArgs {
     pub input: PathBuf,
 }
 
+/// Arguments for an explicit edit, revoking the exact original and creating a new draft.
+#[derive(Clone, Debug, clap::Args)]
+pub struct EditArgs {
+    /// Input for the new draft.
+    #[command(flatten)]
+    pub plan: PlanArgs,
+    /// Exact immutable hash whose consent this edit revokes.
+    #[arg(long = "plan-hash", value_name = "HASH")]
+    pub plan_hash: String,
+}
+
 /// Arguments for `xtrace exercise review`.
 #[derive(Clone, Debug, clap::Args)]
 pub struct ReviewArgs {
@@ -79,6 +90,8 @@ pub struct ShowArgs {
 pub enum ExerciseCommand {
     /// Build a private immutable plan from an actually observed operation.
     Plan(PlanArgs),
+    /// Replace an exact active plan with a new unapproved draft; sends nothing.
+    Edit(EditArgs),
     /// Explicitly review an exact plan; sends nothing.
     Review(ReviewArgs),
     /// Approve an exact reviewed plan; sends nothing.
@@ -103,6 +116,7 @@ fn map_error(error: ExerciseError) -> CliError {
         ExerciseError::UnresolvedInput => ("XTR-EXERCISE-UNRESOLVED", ErrorCategory::Policy),
         ExerciseError::ApprovalRequired => ("XTR-EXERCISE-APPROVAL", ErrorCategory::Policy),
         ExerciseError::CredentialValue => ("XTR-EXERCISE-CREDENTIAL", ErrorCategory::Policy),
+        ExerciseError::Superseded => ("XTR-EXERCISE-SUPERSEDED", ErrorCategory::Conflict),
         ExerciseError::AlreadyConsumed => ("XTR-EXERCISE-CONSUMED", ErrorCategory::Conflict),
     };
     CliError::App(AppError::new(
@@ -186,6 +200,14 @@ pub async fn run(command: ExerciseCommand) -> Result<i32, CliError> {
                 let request = input(&args.input)?;
                 let (service, project) = open(&args.common)?;
                 (service.create(project, request, now()?).map_err(map_error)?, args.common.json)
+            }
+            ExerciseCommand::Edit(args) => {
+                let request = input(&args.plan.input)?;
+                let (service, project) = open(&args.plan.common)?;
+                (
+                    service.edit(project, &args.plan_hash, request, now()?).map_err(map_error)?,
+                    args.plan.common.json,
+                )
             }
             ExerciseCommand::Review(args) => {
                 let (service, project) = open(&args.common)?;

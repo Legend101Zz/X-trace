@@ -2166,3 +2166,151 @@ fn exercise_rejects_surplus_draft_phase_fields_without_replacing_private_bytes()
     assert_eq!(document["phase"]["phase"], "reviewed");
     assert_eq!(document["requests_sent"], 0);
 }
+
+#[test]
+fn exercise_explicit_edit_recovers_each_publication_boundary_and_revokes_old_consent() {
+    use std::net::TcpListener;
+    let fx = project_with_catalog(TRANSCRIPT);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (input, _) = exercise_input(&fx, &format!("http://{}", listener.local_addr().unwrap()));
+    let path = input.to_str().unwrap();
+    let command = |args: &[&str]| {
+        let output = exercise_command(&fx, args);
+        assert!(output.status.success(), "{output:?}");
+        json(&output)
+    };
+    let old = command(&["plan", "--input", path]);
+    let hash = old["plan_hash"].as_str().unwrap();
+    let id = old["plan_id"].as_str().unwrap();
+    let item = old["preview"]["items"][0]["item_id"].as_str().unwrap();
+    command(&["review", "--plan-hash", hash]);
+    let approve = [
+        "approve",
+        "--plan-hash",
+        hash,
+        "--plan-id",
+        id,
+        "--item",
+        item,
+        "--confirm-owned-development-target",
+    ];
+    command(&approve);
+    let directory = fx.database().parent().unwrap().join("exercise-plans");
+    let original = directory.join(format!("{hash}.json"));
+    let previous = fs::read(&original).unwrap();
+    let edit = ["edit", "--plan-hash", hash, "--input", path];
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join("lifecycle.lock"))
+        .unwrap();
+    fs4::FileExt::try_lock(&lock).unwrap();
+    for args in [&edit[..], &approve[..]] {
+        let busy = exercise_command(&fx, args);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&busy.stderr).unwrap()["code"],
+            "XTR-EXERCISE-CONFLICT"
+        );
+    }
+    assert_eq!(fs::read(&original).unwrap(), previous);
+    drop(lock);
+    let next = command(&edit);
+    let next_hash = next["plan_hash"].as_str().unwrap();
+    assert_ne!(next_hash, hash);
+    assert_ne!(next["plan_id"], old["plan_id"]);
+    assert_ne!(next["preview"]["items"][0]["item_id"], item);
+    assert_eq!(next["supersedes"], hash);
+    assert_eq!(next["phase"]["phase"], "draft");
+    let replacement = directory.join(format!("{next_hash}.json"));
+    let archive = directory.join(format!("{next_hash}.predecessor"));
+    let intent = directory.join("edit-intent-v1.json");
+    let scratch = directory.join("edit-scratch-v1.tmp");
+    let terminal = fs::read(&original).unwrap();
+    let draft = fs::read(&replacement).unwrap();
+    assert_eq!(fs::read(&archive).unwrap(), previous);
+    let active = directory.join("edit-active-v1");
+    let prepared = &draft;
+    let write_private = |file: &Path, bytes: &[u8]| {
+        fs::write(file, bytes).unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    // An existing private scratch outside a claimed edit reservation belongs to its owner.
+    write_private(&scratch, b"unrelated");
+    let refused = exercise_command(&fx, &["edit", "--plan-hash", next_hash, "--input", path]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+        "XTR-EXERCISE-STAGING"
+    );
+    assert_eq!(fs::read(&scratch).unwrap(), b"unrelated");
+    fs::remove_file(&scratch).unwrap();
+
+    // The process can die after preparation while the original still owns the active name.
+    fs::remove_file(&original).unwrap();
+    fs::remove_file(&replacement).unwrap();
+    fs::rename(&archive, &original).unwrap();
+    write_private(&active, b"");
+    write_private(&scratch, b"torn initial intent");
+    assert_eq!(command(&["show", "--plan-hash", hash])["phase"]["phase"], "approved");
+    assert!(!active.exists() && !scratch.exists());
+    write_private(&active, b"");
+    write_private(&intent, prepared);
+    assert_eq!(command(&["show", "--plan-hash", hash])["phase"]["phase"], "approved");
+    assert!(!intent.exists() && !replacement.exists());
+    assert_eq!(fs::read(&original).unwrap(), previous);
+
+    // After the commit rename, readers must roll forward through any interrupted copy.
+    fs::rename(&original, &archive).unwrap();
+    for completed in 0..=2 {
+        if completed < 1 && original.exists() {
+            fs::remove_file(&original).unwrap();
+        }
+        if completed < 2 && replacement.exists() {
+            fs::remove_file(&replacement).unwrap();
+        }
+        if completed >= 1 {
+            write_private(&original, &terminal);
+        }
+        if completed == 2 {
+            write_private(&replacement, &draft);
+        }
+        write_private(&active, b"");
+        if completed < 2 {
+            write_private(&intent, prepared);
+            write_private(&scratch, b"interrupted output");
+        }
+        let view = command(&["show", "--plan-hash", hash]);
+        assert_eq!(view["phase"]["phase"], "superseded");
+        assert_eq!(view["phase"]["previous"]["phase"], "approved");
+        assert_eq!(view["phase"]["replacement_hash"], next_hash);
+        assert_eq!(view["ready_for_approval"], false);
+        assert_eq!(view["requests_sent"], 0);
+        assert_eq!(fs::read(&original).unwrap(), terminal);
+        assert_eq!(fs::read(&replacement).unwrap(), draft);
+        assert_eq!(fs::read(&archive).unwrap(), previous);
+        assert!(!intent.exists() && !scratch.exists());
+    }
+    // A conflicting destination prevents recovery and is never replaced or erased.
+    write_private(&active, b"");
+    write_private(&intent, prepared);
+    write_private(&replacement, b"unrelated owner-private data");
+    let refused = exercise_command(&fx, &["show", "--plan-hash", hash]);
+    assert!(!refused.status.success());
+    assert!(intent.exists());
+    assert_eq!(fs::read(&replacement).unwrap(), b"unrelated owner-private data");
+    assert_eq!(fs::read(&archive).unwrap(), previous);
+    fs::remove_file(&replacement).unwrap();
+    assert_eq!(command(&["show", "--plan-hash", next_hash])["phase"]["phase"], "draft");
+    for args in [&edit[..], &approve[..], &["review", "--plan-hash", hash][..]] {
+        let refused = exercise_command(&fx, args);
+        assert!(!refused.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&refused.stderr).unwrap()["code"],
+            "XTR-EXERCISE-SUPERSEDED"
+        );
+    }
+    let further = command(&["edit", "--plan-hash", next_hash, "--input", path]);
+    assert_eq!(further["supersedes"], next_hash);
+    assert_eq!(command(&["show", "--plan-hash", hash])["phase"]["replacement_hash"], next_hash);
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}

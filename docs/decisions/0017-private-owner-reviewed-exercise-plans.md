@@ -45,17 +45,22 @@ classification, never a guarantee. Conflicting handlers produce unknown effect. 
 item consent, including read-only candidates. The review projects this requirement per item and as an aggregate.
 Only a ready, unexpired Reviewed plan reports that approval is currently available.
 
-The CLI creates independent immutable plans. A second creation from modified inputs starts a new draft and cannot
-inherit prior consent. It also leaves the original plan's consent intact. An edit operation that revokes the
-original is still needed for the viewer. Before exposing edits, introduce a durable supersession transition that
-competes with reservation of the original using the same project lock. It must reject an already consumed original
-and recover a single consistent predecessor/successor relationship after interruption. Creating two independent
-files and relying on the viewer to hide the older hash would leave an executable approval. Restoring a sheet or
-reading a plan changes nothing. The lifecycle is:
+The CLI creates independent immutable plans. A second creation leaves existing consent intact. An
+explicit edit names the original hash, validates a replacement from current catalog/recording evidence and
+creates an independently identified draft. The replacement's immutable content includes the original hash and a
+BLAKE3 digest of its exact canonical private state, including prior review and consent. Plans created before this
+field existed retain their original serialized content and hash. Restoring a sheet or showing a plan changes no
+permission. The possible transitions are
 
 ```text
 Draft -> Reviewed -> Approved -> Consumed (delivery unknown)
+Draft, Reviewed or Approved -> Superseded (one independently reviewable replacement draft)
 ```
+
+A consumed or expired original cannot be edited. Supersession permanently revokes every item consent on the
+original. Its private review reports the replacement hash, replacement creation time and prior phase. Retrying the edit on the original
+returns `XTR-EXERCISE-SUPERSEDED` after a committed edit. Show the original to recover the exact successor.
+Neither review nor approval transfers to the replacement.
 
 Review pins the exact hash but may show unresolved inputs. Approval requires review, a second explicit confirmation
 that the exact target is the operator's ordinary local development application, and the exact item ID set. A missing
@@ -107,7 +112,7 @@ a success acknowledgment. A pre-publication failure cleans up only the staging n
 owned open descriptor. A failure with ambiguous publication never removes or rolls back the destination. An
 executor will also need a fresh clock check immediately before making the approved request.
 
-All writers in a project serialize through the lifecycle lock and exclusively create the same owner-private
+Creation, review, approval and reservation serialize through the project lifecycle lock and exclusively create the same owner-private
 `pending-lifecycle.json` in the plans directory. Termination before rename can strand at most one new
 staging file per project, containing at most 262,144 bytes of private input. A subsequent write refuses an
 occupied slot with `XTR-EXERCISE-STAGING`; it never reads the occupant as consent, truncates it, unlinks it,
@@ -117,6 +122,25 @@ owner-private storage to preserve it, check the named destination plan, then rei
 command only if still necessary. Keep unrelated entries and the lifecycle lock in place. Erring on an
 unadmitted filesystem entry also leaves it untouched. The owner controls retention of preserved content.
 
+### Atomic edits and interruption
+
+An edit holds the same project lock, compares the entire predecessor with its originally read state, and
+checks trusted time before the commit rename and after publication. It refuses an occupied regular lifecycle
+staging slot. A separate exclusive empty marker claims the edit scratch and intent names before any private
+input is written. A preexisting scratch or intent outside a reservation is preserved. Every edit payload uses the
+existing 262,144-byte document ceiling.
+
+The synced intent is the replacement draft itself. The commit atomically renames the active original to
+an archive named for the replacement, retaining its exact bytes and removing the live predecessor name.
+An older client cannot use this archived approval. Every new client checks the edit reservation while holding
+the project lock before reading or mutating plans. If the original still owns its name, recovery abandons the
+uncommitted intent. If the archive exists, recovery verifies the original state digest and the replacement hash,
+writes a small terminal receipt at the original hash and renames the intent to the replacement hash. Only then
+does it clear the reservation. A missing or conflicting output inside a committed transaction is handled by
+this fixed recovery protocol. Conflicting bytes are preserved and access fails closed. The descriptor-bound
+scratch file within an active reservation may be discarded after interruption. An expired plan is never rearmed.
+Recovery after the commit can finish naming an already-expired replacement. Approval still checks its own expiry.
+
 ## Reachable CLI
 
 `--project-dir` selects the initialized repository; `--json` requests the private review JSON on stdout. Errors use
@@ -124,6 +148,7 @@ stable `XTR-EXERCISE-*` codes with no rejected input echoed. These commands send
 
 ```text
 xtrace exercise plan --input <owner-private-json-file> --project-dir <project> --json
+xtrace exercise edit --plan-hash <original-hash> --input <owner-private-json-file> --project-dir <project> --json
 xtrace exercise show --plan-hash <hash> --project-dir <project> --json
 xtrace exercise review --plan-hash <hash> --project-dir <project> --json
 xtrace exercise approve --plan-id <id> --plan-hash <hash> --item <item-id> \

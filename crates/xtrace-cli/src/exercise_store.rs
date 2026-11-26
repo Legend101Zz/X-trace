@@ -1,5 +1,7 @@
 //! CLI adapter for owner-private immutable plans and atomic lifecycle updates.
 
+mod edit;
+
 use std::io::Write as _;
 
 use xtrace_application::catalog_discovery::history::CatalogHistoryService;
@@ -52,6 +54,7 @@ impl PrivateExerciseStore {
         self.plans
             .validate_file_binding("lifecycle.lock", &lock, false)
             .map_err(|_| ExerciseError::StorageUnavailable)?;
+        self.recover_edit()?;
         let result = action();
         self.plans
             .validate_file_binding("lifecycle.lock", &lock, false)
@@ -75,8 +78,19 @@ impl PrivateExerciseStore {
             .plans
             .read_bounded_file(&name, MAX_PLAN_DOCUMENT_BYTES)
             .map_err(|_| ExerciseError::StorageUnavailable)?;
-        let plan: StoredExercisePlan =
-            serde_json::from_slice(&bytes).map_err(|_| ExerciseError::StorageUnavailable)?;
+        let plan = match serde_json::from_slice::<StoredExercisePlan>(&bytes) {
+            Ok(plan) => {
+                if matches!(
+                    plan.phase,
+                    xtrace_application::exercise::ExercisePhase::Superseded { .. }
+                ) {
+                    return Err(ExerciseError::StorageUnavailable);
+                }
+                self.check_incoming_edit(&plan)?;
+                plan
+            }
+            Err(_) => self.read_revocation(&bytes)?,
+        };
         if plan.content.binding.project_id != project || plan.plan_hash != hash {
             return Err(ExerciseError::HashMismatch);
         }
@@ -225,6 +239,14 @@ impl ExercisePlanPort for PrivateExerciseStore {
         })
     }
 
+    fn supersede(
+        &self,
+        predecessor: &StoredExercisePlan,
+        replacement: &StoredExercisePlan,
+    ) -> Result<(), ExerciseError> {
+        self.locked(|| self.commit_edit(predecessor, replacement, crate::exercise::trusted_now))
+    }
+
     fn load(&self, project: ProjectId, hash: &str) -> Result<StoredExercisePlan, ExerciseError> {
         self.locked(|| self.read(project, hash))
     }
@@ -244,6 +266,12 @@ impl ExercisePlanPort for PrivateExerciseStore {
                 || expected_revision.checked_add(1) != Some(next.revision)
             {
                 return Err(ExerciseError::Conflict);
+            }
+            if matches!(
+                previous.phase,
+                xtrace_application::exercise::ExercisePhase::Superseded { .. }
+            ) {
+                return Err(ExerciseError::Superseded);
             }
             self.publish(next)
         })
@@ -266,6 +294,7 @@ mod tests {
         StoredExercisePlan {
             content: ExercisePlanContent {
                 schema_version: 1,
+                supersedes: None,
                 plan_id: uuid::Uuid::now_v7().to_string(),
                 binding: ExerciseOperationBinding {
                     project_id: project,
@@ -327,6 +356,103 @@ mod tests {
             project_data_root: root.path().into(),
         });
         (root, store)
+    }
+
+    struct EditClockFixture<'a> {
+        store: &'a PrivateExerciseStore,
+        binding: ExerciseOperationBinding,
+        before: u64,
+        after: u64,
+    }
+
+    impl ExercisePlanPort for EditClockFixture<'_> {
+        fn observed_binding(
+            &self,
+            project: ProjectId,
+            _request: &CreateExercisePlan,
+        ) -> Result<ExerciseOperationBinding, ExerciseError> {
+            self.store.check_project(project)?;
+            Ok(self.binding.clone())
+        }
+
+        fn insert(&self, plan: &StoredExercisePlan) -> Result<(), ExerciseError> {
+            self.store.insert(plan)
+        }
+
+        fn load(
+            &self,
+            project: ProjectId,
+            hash: &str,
+        ) -> Result<StoredExercisePlan, ExerciseError> {
+            self.store.load(project, hash)
+        }
+
+        fn replace(
+            &self,
+            project: ProjectId,
+            hash: &str,
+            revision: u64,
+            next: &StoredExercisePlan,
+        ) -> Result<(), ExerciseError> {
+            self.store.replace(project, hash, revision, next)
+        }
+
+        fn supersede(
+            &self,
+            previous: &StoredExercisePlan,
+            next: &StoredExercisePlan,
+        ) -> Result<(), ExerciseError> {
+            let times = std::cell::Cell::new(self.before);
+            self.store
+                .locked(|| self.store.commit_edit(previous, next, || Ok(times.replace(self.after))))
+        }
+    }
+
+    #[test]
+    fn edit_expiry_on_each_side_of_the_commit_never_acknowledges_or_rearms_consent() {
+        for expire_before_commit in [true, false] {
+            let (_root, store) = private_store();
+            let sample = stored(store.project).content;
+            let now = sample.created_at;
+            let expiry = sample.expires_at;
+            let service = ExercisePlanService::new(EditClockFixture {
+                store: &store,
+                binding: sample.binding,
+                before: if expire_before_commit { expiry } else { now },
+                after: expiry,
+            });
+            let original = service.create(store.project, sample.request.clone(), now).unwrap();
+            service.review(store.project, &original.plan_hash, now).unwrap();
+            let item = review_document(&original, now).unwrap()["preview"]["items"][0]["item_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let approved =
+                service.approve(store.project, &original.plan_hash, &[item], true, now).unwrap();
+            assert_eq!(
+                service.edit(store.project, &original.plan_hash, sample.request, now),
+                Err(ExerciseError::Expired)
+            );
+            let current = service.show(store.project, &original.plan_hash).unwrap();
+            if expire_before_commit {
+                assert_eq!(current, approved);
+            } else {
+                let view = review_document(&current, now).unwrap();
+                assert_eq!(view["phase"]["phase"], "superseded");
+                assert_eq!(
+                    view["phase"]["previous"],
+                    serde_json::to_value(&approved.phase).unwrap()
+                );
+                let replacement = service
+                    .show(store.project, view["phase"]["replacement_hash"].as_str().unwrap())
+                    .unwrap();
+                assert!(matches!(replacement.phase, ExercisePhase::Draft {}));
+                assert_eq!(
+                    service.consume_once(store.project, &original.plan_hash, now),
+                    Err(ExerciseError::Superseded)
+                );
+            }
+        }
     }
 
     #[test]

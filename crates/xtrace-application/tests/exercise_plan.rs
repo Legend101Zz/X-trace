@@ -12,6 +12,7 @@ struct MemoryPort {
     binding: ExerciseOperationBinding,
     plans: Arc<Mutex<BTreeMap<String, StoredExercisePlan>>>,
     consume_barrier: Option<Arc<Barrier>>,
+    race_approval: bool,
 }
 impl ExercisePlanPort for MemoryPort {
     fn observed_binding(
@@ -36,6 +37,24 @@ impl ExercisePlanPort for MemoryPort {
         rows.insert(plan.plan_hash.clone(), plan.clone());
         Ok(())
     }
+    fn supersede(
+        &self,
+        previous: &StoredExercisePlan,
+        next: &StoredExercisePlan,
+    ) -> Result<(), ExerciseError> {
+        let revoked = previous.revoked_by(next)?;
+        if let Some(barrier) = &self.consume_barrier {
+            barrier.wait();
+        }
+        let mut rows = self.plans.lock().unwrap();
+        if rows.get(&previous.plan_hash) != Some(previous) || rows.contains_key(&next.plan_hash) {
+            return Err(ExerciseError::Conflict);
+        }
+        rows.insert(previous.plan_hash.clone(), revoked);
+        rows.insert(next.plan_hash.clone(), next.clone());
+        Ok(())
+    }
+
     fn load(&self, project: ProjectId, hash: &str) -> Result<StoredExercisePlan, ExerciseError> {
         self.plans
             .lock()
@@ -52,7 +71,9 @@ impl ExercisePlanPort for MemoryPort {
         revision: u64,
         next: &StoredExercisePlan,
     ) -> Result<(), ExerciseError> {
-        if matches!(next.phase, ExercisePhase::Consumed { .. }) {
+        if matches!(next.phase, ExercisePhase::Consumed { .. })
+            || (self.race_approval && matches!(next.phase, ExercisePhase::Approved { .. }))
+        {
             if let Some(barrier) = &self.consume_barrier {
                 barrier.wait();
             }
@@ -105,7 +126,10 @@ fn fixture(method: &str) -> (MemoryPort, CreateExercisePlan) {
         body: ExerciseBody::EmptyByOperator {},
         lifetime_seconds: 60,
     };
-    (MemoryPort { binding, plans: Arc::default(), consume_barrier: None }, request)
+    (
+        MemoryPort { binding, plans: Arc::default(), consume_barrier: None, race_approval: false },
+        request,
+    )
 }
 
 fn item_ids(plan: &StoredExercisePlan) -> Vec<String> {
@@ -470,4 +494,110 @@ fn admitted_drafts_have_space_for_exact_approval_at_the_document_limit() {
     let approved = service.approve(project, &max.plan_hash, &item_ids(&max), true, 102).unwrap();
     assert_eq!(serde_json::to_vec(&approved).unwrap().len(), MAX_PLAN_DOCUMENT_BYTES);
     service.consume_once(project, &max.plan_hash, 103).unwrap();
+}
+
+#[test]
+fn explicit_edit_preserves_predecessor_history_and_requires_fresh_item_consent() {
+    let (port, request) = fixture("POST");
+    let project = port.binding.project_id;
+    let service = ExercisePlanService::new(port);
+    let original = service.create(project, request.clone(), 100).unwrap();
+    service.review(project, &original.plan_hash, 101).unwrap();
+    let prior =
+        service.approve(project, &original.plan_hash, &item_ids(&original), true, 102).unwrap();
+    let independent = service.create(project, request.clone(), 102).unwrap();
+    assert_eq!(service.show(project, &original.plan_hash).unwrap(), prior);
+    let mut invalid = request.clone();
+    invalid.lifetime_seconds = 0;
+    assert_eq!(
+        service.edit(project, &original.plan_hash, invalid, 103),
+        Err(ExerciseError::InvalidInput)
+    );
+    assert_eq!(
+        service.edit(project, &original.plan_hash, request.clone(), 160),
+        Err(ExerciseError::Expired)
+    );
+    assert_eq!(service.show(project, &original.plan_hash).unwrap(), prior);
+
+    let next = service.edit(project, &original.plan_hash, request.clone(), 103).unwrap();
+    assert_ne!(original.content.plan_id, next.content.plan_id);
+    assert_ne!(original.plan_hash, next.plan_hash);
+    assert_ne!(item_ids(&original), item_ids(&next));
+    let revoked = service.show(project, &original.plan_hash).unwrap();
+    let view = review_document(&revoked, 104).unwrap();
+    assert_eq!(view["phase"]["phase"], "superseded");
+    assert_eq!(view["phase"]["replacement_hash"], next.plan_hash);
+    assert_eq!(view["phase"]["previous"], serde_json::to_value(&prior.phase).unwrap());
+    assert_eq!(view["ready_for_approval"], false);
+    assert_eq!(view["requests_sent"], 0);
+    assert_eq!(service.review(project, &original.plan_hash, 104), Err(ExerciseError::Superseded));
+    assert_eq!(
+        service.approve(project, &original.plan_hash, &item_ids(&original), true, 104),
+        Err(ExerciseError::Superseded)
+    );
+    assert_eq!(
+        service.consume_once(project, &original.plan_hash, 104),
+        Err(ExerciseError::Superseded)
+    );
+    assert_eq!(
+        service.edit(project, &original.plan_hash, request.clone(), 104),
+        Err(ExerciseError::Superseded)
+    );
+    assert_eq!(service.show(project, &independent.plan_hash).unwrap(), independent);
+    assert_eq!(
+        service.consume_once(project, &next.plan_hash, 104),
+        Err(ExerciseError::ApprovalRequired)
+    );
+    service.review(project, &next.plan_hash, 105).unwrap();
+    assert_eq!(
+        service.approve(project, &next.plan_hash, &item_ids(&original), true, 105),
+        Err(ExerciseError::ApprovalRequired)
+    );
+    service.approve(project, &next.plan_hash, &item_ids(&next), true, 106).unwrap();
+    service.consume_once(project, &next.plan_hash, 107).unwrap();
+    assert_eq!(
+        service.edit(project, &next.plan_hash, request, 108),
+        Err(ExerciseError::AlreadyConsumed)
+    );
+}
+
+#[test]
+fn explicit_edit_races_the_same_original_revision_as_approval_or_reservation() {
+    for reservation in [false, true] {
+        let (mut port, request) = fixture("GET");
+        let project = port.binding.project_id;
+        let setup = ExercisePlanService::new(port.clone());
+        let original = setup.create(project, request.clone(), 100).unwrap();
+        setup.review(project, &original.plan_hash, 101).unwrap();
+        if reservation {
+            setup.approve(project, &original.plan_hash, &item_ids(&original), true, 102).unwrap();
+        }
+        port.race_approval = !reservation;
+        port.consume_barrier = Some(Arc::new(Barrier::new(2)));
+        let service = ExercisePlanService::new(port.clone());
+        let (edit, transition) = std::thread::scope(|scope| {
+            let edit = scope.spawn(|| service.edit(project, &original.plan_hash, request, 103));
+            let transition = if reservation {
+                service.consume_once(project, &original.plan_hash, 103)
+            } else {
+                service.approve(project, &original.plan_hash, &item_ids(&original), true, 103)
+            };
+            (edit.join().unwrap(), transition)
+        });
+        if let Ok(next) = edit {
+            assert_eq!(transition, Err(ExerciseError::Conflict));
+            assert!(
+                matches!(setup.show(project, &original.plan_hash).unwrap().phase, ExercisePhase::Superseded { replacement_hash, .. } if replacement_hash == next.plan_hash)
+            );
+            assert!(matches!(
+                setup.show(project, &next.plan_hash).unwrap().phase,
+                ExercisePhase::Draft {}
+            ));
+            assert_eq!(port.plans.lock().unwrap().len(), 2);
+        } else {
+            assert_eq!(edit, Err(ExerciseError::Conflict));
+            assert_eq!(setup.show(project, &original.plan_hash).unwrap(), transition.unwrap());
+            assert_eq!(port.plans.lock().unwrap().len(), 1);
+        }
+    }
 }

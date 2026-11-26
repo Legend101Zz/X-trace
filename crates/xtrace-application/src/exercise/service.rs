@@ -27,6 +27,33 @@ impl<P: ExercisePlanPort> ExercisePlanService<P> {
         request: CreateExercisePlan,
         now: u64,
     ) -> Result<StoredExercisePlan, ExerciseError> {
+        let plan = self.draft(project, request, None, now)?;
+        self.port.insert(&plan)?;
+        Ok(plan)
+    }
+
+    /// Replace an exact active plan with a separately identified draft. The old consent is terminal.
+    pub fn edit(
+        &self,
+        project: ProjectId,
+        hash: &str,
+        request: CreateExercisePlan,
+        now: u64,
+    ) -> Result<StoredExercisePlan, ExerciseError> {
+        let original = self.show(project, hash)?;
+        original.ensure_editable_at(now)?;
+        let replacement = self.draft(project, request, Some(original.edit_predecessor()?), now)?;
+        self.port.supersede(&original, &replacement)?;
+        Ok(replacement)
+    }
+
+    fn draft(
+        &self,
+        project: ProjectId,
+        request: CreateExercisePlan,
+        supersedes: Option<EditPredecessor>,
+        now: u64,
+    ) -> Result<StoredExercisePlan, ExerciseError> {
         let binding = self.port.observed_binding(project, &request)?;
         if binding.project_id != project
             || binding.selected_catalog.revision_id != request.revision_id
@@ -39,6 +66,7 @@ impl<P: ExercisePlanPort> ExercisePlanService<P> {
         }
         let content = ExercisePlanContent {
             schema_version: 1,
+            supersedes,
             plan_id: uuid::Uuid::now_v7().to_string(),
             expires_at: now
                 .checked_add(request.lifetime_seconds)
@@ -52,7 +80,6 @@ impl<P: ExercisePlanPort> ExercisePlanService<P> {
         let plan =
             StoredExercisePlan { content, plan_hash, revision: 0, phase: ExercisePhase::Draft {} };
         ensure_envelope_capacity(&plan)?;
-        self.port.insert(&plan)?;
         Ok(plan)
     }
 
@@ -86,6 +113,7 @@ impl<P: ExercisePlanPort> ExercisePlanService<P> {
                 self.save(project, hash, revision, &mut plan)?;
             }
             ExercisePhase::Consumed { .. } => return Err(ExerciseError::AlreadyConsumed),
+            ExercisePhase::Superseded { .. } => return Err(ExerciseError::Superseded),
             // A repeated review neither renews expiry nor restores/changes consent.
             ExercisePhase::Reviewed { .. } | ExercisePhase::Approved { .. } => {}
         }
@@ -107,6 +135,7 @@ impl<P: ExercisePlanPort> ExercisePlanService<P> {
         let reviewed_at = match plan.phase {
             ExercisePhase::Reviewed { reviewed_at } => reviewed_at,
             ExercisePhase::Consumed { .. } => return Err(ExerciseError::AlreadyConsumed),
+            ExercisePhase::Superseded { .. } => return Err(ExerciseError::Superseded),
             _ => return Err(ExerciseError::ApprovalRequired),
         };
         if !confirm_owned_development_target {
@@ -151,6 +180,7 @@ impl<P: ExercisePlanPort> ExercisePlanService<P> {
         match plan.phase {
             ExercisePhase::Approved { .. } => {}
             ExercisePhase::Consumed { .. } => return Err(ExerciseError::AlreadyConsumed),
+            ExercisePhase::Superseded { .. } => return Err(ExerciseError::Superseded),
             _ => return Err(ExerciseError::ApprovalRequired),
         }
         check_ready(&plan.content, &synthesize(&plan.content)?)?;
@@ -194,7 +224,7 @@ pub fn review_document(plan: &StoredExercisePlan, now: u64) -> Result<Value, Exe
                 Value::String(xtrace_exercise::canonical::item_uuid(&plan.plan_hash, operation));
         }
     }
-    Ok(json!({
+    let mut document = json!({
         "kind": "exercise_plan_review",
         "plan_hash": plan.plan_hash,
         "plan_id": plan.content.plan_id,
@@ -226,7 +256,11 @@ pub fn review_document(plan: &StoredExercisePlan, now: u64) -> Result<Value, Exe
         "execution_available": false,
         "result": { "status": "unavailable", "reason": "executor_not_implemented" },
         "note": "Read-only is a candidate classification, not a guarantee. Private operator review; do not publish."
-    }))
+    });
+    if let Some(prior) = &plan.content.supersedes {
+        document["supersedes"] = Value::String(prior.plan_hash.clone());
+    }
+    Ok(document)
 }
 
 fn check_hash_syntax(hash: &str) -> Result<(), ExerciseError> {
@@ -237,6 +271,57 @@ fn check_hash_syntax(hash: &str) -> Result<(), ExerciseError> {
 }
 
 impl StoredExercisePlan {
+    fn edit_predecessor(&self) -> Result<EditPredecessor, ExerciseError> {
+        let bytes = serde_json::to_vec(self).map_err(|_| ExerciseError::InvalidInput)?;
+        Ok(EditPredecessor {
+            plan_hash: self.plan_hash.clone(),
+            state_digest: blake3::hash(&bytes).to_hex().to_string(),
+        })
+    }
+
+    /// Check the independent draft and its cryptographic binding to this exact previous state.
+    pub fn revoked_by(&self, successor: &Self) -> Result<Self, ExerciseError> {
+        self.ensure_editable_at(successor.content.created_at)?;
+        if successor.content.supersedes.as_ref() != Some(&self.edit_predecessor()?)
+            || successor.content.binding.project_id != self.content.binding.project_id
+            || successor.content.plan_id == self.content.plan_id
+            || successor.plan_hash == self.plan_hash
+            || !matches!(successor.phase, ExercisePhase::Draft {})
+            || successor.revision != 0
+        {
+            return Err(ExerciseError::HashMismatch);
+        }
+        verify_identity(successor, successor.content.binding.project_id, &successor.plan_hash)?;
+        self.with_revocation(&successor.plan_hash, successor.content.created_at)
+    }
+
+    // Reconstruct terminal state from the preserved active envelope.
+    fn with_revocation(&self, replacement_hash: &str, at: u64) -> Result<Self, ExerciseError> {
+        verify_identity(self, self.content.binding.project_id, &self.plan_hash)?;
+        check_hash_syntax(replacement_hash)?;
+        self.ensure_editable_at(at)?;
+        if replacement_hash == self.plan_hash {
+            return Err(ExerciseError::HashMismatch);
+        }
+        let mut revoked = self.clone();
+        revoked.revision += 1;
+        revoked.phase = ExercisePhase::Superseded {
+            replacement_created_at: at,
+            replacement_hash: replacement_hash.to_owned(),
+            previous: Box::new(self.phase.clone()),
+        };
+        Ok(revoked)
+    }
+
+    /// Refuse to supersede a reserved, superseded, expired or clock-invalid plan.
+    pub fn ensure_editable_at(&self, now: u64) -> Result<(), ExerciseError> {
+        match self.phase {
+            ExercisePhase::Consumed { .. } => Err(ExerciseError::AlreadyConsumed),
+            ExercisePhase::Superseded { .. } => Err(ExerciseError::Superseded),
+            _ => self.ensure_active_at(now),
+        }
+    }
+
     /// Check a trusted clock reading against the last transition and exclusive expiry.
     /// The durable adapter repeats this check around publication under its lock.
     pub fn ensure_active_at(&self, now: u64) -> Result<(), ExerciseError> {
@@ -245,6 +330,7 @@ impl StoredExercisePlan {
             ExercisePhase::Reviewed { reviewed_at } => reviewed_at,
             ExercisePhase::Approved { approved_at, .. } => approved_at,
             ExercisePhase::Consumed { consumed_at } => consumed_at,
+            ExercisePhase::Superseded { replacement_created_at, .. } => replacement_created_at,
         };
         if now < latest || now < self.content.created_at || now >= self.content.expires_at {
             return Err(ExerciseError::Expired);
@@ -302,6 +388,19 @@ fn verify_identity(
                         &plan.content.binding.operation_id.to_string(),
                     )]
                 && check_ready(&plan.content, &synthesize(&plan.content)?).is_ok()
+        }
+        ExercisePhase::Superseded { replacement_created_at, replacement_hash, previous } => {
+            if matches!(
+                **previous,
+                ExercisePhase::Consumed { .. } | ExercisePhase::Superseded { .. }
+            ) || !(1..=3).contains(&plan.revision)
+            {
+                return Err(ExerciseError::HashMismatch);
+            }
+            let mut original = plan.clone();
+            original.phase = *previous.clone();
+            original.revision -= 1;
+            original.with_revocation(replacement_hash, *replacement_created_at)? == *plan
         }
         ExercisePhase::Consumed { consumed_at } => {
             plan.revision == 3 && in_lifetime.contains(consumed_at)
@@ -429,6 +528,10 @@ fn validate(content: &ExercisePlanContent) -> Result<(), ExerciseError> {
         || req.inputs.len() > 64
     {
         return Err(ExerciseError::InvalidInput);
+    }
+    if let Some(predecessor) = &content.supersedes {
+        check_hash_syntax(&predecessor.plan_hash)?;
+        check_hash_syntax(&predecessor.state_digest)?;
     }
     validate_target(&req.target)?;
     let route = &catalog.route_template;
