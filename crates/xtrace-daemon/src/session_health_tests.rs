@@ -29,11 +29,11 @@ pub(crate) struct HealthFixture {
 impl HealthFixture {
     pub(crate) fn new() -> Self {
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH").expect("private scratch");
+        let branch = crate::test_scratch::private_branch("health");
         let root = tempfile::Builder::new()
             .prefix("health-")
             .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(scratch)
+            .tempdir_in(branch.path())
             .expect("private project directory");
         let database = root.path().join("metadata.sqlite3");
         let store = SqliteStore::open(&database, OpenOptions::default()).expect("store");

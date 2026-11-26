@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,15 @@ def sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def _remove_path(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, required=True)
@@ -32,6 +42,8 @@ def main(argv=None):
     ap.add_argument("--tree", type=Path)
     ap.add_argument("--commit")
     ap.add_argument("--source-date-epoch", type=int)
+    ap.add_argument("--emit-dist", type=Path,
+                    help="When reproducible, copy verified build-a/dist/<platform> into this directory.")
     a = ap.parse_args(argv)
     out = a.out.resolve()
     if a.tree:
@@ -42,6 +54,7 @@ def main(argv=None):
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
         epoch = int(subprocess.check_output(["git", "log", "-1", "--format=%ct", commit], cwd=REPO, text=True))
     results = {}
+    plat_dirs = {}
     for name in ("build-a", "build-b"):
         base = out / name
         if base.exists():
@@ -62,6 +75,7 @@ def main(argv=None):
             cmd += ["--platform", a.platform]
         subprocess.run(cmd, check=True)
         (plat,) = [d for d in (base / "dist").iterdir() if d.is_dir()]
+        plat_dirs[name] = plat
         results[name] = {f.name: sha(f) for f in sorted(plat.iterdir()) if f.name != "build-info.json"}
         shutil.rmtree(base / "work", ignore_errors=True)
     a_, b_ = results["build-a"], results["build-b"]
@@ -69,6 +83,14 @@ def main(argv=None):
     report = {"commit": commit, "sourceDateEpoch": epoch, "reproducible": not diff, "differing": diff,
               "buildA": a_, "buildB": b_}
     (out / "repro.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if a.emit_dist is not None:
+        emit_root = a.emit_dist.resolve()
+        src_plat = plat_dirs["build-a"]
+        dst_plat = emit_root / src_plat.name
+        _remove_path(dst_plat)
+        if not diff:
+            emit_root.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src_plat, dst_plat, symlinks=True)
     print(json.dumps({"reproducible": not diff, "differing": diff}))
     return 0 if not diff else 1
 

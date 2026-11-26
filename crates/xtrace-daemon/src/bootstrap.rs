@@ -740,11 +740,8 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_dir(label: &str) -> PathBuf {
-        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-            .map(PathBuf::from)
-            .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
-        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
-        unique_dir_in(&root, label)
+        let branch = crate::test_scratch::private_branch(label);
+        unique_dir_in(branch, label)
     }
 
     // Retain admission and private child creation; report child failures at the fixture call.
@@ -952,12 +949,9 @@ mod tests {
         use std::os::unix::fs::symlink;
         // Distinct sites identify setup admission, child creation, symlink creation and write
         // rejection even on the macOS lane, which withholds assertion messages.
-        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-            .map(PathBuf::from)
-            .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
-        let root = AdmittedPrivateRoot::open(&scratch).expect("symlink test scratch admission");
-        let real_dir = unique_dir_in(&root, "real-parent");
-        let link_dir = unique_dir_in(&root, "link-parent");
+        let root = crate::test_scratch::private_branch("symlink");
+        let real_dir = unique_dir_in(root, "real-parent");
+        let link_dir = unique_dir_in(root, "link-parent");
         let link = link_dir.join("parent-link");
         symlink(&real_dir, &link).expect("create parent symlink");
         let target = link.join("bootstrap.json");

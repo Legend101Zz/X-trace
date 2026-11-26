@@ -2993,3 +2993,40 @@ class MacosWorkflowStructureTests(unittest.TestCase):
     def test_not_covered_marker_comment_is_present(self):
         self.assertIn("# NOT COVERED until broker code exists: other-UID broker negative "
                       "(ADR 0006 addendum 2026-10-10, item 3)", self.text)
+
+
+class ReleaseGateDeduplicationTests(unittest.TestCase):
+    """Ensures `rust-focused` + `rust-workspace` cover all workspace crates exactly once."""
+
+    def test_focused_and_workspace_gates_partition_workspace_without_omission(self) -> None:
+        names = [gate.name for gate in run_gates.GATES]
+        self.assertEqual(tuple(names), ci_floor.EXPECTED_GATE_NAMES)
+        focused_idx = names.index("rust-focused")
+        workspace_idx = names.index("rust-workspace")
+        self.assertEqual(workspace_idx, focused_idx + 1, "rust-workspace must immediately follow rust-focused")
+
+        focused_argv = run_gates.GATES[focused_idx].argv
+        workspace_argv = run_gates.GATES[workspace_idx].argv
+        focused_pkgs = [focused_argv[i + 1] for i, a in enumerate(focused_argv[:-1]) if a == "-p"]
+        excluded_pkgs = [workspace_argv[i + 1] for i, a in enumerate(workspace_argv[:-1]) if a == "--exclude"]
+
+        self.assertEqual(tuple(focused_pkgs), run_gates.FOCUSED_RUST_PACKAGES)
+        self.assertEqual(excluded_pkgs, focused_pkgs, "rust-workspace must exclude only the crates just tested")
+        self.assertEqual(len(set(focused_pkgs)), len(focused_pkgs))
+        for argv in (focused_argv, workspace_argv):
+            self.assertEqual(argv[:3], ("cargo", "test", "--locked"))
+            self.assertIn("--all-features", argv)
+            self.assertIn("--no-fail-fast", argv)
+        self.assertIn("--workspace", workspace_argv)
+
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        cargo_toml = (repo_root / "Cargo.toml").read_text(encoding="utf-8")
+        member_paths = re.findall(r'"(crates/[^"]+)"', cargo_toml)
+        members = set()
+        for rel in member_paths:
+            pkg_toml = (repo_root / rel / "Cargo.toml").read_text(encoding="utf-8")
+            match = re.search(r'(?m)^name\s*=\s*"([^"]+)"', pkg_toml)
+            self.assertIsNotNone(match, rel)
+            members.add(match.group(1))
+        self.assertTrue(set(focused_pkgs).issubset(members), f"unknown focused packages: {set(focused_pkgs) - members}")
+        self.assertGreater(len(members - set(excluded_pkgs)), 0, "rust-workspace must still test remaining crates")

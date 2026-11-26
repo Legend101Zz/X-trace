@@ -46,10 +46,8 @@ jobs:
           rustc --version; cargo --version; node --version; java -version; python3 --version; openssl version
       - name: Packaging tool unit checks
         run: python3 -B -m unittest discover -s tools/supply_chain -p 'test_*.py'
-      - name: Build, then rebuild twice from clean exports and compare (reproducibility)
-        run: python3 packaging/repro_check.py --out "$RUNNER_TEMP/repro" --platform "${{ matrix.platform }}"
-      - name: Build the artifact set
-        run: python3 packaging/build.py --out dist --platform "${{ matrix.platform }}"
+      - name: Build twice from clean exports, compare (reproducibility), and emit verified dist
+        run: python3 packaging/repro_check.py --out "$RUNNER_TEMP/repro" --emit-dist dist --platform "${{ matrix.platform }}"
       - name: Verify checksums and fresh-profile install/upgrade/uninstall
         run: |
           set -eu

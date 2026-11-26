@@ -285,6 +285,11 @@ def _bounded_unconfirmed(records: list[dict[str, Any]]) -> tuple[list[dict[str, 
     return sample, len(records), len(records) > MAX_UNCONFIRMED_SAMPLE
 
 
+# Crates tested in `rust-focused` immediately before `rust-workspace`. Because the floor stops on
+# first gate failure, `rust-workspace` excludes these exact packages so the pair covers every
+# workspace crate once per floor tuple without re-running the heavy `xtrace-store` cardinality suite.
+FOCUSED_RUST_PACKAGES: tuple[str, ...] = ("xtrace-application", "xtrace-store", "xtrace-cli")
+
 GATES: tuple[Gate, ...] = (
     Gate("rust-format", ("cargo", "fmt", "--all", "--check")),
     Gate("rust-clippy", ("cargo", "clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings")),
@@ -302,8 +307,8 @@ GATES: tuple[Gate, ...] = (
     Gate("web-api-drift", ("npm", "run", "check:api", "--prefix", "web/app")),
     Gate("web-embedded-assets", ("npm", "run", "check:embedded", "--prefix", "web/app")),
     Gate("rust-cli-spring-journey", ("cargo", "test", "--locked", "-p", "xtrace-cli", "--test", "java_run_spring", "--", "--test-threads=1")),
-    Gate("rust-focused", ("cargo", "test", "--locked", "-p", "xtrace-application", "-p", "xtrace-store", "-p", "xtrace-cli", "--all-features", "--no-fail-fast")),
-    Gate("rust-workspace", ("cargo", "test", "--locked", "--workspace", "--all-features", "--no-fail-fast")),
+    Gate("rust-focused", ("cargo", "test", "--locked", *(arg for pkg in FOCUSED_RUST_PACKAGES for arg in ("-p", pkg)), "--all-features", "--no-fail-fast")),
+    Gate("rust-workspace", ("cargo", "test", "--locked", "--workspace", *(arg for pkg in FOCUSED_RUST_PACKAGES for arg in ("--exclude", pkg)), "--all-features", "--no-fail-fast")),
     Gate("rust-build", ("cargo", "build", "--locked", "--workspace", "--all-features")),
     Gate("restricted-build", ("cargo", "build", "--locked", "--workspace", "--all-features"), env="restricted"),
     Gate("working-diff-check", ("git", "diff", "--check")),

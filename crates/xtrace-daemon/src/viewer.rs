@@ -2542,16 +2542,11 @@ mod tests {
         use xtrace_protocol::xtf::XtfEventEnvelope;
         use xtrace_store::SegmentCommitRequest;
 
-        let scratch = std::path::PathBuf::from(
-            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
-        );
-        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
-            .expect("admitted private test scratch");
+        let branch = crate::test_scratch::private_branch("viewer-lines");
         let root = tempfile::Builder::new()
             .prefix("viewer-lines-")
             .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .tempdir_in(scratch)
+            .tempdir_in(branch.path())
             .expect("temporary project root");
         let database = root.path().join("metadata.sqlite3");
         let store = SqliteStore::open(&database, OpenOptions::default()).expect("open store");
@@ -2712,16 +2707,11 @@ mod tests {
         use xtrace_protocol::xtf::XtfEventEnvelope;
         use xtrace_store::SegmentCommitRequest;
 
-        let scratch = std::path::PathBuf::from(
-            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
-        );
-        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
-            .expect("admitted private test scratch");
+        let branch = crate::test_scratch::private_branch("viewer-throw");
         let root = tempfile::Builder::new()
             .prefix("viewer-throw-")
             .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .tempdir_in(scratch)
+            .tempdir_in(branch.path())
             .expect("temporary project root");
         let database = root.path().join("metadata.sqlite3");
         let store = SqliteStore::open(&database, OpenOptions::default()).expect("open store");
@@ -2844,16 +2834,11 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_identity_corruption_is_reported_by_the_authenticated_http_handler() {
-        let scratch = std::path::PathBuf::from(
-            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
-        );
-        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
-            .expect("admitted private test scratch");
+        let branch = crate::test_scratch::private_branch("viewer-observed-corruption");
         let project_root = tempfile::Builder::new()
             .prefix("viewer-observed-corruption-")
             .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .tempdir_in(scratch)
+            .tempdir_in(branch.path())
             .expect("temporary project root");
         #[cfg(unix)]
         std::fs::set_permissions(project_root.path(), std::fs::Permissions::from_mode(0o700))

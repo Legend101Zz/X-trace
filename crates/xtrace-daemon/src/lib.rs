@@ -101,6 +101,8 @@ pub mod secret;
 pub mod session;
 #[cfg(test)]
 mod session_health_tests;
+#[cfg(test)]
+mod test_scratch;
 pub mod tls;
 pub mod viewer;
 
