@@ -60,17 +60,24 @@ try {
     const feedback = empty.getByText('Example command copied.');
     await expect(feedback).toBeVisible();
     if (width === 1024) {
-      assert.ok(await feedback.evaluate((label) => {
+      const feedbackPosition = await feedback.evaluate((label) => {
         const range = document.createRange();
         range.selectNodeContents(label);
         const pane = label.closest('#recordings-panel').getBoundingClientRect();
         const lines = [...range.getClientRects()].filter((line) => line.width && line.height);
-        return lines.length > 0 && lines.every((line) => {
+        if (!lines.length) return 'no-lines';
+        for (const line of lines) {
+          if (line.left < pane.left || line.right > pane.right) return 'outside-inline';
+          if (line.top < pane.top || line.bottom > pane.bottom) return 'outside-block';
           const y = line.top + line.height / 2;
-          return line.left >= pane.left && line.right <= pane.right && line.top >= pane.top && line.bottom <= pane.bottom
-            && [line.left + 1, line.right - 1].every((x) => label.contains(document.elementFromPoint(x, y)));
-        });
-      }), 'the Requests drawer contains every line of the copy confirmation');
+          if (![line.left + 1, line.right - 1].every((x) => label.contains(document.elementFromPoint(x, y)))) {
+            return 'covered';
+          }
+        }
+        return 'inside';
+      });
+      if (feedbackPosition !== 'inside') console.error(`First recording drawer feedback: ${feedbackPosition}`);
+      assert.equal(feedbackPosition, 'inside', 'the Requests drawer contains every line of the copy confirmation');
     }
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'xtrace run --project-dir ./your-project --java-agent ./xtrace-java-agent.jar -- java -jar ./your-app.jar');
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
@@ -110,7 +117,9 @@ try {
   assert.equal(external, 0);
   assert.deepEqual(await page.evaluate(() => [localStorage.length, sessionStorage.length]), [0, 0]);
   console.log(recordingId ? 'recorded Spring Help tour passed' : 'first recording and Help tour passed');
-} catch {
+} catch (error) {
+  const location = error?.stack?.match(/first-recording-journey\.mjs:(\d{1,5}):(\d{1,5})/);
+  if (location) console.error(`First recording source location: ${location[1]}:${location[2]}`);
   console.error(`First recording browser journey failed during ${stage}`);
   process.exitCode = 1;
 } finally {

@@ -64,6 +64,13 @@
 .empty.first-recording { box-sizing: border-box; width: 100%; min-width: 0; overflow-wrap: anywhere; }
 .first-recording-command { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
 .first-recording-command code { overflow-wrap: anywhere; }
+/* The intermediate Requests drawer is only 240px wide by default. Keep the
+   command, its result and the tour action together inside its scroll port. */
+@media (min-width: 861px) and (max-width: 1199px) {
+  .workspace-requests > .pane:has(> .first-recording) { overflow-y: auto; }
+  .workspace-requests > .pane:has(> .first-recording) > * { flex-shrink: 0; }
+  .workspace-requests .first-recording { padding: 12px; }
+}
 @media (max-width: 860px) {
   .viewer-tour { inset-block-end: 104px; }
 }
