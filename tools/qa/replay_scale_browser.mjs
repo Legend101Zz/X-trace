@@ -397,6 +397,42 @@ async function measureSample(index, options, manifest, chromium) {
     await navigateBoth('steps', detail.events, 'initial_steps_navigation');
     await switchMode('map', 'initial_map');
     await navigateBoth('map', detail.events, 'initial_map_navigation');
+    if (options['verify-map-tree-window']) {
+      setStage('constrained_map_dock', 'geometry');
+      const splitter = page.getByRole('separator', { name: 'Resize Inspector', exact: true });
+      check(await splitter.getAttribute('aria-orientation') === 'horizontal');
+      const geometry = () => page.evaluate(() => {
+        const host = document.querySelector('#events-panel > .steps-content');
+        const tree = host?.querySelector('.canvas-tree');
+        const drawing = host?.querySelector('.canvas-scroll');
+        if (!host || !tree || !drawing) return null;
+        const hostBox = host.getBoundingClientRect();
+        const viewportTop = hostBox.top + host.clientTop;
+        const viewportBottom = viewportTop + host.clientHeight;
+        const fits = (element) => {
+          const box = element.getBoundingClientRect();
+          // clientHeight is rounded to whole CSS pixels.
+          return element.clientHeight > 0 && box.top >= viewportTop - 1 && box.bottom <= viewportBottom + 1;
+        };
+        return { fit: fits(tree) && fits(drawing), height: host.clientHeight,
+          hostScroll: host.scrollTop, pageScroll: document.scrollingElement?.scrollTop };
+      });
+      const originalGeometry = await geometry();
+      check(originalGeometry?.fit);
+      const originalSize = await splitter.getAttribute('aria-valuenow');
+      await splitter.press('ArrowUp');
+      await splitter.press('ArrowUp');
+      check(await splitter.getAttribute('aria-valuenow') !== originalSize);
+      const constrained = await geometry();
+      check(constrained?.fit && constrained.height < originalGeometry.height);
+      await navigateBoth('map', detail.events, 'constrained_map_dock');
+      const afterNavigation = await geometry();
+      check(afterNavigation?.fit && afterNavigation.hostScroll === constrained.hostScroll
+        && afterNavigation.pageScroll === constrained.pageScroll);
+      await splitter.press('ArrowDown');
+      await splitter.press('ArrowDown');
+      check(await splitter.getAttribute('aria-valuenow') === originalSize);
+    }
     await switchMode('steps', 'initial_steps_return');
 
     for (let later = 1; later <= options['later-pages']; later += 1) {

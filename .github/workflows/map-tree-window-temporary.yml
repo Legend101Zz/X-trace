@@ -85,6 +85,7 @@ jobs:
           assert sample["initial"] is None and report["summary"]["validInitialSamples"] == 0
           assert {
               "initial_steps_and_details_identity_matched",
+              "constrained_map_dock_next", "constrained_map_dock_back",
               "bounded_later_map_keyboard_end", "bounded_later_map_keyboard_up",
               "bounded_later_map_keyboard_home",
           } <= set(sample["actions"])

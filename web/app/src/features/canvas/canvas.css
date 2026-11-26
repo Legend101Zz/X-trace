@@ -44,3 +44,37 @@ div.canvas-view {
   border: 0;
   pointer-events: none;
 }
+
+/* Use the Events scrollport's remaining space after its header and paging
+   controls. A viewport-height Map can extend behind the bottom Inspector. */
+#events-panel > .steps-content:has(> #replay-view-map-panel > .canvas-view) {
+  display: flex;
+  flex-direction: column;
+}
+
+#events-panel #replay-view-map-panel:has(> .canvas-view) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 0 0;
+  min-block-size: 9rem;
+}
+
+#replay-view-map-panel > .canvas-view {
+  height: auto;
+  min-height: 0;
+  max-height: min(640px, 65dvh);
+  flex: 1 1 0;
+  gap: 6px;
+}
+
+#replay-view-map-panel > .canvas-view > :is(.canvas-scroll, .canvas-tree) {
+  min-block-size: var(--tap);
+}
+
+/* Keep the open outcome reachable without assigning the whole Map budget
+   to a long outcome or to its recorded limitations. */
+#events-panel > .steps-content:has(> #replay-view-map-panel > .canvas-view) > .recording-why {
+  max-block-size: min(20%, 5rem);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
