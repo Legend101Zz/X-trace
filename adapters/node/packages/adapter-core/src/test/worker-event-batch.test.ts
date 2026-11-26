@@ -5,9 +5,10 @@ import { MessageChannel, receiveMessageOnPort, type Worker } from "node:worker_t
 import { create, toBinary } from "@bufbuild/protobuf";
 import { blake3 } from "hash-wasm";
 import { AgentEnvelopeSchema, RecordingEventKind, type AgentEnvelope } from "@xtrace/protocol";
-import { createCaptureCredits, createHttpCaptureTransport } from "../runtime/transport.cjs";
+import { createCaptureCredits, createHttpCaptureTransport, returnCaptureCredits } from "../runtime/transport.cjs";
 import { createRecordingAssembler, HOLD_START_MS, type InputMessage, type SendFn } from "../worker-core.js";
 import { createWorkerDelivery } from "../worker-delivery.js";
+import { BoundedSendQueue } from "../send-queue.js";
 import {
   FINISH_PROGRESS_WORDS, noteFinishPreparation, noteFinishProgress, noteFinishWork, readFinishProgress,
   type FinishBoundary, type FinishPreparation, type FinishWork,
@@ -470,3 +471,86 @@ test("finish preparation from a previous dispatch cannot be attached to a new fi
   assert.deepEqual(readFinishProgress(progress),
     { received: 2, dispatched: 2, submitted: 1, written: 0, staged: 0, active: "finish" });
 });
+
+for (const [firstAck, title] of [
+  ["staged", "two admitted finishes write in order and return credit only on their own staged ACK"],
+  ["rejected", "a rejected finish ACK stops an already-admitted second finish and queued close"],
+] as const) {
+  test(title, async () => {
+    const credits = createCaptureCredits();
+    const staged = () => Atomics.load(credits, 0);
+    const sendQueue = new BoundedSendQueue(64);
+    const firstWritten = deferred();
+    const secondWritten = deferred();
+    const firstStage = deferred();
+    const secondStage = deferred();
+    const stopped = deferred();
+    const written: Array<{ recording: string | undefined; credits: number }> = [];
+    const assembler = createRecordingAssembler((_, payload, recording) => sendQueue.enqueue(async () => {
+      if (payload.case !== "recordingFinished") return;
+      written.push({ recording, credits: staged() });
+      if (recording === A) {
+        firstWritten.resolve();
+        await firstStage.promise;
+      } else {
+        secondWritten.resolve();
+        await secondStage.promise;
+      }
+    }));
+    let closed = false;
+    let failed = false;
+    const delivery = createWorkerDelivery(assembler, {
+      staged(count) { returnCaptureCredits(credits, count); },
+      async close() {
+        await sendQueue.drain();
+        closed = true;
+        stopped.resolve();
+      },
+      fail() {
+        failed = true;
+        stopped.resolve();
+      },
+    });
+    const worker = Object.assign(new EventEmitter(), { postMessage: delivery.enqueue, ref() {} });
+    const transport = createHttpCaptureTransport(worker as unknown as Worker, credits);
+
+    for (const recording of [A, B]) {
+      assert.equal(transport.start(recording, "GET", 1n), true);
+      assert.equal(transport.event(recording, {
+        kind: "frame-enter", eventId: `fixture-${recording}`, sequence: 2n, monotonicNs: 2n,
+        parentEventId: "", symbol: "handler", exceptionType: "",
+      }), true);
+    }
+    for (const recording of [A, B]) {
+      assert.equal(transport.finish(recording, 2n, 1n, 0, { outcome: "responded", httpStatus: 200 }), true);
+    }
+    transport.close();
+    const initial = await Promise.race([firstWritten.promise.then(() => true), stopped.promise.then(() => false)]);
+    assert.equal(initial, true);
+    assert.deepEqual(written, [{ recording: A, credits: 4 }]);
+    assert.equal(staged(), 4);
+    assert.equal(closed, false);
+
+    if (firstAck === "rejected") {
+      firstStage.reject(new Error("fixture ACK rejected"));
+      await stopped.promise;
+      assert.deepEqual(written, [{ recording: A, credits: 4 }]);
+      assert.equal(staged(), 4);
+      assert.equal(failed, true);
+      assert.equal(closed, false);
+      return;
+    }
+
+    firstStage.resolve();
+    const next = await Promise.race([secondWritten.promise.then(() => true), stopped.promise.then(() => false)]);
+    assert.equal(next, true);
+    assert.deepEqual(written, [{ recording: A, credits: 4 }, { recording: B, credits: 5 }]);
+    assert.equal(staged(), 5);
+    assert.equal(closed, false);
+    secondStage.resolve();
+    await stopped.promise;
+    assert.equal(staged(), 6);
+    assert.equal(failed, false);
+    assert.equal(closed, true);
+  });
+}
