@@ -1,0 +1,73 @@
+name: Installed Spring exercise atomic edit and fresh item consent
+on:
+  push:
+    branches: [codex/proof-exercise-atomic-installed-121]
+permissions:
+  contents: read
+jobs:
+  installed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    env:
+      PRODUCT: b32ccdd033432ee121933421e19c80814f806c33
+      PRODUCT_TREE: 93a470fa2dfc4675380c1773dedc9942c3fa46c1
+      EDIT_PATCH_SHA256: b1a58451d31ead04e594b9e03d7457e2390a642e7c9771598d18d96204fe1d55
+      INSTALLER_PATCH_SHA256: a645c26919b74e66e4ce3a25ee57415732d8abf9994794f77b2498823a90457b
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PRODUCT }}
+          path: product
+          fetch-depth: 4
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          sparse-checkout: .github/proof/exercise-atomic-installed-121
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.97.1
+      - name: Verify wrapper, helper and product and admit private scratch
+        id: admit
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git -C ../wrapper rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C ../wrapper rev-parse HEAD^)" = "$PRODUCT"
+          helper="$GITHUB_WORKSPACE/wrapper/.github/proof/exercise-atomic-installed-121/installed.py"
+          test "$(sha256sum "$helper" | cut -d' ' -f1)" = '396ccf3a0abdf94121a122561a01381630dd81bc7164c76ab0a044f04857cc74'
+          root="$RUNNER_TEMP/xp121"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/private" "$root/public" "$root/logs"
+      - name: Verify one installed Spring capture, explicit edit, fresh item consent and zero exercise connections
+        run: |
+          set -euo pipefail
+          umask 077
+          helper="$GITHUB_WORKSPACE/wrapper/.github/proof/exercise-atomic-installed-121/installed.py"
+          python3 -B "$helper" > "$RUNNER_TEMP/xp121/logs/outer.stdout" 2> "$RUNNER_TEMP/xp121/logs/outer.stderr"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.admit.outcome == 'success' }}
+        with:
+          name: installed-exercise-atomic-counts
+          path: ${{ runner.temp }}/xp121/public/counts.json
+          if-no-files-found: error
+          retention-days: 7
