@@ -235,7 +235,7 @@ def detail_read_incomplete(detail: dict | None) -> bool:
 
 
 def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int = 400,
-                *, fineract_pair=False) -> dict[str, Any]:
+                *, fineract_pair=False, fineract_phase=False) -> dict[str, Any]:
     """Save observed pages. Success requires a complete listing and every listed detail."""
     out_dir.mkdir(parents=True, exist_ok=True)
     listing: list[dict] = []
@@ -364,7 +364,9 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             d["nextCursor"] = None
         if incomplete_evidence:
             d["incompleteEvidence"] = list(incomplete_evidence)
-        d.setdefault("recordingId", rid)
+        # The first-serial diagnostic retains only an actual wire identity.
+        if not fineract_phase:
+            d.setdefault("recordingId", rid)
         if "sessionContext" in rec:
             d.setdefault("sessionContext", rec["sessionContext"])
         if rec.get("openedAt") is not None:  # kept for time-window attribution of recordings to scenarios
@@ -646,7 +648,8 @@ def burst_accounting(details: dict[str, dict], sent: list[tuple[str | None, str,
 def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list, expectations: dict,
                         before: dict, deadline: float, *, require_complete: bool = False,
                         before_capacity: dict[str, int] | None = None,
-                        optional_roots: tuple[tuple[str, str, int], ...] = (), diagnose: bool = False) -> dict[str, Any]:
+                        optional_roots: tuple[tuple[str, str, int], ...] = (), diagnose: bool = False,
+                        phase_observation: list | None = None) -> dict[str, Any]:
     """Poll observable read state within the caller's remaining scenario budget; no drain sleep."""
     boundary = burst_accounting({}, sent, expectations, before, before_capacity, optional_roots)
     polls, observed, observed_poll, failure = 0, None, None, None
@@ -667,12 +670,17 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
             boundary["diagnostic"] = {"status": status, "polls": polls, "failure": failure,
                                       "snapshot": snapshot, "snapshotPoll": observed_poll,
                                       "lastComplete": complete_snapshot, "lastCompletePoll": last_complete_poll}
+            if phase_observation is not None:
+                # Retain one existing snapshot reference only. Projection and I/O happen
+                # after every workload, timed judgment, stop and final API measurement.
+                phase_observation.append((last_complete, last_complete_poll))
 
     client.deadline = deadline
     try:
         while time.monotonic() < deadline:
             polls += 1
-            api = collect_api(client, out_dir)
+            api = (collect_api(client, out_dir, fineract_phase=True) if phase_observation is not None
+                   else collect_api(client, out_dir))
             # Keep observed counts for diagnosis even when the snapshot cannot verify the boundary.
             if api["ok"] or api["details"] or api.get("recordings"):
                 boundary = burst_accounting(api["details"], sent, expectations, before, before_capacity, optional_roots)
@@ -1122,11 +1130,12 @@ class OrderedCampaign:
     pre_dispatch: frozenset[tuple[str, str]]
     inject_probes: Callable[[str, dict[str, str]], list[dict]]
     judge: Callable[[dict, dict, list[OrderedPhase], list[dict]], tuple[dict, list[dict], set[str], set[str], list[dict]]]
+    fineract_phase: bool = False
 
 
 def capture_ordered_phases(stack: Any, scenarios: list, norm_extra: list, expectations: dict,
                            pre_dispatch: frozenset, out_dir: pathlib.Path, client: ViewerClient | None,
-                           initial: dict | None, deadline: float) -> list[OrderedPhase]:
+                           initial: dict | None, deadline: float, *, phase_observation: list | None = None) -> list[OrderedPhase]:
     """Run the authored order even when accounting cannot verify a phase.
 
     Pre-dispatch denials remain in the application workload. The MVC accounting
@@ -1159,7 +1168,8 @@ def capture_ordered_phases(stack: Any, scenarios: list, norm_extra: list, expect
             scoped = {result["id"]: expectations[result["id"]] for result in results}
             boundary = wait_burst_boundary(client, out_dir / f"phase-{index + 1}-api", sent, scoped, before, deadline,
                                            require_complete=not concurrent, before_capacity=counters,
-                                           optional_roots=tuple(pre_dispatch_roots), diagnose=True)
+                                           optional_roots=tuple(pre_dispatch_roots), diagnose=True,
+                                           phase_observation=phase_observation if index == 0 and not concurrent else None)
         else:
             boundary = burst_accounting({}, sent, {}, before, counters)
             boundary.update(verified=False, verifiedAt=None, readError="prior recording boundary unverified")
@@ -1233,6 +1243,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     phases: list[OrderedPhase] = []
     probes: list[dict] = []
     ordered_request_attempts = 0
+    phase_observation = [] if project == "fineract" and ordered_campaign is not None and ordered_campaign.fineract_phase else None
     initial_diagnostic = {"status": "not-reached", "failure": None}
     try:
         t0 = time.perf_counter()
@@ -1268,7 +1279,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
                     notes["initialBoundaryFailure"] = type(exc).__name__
                 phases = capture_ordered_phases(
                     stack, scenarios, norm_extra, expectations, ordered_campaign.pre_dispatch, out_dir, live_client,
-                    initial_details, time.monotonic() + 60.0)
+                    initial_details, time.monotonic() + 60.0,
+                    phase_observation=phase_observation)
                 results = [result for phase in phases for result in phase.results]
                 sent_log = [(r["id"], q["request"]["method"], q["request"]["path"])
                             for r in results for q in r["requests"]]
@@ -1340,6 +1352,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     else:
         stop = subprocess.run(stop_args, env=env, capture_output=True, text=True, timeout=60)
     notes["stopCommand"] = {"exitCode": stop.returncode, "notImplemented": stop.returncode == 9}
+
 
     api: dict[str, Any] = {"ok": False, "reason": "viewer not started", "recordings": [], "details": {}}
     verdicts: dict[str, Any] = {}
@@ -1454,4 +1467,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
                                   and all(probe["passed"] for probe in probe_verdicts)) else "failed",
         )
     (out_dir / "receipt.json").write_text(json.dumps(receipt, indent=1, sort_keys=True))
+    if phase_observation is not None:
+        import fineract_phase_evidence
+        fineract_phase_evidence.save_deferred(out_dir, phase_observation, stop)
     return receipt

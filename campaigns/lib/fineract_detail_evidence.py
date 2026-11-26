@@ -249,7 +249,9 @@ def capture(doc, markers, scope, *, api, session_in_detail=True):
         positives = sum(counter(drops, key) == "positive" for key in drops)
     gap_status = "malformed" if "malformed" in gap_problems else "missing" if gap_problems else "observed"
     terminal = "observed" if outcome in OUTCOMES or capacity in ("zero", "positive") else "unavailable"
-    return {"markers": markers, "completion": enum_value(doc.get("completion", MISSING), COMPLETIONS),
+    from fineract_phase_evidence import metadata
+    return {"duration": metadata(doc, api=api)["duration"],
+            "markers": markers, "completion": enum_value(doc.get("completion", MISSING), COMPLETIONS),
             "terminal": terminal,
             "outcome": outcome, "capacityDrops": capacity, "sessionRejectedRequests": session,
             "dropBuckets": {"state": drop_state, "positive": positives},
@@ -334,8 +336,9 @@ def valid_capture(value, scope):
             "eventKinds", "gapReasons", "gapState", "eventScope"}
     unknown = ("missing", "unavailable", "malformed", "unrecognized")
     counters = ("zero", "positive", "missing", "unavailable", "malformed")
-    if (not isinstance(value, dict) or set(value) != keys or not valid_markers(value["markers"])
+    if (not isinstance(value, dict) or set(value) not in (keys, keys | {"duration"}) or not valid_markers(value["markers"])
             or value["completion"] not in (*COMPLETIONS, *unknown) or value["outcome"] not in (*OUTCOMES, *unknown)
+            or ("duration" in value and value["duration"] not in ("present", "null", "missing", "malformed"))
             or value["capacityDrops"] not in counters or value["sessionRejectedRequests"] not in counters
             or value["terminal"] != ("observed" if value["outcome"] in OUTCOMES
                                      or value["capacityDrops"] in ("zero", "positive") else "unavailable")
@@ -361,7 +364,11 @@ def valid_capture(value, scope):
 
 
 def public_pair(pair):
-    if not isinstance(pair, dict) or set(pair) != {"cliRead", "apiRead", "cli", "api"}:
+    from fineract_phase_evidence import valid
+    if not isinstance(pair, dict) or set(pair) not in ({"cliRead", "apiRead", "cli", "api"},
+                                                     {"cliRead", "apiRead", "cli", "api", "phaseEvidence"}):
+        return None
+    if "phaseEvidence" in pair and not valid(pair["phaseEvidence"]):
         return None
     cli_state, api_state, cli, api = (pair[key] for key in ("cliRead", "apiRead", "cli", "api"))
     if cli_state in ("rejected", "unavailable"):
@@ -369,6 +376,10 @@ def public_pair(pair):
             return None
     elif cli_state not in ("whole-recording", "one-page") or not valid_capture(cli, cli_state):
         return None
+    if cli is None and "phaseEvidence" in pair:
+        phase = pair["phaseEvidence"]
+        if phase["liveState"] != "unavailable" or phase["stopState"] != "unavailable":
+            return None
     if cli is not None:
         markers = cli["markers"]
         if (cli["eventScope"] == "bounded-prefix" or
@@ -389,4 +400,6 @@ def public_pair(pair):
                 "different-or-bounded-windows" if api is not None else "unavailable"),
             "observationPhases": "earlier-saved-api-later-cli" if api is not None else None,
             "sharedKnownMarkerCategories": categories, "sessionScope": "session-wide",
-            "identityScope": "same-recording-not-client-attribution" if api is not None else "unavailable"}
+            "identityScope": "same-recording-not-client-attribution" if api is not None else "unavailable",
+            "terminalMeaning": "persisted-terminal-metadata-not-adapter-finish",
+            "recoveryMeaning": "not-listed-does-not-exclude-earlier-recovery"}

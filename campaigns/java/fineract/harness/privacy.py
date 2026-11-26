@@ -254,7 +254,7 @@ class PrivacyEvidence:
         complete_api = (isinstance(api, dict) and api.get("ok") is True and type(api.get("incompleteDetails")) is int and api["incompleteDetails"] == 0
                         and "listReadGap" in api and api["listReadGap"] is None and type(api.get("recordings")) is int and api["recordings"] > 0)
         valid_cli = (isinstance(cli, dict) and (cli.get("schema") in ("xtrace-fineract-cli-sinks/1", "xtrace-fineract-cli-sinks/2")
-                     or (cli.get("schema") == "xtrace-fineract-cli-sinks/3"
+                     or (cli.get("schema") in ("xtrace-fineract-cli-sinks/3", "xtrace-fineract-cli-sinks/4")
                          and receipt_diagnostics.cli_diagnostics(cli) is not None))
                      and type(cli.get("recordings")) is int and cli["recordings"] > 0
                      and isinstance(cli.get("commandExits"), list) and bool(cli["commandExits"])

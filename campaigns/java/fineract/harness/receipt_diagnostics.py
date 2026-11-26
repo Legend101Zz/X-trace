@@ -35,9 +35,9 @@ def boundary_manifest(doc):
 
 def cli_diagnostics(doc):
     """Project the first CLI failure only from a consistent bounded collection manifest."""
-    if not isinstance(doc, dict) or doc.get("schema") not in ("xtrace-fineract-cli-sinks/2", "xtrace-fineract-cli-sinks/3"):
+    if not isinstance(doc, dict) or doc.get("schema") not in ("xtrace-fineract-cli-sinks/2", "xtrace-fineract-cli-sinks/3", "xtrace-fineract-cli-sinks/4"):
         return None
-    current = doc["schema"] == "xtrace-fineract-cli-sinks/3"
+    current = doc["schema"] in ("xtrace-fineract-cli-sinks/3", "xtrace-fineract-cli-sinks/4")
     keys = ("listCommands", "detailCommands", "recordings", "completedDetails")
     if any(not bounded(doc.get(key)) for key in keys) or type(doc.get("complete")) is not bool:
         return None
@@ -96,6 +96,10 @@ def cli_diagnostics(doc):
         pair = fineract_detail_evidence.public_pair(doc["firstIncomplete"])
         if pair is None:
             return None
+        if doc["schema"] == "xtrace-fineract-cli-sinks/4":
+            if ("phaseEvidence" not in doc["firstIncomplete"]
+                    or any(side is not None and "duration" not in side for side in (pair["cli"], pair["api"]))):
+                return None
         cli = pair["cli"]
         if cli is not None:
             census = cli["markers"]

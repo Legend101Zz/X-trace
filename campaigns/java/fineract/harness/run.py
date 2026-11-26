@@ -12,6 +12,7 @@ import zipfile
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
 import xcamp  # noqa: E402
+import fineract_phase_evidence  # noqa: E402
 import xinstr  # noqa: E402
 import installed_java  # noqa: E402
 import recording_evidence  # noqa: E402
@@ -299,9 +300,10 @@ def instrumented():
         baseline_fingerprints=fingerprints,
         harness_files=[HERE, pathlib.Path(recording_evidence.__file__), pathlib.Path(installed_java.__file__),
                        pathlib.Path(xinstr.__file__), pathlib.Path(xinstr.boundary_diagnostics.__file__),
+                       pathlib.Path(fineract_phase_evidence.__file__),
                        pathlib.Path(xcamp.__file__)],
         ordered_campaign=xinstr.OrderedCampaign(recording_evidence.PRE_DISPATCH, recording_evidence.inject_probes,
-                                                recording_evidence.judge))
+                                                recording_evidence.judge, fineract_phase=True))
     # Final sink scans are performed after this process closes all capture outputs.
     return 0 if receipt["result"] == "recorded" and all(historic.values()) else 1
 

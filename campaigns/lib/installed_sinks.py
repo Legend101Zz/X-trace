@@ -74,7 +74,7 @@ def collect(root, project, capture, *, env=None):
     source = root / "campaign/java/fineract/src"
     output = root / "sinks/cli"
     output.mkdir(parents=True, mode=0o700, exist_ok=False)
-    status = dict(schema="xtrace-fineract-cli-sinks/3", complete=False, artifactComplete=False,
+    status = dict(schema="xtrace-fineract-cli-sinks/4", complete=False, artifactComplete=False,
                   listCommands=0, detailCommands=0, recordings=0, completedDetails=0, commandExits=[], firstFailure=None)
     env = {**(os.environ if env is None else env), "XTRACE_DATA_HOME": str(root / "data"), "TMPDIR": str(root / "tmp")}
     deadline = time.monotonic() + TOTAL_SECONDS
@@ -179,6 +179,14 @@ def collect(root, project, capture, *, env=None):
             status["firstIncomplete"] = fineract_detail_evidence.first_pair(capture / "api", rid, pages, doc, MAX_OUTPUT)
         except (OSError, ValueError, TypeError, RecursionError):
             status["firstIncomplete"] = fineract_detail_evidence.unavailable_pair("unavailable")
+    if first_incomplete is not None:
+        import fineract_phase_evidence
+        # Identity comes from the already checked CLI page; unavailable identity cannot correlate.
+        rid, pages, _ = first_incomplete
+        if not pages.rejected and fineract_detail_evidence.uuid_value(pages.project) and fineract_detail_evidence.uuid_value(rid):
+            status["firstIncomplete"]["phaseEvidence"] = fineract_phase_evidence.correlate(capture, pages.project, rid)
+        else:
+            status["firstIncomplete"]["phaseEvidence"] = fineract_phase_evidence.correlate(capture, None, None)
     try:
         inventory = admitted.inventory([capture / "api"])
         files = inventory["files"]
