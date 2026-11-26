@@ -10,9 +10,14 @@ from pathlib import Path
 import re
 import resource
 import stat
+import sys
 import subprocess
 import time
 import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from campaigns.java.jhipster.harness import partial_provenance
+from campaigns.lib.detail_pages import bound_page_end
 
 MAX_RECORDINGS = 100
 MAX_PAGES = 40
@@ -61,32 +66,40 @@ def capture_evidence(doc, marker_key):
             "completion": completion if completion in COMPLETION_STATES else None}
 
 
-def paired_api_evidence(api, rid):
+def paired_api_detail(api, rid):
     """Read only the earlier saved detail for the matching CLI identity."""
     path = api / f"recording-{rid}.json"
     try:
         if any(parent.is_symlink() for parent in (api, *api.parents)):
-            return "rejected", None
+            return "rejected", None, None
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_OUTPUT:
-                return "rejected", None
+                return "rejected", None, None
             payload = stream.read(MAX_OUTPUT + 1)
             if len(payload) > MAX_OUTPUT:
-                return "rejected", None
+                return "rejected", None, None
             doc = json.loads(payload)
     except FileNotFoundError:
-        return "missing", None
+        return "missing", None, None
     except (OSError, ValueError, RecursionError):
-        return "rejected", None
+        return "rejected", None, None
     if not isinstance(doc, dict) or doc.get("recordingId") != rid or not isinstance(doc.get("events"), list):
-        return "rejected", None
+        return "rejected", None, None
     if "_detailReadGap" in doc or "_http" in doc:
-        return "partial-read", capture_evidence(doc, "incompleteEvidence") if "_http" not in doc else None
+        return "partial-read", capture_evidence(doc, "incompleteEvidence") if "_http" not in doc else None, None
     if "nextCursor" not in doc or doc["nextCursor"] is not None:
-        return "rejected", None
-    return "complete-read", capture_evidence(doc, "incompleteEvidence")
+        return "rejected", None, None
+    pages = doc.get("_verifiedDetailPages")
+    bound = type(pages) is int and 1 <= pages <= MAX_PAGES
+    return "complete-read", capture_evidence(doc, "incompleteEvidence"), doc if bound else None
+
+
+def paired_api_evidence(api, rid):
+    """Read marker evidence, including aggregates predating per-page provenance."""
+    state, markers, _ = paired_api_detail(api, rid)
+    return state, markers
 
 
 class CollectionFailure(Exception):
@@ -193,7 +206,7 @@ def collect(root: Path, *, list_limit: int = 100, detail_limit: int = 1000) -> b
                     raise CollectionFailure("missing-cursor")
                 if "incomplete_evidence" in doc and doc["incomplete_evidence"] != []:
                     first_incomplete = rid, capture_evidence(doc, "incomplete_evidence"), (
-                        page == 0 and doc["next_cursor"] is None)
+                        page == 0 and doc["next_cursor"] is None), doc
                     raise CollectionFailure("incomplete-evidence")
                 cursor = doc["next_cursor"]
                 if cursor is None:
@@ -210,11 +223,19 @@ def collect(root: Path, *, list_limit: int = 100, detail_limit: int = 1000) -> b
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
         status["firstFailure"] = {"stage": stage, "reason": "io-error", "exitCode": None}
     if first_incomplete is not None:
-        rid, evidence, cli_full_read = first_incomplete
-        api_read, api_evidence = paired_api_evidence(api, rid)
+        rid, evidence, cli_full_read, cli_doc = first_incomplete
+        api_read, api_evidence, api_doc = paired_api_detail(api, rid)
+        cli_scope_verified = cli_full_read
+        if cli_full_read:
+            try:
+                bound_page_end(cli_doc, "recording_id", rid, None, detail_limit, -1)
+            except ValueError:
+                cli_scope_verified = False
         status["firstIncomplete"] = {
             "cli": evidence, "api": api_evidence, "apiRead": api_read,
-            "cliReadScope": "whole-recording" if cli_full_read else "one-page",
+            "cliReadScope": "whole-recording" if cli_scope_verified else "one-page",
+            "provenance": {"cli": partial_provenance.project(cli_doc, whole=cli_scope_verified),
+                           "api": partial_provenance.project(api_doc, whole=True) if api_doc else None},
         }
     artifact = root / "sinks" / "recordings.zip"
     status["artifactComplete"] = False

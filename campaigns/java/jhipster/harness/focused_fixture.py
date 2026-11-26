@@ -25,6 +25,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "campaigns/lib"))
 import boundary_diagnostics  # noqa: E402
 import collect_sinks  # noqa: E402
+from campaigns.java.jhipster.harness import partial_provenance  # noqa: E402
+from detail_pages import bound_page_end  # noqa: E402
 import installed  # noqa: E402
 import xcamp  # noqa: E402
 import xinstr  # noqa: E402
@@ -32,7 +34,7 @@ import xinstr  # noqa: E402
 CHECKS = ("archive-verified", "fresh-install-verified", "installed-bytes-verified",
           "owned-spring-bound-port", "initial-api-empty", "mapped-request-complete",
           "committed-filter-403", "route-less-inventory-exact", "strict-attribution-preserved",
-          "post-stop-api-exact", "cli-list-show-complete")
+          "post-stop-api-exact", "cli-list-show-complete", "same-recording-paginated-provenance")
 
 
 def require(ok):
@@ -96,6 +98,52 @@ def read_until(client, directory, predicate, deadline):
         raise TimeoutError("focused API observation deadline")
     finally:
         client.deadline = None
+
+
+def compare_mapped_pages(root, api, cli_rows, detail_limit):
+    mapped = [rid for rid, detail in api["details"].items()
+              if xinstr.recording_matches(detail, "POST", "/orders")]
+    require(len(mapped) == 1)
+    rid = mapped[0]
+    state, _, api_doc = collect_sinks.paired_api_detail(root / "post-stop-api", rid)
+    require(state == "complete-read" and api_doc is not None and api_doc["_verifiedDetailPages"] >= 2)
+    require(api_doc.get("_allDetailMarkerListsEmpty") is True)
+    metadata = [row for row in api["recordings"] if row.get("recordingId") == rid]
+    require(len(metadata) == 1)
+    index = cli_rows.index(rid)
+    files = sorted((root / "sinks/cli").glob(f"detail-{index:03d}-*.stdout"))
+    require(2 <= len(files) <= collect_sinks.MAX_PAGES)
+    events, seen = [], set()
+    previous, cursor, first = -1, None, None
+    for page, path in enumerate(files):
+        require(path.name == f"detail-{index:03d}-{page:02d}.stdout")
+        doc = json.loads(path.read_bytes())
+        previous = bound_page_end(doc, "recording_id", rid, cursor, detail_limit, previous)
+        require(doc.get("incomplete_evidence") == [] and doc["events"])
+        if first is None:
+            first = doc
+        events.extend(doc["events"])
+        cursor = doc["next_cursor"]
+        if page == len(files) - 1:
+            require(cursor is None)
+        else:
+            require(isinstance(cursor, str) and cursor and cursor not in seen)
+            seen.add(cursor)
+    require([(e["sequence"], e["kind"]) for e in events]
+            == [(e["sequence"], e["kind"]) for e in api_doc["events"]])
+    # Both readers use the same detail query. The post-stop list counts durable segment
+    # metadata independently, so a shared omission must still fail this fixture.
+    inventory = metadata[0]
+    require(inventory.get("eventCount") == str(len(events))
+            and inventory.get("firstSequence") == events[0]["sequence"]
+            and inventory.get("lastSequence") == events[-1]["sequence"])
+    api_observation = partial_provenance.project(api_doc, whole=True)
+    cli_observation = partial_provenance.project({**first, "events": events}, whole=True)
+    require(partial_provenance.valid(cli_observation) and cli_observation == api_observation
+            and cli_observation["scope"] == "whole-recording"
+            and cli_observation["eventKinds"]["request_update"] > 0
+            and cli_observation["eventKinds"]["response"] > 0)
+    return {"apiPages": api_doc["_verifiedDetailPages"], "cliPages": len(files), "comparedEvents": len(events)}
 
 
 def prove(candidate, fixture, summary):
@@ -170,7 +218,7 @@ def prove(candidate, fixture, summary):
         # Signal only the launcher we own. Its handler forwards shutdown and drains the daemon.
         launcher.terminate()
         require(launcher.wait(timeout=15) == 143)
-        final = xinstr.collect_api(client, root / "post-stop-api")
+        final = xinstr.collect_api(client, root / "post-stop-api", verified_detail_limit=2)
         require(final["ok"] and set(final["details"]) == set(api["details"]) and terminal_pair(final))
         summary["checks"]["post-stop-api-exact"] = "passed"
     finally:
@@ -181,10 +229,12 @@ def prove(candidate, fixture, summary):
     status = json.loads((root / "sinks/cli-status.json").read_text())
     require(status["recordings"] == 2 and status["completedDetails"] == 2
             and status["listCommands"] == 2 and status["detailCommands"] >= 3)
-    cli_ids = {row["recording_id"] for path in (root / "sinks/cli").glob("list-*.stdout")
-               for row in json.loads(path.read_bytes())["recordings"]}
-    require(cli_ids == set(api["details"]))
+    cli_rows = [row["recording_id"] for path in sorted((root / "sinks/cli").glob("list-*.stdout"))
+                for row in json.loads(path.read_bytes())["recordings"]]
+    require(set(cli_rows) == set(api["details"]))
     summary["checks"]["cli-list-show-complete"] = "passed"
+    summary["pairedRead"] = compare_mapped_pages(root, final, cli_rows, 2)
+    summary["checks"]["same-recording-paginated-provenance"] = "passed"
     summary["cli"] = {key: status[key] for key in ("listCommands", "detailCommands", "recordings", "completedDetails")}
 
 
@@ -212,6 +262,8 @@ def main(argv=None):
             with redirect_stdout(out), redirect_stderr(err):
                 try:
                     require(candidate.prerequisites() == 0 and candidate.verify_archive() == 0)
+                    summary["sourceSha"] = candidate.source_sha
+                    summary["archiveSha256"] = candidate.package_sha
                     summary["checks"]["archive-verified"] = "passed"
                     require(candidate.install() == 0)
                     require(candidate.command(["sh", str(candidate.prefix / "current/install.sh"), "verify",

@@ -23,6 +23,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 import boundary_diagnostics
+from detail_pages import bound_page_end
 import private_diagnostic
 
 # matched against the class part of a frame symbol such as `OwnerController.findOwner`
@@ -233,8 +234,12 @@ def detail_read_incomplete(detail: dict | None) -> bool:
     return detail is None or "_detailReadGap" in detail or "_http" in detail
 
 
-def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int = 400) -> dict[str, Any]:
+def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int = 400,
+                *, verified_detail_limit: int | None = None) -> dict[str, Any]:
     """Save observed pages. Success requires a complete listing and every listed detail."""
+    if verified_detail_limit is not None and (type(verified_detail_limit) is not int or not 1 <= verified_detail_limit <= 1000):
+        raise ValueError("invalid detail limit")
+    detail_limit = verified_detail_limit or 1000
     out_dir.mkdir(parents=True, exist_ok=True)
     listing: list[dict] = []
     after = None
@@ -307,8 +312,11 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
         first: dict | None = None
         detail_gap = None
         incomplete_evidence: dict[str, None] = {}
-        for _ in range(40):
-            q = f"/api/v1/recordings/{rid}?limit=1000" + (f"&cursor={quote(cursor, safe='')}" if cursor else "")
+        last_sequence = -1
+        pages_bound = verified_detail_limit is not None
+        every_marker_list_empty = True
+        for page_number in range(1, 41):
+            q = f"/api/v1/recordings/{rid}?limit={detail_limit}" + (f"&cursor={quote(cursor, safe='')}" if cursor else "")
             try:
                 st, doc = client.get(q)
             except (OSError, http.client.HTTPException) as exc:
@@ -329,8 +337,17 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
                 detail_gap = "detail malformed page"
                 failed("detail", "schema")
                 break
+            if pages_bound:
+                every_marker_list_empty &= doc.get("incompleteEvidence") == []
+                try:
+                    last_sequence = bound_page_end(doc, "recordingId", rid, cursor, detail_limit, last_sequence)
+                except ValueError:
+                    # Keep the original read verdict; only the stronger provenance needs this binding.
+                    pages_bound = False
             if first is None:
-                first = {k: v for k, v in doc.items() if k != "events"}
+                # These facts come from checking the entire chain, never from a returned page.
+                first = {k: v for k, v in doc.items()
+                         if k not in ("events", "_verifiedDetailPages", "_allDetailMarkerListsEmpty")}
             events.extend(rows)
             if isinstance(doc.get("incompleteEvidence"), list):
                 incomplete_evidence.update((code, None) for code in doc["incompleteEvidence"] if isinstance(code, str))
@@ -351,6 +368,9 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             d["_detailReadGap"] = detail_gap
         else:
             d["nextCursor"] = None
+            if pages_bound:
+                d["_verifiedDetailPages"] = page_number
+                d["_allDetailMarkerListsEmpty"] = every_marker_list_empty
         if incomplete_evidence:
             d["incompleteEvidence"] = list(incomplete_evidence)
         d.setdefault("recordingId", rid)
@@ -1338,7 +1358,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if not token:
             raise RuntimeError("no bootstrap token in viewer url")
         client.exchange(token)
-        api = collect_api(client, out_dir / "api")
+        api = collect_api(client, out_dir / "api", verified_detail_limit=1000 if project == "jhipster" else None)
         api["recordings"] = [r for r in api["recordings"] if r["recordingId"] not in before_ids]
         api["details"] = {rid: d for rid, d in api["details"].items() if rid not in before_ids}
     except Exception as exc:

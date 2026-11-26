@@ -714,10 +714,22 @@ def capture_projection(value):
 
 
 def first_incomplete_projection(value):
-    if (not isinstance(value, dict) or set(value) != {"cli", "api", "apiRead", "cliReadScope"}
+    if (not isinstance(value, dict) or set(value) not in ({"cli", "api", "apiRead", "cliReadScope"}, {"cli", "api", "apiRead", "cliReadScope", "provenance"})
             or value["apiRead"] not in ("complete-read", "partial-read", "missing", "rejected")
             or value["cliReadScope"] not in ("whole-recording", "one-page")):
         return None
+    same_scope = False
+    if "provenance" in value:
+        provenance = value["provenance"]
+        if (not isinstance(provenance, dict) or set(provenance) != {"cli", "api"}
+                or not collect_sinks.partial_provenance.valid(provenance["cli"])
+                or (provenance["cli"]["scope"] == "whole-recording" and value["cliReadScope"] != "whole-recording")
+                or (provenance["api"] is not None and not collect_sinks.partial_provenance.valid(provenance["api"]))
+                or (provenance["api"] is not None and value["apiRead"] != "complete-read")):
+            return None
+        # Legacy aggregates lack proof of every page. Count-limited windows may differ, too.
+        same_scope = (provenance["api"] is not None
+                      and provenance["api"]["scope"] == provenance["cli"]["scope"] == "whole-recording")
     cli = capture_projection(value["cli"])
     api = capture_projection(value["api"])
     state = value["apiRead"]
@@ -726,7 +738,7 @@ def first_incomplete_projection(value):
         return None
     return {**value, "observationPhases": "earlier-saved-api-later-cli" if state in (
                 "complete-read", "partial-read") else None,
-            "sameReadScope": state == "complete-read" and value["cliReadScope"] == "whole-recording",
+            "sameReadScope": same_scope,
             "sharedKnownCategories": (sum(cli["markers"][key] > 0 and api["markers"][key] > 0
                                           for key in collect_sinks.MARKER_CLASSES if key != "unclassified")
                                       if api is not None and cli is not None else None)}
