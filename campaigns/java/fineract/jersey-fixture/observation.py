@@ -68,12 +68,26 @@ def compare_inventory(cli, api, project_id, supported):
     return details, counts
 
 
+class OutcomeMismatch(ValueError):
+    """Carry only the fixed comparison that failed. Exclude exception and event payloads."""
+
+    def __init__(self, request_class, expected_kind, expected_status, kind, status):
+        super().__init__("HTTP outcome evidence")
+        kinds = ("responded", "exception_propagated", "client_aborted", "unobserved")
+        self.evidence = {"requestClass": request_class, "expectedKind": expected_kind,
+                         "expectedStatus": expected_status,
+                         "observedKind": kind if kind in kinds else "unavailable",
+                         "observedStatus": status if status is None or type(status) is int and 100 <= status <= 599
+                         else "unavailable"}
+
+
 def judge(details, version):
     supported = version == "3.1.11"
-    expected = {"http.request GET": (403, None)}
+    expected = {"http.request GET": (403, None, "filter-refusal")}
     if supported:
-        expected.update({f"http.request GET {ITEM}": (200, "read"), f"http.request POST {ITEM}": (404, None),
-                         f"http.request GET {DEFERRED}": (None, "deferred")})
+        expected.update({f"http.request GET {ITEM}": (200, "read", "mapped-read"),
+                         f"http.request POST {ITEM}": (404, None, "conversion"),
+                         f"http.request GET {DEFERRED}": (None, "deferred", "deferred")})
     observed = set()
     for detail in details.values():
         events = detail["events"]
@@ -82,15 +96,17 @@ def judge(details, version):
         symbol = roots[0]["symbol"]
         require(symbol in expected and symbol not in observed, "unexpected or duplicate recording")
         observed.add(symbol)
-        status, method = expected[symbol]
+        status, method, request_class = expected[symbol]
         route = symbol != "http.request GET"
         driver = "jersey" if route else "servlet"
         require(roots[0]["interaction"]["driver"] == driver, "request framework provenance")
         responses = [e for e in events if e["kind"] == "recording_event_kind:response"]
         require(len(responses) == 1 and responses[0]["interaction"]["driver"] == driver, "response provenance")
-        outcome = detail["outcome"] or {}
-        require(outcome.get("kind") == ("responded" if status else "unobserved")
-                and outcome.get("httpStatus") == status, "HTTP outcome evidence")
+        outcome = detail["outcome"] if isinstance(detail["outcome"], dict) else {}
+        expected_kind = "responded" if status else "unobserved"
+        kind, recorded_status = outcome.get("kind"), outcome.get("httpStatus", "unavailable")
+        if kind != expected_kind or type(recorded_status) is not type(status) or recorded_status != status:
+            raise OutcomeMismatch(request_class, expected_kind, status, kind, recorded_status)
         require(detail["completion"] == "complete" and not detail["incompleteEvidence"], "capture completion")
         enters = [e for e in events if e["kind"] == "recording_event_kind:frame_enter"]
         services = [e for e in enters if e["symbol"] == SERVICE]

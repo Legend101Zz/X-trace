@@ -140,8 +140,9 @@ public final class JerseyBridge {
   }
 
   public static void dispatchExit(Object response, Throwable thrown) {
-    // Null on Jersey async/SSE dispatch. An escaped failure has no observed final response here.
-    if (response == null || thrown != null) SpringMvcBridge.jerseyOutcomeUncertain();
+    // A normal null return denotes async/SSE. A throw can still be mapped by Jersey
+    // before service returns; the enclosing servlet owns the final status in that case.
+    if (response == null && thrown == null) SpringMvcBridge.jerseyOutcomeUncertain();
     BootstrapBridge.frameExit(APPLY, thrown);
   }
 

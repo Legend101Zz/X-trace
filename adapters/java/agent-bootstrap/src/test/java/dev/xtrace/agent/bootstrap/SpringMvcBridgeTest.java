@@ -72,6 +72,34 @@ public class SpringMvcBridgeTest {
     assertEquals(0, sink.dropped, "a buffered response is not event loss");
   }
 
+  private void recordJerseyDispatchExit(Throwable thrown) {
+    SpringMvcBridge.servletEnter();
+    assertTrue(BootstrapBridge.jerseyStart("POST", "/items/{id}", System.nanoTime()));
+    SpringMvcBridge.jerseyStarted();
+    BootstrapBridge.frameEnter("org.glassfish.jersey.server.model.ResourceMethodInvoker.apply");
+    JerseyBridge.dispatchExit(null, thrown);
+    BootstrapBridge.frameExit(JerseyBridge.SERVICE, null);
+    assertEquals(0, sink.finishes);
+  }
+
+  @Test
+  void mappedJerseyDispatchThrowUsesStatusAtNormalOuterReturn() {
+    recordJerseyDispatchExit(new IllegalArgumentException("conversion"));
+    SpringMvcBridge.servletEnd(new Request("POST", "/items/{id}"), new Response(404), null);
+    assertEquals(1, sink.finishes);
+    assertTrue(sink.kinds.contains(BridgeEventKind.FRAME_THROW));
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(404, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void normalNullJerseyDispatchKeepsOuterStatusProvisional() {
+    recordJerseyDispatchExit(null);
+    SpringMvcBridge.servletEnd(new Request("POST", "/items/{id}"), new Response(200), null);
+    assertEquals(1, sink.finishes);
+    assertProvisional(200);
+  }
+
   @Test
   void sendErrorRemainsProvisionalEvenIfContainerReportsCommitted() {
     Request request = new Request("GET", "/send-error");
@@ -969,6 +997,11 @@ public class SpringMvcBridgeTest {
         starts.add(new String[] {method, route});
       }
       return true;
+    }
+
+    @Override
+    public boolean offerJerseyStart(String id, long ns, String method, String route) {
+      return offerStart(id, ns, method, route);
     }
 
     @Override

@@ -14,7 +14,7 @@ import time
 import traceback
 from urllib.parse import urlsplit
 
-from observation import api_reader, cli_reader, compare_inventory, judge
+from observation import OutcomeMismatch, api_reader, cli_reader, compare_inventory, judge
 from pages import list_pages
 from verify_fixture import require, verify_fixture
 
@@ -190,6 +190,23 @@ def leg(root, jar, version, cli, agent, java, progress):
             **notices, **counts}
 
 
+def observe_legs(root, fixtures, cli, agent, java, report):
+    for jar, version in fixtures:
+        progress = {"phase": "fixture-setup", "responsesVerified": 0, "differentHttpStatus": None,
+                    "probeDecisions": {}, "failureSite": None, "cleanupFailure": None, "outcomeMismatch": None}
+        report["legProgress"][version] = progress
+        try:
+            report["legs"][version] = leg(root / version, jar, version, cli, agent, java, progress)
+        except Exception as error:
+            progress["failureSite"] = failure_site(error)
+            if isinstance(error, OutcomeMismatch):
+                progress["outcomeMismatch"] = error.evidence
+            with (root / ("private-error-" + version + ".log")).open("x") as stream:
+                traceback.print_exc(file=stream)
+        else:
+            progress["phase"] = "complete"
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ("root", "prefix", "archive", "java", "supported", "unsupported"):
@@ -211,18 +228,11 @@ def main():
         stage = "fixture-identity"
         require(verify_fixture(args.supported, "3.1.11")[0] == verify_fixture(args.unsupported, "3.1.10")[0],
                 "application class bytes differ between the two real fixtures")
-        for jar, version in ((args.supported, "3.1.11"), (args.unsupported, "3.1.10")):
-            stage = "installed-jersey-" + version
-            progress = {"phase": "fixture-setup", "responsesVerified": 0, "differentHttpStatus": None,
-                        "probeDecisions": {}, "failureSite": None, "cleanupFailure": None}
-            report["legProgress"][version] = progress
-            try:
-                report["legs"][version] = leg(root / version, jar, version, cli, agent, args.java, progress)
-            except Exception as error:
-                progress["failureSite"] = failure_site(error)
-                raise
-            progress["phase"] = "complete"
-        stage, report["status"] = "complete", "passed"
+        stage = "installed-legs"
+        observe_legs(root, ((args.supported, "3.1.11"), (args.unsupported, "3.1.10")),
+                     cli, agent, args.java, report)
+        if set(report["legs"]) == {"3.1.11", "3.1.10"}:
+            stage, report["status"] = "complete", "passed"
     except Exception:
         # Keep exception text, command output and any bootstrap material out of the public receipt.
         with (root / "private-error.log").open("x") as stream:

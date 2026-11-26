@@ -103,7 +103,7 @@ public final class SpringMvcBridge {
     state.jersey = true;
   }
 
-  /** A Jersey activation encountered async work, a nested service or an escaped dispatch. */
+  /** A Jersey activation encountered async work, ambiguous ownership or an exception escaping the Jersey service. */
   public static void jerseyOutcomeUncertain() {
     ServletState state = SERVLET.get();
     if (state != null && state.jersey) state.asyncStarted = true;
