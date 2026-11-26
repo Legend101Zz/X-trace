@@ -199,6 +199,14 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
         'phone header places the request above the selected event');
       await expect(page.locator('.topbar')).toBeHidden();
       await expect(more.getByRole('button', { name: 'Step in', exact: true })).toBeFocused();
+      const refresh = page.locator('#events-panel').getByRole('button', { name: 'Refresh', exact: true });
+      await assertLabelUncovered(refresh);
+      assert.ok(await refresh.evaluate(button => {
+        const box = button.getBoundingClientRect();
+        return box.width >= 44 && box.height >= 44 &&
+          [[box.left + 3, box.top + 3], [box.right - 3, box.bottom - 3]].every(
+            ([x, y]) => button.contains(document.elementFromPoint(x, y)));
+      }), 'Refresh is fully available when phone More opens, before an action can scroll it into view');
       for (const label of ['Step in', 'Step over', 'Step out', 'Tools', /^Replay speed,/, 'Close']) {
         const action = more.getByRole('button', { name: label, exact: true });
         await expect(action).toBeInViewport({ ratio: 1 });
@@ -255,7 +263,27 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
         await goto(sequence);
       }
       if (label === 'Calls and returns' && verifyRecordingSelection) {
-        await verifyRecordingSelection({ sequence, activate });
+        // Remember the ordinary guarded reads made by the existing switch proof.
+        // The source caller opens a legacy fixture; the installed caller opens a real second capture.
+        const knownDetails = new Map();
+        const observedReads = [];
+        const observedReadErrors = [];
+        const observeDetail = response => {
+          if (response.request().method() !== 'GET' || !/^\/api\/v1\/recordings\/[^/]+$/.test(new URL(response.url()).pathname)) return;
+          observedReads.push((async () => {
+            assert.equal(response.status(), 200, 'the existing recording switch receives a guarded detail response');
+            const detail = await response.json();
+            knownDetails.set(detail.recordingId, detail);
+          })().catch(problem => { observedReadErrors.push(problem); }));
+        };
+        if (width === 320) page.on('response', observeDetail);
+        try {
+          await verifyRecordingSelection({ sequence, activate });
+          await Promise.all(observedReads);
+          if (observedReadErrors.length) throw observedReadErrors[0];
+        } finally {
+          page.off('response', observeDetail);
+        }
         if (width === 320) {
           const tabs = page.getByRole('tablist', { name: 'Open recordings' }).getByRole('tab');
           await expect(tabs).toHaveCount(2);
@@ -265,9 +293,60 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
             const name = await tab.getAttribute('aria-label');
             await expect(suffix).toHaveText(name.slice(-8));
             await assertLabelUncovered(suffix);
+            const route = tab.locator('.open-recording-route');
+            await assertLabelUncovered(route);
+            assert.ok(await route.evaluate((element) => element.scrollWidth <= element.clientWidth),
+              'both open recording choices show their complete route labels at 320px');
+            assert.ok(await tab.evaluate((element) => {
+              const box = element.getBoundingClientRect();
+              return box.width >= 44 && box.height >= 44 &&
+                element.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2));
+            }), 'both open recording choices retain full-sized hittable targets');
             identities.push(name.slice(-8));
           }
           assert.equal(new Set(identities).size, 2, 'both open recordings show distinct observed identities');
+          const tablist = page.getByRole('tablist', { name: 'Open recordings' });
+          const current = tablist.getByRole('tab', { selected: true });
+          const currentId = await current.getAttribute('id');
+          const original = page.locator(`[id="${currentId}"]`);
+          await original.focus();
+          async function switchAndVerify(tab, key, recording) {
+            const known = knownDetails.get(recording);
+            assert.ok(known, 'the original switch proof supplied this recording projection');
+            const [reply] = await Promise.all([
+              page.waitForResponse(response => response.request().method() === 'GET' &&
+                new URL(response.url()).pathname === `/api/v1/recordings/${encodeURIComponent(recording)}`),
+              tab.press(key),
+            ]);
+            assert.equal(reply.status(), 200, 'keyboard selection receives a successful guarded viewer read');
+            const detail = await reply.json();
+            assert.equal(detail.recordingId, recording, 'keyboard detail belongs to the selected recording');
+            assert.deepEqual(detail.events, known.events, 'keyboard selection reads the previously verified recording projection');
+            await expect(page.locator('#events-panel').getByRole('button', { name: 'Refresh', exact: true })).toBeEnabled();
+            await expect(page.getByRole('region', { name: 'Loaded event window' }).getByText('Loading event window…', { exact: true })).not.toBeVisible();
+            if (detail.events.length === 0) await expect(page.getByText('No projected events', { exact: true })).toBeVisible();
+            else await expect(page.getByRole('region', { name: 'Loaded event window' })).toContainText(`${detail.events.length} loaded ${detail.events.length === 1 ? 'event' : 'events'}`);
+          }
+          const otherRecording = await tablist.getByRole('tab', { selected: false }).getAttribute('id');
+          await switchAndVerify(original, 'ArrowRight', otherRecording.replace(/^open-recording-/, ''));
+          const other = tablist.getByRole('tab', { selected: true });
+          const otherId = await other.getAttribute('id');
+          assert.notEqual(otherId, currentId, 'ArrowRight selects the other open recording');
+          await expect(other).toBeFocused();
+          await expect(page.locator('#events-panel .center-title h1')).toHaveText(otherId.replace(/^open-recording-/, ''));
+          await switchAndVerify(other, 'ArrowLeft', currentId.replace(/^open-recording-/, ''));
+          await expect(original).toHaveAttribute('aria-selected', 'true');
+          await expect(original).toBeFocused();
+          await expect(page.locator('#events-panel .center-title h1')).toHaveText(currentId.replace(/^open-recording-/, ''));
+          const close = page.locator('.recording-tabs').getByRole('button', { name: 'Close recording', exact: true });
+          await expect(close).toBeVisible();
+          assert.ok(await close.evaluate((element) => {
+            const box = element.getBoundingClientRect();
+            return box.width === 44 && box.height === 44 &&
+              element.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2));
+          }), 'phone close remains a fixed 44px target beside both recording choices');
+          assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
+            'two recording choices and close do not widen the phone viewport');
         }
         await expect(selected.locator('.event-seq')).toHaveText(sequence);
         await expect(page.locator('.replay-filter-note')).toContainText(`showing ${expected.length} of ${events.length} loaded steps`);
@@ -411,6 +490,9 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     }
     if (width === 736) {
       await expect(page.locator('#events-panel .recording-why')).toHaveJSProperty('open', true);
+      const tail = events.at(-1).sequence;
+      await goto(tail);
+      await verifyMapReturn(page, tail, activate);
       const readableRow = await page.locator('.steps-list .event').evaluateAll((rows) => rows.some((row) => {
         const box = row.getBoundingClientRect();
         const x = box.left + box.width / 2;
@@ -465,6 +547,11 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     const planDialog = panel('Send again');
     const planClose = planDialog.getByRole('button', { name: 'Close', exact: true });
     await expect(planClose).toBeFocused();
+    const restoreSummary = planDialog.locator('summary').filter({ hasText: 'Open an existing plan' });
+    await page.keyboard.press('Shift+Tab');
+    await expect(restoreSummary).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(planClose).toBeFocused();
     const revisionField = planDialog.getByLabel('Catalog revision ID', { exact: true });
     await activate(revisionField);
     await expect(revisionField).toBeFocused();
@@ -487,6 +574,28 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
 
 export async function assertReadableTourStep(page) {
   await expect(page.locator('#events-panel .recording-why')).toHaveJSProperty('open', true);
+  await assertReadableSelection(page, 'the recorded step sentence remains readable alongside the open disclosure and tour');
+}
+
+export async function verifyMapReturn(page, sequence, activate) {
+  const views = page.getByRole('tablist', { name: 'Replay view' });
+  const map = views.getByRole('tab', { name: 'Map', exact: true });
+  const steps = views.getByRole('tab', { name: 'Steps', exact: true });
+  const selected = page.locator('#events-panel .event[aria-current="true"]');
+  await expect(selected.locator('.event-seq')).toHaveText(sequence);
+  await activate(map);
+  await expect(map).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.steps-list')).toHaveCount(0);
+  await activate(steps);
+  await expect(steps).toHaveAttribute('aria-selected', 'true');
+  await expect(selected).toBeFocused();
+  // Sample the settled remount, after Chromium delivered the row measurements.
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(selected.locator('.event-seq')).toHaveText(sequence);
+  await assertReadableSelection(page, 'the same recorded step sentence is readable after returning from Map');
+}
+
+async function assertReadableSelection(page, message) {
   const row = page.locator('#events-panel .event[aria-current="true"]');
   await expect(row).toBeInViewport({ ratio: 1 });
   const readable = await row.locator('.event-kind').evaluate((sentence) => {
@@ -498,5 +607,5 @@ export async function assertReadableTourStep(page) {
       return [line.left + 1, line.right - 1].every((x) => sentence.contains(document.elementFromPoint(x, y)));
     });
   });
-  assert.ok(readable, 'the recorded step sentence remains readable alongside the open disclosure and tour');
+  assert.ok(readable, message);
 }

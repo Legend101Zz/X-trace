@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { chromium, expect } from '@playwright/test';
+import { verifyMapReturn } from './replay-tools-journey.mjs';
 import { jumpToLoadedSequence, verifyMountedWindow, verifyReplayWindowNavigation } from './replay-window-journey.mjs';
 
 const chunks = [];
@@ -73,12 +74,14 @@ try {
   let observed = first.sequences.length + middle.sequences.length + later.sequences.length;
   let hasLine = first.hasLine || middle.hasLine || later.hasLine;
   let tail = later;
+  const successors = [later];
   // Count only actual ordered events, even if byte or verified-input limits shorten each page.
   for (let additional = 0; (observed <= 200 || !hasLine) && tail.next != null && additional < 200; additional += 1) {
     const next = await read(recordingId, tail.next);
     verifyOrderedPage(next, tail.sequences.at(-1));
     observed += next.sequences.length;
     hasLine ||= next.hasLine;
+    successors.push(next);
     tail = next;
   }
   assert.ok(observed > 200 && hasLine, 'paged Spring recording has more than 200 persisted events including line evidence');
@@ -120,6 +123,29 @@ try {
     await verifyMountedWindow(page, first.sequences);
     await laterButton().click();
     await verifyMountedWindow(page, [...first.sequences, ...middle.sequences]);
+    if (width === 736) {
+      stage = 'return from Map to a distant virtual Spring row';
+      const retained = [...first.sequences, ...middle.sequences];
+      for (const next of successors) {
+        if (retained.length > 80) break;
+        await laterButton().click();
+        retained.push(...next.sequences);
+        await expect(page.getByText(`${retained.length} ordered events`, { exact: true })).toBeVisible();
+      }
+      assert.ok(retained.length > 80, 'the selected real window exceeds the mounted row cap');
+      const list = page.getByRole('list', { name: 'Loaded replay steps' });
+      await list.evaluate((element) => {
+        const body = element.closest('.steps-content');
+        const owner = body && getComputedStyle(body).overflowY === 'auto' ? body : element.closest('#events-panel');
+        owner.scrollTop = 0;
+      });
+      const target = retained.at(-1);
+      await expect(list.locator(`[aria-posinset="${retained.length}"]`)).toHaveCount(0);
+      await jumpToLoadedSequence(page, target);
+      await verifyMapReturn(page, target, (button) => button.click());
+      await expect(currentStep.locator('..')).toHaveAttribute('aria-posinset', String(retained.length));
+      assert.ok(await list.locator('[data-step-sequence]').count() <= 80, 'returning from Map preserves the mounted row cap');
+    }
     await jumpToLoadedSequence(page, selected);
     if (width < 700) await switchPane('Requests');
     await tab(otherId).click();

@@ -18,6 +18,7 @@
 .open-recording { min-height: 44px; min-width: 44px; max-width: 20rem; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 4px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); }
 .open-recording[aria-selected='true'] { background: var(--select); border-color: var(--amber); }
 .open-recording:focus-visible { outline-offset: -2px; }
+.recording-tabs-close-icon { display: none; }
 .shell > .viewer-preferences { justify-content: space-between; align-items: center; gap: 8px; }
 .phone-back-to-step { display: none; }
 .recording-why > summary { display: list-item; padding: 8px 12px; color: var(--amber); cursor: pointer; }
@@ -200,6 +201,15 @@
 @media (max-width: 699px) {
   .viewer-workspace[data-pane='events'] .steps-and-code > .pane { overflow: hidden; }
   .viewer-workspace[data-pane='events'] .steps-content { display: block; flex: 1 1 auto; min-height: 0; overflow: auto; order: 1; }
+  /* More moves focus into the bottom controls. Keep Refresh visible even when
+     the selected step has already scrolled the recording heading out of view. */
+  #events-panel:has(.phone-more:not([hidden])) .steps-content > .center-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--panel);
+  }
+  #events-panel .center-head > .button { min-width: 44px; min-height: 44px; }
   .viewer-workspace[data-pane='events'] .replay-toolbar { order: 2; flex: 0 0 auto; }
   .shell .phone-back-to-step { text-align: left; overflow-wrap: anywhere; }
 }
@@ -221,10 +231,17 @@
   .recording-tabs-list .open-recording {
     display: grid;
     align-content: center;
-    min-width: calc(8ch + 12px);
+    /* Two choices fit without spending their route space on the close label.
+       Further tabs scroll within the same finite strip, regardless of label length. */
+    flex: 1 0 calc(50% - 2px);
+    min-width: 0;
+    max-width: none;
     padding-inline: 5px;
     line-height: 1.15;
   }
+  .recording-tabs-close { width: 44px; min-width: 44px; height: 44px; padding: 0; }
+  .recording-tabs-close-label { display: none; }
+  .recording-tabs-close-icon { display: inline; font-size: 20px; line-height: 1; }
   .open-recording-route { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .open-recording-separator { display: none; }
   .open-recording-id { font: 11px/1.2 var(--mono); }

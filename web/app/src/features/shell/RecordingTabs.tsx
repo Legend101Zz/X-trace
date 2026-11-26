@@ -41,6 +41,10 @@ export function RecordingTabs({ recordings, selected, onSelect, onClose }: {
         <span className="open-recording-id">{id.slice(-8)}</span>
       </button>)}
     </div>
-    {selected ? <button type="button" className="button" onClick={() => onClose(selected)}>Close recording</button> : null}
+    {selected ? <button type="button" className="button recording-tabs-close" aria-label="Close recording"
+      title="Close recording" onClick={() => onClose(selected)}>
+      <span className="recording-tabs-close-label">Close recording</span>
+      <span className="recording-tabs-close-icon" aria-hidden="true">×</span>
+    </button> : null}
   </div>;
 }
