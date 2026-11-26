@@ -183,6 +183,14 @@
     position: absolute; z-index: 5; inset: 0 auto 0 max(240px, var(--requests-size)); width: 8px;
   }
   .viewer-workspace:not([data-pane='recordings']) > :is(.workspace-requests, .panel-splitter--requests) { display: none; }
+  /* On first use both the command and the Steps guidance must be readable.
+     Reserve the open drawer's width before laying out the empty panes. */
+  .viewer-workspace[data-pane='recordings']:has(.first-recording) {
+    padding-inline-start: calc(max(240px, var(--requests-size)) + 8px);
+  }
+  .viewer-workspace[data-pane='recordings']:has(.workspace-requests[data-collapsed='true'] .first-recording) {
+    padding-inline-start: 52px;
+  }
   .viewer-workspace > .workspace-requests[data-collapsed='true'] { width: 44px; }
   .viewer-workspace:has(> .workspace-requests[data-collapsed='true']) > .panel-splitter--requests { left: 44px; }
 }

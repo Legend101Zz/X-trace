@@ -80,6 +80,22 @@ try {
       });
       if (feedbackPosition !== 'inside') console.error(`First recording drawer feedback: ${feedbackPosition}`);
       assert.equal(feedbackPosition, 'inside', 'the Requests drawer contains every line of the copy confirmation');
+      const steps = page.locator('#events-panel');
+      const divider = await page.getByRole('separator', { name: 'Resize Requests' }).boundingBox();
+      const panel = await steps.boundingBox();
+      assert.ok(divider && panel && panel.x >= divider.x + divider.width,
+        'the first-use Requests drawer leaves the Steps pane unobstructed');
+      for (const text of ['No recording selected', 'Choose a linked or unmatched recording in Requests.']) {
+        const label = steps.getByText(text, { exact: true });
+        await expect(label).toBeVisible();
+        assert.ok(await label.evaluate(element => {
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          const lines = [...range.getClientRects()].filter(rect => rect.width && rect.height);
+          return lines.length > 0 && lines.every(rect => [rect.left + 1, rect.right - 1].every(x =>
+            element.contains(document.elementFromPoint(x, rect.top + rect.height / 2))));
+        }), 'every line of the empty Steps instruction is readable next to Requests');
+      }
     }
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'xtrace run --project-dir ./your-project --java-agent ./xtrace-java-agent.jar -- java -jar ./your-app.jar');
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
