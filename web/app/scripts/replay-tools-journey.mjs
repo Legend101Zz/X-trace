@@ -82,7 +82,30 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
   const ensureMore = async () => {
     if (page.viewportSize().width >= 700) return;
     const more = page.getByRole('group', { name: 'Replay navigation' }).getByRole('button', { name: 'More', exact: true });
-    if (await more.getAttribute('aria-expanded') !== 'true') await activate(more);
+    if (await more.getAttribute('aria-expanded') === 'true') return;
+    try {
+      await activate(more);
+      await expect(more).toHaveAttribute('aria-expanded', 'true');
+    } catch (error) {
+      // Classify the rendered hit target without logging DOM text, selectors or captured values.
+      const hit = await page.evaluate(() => {
+        const button = document.querySelector('.phone-actions button[aria-expanded]');
+        if (!button) return 'missing';
+        const box = button.getBoundingClientRect();
+        const x = box.left + box.width / 2;
+        const y = box.top + box.height / 2;
+        if (!box.width || !box.height || x < 0 || x >= innerWidth || y < 0 || y >= innerHeight) return 'outside';
+        const target = document.elementFromPoint(x, y);
+        if (button.contains(target)) return 'more';
+        if (target?.closest('.replay-tool-panel--jump')) return 'jump';
+        if (target?.closest('[role="dialog"]')) return 'dialog';
+        if (target?.closest('.viewer-preferences, .tabs')) return 'footer';
+        if (target?.closest('#events-panel')) return 'steps';
+        return 'other';
+      }).catch(() => 'unavailable');
+      process.stderr.write(`Replay More hit after failure: ${hit}\n`);
+      throw error;
+    }
   };
   const openPanel = async (name) => {
     await ensureMore();
@@ -290,6 +313,11 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
           await expect(button).toBeFocused();
           await expect(dialog).toContainText(`No ${direction === 'Next' ? 'later' : 'earlier'} ${label.toLowerCase()} in the loaded steps.`);
           await activate(dialog.getByRole('button', { name: 'Close', exact: true }));
+          await expect(dialog).toHaveCount(0);
+          const opener = pointer === 'fine' ? selected : tools.getByRole('button', {
+            name: width < 1280 ? 'Tools' : 'Jump', exact: true,
+          });
+          await expect(opener).toBeFocused();
           await expect(selected.locator('.event-seq')).toHaveText(before);
           jumpReport.checkedJump(kind, direction.toLowerCase(), 'absence-reason-checked');
         }
