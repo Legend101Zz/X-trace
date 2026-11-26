@@ -1,4 +1,4 @@
-//! CLI adapter for owner-private immutable plans and atomic lifecycle updates.
+//! Project-scoped durable plan adapter shared by CLI commands and the foreground viewer.
 
 mod edit;
 
@@ -22,12 +22,81 @@ use xtrace_store::recording_port::SqliteRecordingReader;
 // one staging file; the next writer refuses it without truncating or unlinking it.
 const STAGING: &str = "pending-lifecycle.json";
 
-/// The only local durable adapter in this slice. Viewer wiring is separate.
+/// A capability constructed from a validated local project. No HTTP field
+/// selects a directory, catalog connection, or project identity.
+pub(crate) struct ExerciseProject {
+    id: ProjectId,
+    root: AdmittedPrivateRoot,
+    catalog: SqliteStore,
+}
+
+impl ExerciseProject {
+    pub(crate) fn new(id: ProjectId, root: AdmittedPrivateRoot, catalog: SqliteStore) -> Self {
+        Self { id, root, catalog }
+    }
+
+    pub(crate) fn open(
+        &self,
+        create_directory: bool,
+    ) -> Result<PrivateExerciseStore, xtrace_private_storage::PrivateStorageError> {
+        let plans = if create_directory {
+            self.root.open_or_create_private_child("exercise-plans")?
+        } else {
+            self.root.open_private_child("exercise-plans")?
+        };
+        Ok(PrivateExerciseStore {
+            project: self.id,
+            plans,
+            catalog: self.catalog.clone(),
+            project_data_root: self.root.path().to_owned(),
+        })
+    }
+
+    /// Invoked on the viewer's bounded worker only after session authorization.
+    /// Reading or editing an unknown plan cannot create a plans directory.
+    pub(crate) fn handle_viewer_action(
+        &self,
+        action: xtrace_daemon::ViewerExerciseAction,
+    ) -> Result<serde_json::Value, ExerciseError> {
+        use crate::exercise::trusted_now;
+        use xtrace_application::exercise::{ExercisePlanService, review_document};
+        use xtrace_daemon::ViewerExerciseAction as Action;
+
+        let store = self
+            .open(matches!(action, Action::Create(_)))
+            .map_err(|_| ExerciseError::StorageUnavailable)?;
+        let service = ExercisePlanService::new(store);
+        let plan = match action {
+            Action::Create(request) => service.create(self.id, request, trusted_now()?)?,
+            Action::Edit { hash, replacement } => {
+                service.edit(self.id, &hash, replacement, trusted_now()?)?
+            }
+            Action::Show { hash } => service.show(self.id, &hash)?,
+            Action::Review { hash } => service.review(self.id, &hash, trusted_now()?)?,
+            Action::Approve { hash, plan_id, item_ids, confirm_owned_development } => {
+                let current = service.show(self.id, &hash)?;
+                if current.content.plan_id != plan_id {
+                    return Err(ExerciseError::HashMismatch);
+                }
+                service.approve(
+                    self.id,
+                    &hash,
+                    &item_ids,
+                    confirm_owned_development,
+                    trusted_now()?,
+                )?
+            }
+        };
+        review_document(&plan, trusted_now()?)
+    }
+}
+
+/// All command and viewer writes serialize through the same project lock.
 pub(crate) struct PrivateExerciseStore {
-    pub(crate) project: ProjectId,
-    pub(crate) plans: AdmittedPrivateRoot,
-    pub(crate) catalog: SqliteStore,
-    pub(crate) project_data_root: std::path::PathBuf,
+    project: ProjectId,
+    plans: AdmittedPrivateRoot,
+    catalog: SqliteStore,
+    project_data_root: std::path::PathBuf,
 }
 
 impl PrivateExerciseStore {

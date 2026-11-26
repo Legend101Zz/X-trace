@@ -1,0 +1,31 @@
+/* Each Map surface owns its scroll; neither can stretch the full event window into the page. */
+div.canvas-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  height: min(640px, 65dvh);
+  min-width: 0;
+  min-height: 12rem;
+  overflow: hidden;
+}
+
+.canvas-view > .canvas-scroll,
+.canvas-view > .canvas-tree {
+  min-width: 0;
+  min-height: 3rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.canvas-view > .canvas-scroll { flex: 1 1 0; }
+.canvas-view > .canvas-tree { flex: 2 1 0; align-content: start; }
+
+/* Evidence remains reachable without consuming either surface's minimum viewport. */
+.canvas-view > .canvas-notes {
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 0;
+  max-height: 25%;
+  overflow: auto;
+  overscroll-behavior: contain;
+}

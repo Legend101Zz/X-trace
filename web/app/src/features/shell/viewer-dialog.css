@@ -1,0 +1,76 @@
+.viewer-dialog {
+  position: fixed;
+  inset: 0 0 0 auto;
+  margin: 0;
+  box-sizing: border-box;
+  width: min(100%, 31rem);
+  height: 100dvh;
+  max-width: 100%;
+  max-height: 100%;
+  padding: 0;
+  border: 0;
+  border-inline-start: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--text);
+}
+.viewer-dialog[open] { display: flex; flex-direction: column; }
+.viewer-dialog::backdrop { background: rgb(0 0 0 / 55%); }
+.viewer-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--chrome);
+}
+.viewer-dialog-body { flex: 1; min-height: 0; overflow: auto; padding: 0 16px 16px; }
+.viewer-dialog :is(button, select), .viewer-dialog-actions .button { min-height: 44px; min-width: 44px; }
+.viewer-dialog-body section { padding-block: 14px; border-bottom: 1px solid var(--line); }
+.viewer-dialog-body h3 { margin: 0 0 8px; }
+.viewer-dialog-body :is(dt, label) { font-weight: 600; }
+.viewer-dialog-body dd { margin: 2px 0 10px; }
+.viewer-dialog-body li + li { margin-top: 5px; }
+.viewer-dialog-body section > label,
+.viewer-dialog-body .theme-preference { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-block: 4px; }
+.viewer-dialog-body p { margin-block: 8px 0; color: var(--muted); }
+.viewer-dialog-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.viewer-shell[data-motion='reduce'] .event[aria-current='true'] { animation: none; }
+.viewer-shell[data-motion='reduce'] .canvas-scroll { scroll-behavior: auto; }
+@media (min-width: 1024px) and (pointer: fine) {
+  .viewer-shell[data-density='compact'] .recording { padding-block: 7px; }
+  .viewer-shell[data-density='compact'] .event { padding-block: 6px; }
+}
+.viewer-help-tabs { display: flex; flex-wrap: wrap; gap: 6px; padding-block-start: 12px; }
+.viewer-help-tabs [aria-selected='true'] { border-color: var(--amber); background: var(--select); }
+.viewer-tour {
+  position: fixed;
+  z-index: 6;
+  inset: auto 12px 64px auto;
+  box-sizing: border-box;
+  width: min(23rem, calc(100% - 24px));
+  max-height: calc(100dvh - 120px);
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel-raised);
+  color: var(--text);
+}
+.viewer-tour--recordings { inset-inline: 12px auto; }
+.viewer-tour h2 { margin: 4px 0; }
+.viewer-tour-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: 6px; margin-top: 10px; }
+:is(.viewer-tour, .first-recording) .button { min-height: 44px; }
+.empty.first-recording { box-sizing: border-box; width: 100%; min-width: 0; overflow-wrap: anywhere; }
+.first-recording-command { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+.first-recording-command code { overflow-wrap: anywhere; }
+/* The intermediate Requests drawer is only 240px wide by default. Keep the
+   command, its result and the tour action together inside its scroll port. */
+@media (min-width: 861px) and (max-width: 1199px) {
+  .workspace-requests > .pane:has(> .first-recording) { overflow-y: auto; }
+  .workspace-requests > .pane:has(> .first-recording) > * { flex-shrink: 0; }
+  .workspace-requests .first-recording { padding: 12px; }
+}
+@media (max-width: 860px) {
+  .viewer-tour { inset-block-end: 104px; }
+}

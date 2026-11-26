@@ -554,6 +554,28 @@ pub(crate) fn open_recording_reader<F>(
 where
     F: Fn(&str) -> Option<PathBuf>,
 {
+    let project = open_recording_project(project_dir, env_reader)?;
+    Ok((project.id, project.reader, project.correlation_id))
+}
+
+pub(crate) struct RecordingProject {
+    pub(crate) id: xtrace_domain::ProjectId,
+    pub(crate) reader: SqliteRecordingReader,
+    pub(crate) catalog: xtrace_store::catalog_history_store::SqliteCatalogHistoryStore,
+    correlation_id: CorrelationId,
+    #[cfg(unix)]
+    pub(crate) exercise: crate::exercise_store::ExerciseProject,
+}
+
+/// Validate the pointer once. The reader and optional exercise actions use the
+/// same read-only catalog and the same admitted project directory for their lifetime.
+pub(crate) fn open_recording_project<F>(
+    project_dir: &Path,
+    env_reader: &F,
+) -> Result<RecordingProject, CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
     let repo = resolve_repo(project_dir)?;
     let pointer = RepositoryPointer::read(&repo)?;
     let data_home = resolve_data_home(Some(&pointer), env_reader)?;
@@ -600,8 +622,20 @@ where
             context.correlation_id,
         )));
     }
+    let catalog =
+        xtrace_store::catalog_history_store::SqliteCatalogHistoryStore::new(store.clone());
+    #[cfg(unix)]
+    let exercise =
+        crate::exercise_store::ExerciseProject::new(project.id(), private_root, store.clone());
     let reader = SqliteRecordingReader::new(store, project_directory).with_source_root(repo);
-    Ok((project.id(), reader, context.correlation_id))
+    Ok(RecordingProject {
+        catalog,
+        id: project.id(),
+        reader,
+        correlation_id: context.correlation_id,
+        #[cfg(unix)]
+        exercise,
+    })
 }
 
 /// Resolves the user-data home directory for the supplied pointer
@@ -1382,6 +1416,43 @@ mod tests {
         init(repo.clone(), "Open".into(), String::new(), &env_reader).expect("init");
         open(repo.clone(), String::new(), &env_reader).expect("open");
         open(repo, String::new(), &env_reader).expect("open replay");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn viewer_exercise_lookup_uses_the_selected_project_without_initializing_plans() {
+        use xtrace_application::exercise::ExerciseError;
+        use xtrace_daemon::ViewerExerciseAction;
+
+        let repo = tempdir("viewer-plan-repo");
+        let home = tempdir("viewer-plan-home");
+        let env_reader = reader(HashMap::from([(USER_DATA_HOME_ENV, home.clone())]));
+        init(repo.clone(), "Viewer".into(), String::new(), &env_reader).expect("init");
+        let selected = open_recording_project(&repo, &env_reader).expect("viewer project");
+        let data = UserDataPaths::project_dir_with_home(&home, selected.id).expect("project data");
+        let plans = data.join("exercise-plans");
+        let show = || ViewerExerciseAction::Show { hash: "a".repeat(64) };
+        assert!(!plans.exists());
+        assert_eq!(
+            selected.exercise.handle_viewer_action(show()),
+            Err(ExerciseError::StorageUnavailable)
+        );
+        assert!(!plans.exists());
+
+        // The original project handle observes a directory subsequently admitted
+        // by the CLI, even though it opened its catalog read-only before creation.
+        let verified = crate::daemon::open_validated_project(
+            crate::daemon::preflight_project(&repo, &env_reader).expect("preflight"),
+        )
+        .expect("CLI project");
+        let cli = crate::exercise_store::ExerciseProject::new(
+            verified.project_id,
+            verified.private_root,
+            verified.store,
+        );
+        let _store = cli.open(true).expect("admit CLI plans directory");
+        assert_eq!(selected.exercise.handle_viewer_action(show()), Err(ExerciseError::NotFound));
+        assert!(plans.join("lifecycle.lock").is_file());
     }
 
     #[test]

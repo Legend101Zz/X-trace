@@ -197,14 +197,32 @@ The existing explicitly asserted no-plan `approve --plan-hash abc` and bare `sho
 not-implemented fallback. A selected plan takes the implemented path. `exercise run` remains exit 9 because there is
 no executor. This preserves the old assertions; it does not claim unselected behavior is a completed feature.
 
+## Authenticated viewer planning
+
+The foreground viewer admits the project once and retains its read-only catalog, recording reader and private
+project binding. The CLI supplies a planning callback to the daemon. An explicit draft creation can initialize
+the private plan directory. Existing-plan reads and transitions require that directory to exist.
+The recording, catalog-export and exercise actions share the viewer's bounded blocking-worker capacity.
+An authenticated POST requires the exact viewer Origin, host, same-origin fetch metadata, client header,
+session cookie and JSON content type. Bodies and private review responses stay within the local viewer.
+The GET show route reads the current private phase. The POST routes create, edit, review or approve.
+Approval binds the displayed plan ID and hash, selected item IDs and a fresh owner confirmation.
+
+Send again opens for a linked recording. The operator supplies the selected catalog revision and operation
+version, an explicit target, missing inputs and body decision. The sheet holds fields in memory. Reopening it
+can show the saved identity and requires an explicit read before displaying its current phase. An explicit saved
+edit replaces the original. The service verifies the observed relationship again and enforces expiry and consent.
+The recording's catalog revision and version at capture remain unobserved.
+
+The shared credential-shape checks and deterministic JSON encoder live in the IO-free domain crate. Their
+export interfaces keep their established public paths. This keeps export catalog projection, application
+planning and the exercise synthesis engine in an acyclic dependency graph.
+
 ## Remaining work and evidence boundary
 
-The authenticated viewer API/OpenAPI routes, responsive Plan/Review/Send sheets, missing-input controls, per-item
-consent rendering, keyboard/phone behavior, credential-store resolver, guarded executor, sanitized attempt metadata,
-actual exercise item propagation and verified result-recording linkage are not implemented by this slice. The review
-reports `execution_available: false`, zero requests sent by these methods and an unavailable executor result; it never
-links a prior recording as a newly executed result. An eventual attempt can claim a result only from an actually
-observed recording carrying the exact exercise item identity. That contract needs a further reviewed source slice.
+The installed browser journey, genuine owner-operated exercise, credential resolution, guarded executor and
+observed result linkage remain open. Public evidence contains bounded stage counts. Private review data stays
+in admitted owner storage and authenticated local responses.
 
 Fixture coverage includes explicit catalog-version selection for two revisions of one observed operation, a
 missing historical version, interrupted staging, consent, edits, tampering, unresolved values/body, expiry, clock rollback, privacy and an

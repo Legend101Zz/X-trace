@@ -4,6 +4,9 @@
 //! only a fixed asset manifest and the bounded recording and observed-query
 //! application services; it has no storage or repository dependency.
 
+mod exercise;
+pub use exercise::{ViewerExerciseAction, ViewerExerciseHandler};
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::Ipv4Addr;
@@ -41,6 +44,9 @@ use xtrace_application::{
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{CorrelationId, OperationId, ProjectId, RecordingId};
+
+mod export;
+pub use export::CatalogExportCancellation;
 
 const MAX_CONNECTIONS: usize = 32;
 const MAX_HTTP_HEADERS: usize = 32;
@@ -91,6 +97,8 @@ struct ViewerState<P> {
     recording_service: RecordingQueryService<P>,
     observed_service: ObservedEndpointQueryService<P>,
     query_lane: QueryLane,
+    catalog_exports: Option<Arc<export::CatalogExportReader>>,
+    export_slots: Arc<Semaphore>,
     project_id: ProjectId,
     origin: String,
     host: String,
@@ -172,6 +180,7 @@ impl Drop for QueryCompletion {
 
 /// Bound viewer listener and the URL needed to authenticate its first browser.
 pub struct BoundViewer<P> {
+    exercise: Option<ViewerExerciseHandler>,
     listener: TcpListener,
     state: Arc<ViewerState<P>>,
 }
@@ -187,6 +196,43 @@ impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundVie
         observed_service: ObservedEndpointQueryService<P>,
         project_id: ProjectId,
     ) -> Result<Self, ViewerError> {
+        Self::bind_inner(recording_service, observed_service, project_id, None).await
+    }
+
+    /// Binds the viewer with a read-only, already-admitted catalog snapshot reader.
+    /// The project ID supplied to the reader is always the viewer's bound project.
+    ///
+    /// # Errors
+    /// Returns the same listener and token-generation failures as [`Self::bind`].
+    pub async fn bind_with_catalog_exports<F>(
+        recording_service: RecordingQueryService<P>,
+        observed_service: ObservedEndpointQueryService<P>,
+        project_id: ProjectId,
+        reader: F,
+    ) -> Result<Self, ViewerError>
+    where
+        F: Fn(
+                ProjectId,
+                xtrace_application::catalog_discovery::history::CatalogExportRevision,
+                xtrace_application::catalog_discovery::history::CatalogExportScope,
+                CatalogExportCancellation,
+            ) -> Result<
+                xtrace_application::catalog_discovery::history::CatalogExportSnapshot,
+                xtrace_application::catalog_discovery::history::CatalogExportReadError,
+            > + Send
+            + Sync
+            + 'static,
+    {
+        Self::bind_inner(recording_service, observed_service, project_id, Some(Arc::new(reader)))
+            .await
+    }
+
+    async fn bind_inner(
+        recording_service: RecordingQueryService<P>,
+        observed_service: ObservedEndpointQueryService<P>,
+        project_id: ProjectId,
+        catalog_exports: Option<Arc<export::CatalogExportReader>>,
+    ) -> Result<Self, ViewerError> {
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.map_err(ViewerError::Listener)?;
         let address = listener.local_addr().map_err(ViewerError::Listener)?;
@@ -199,6 +245,8 @@ impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundVie
             recording_service,
             observed_service,
             query_lane: QueryLane::new(MAX_QUERY_CONCURRENCY),
+            catalog_exports,
+            export_slots: Arc::new(Semaphore::new(export::MAX_EXPORT_CONCURRENCY)),
             project_id,
             origin,
             host,
@@ -209,7 +257,14 @@ impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundVie
             })),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
         });
-        Ok(Self { listener, state })
+        Ok(Self { listener, state, exercise: None })
+    }
+
+    /// Enables planning against the project admitted by the foreground composition root.
+    #[must_use]
+    pub fn with_exercise_handler(mut self, handler: ViewerExerciseHandler) -> Self {
+        self.exercise = Some(handler);
+        self
     }
 
     /// Returns the structured, credential-bearing initial browser URL.
@@ -248,7 +303,7 @@ impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundVie
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let app = router(self.state.clone());
+        let app = router(self.state.clone(), self.exercise);
         let service =
             ServiceBuilder::new().layer(ConcurrencyLimitLayer::new(MAX_CONNECTIONS)).service(app);
         let shutdown = Box::pin(shutdown);
@@ -278,6 +333,7 @@ impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundVie
         drop(service);
         let end = Instant::now() + Duration::from_secs(2);
         self.state.query_lane.close();
+        self.state.export_slots.close();
         while !connections.is_empty() && Instant::now() < end {
             if timeout(Duration::from_millis(100), connections.join_next()).await.is_err() {
                 continue;
@@ -338,6 +394,7 @@ where
 
 fn router<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static>(
     state: Arc<ViewerState<P>>,
+    exercise: Option<ViewerExerciseHandler>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -347,6 +404,8 @@ fn router<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static>(
         .route("/assets/fonts/chivo-latin-600-normal.woff2", get(chivo_bold_font))
         .route("/assets/fonts/azeret-mono-latin-400-normal.woff2", get(mono_font))
         .route("/api/v1/auth/exchange", post(exchange))
+        .route("/api/v1/exports/preview", post(export::preview_route))
+        .route("/api/v1/exports/save", post(export::save_route))
         .route("/api/v1/recordings", get(list_recordings))
         .route("/api/v1/recordings/:recording_id", get(show_recording))
         .route(
@@ -359,6 +418,7 @@ fn router<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static>(
         .route("/api/v1/endpoints", get(list_observed_endpoints))
         .route("/api/v1/endpoints/:operation_id/recordings", get(list_operation_recordings))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
+        .merge(exercise::routes(exercise))
         .layer(axum::middleware::from_fn(add_response_security))
         .fallback(not_found)
         .with_state(state)
@@ -1701,7 +1761,7 @@ fn problem_with_id(
 fn problem_with_dynamic_code(
     status: StatusCode,
     title: &'static str,
-    detail: &'static str,
+    detail: &str,
     code: &str,
     request_id: CorrelationId,
 ) -> Response {
@@ -1758,6 +1818,8 @@ fn add_security_headers(headers: &mut HeaderMap) {
     reason = "HTTP tests use fixed local fixture data"
 )]
 mod tests {
+    include!("viewer/export_tests.rs");
+
     use super::*;
     use rusqlite::{Connection, params};
     #[cfg(unix)]
@@ -1893,6 +1955,13 @@ mod tests {
     }
 
     async fn start_with(fixture: ReadFixture) -> RunningViewer {
+        start_with_planning(fixture, None).await
+    }
+
+    async fn start_with_planning(
+        fixture: ReadFixture,
+        planning: Option<ViewerExerciseHandler>,
+    ) -> RunningViewer {
         let project_id = ProjectId::new();
         let bound = BoundViewer::bind(
             RecordingQueryService::new(fixture.clone()),
@@ -1901,6 +1970,8 @@ mod tests {
         )
         .await
         .expect("bind local viewer");
+        let bound =
+            if let Some(handler) = planning { bound.with_exercise_handler(handler) } else { bound };
         let query_lane = bound.state.query_lane.clone();
         let ready = bound.readiness();
         let host = ready.origin.strip_prefix("http://").unwrap().to_owned();
@@ -1921,6 +1992,62 @@ mod tests {
             shutdown,
             task,
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_owner_plan_review_has_a_closed_body_and_show_is_read_only() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let handler: ViewerExerciseHandler = Arc::new(move |action| {
+            let name = match action {
+                ViewerExerciseAction::Review { .. } => "review",
+                ViewerExerciseAction::Show { .. } => "show",
+                ViewerExerciseAction::Approve { .. } => "approve",
+                _ => return Err(xtrace_application::exercise::ExerciseError::InvalidInput),
+            };
+            observed.lock().unwrap().push(name);
+            Ok(serde_json::json!({"action": name, "requests_sent": 0}))
+        });
+        let viewer = start_with_planning(ReadFixture::default(), Some(handler)).await;
+        let cookie = authenticate(&viewer).await;
+        let hash = "b".repeat(64);
+        let path = format!("/api/v1/exercise/plans/{hash}");
+        let headers = request_headers(&viewer.host, &viewer.origin);
+        let post = |suffix: &str, body: &str, headers: &str| {
+            format!(
+                "POST {path}/{suffix} HTTP/1.1\r\n{headers}Cookie: {cookie}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let no_origin = headers.replace(&format!("Origin: {}\r\n", viewer.origin), "");
+        assert!(
+            request(&viewer.host, &post("review", "{}", &no_origin))
+                .await
+                .starts_with("HTTP/1.1 403")
+        );
+        let invalid = request(
+            &viewer.host,
+            &post("review", r#"{"private_input":"omitted-value"}"#, &headers),
+        )
+        .await;
+        assert!(invalid.starts_with("HTTP/1.1 400"));
+        assert!(!invalid.contains("omitted-value"));
+        assert!(
+            request(&viewer.host, &post("approve", "{}", &headers))
+                .await
+                .starts_with("HTTP/1.1 400")
+        );
+        let read = format!(
+            "GET {path} HTTP/1.1\r\n{headers}Cookie: {cookie}\r\nConnection: close\r\n\r\n"
+        );
+        let shown = request(&viewer.host, &read).await;
+        assert!(shown.starts_with("HTTP/1.1 200"));
+        assert!(shown.to_ascii_lowercase().contains("cache-control: no-store"));
+        let reviewed = request(&viewer.host, &post("review", "{}", &headers)).await;
+        assert!(reviewed.starts_with("HTTP/1.1 200"));
+        assert_eq!(seen.lock().unwrap().as_slice(), ["show", "review"]);
+        viewer.shutdown.send(()).unwrap();
+        viewer.task.await.unwrap().unwrap();
     }
 
     async fn request(host: &str, text: &str) -> String {
@@ -2685,6 +2812,51 @@ mod tests {
             cursor = body["nextCursor"].as_str().map(str::to_owned);
             assert_eq!(cursor.is_some(), page < 2);
         }
+        // This is the actual HTTP route over persisted XTF, not a canned read-port
+        // response. Cross the forward-page boundary in both directions with a new limit.
+        let get_page = |suffix: &str| {
+            format!(
+                "GET /api/v1/recordings/{recording_id}?{suffix} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            )
+        };
+        let raw = get_page(&format!(
+            "limit=3&aroundFrame={}",
+            returned[6]["frameId"].as_str().expect("frame")
+        ));
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "persisted window must return HTTP 200");
+        let page: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1).expect("JSON");
+        assert_eq!(page["firstSequence"], "7");
+        let previous = page["prevCursor"].as_str().expect("HTTP backward cursor");
+        let raw = get_page(&format!("limit=2&cursor={previous}"));
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "persisted window must return HTTP 200");
+        let back: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1).expect("JSON");
+        assert_eq!(back["firstSequence"], "5");
+        assert_eq!(back["lastSequence"], "6");
+        assert_eq!(back["events"][0]["sequence"], "5");
+        assert_eq!(back["events"][1]["sequence"], "6");
+        let forward = back["nextCursor"].as_str().expect("HTTP forward cursor");
+        let response = request(&viewer.host, &get_page(&format!("limit=3&cursor={forward}"))).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "persisted window must return HTTP 200");
+        let again: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1).expect("JSON");
+        assert_eq!(again["firstSequence"], "7");
+        assert_eq!(again["lastSequence"], "9");
+        // A valid token scoped to this recording cannot be replayed on another route.
+        let foreign = RecordingId::new();
+        let raw = format!(
+            "GET /api/v1/recordings/{foreign}?cursor={previous} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "invalid cursor must return HTTP 400");
+        assert!(response.contains("XTR-VALIDATION-RECORDING-CURSOR"));
+        let response = request(&viewer.host, &get_page("cursor=v2.bad")).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "invalid cursor must return HTTP 400");
         assert_eq!(returned.len(), 8);
         for (event, sequence) in returned.iter().zip(2..=9) {
             assert_eq!(event["sequence"], sequence.to_string());
@@ -3313,6 +3485,8 @@ mod tests {
             recording_service: RecordingQueryService::new(ReadFixture::default()),
             observed_service: ObservedEndpointQueryService::new(ReadFixture::default()),
             query_lane: QueryLane::new(0),
+            catalog_exports: None,
+            export_slots: Arc::new(Semaphore::new(export::MAX_EXPORT_CONCURRENCY)),
             project_id: ProjectId::new(),
             origin: "http://127.0.0.1:12345".to_owned(),
             host: "127.0.0.1:12345".to_owned(),
@@ -3373,6 +3547,8 @@ mod tests {
             recording_service: RecordingQueryService::new(ReadFixture::default()),
             observed_service: ObservedEndpointQueryService::new(ReadFixture::default()),
             query_lane: QueryLane::new(MAX_QUERY_CONCURRENCY),
+            catalog_exports: None,
+            export_slots: Arc::new(Semaphore::new(export::MAX_EXPORT_CONCURRENCY)),
             project_id: ProjectId::new(),
             origin: format!("http://{address}"),
             host: address.to_string(),
@@ -3381,7 +3557,7 @@ mod tests {
         });
         let service = ServiceBuilder::new()
             .layer(ConcurrencyLimitLayer::new(MAX_CONNECTIONS))
-            .service(router(state));
+            .service(router(state, None));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             serve_connection_with_timeout(stream, service, Duration::from_millis(80)).await

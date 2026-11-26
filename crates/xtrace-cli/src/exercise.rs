@@ -138,19 +138,14 @@ fn open(
     let preflight =
         crate::daemon::preflight_project(&common.project_dir, &crate::paths::read_env_path)?;
     let project = crate::daemon::open_validated_project(preflight)?;
-    let plans = project
-        .private_root
-        .open_or_create_private_child("exercise-plans")
-        .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    Ok((
-        ExercisePlanService::new(crate::exercise_store::PrivateExerciseStore {
-            project: project.project_id,
-            plans,
-            catalog: project.store,
-            project_data_root: project.project_data_root,
-        }),
+    let store = crate::exercise_store::ExerciseProject::new(
         project.project_id,
-    ))
+        project.private_root,
+        project.store,
+    )
+    .open(true)
+    .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    Ok((ExercisePlanService::new(store), project.project_id))
 }
 
 #[cfg(unix)]

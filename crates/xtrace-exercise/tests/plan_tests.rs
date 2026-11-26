@@ -166,7 +166,7 @@ fn candidate_never_invents_credentials() {
     let item = plan.items.iter().find(|i| i.operation_id == "op-get").unwrap();
     let r = item.params.iter().find(|p| p.name == "ref").unwrap();
     assert_eq!(r.value.as_deref(), Some("fine"));
-    let text = xtrace_export::canonical::json_compact(&plan_value(&plan));
+    let text = xtrace_domain::canonical_json::json_compact(&plan_value(&plan));
     assert!(!text.contains("eyJ") && !text.contains("abcdefghijklmnopqrstu"), "{text}");
 }
 

@@ -71,7 +71,7 @@ fn env_name(prefix: &str, name: &str, taken: &mut BTreeSet<String>) -> String {
     candidate
 }
 
-fn slug(path: &str) -> String {
+pub(crate) fn slug(path: &str) -> String {
     let mut s: String = path
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
