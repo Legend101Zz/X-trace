@@ -1,0 +1,146 @@
+name: Node admission and root boundary proof
+on:
+  push:
+    branches: [codex/proof-medusa-root-admission-120]
+permissions:
+  contents: read
+concurrency:
+  group: medusa-installed-120
+  cancel-in-progress: false
+jobs:
+  ownership:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MEDUSA_PRODUCT_SHA: 480e0e724ba7f7418ce44c39b5b8497db258d86f
+      MEDUSA_PRODUCT_TREE: ede52777d8b8b20fb1550e5a93d6886358ca7e7f
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.21.0
+      - name: Admit source and private directories
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$MEDUSA_PRODUCT_SHA"
+          git checkout --detach "$MEDUSA_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$MEDUSA_PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          owner="$(mktemp -d "$RUNNER_TEMP/medusa-owned-proof.XXXXXXXX")"
+          root="$owner/proof"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/outer" "$root/safe"
+          printf '%s\n' "MEDUSA_ROOT=$root" >> "$GITHUB_ENV"
+          printf '%s\n' 'admitted=true' >> "$GITHUB_OUTPUT"
+      - name: Run only the synthetic admission boundary check
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          cat >"$MEDUSA_ROOT/outer/controller.py" <<'MEDUSA_CONTROLLER'
+          """Run the single synthetic HTTP capture-pressure case and emit finite evidence."""
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          from tools.release.private_roots import admit_directory, atomic_write_private
+
+          root = Path(os.environ["MEDUSA_ROOT"])
+          admit_directory(root)
+          sys.path.insert(0, str(Path("campaigns/node/medusa/harness").resolve()))
+          from installed_process import contain_children, verify_children_gone
+
+          commands = {
+              "locked-dependencies": (["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], 300),
+              "protocol-compile": (["npm", "run", "build:protocol"], 120),
+              "adapter-compile": (["npm", "run", "build:core"], 120),
+              "root-pressure-case": (
+                  ["node", "--test", "--test-reporter=tap", "packages/adapter-core/dist/test/http-root-admission.test.js"], 30),
+          }
+          receipt = {
+              "schemaVersion": 1, "kind": "medusa-root-admission-boundary-120", "status": "failed",
+              "sourceSha": os.environ["MEDUSA_PRODUCT_SHA"], "sourceTree": os.environ["MEDUSA_PRODUCT_TREE"],
+              "wrapperSha": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "counts": None,
+              "stages": {stage: {"command": "unreached", "exitCode": None, "cleanup": "unreached"}
+                         for stage in commands},
+          }
+
+
+          def save():
+              atomic_write_private(root / "safe/receipt.json", (json.dumps(receipt, sort_keys=True) + "\n").encode())
+
+
+          def command(stage, argv, seconds):
+              row = receipt["stages"][stage]
+              out = root / "outer" / (stage + ".stdout")
+              with out.open("xb") as stdout, out.with_suffix(".stderr").open("xb") as stderr:
+                  try:
+                      env = dict(os.environ, npm_config_cache=str(root / "npm-cache"))
+                      child = subprocess.Popen(argv, cwd="adapters/node", env=env, stdin=subprocess.DEVNULL,
+                                               stdout=stdout, stderr=stderr)
+                      try:
+                          row["exitCode"] = child.wait(timeout=seconds)
+                          row["command"] = "exited"
+                      except subprocess.TimeoutExpired:
+                          row["command"] = "deadline"
+                          if child.poll() is None:
+                              child.kill()
+                          try:
+                              child.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              row["command"] = "unreaped"
+                  except OSError:
+                      row["command"] = "spawn-or-io"
+                  finally:
+                      row["cleanup"] = "failed"
+                      save()
+                      try:
+                          verify_children_gone()
+                      except TimeoutError:
+                          pass
+                      else:
+                          row["cleanup"] = "passed"
+                          save()
+              return row == {"command": "exited", "exitCode": 0, "cleanup": "passed"}
+
+
+          save()
+          contain_children()
+          for step, (argv, seconds) in commands.items():
+              if not command(step, argv, seconds):
+                  sys.exit(1)
+          output = root / "outer/root-pressure-case.stdout"
+          assert 0 < output.stat().st_size <= 65536
+          tap = output.read_text()
+          name = "capture pressure distinguishes a retained root, a root lost after admission, and refusal"
+          assert re.findall(r"^ok ([1-9]) - ([^\n]+)$", tap, re.M) == [("1", name)]
+          expected = {"tests": 1, "pass": 1, "fail": 0, "cancelled": 0, "skipped": 0, "todo": 0}
+          counts = {}
+          for key in expected:
+              value, = re.findall(rf"^# {key} ([0-9]{{1,3}})$", tap, re.M)
+              counts[key] = int(value)
+          assert counts == expected
+          receipt["counts"] = counts
+          receipt["status"] = "passed"
+          save()
+          MEDUSA_CONTROLLER
+          printf '%s  %s\n' '5c4ab0951df984a092940bcb6347ad392ebd2b97fd5c634882ced83866dfcb84' "$MEDUSA_ROOT/outer/controller.py" | sha256sum --check --status
+          PYTHONPATH="$PWD" python3 -B "$MEDUSA_ROOT/outer/controller.py" >"$MEDUSA_ROOT/outer/controller.log" 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && steps.root.outputs.admitted == 'true'
+        with:
+          name: medusa-120-root-admission-counts
+          path: ${{ env.MEDUSA_ROOT }}/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
