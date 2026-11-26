@@ -148,6 +148,43 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       });
     }), 'the rendered label is inside the viewport and unobscured by neighboring panes or controls');
   };
+  const verifyRecordingBar = async (detail, width) => {
+    const summary = page.getByRole('region', { name: 'Recording summary' });
+    const ns = detail.durationNs === null ? null : BigInt(detail.durationNs);
+    const duration = ns === null ? 'Duration unavailable' : ns < 1_000_000n ? `${ns} ns` :
+      `${ns / 1_000_000n}.${(ns / 100_000n) % 10n} ms`;
+    const standard = detail.limitations.includes('capture_policy_not_armed');
+    const capture = summary.locator('.recording-capture');
+    const info = width < 700 ? summary.locator('.replay-context-why') : capture;
+    const opener = info.locator('summary');
+    if (width < 700) {
+      await expect(capture).toBeHidden();
+    } else {
+      const value = summary.locator('.recording-duration-value');
+      await expect(value).toHaveText(duration);
+      await assertLabelUncovered(value);
+      await expect(opener).toHaveText(standard ? 'Standard' : 'Capture');
+    }
+    await assertLabelUncovered(opener);
+    if (pointer === 'coarse' || width < 1024) {
+      const box = await opener.boundingBox();
+      assert.ok(box && box.width >= 44 && box.height >= 44, 'recording evidence has a touch-sized control');
+    }
+    await opener.press('Enter');
+    await expect(info).toHaveJSProperty('open', true);
+    const explanation = info.locator('.replay-context-explanation');
+    await expect(explanation).toBeInViewport({ ratio: 1 });
+    const modeEvidence = explanation.getByText(standard ?
+      'Focused capture was not armed; relaunch with focused capture to record this.' :
+      'Capture mode unavailable for this recording.', { exact: true });
+    await assertLabelUncovered(modeEvidence);
+    assert.deepEqual(await explanation.locator('[aria-label="Recorded capture limitations"] li').allTextContents(), detail.limitations);
+    if (width < 700) await expect(explanation).toContainText(ns === null ?
+      'Duration unavailable for this capture' : `Adapter-observed duration ${duration} (measured by the adapter, not verified by X-trace)`);
+    await opener.press('Escape');
+    await expect(info).toHaveJSProperty('open', false);
+    await expect(opener).toBeFocused();
+  };
   const verifyCompactJumpClose = async () => {
     const opener = page.locator('.replay-tools').getByRole('button', { name: 'Tools', exact: true });
     await openPanel('jump');
@@ -276,7 +313,7 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
             knownDetails.set(detail.recordingId, detail);
           })().catch(problem => { observedReadErrors.push(problem); }));
         };
-        if (width === 320) page.on('response', observeDetail);
+        page.on('response', observeDetail);
         try {
           await verifyRecordingSelection({ sequence, activate });
           await Promise.all(observedReads);
@@ -284,6 +321,10 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
         } finally {
           page.off('response', observeDetail);
         }
+        const activeRecording = await page.locator('#events-panel .center-title h1').textContent();
+        const detail = knownDetails.get(activeRecording);
+        assert.ok(detail && detail.recordingId === activeRecording, 'the recording bar uses the selected recording read by the existing switch');
+        await verifyRecordingBar(detail, width);
         if (width === 320) {
           const tabs = page.getByRole('tablist', { name: 'Open recordings' }).getByRole('tab');
           await expect(tabs).toHaveCount(2);

@@ -27,7 +27,7 @@ const detail = {
   recordingId: recordingA, status: 'complete', completion: 'complete',
   adapterSummary: null as null | { Redacted: { rule_id: string; shape_hint: unknown } },
   capacity: null as null | { eventCap: number; eventCount: number; capacityDroppedEvents: string; dropsByPriority: Record<string, string> },
-  durationNs: '20', dropCountsByPriority: {}, segmentCount: '1', incompleteEvidence: [] as string[], nextCursor: null as string | null, prevCursor: null as string | null,
+  durationNs: '20' as string | null, limitations: [] as string[], dropCountsByPriority: {}, segmentCount: '1', incompleteEvidence: [] as string[], nextCursor: null as string | null, prevCursor: null as string | null,
   sessionContext,
   unavailable: { source: 'unavailable', values: 'unavailable', completion: 'unavailable' },
   outcome: { kind: 'exception', httpStatus: 500, exception: { exceptionType: 'java.lang.IllegalStateException', message: 'boom' }, thrownFromEventId: null },
@@ -288,6 +288,27 @@ describe('replay wiring in the app', () => {
     const banner = screen.getByRole('region', { name: 'Recording outcome' });
     expect(within(banner).getByText('Response status 500 (as reported by the adapter)')).toBeInTheDocument();
     expect(within(banner).getByText('Exception java.lang.IllegalStateException: boom')).toBeInTheDocument();
+  });
+
+  it.each([
+    { limitations: ['capture_policy_not_armed'], durationNs: '4199999', label: 'Standard', duration: '4.1 ms' },
+    { limitations: [], durationNs: null, label: 'Capture', duration: 'Duration unavailable' },
+    { limitations: ['future_limitation'], durationNs: '0', label: 'Capture', duration: '0 ns' },
+  ])('shows recording bar evidence for $limitations with duration $durationNs', async ({ limitations, durationNs, label, duration }) => {
+    const withLocal = events.map(event => ({ ...event, bindings: [{ name: 'observed', role: 'local',
+      nameOrigin: 'declared', value: { state: 'captured', preview: 'seen' } }] }));
+    responseDetail = { ...detail, durationNs, limitations, events: withLocal };
+    await openRecording();
+    const bar = screen.getByRole('region', { name: 'Recording summary' });
+    const pill = within(bar).getByLabelText('Capture evidence');
+    expect(pill).toHaveTextContent(label);
+    expect(bar.querySelector('.recording-duration-value')).toHaveTextContent(duration);
+    const panel = pill.parentElement!;
+    expect(panel).toHaveTextContent(label === 'Standard'
+      ? 'Focused capture was not armed; relaunch with focused capture to record this.'
+      : 'Capture mode unavailable for this recording.');
+    expect([...panel.querySelectorAll('li')].map(item => item.textContent)).toEqual(limitations);
+    expect(panel).not.toHaveTextContent('seen');
   });
 
   it('shows the selected throw type separately from the framework outcome wrapper', async () => {

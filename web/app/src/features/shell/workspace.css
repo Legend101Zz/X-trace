@@ -112,6 +112,14 @@
 .replay-context-status--partial { color: var(--amber); }
 .replay-context-status--invalid { color: var(--danger); }
 .replay-context-status--unavailable { color: var(--muted); font-size: 11px; }
+.recording-duration { font-size: 12px; }
+.recording-capture summary { display: grid; place-items: center; min-width: 44px; min-height: 44px; padding-inline: 8px; border: 1px solid var(--line-strong); border-radius: 2rem; cursor: pointer; }
+.recording-capture summary::-webkit-details-marker { display: none; }
+.recording-capture summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+.compact-capture-evidence { display: none; }
+@media (min-width: 700px) {
+  .replay-context-request { flex-wrap: wrap; }
+}
 .replay-context-event { min-height: 25px; font-size: 12px; }
 .replay-context-event > :first-child { flex-shrink: 0; color: var(--amber); }
 .replay-context-why summary { display: flex; min-width: 44px; min-height: 32px; align-items: center; justify-content: center; color: var(--text); text-decoration: underline; cursor: pointer; }
@@ -239,6 +247,8 @@
   .shell[data-reading='true']:not([data-pane='recordings']) > .recording-tabs { grid-row: 3; }
   .replay-context { padding-inline: 8px; }
   .replay-context-request { gap: 3px; }
+  .recording-duration, .recording-capture { display: none; }
+  .compact-capture-evidence { display: block; }
   .replay-context-event { margin: 0; }
   .phone-replay-toolbar { position: relative; background: var(--panel); }
   .phone-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; }
