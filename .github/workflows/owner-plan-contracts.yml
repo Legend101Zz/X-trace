@@ -1,0 +1,162 @@
+name: Assembled owner Plan source contract qualification
+on:
+  push:
+    branches: [codex/proof-owner-plan-contracts-121]
+permissions:
+  contents: read
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PRODUCT: 4e61efab2030be38fac58bb14205549794a94fa1
+      PRODUCT_TREE: c90c3d8c0bd1c08e23cc648eed5d5c89507fc005
+      EDIT_PATCH_SHA256: 810330681addf17272609329c430a685bbc08c05471b24d3e5b0d42f936d2011
+      BASE: 5b3a677e064d051ab698d09556c6731f8464105b
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Admit exact source and private test directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git show -s --format=%P "$GITHUB_SHA")" = "$PRODUCT"
+          python3 -B - <<'WRAPPER'
+          import os, subprocess
+          expected=['A\t.github/workflows/owner-plan-contracts.yml']
+          actual=subprocess.check_output(['git','diff','--name-status',os.environ['PRODUCT'],os.environ['GITHUB_SHA']],text=True).splitlines()
+          assert actual==sorted(expected)
+          WRAPPER
+          umask 077
+          [[ "$PRODUCT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git show -s --format=%P HEAD)" = "b32ccdd033432ee121933421e19c80814f806c33 d0581314cc4ecfc90ec6483ea3809fb0e0e4c2a7"
+          test "$(git merge-tree --write-tree HEAD^ HEAD^2)" = "$BASE"
+          test "$(git diff --no-ext-diff --full-index --binary "$BASE" "$PRODUCT" | sha256sum | cut -d' ' -f1)" = "$EDIT_PATCH_SHA256"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="${RUNNER_TEMP:?}/xp121"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/priv" "$root/logs" "$root/safe"
+          printf '%s\n' "PROOF=$root" "TMPDIR=$root/tmp" "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.97.1
+      - name: Check original 24 named cases and integrated exact export exercise daemon contracts
+        id: fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path(os.environ['PROOF'])
+          cases = (
+              ('application', ['-p', 'xtrace-application', '--test', 'exercise_plan'], [],
+               ('actual_synthesis_review_and_explicit_per_item_consent_for_every_effect',
+                'body_and_inputs_stay_explicitly_unresolved_and_block_consent',
+                'edits_new_instances_and_tampering_never_inherit_approval',
+                'exclusive_expiry_and_clock_rollback_fail_closed_without_renewal',
+                'private_values_are_not_debug_logged_and_credentials_are_only_handles',
+                'invalid_targets_bounds_and_unobserved_bindings_fail_without_storage',
+                'concurrent_reservation_has_one_winner_and_never_rearms_unknown_delivery',
+                'bounded_bodies_and_transport_control_cannot_enter_a_plan',
+                'corrupted_phase_evidence_never_authorizes_a_reservation',
+                'admitted_drafts_have_space_for_exact_approval_at_the_document_limit',
+                'explicit_edit_preserves_predecessor_history_and_requires_fresh_item_consent',
+                'explicit_edit_races_the_same_original_revision_as_approval_or_reservation')),
+              ('private_store', ['-p', 'xtrace-cli', '--bin', 'xtrace'], ['exercise_store::tests::'],
+               ('exercise_store::tests::expiry_during_staging_cleans_only_owned_staging_and_never_rolls_back_published_state',
+                'exercise_store::tests::actual_private_port_refuses_contending_and_stale_revision_writers',
+                'exercise_store::tests::occupied_staging_blocks_writes_until_owner_preserves_it',
+                'exercise_store::tests::edit_expiry_on_each_side_of_the_commit_never_acknowledges_or_rearms_consent')),
+              ('real_cli_seeded_recording', ['-p', 'xtrace-cli', '--test', 'export_journey'], ['exercise_'],
+               ('exercise_real_cli_plan_review_and_item_approval_send_zero_requests',
+                'exercise_private_input_binding_and_unrecorded_body_fail_closed',
+                'exercise_one_observed_operation_and_two_distinct_catalog_versions',
+                'exercise_no_payload_sources_refuse_extra_fields_before_publication',
+                'exercise_rejects_duplicate_body_keys_and_preserves_unique_body_text',
+                'exercise_rejects_surplus_draft_phase_fields_without_replacing_private_bytes',
+                'exercise_explicit_edit_recovers_each_publication_boundary_and_revokes_old_consent')),
+              ('legacy_fallback', ['-p', 'xtrace-cli', '--test', 'stub_commands'],
+               ['--exact', 'unimplemented_command_exits_nine_with_stable_message_for_each'],
+               ('unimplemented_command_exits_nine_with_stable_message_for_each',)),
+              ('export_catalog_export', ['-p', 'xtrace-export', '--test', 'catalog_export'], [], ('linked_observations_require_positive_count_and_full_scope_identity', 'live_observation_update_changes_rendered_bytes_without_changing_revision', 'selection_uses_stable_ids_and_reports_first_missing_before_rendering', 'all_formats_are_independent_of_catalog_and_observation_read_order', 'missing_claims_and_policy_remain_explicit_without_copying_summary_values', 'viewer_preview_and_approved_save_preserve_exact_cli_artifacts_for_each_scope_and_format', 'viewer_save_refuses_changed_observations_on_the_same_revision', 'endpoint_preview_binds_full_revision_identity_even_for_an_unselected_operation', 'viewer_save_binds_visible_metadata_even_when_logical_files_are_unchanged', 'viewer_save_binds_revision_policy_scope_options_and_approval_digest', 'viewer_preview_reports_colliding_scope_count_and_safe_omission', 'viewer_refuses_invalid_requests_incomplete_catalogs_and_sanitizer_paths_safely', 'http_render_admission_bounds_inputs_and_structural_work_before_rendering', 'root_recipe_preview_names_require_source_root_without_literal_slug_collisions', 'observed_scope_approval_binds_original_selector_and_resolved_catalog_identity')),
+              ('export_curl_quoting', ['-p', 'xtrace-export', '--test', 'curl_quoting'], [], ('curl_quoting_roundtrips_hostile_inputs_10k', 'nul_cannot_be_quoted', 'hostile_catalog_text_cannot_escape_the_recipe', 'hostile_method_cannot_escape_the_recipe')),
+              ('export_export_core', ['-p', 'xtrace-export', '--test', 'export_core'], [], ('legacy_serialized_inputs_keep_summary_and_handler_gaps', 'missing_null_and_explicit_empty_catalog_facts_across_formats', 'legacy_claim_rows_and_summary_facts_agree_across_formats', 'complete_and_partial_rows_check_reported_summary_facts_across_formats', 'handler_summary_consistency_is_independent_of_claim_availability', 'summary_handler_checks_respect_counts_location_scope_and_symbol_filtering', 'mixed_serialized_claims_retain_independent_handler_locations', 'unsafe_claim_evidence_locations_are_omitted_across_formats', 'long_claim_symbols_still_pass_through_the_secret_gate', 'conflicting_claim_values_pass_through_the_secret_gate', 'export_is_independent_of_input_order', 'export_content_hash_stable_across_runs', 'export_has_no_secret_or_canary_values', 'export_omissions_listed_for_every_dropped_example', 'bundle_composes_the_formats_and_preserves_format_specific_omissions', 'selection_filters_and_reports_unknown_ids', 'truncated_view_is_an_explicit_omission', 'files_are_never_executable', 'secret_word_routes_and_prose_descriptions_export', 'unsafe_handler_paths_are_dropped_and_listed_as_omissions')),
+              ('export_golden_curl', ['-p', 'xtrace-export', '--test', 'golden_curl'], [], ('curl_golden', 'curl_all_sh_prints_and_never_executes', 'curl_mutation_label_present', 'curl_scripts_not_marked_executable', 'curl_no_secret_values', 'sh_n_syntax_check', 'curl_export_is_order_independent_and_repeatable', 'hostile_names_and_comments_stay_on_one_line')),
+              ('export_golden_openapi', ['-p', 'xtrace-export', '--test', 'golden_openapi'], [], ('openapi_golden_spring_orders', 'openapi_path_params_always_declared_required', 'openapi_conflicting_claims_surface_x_xtrace_conflicts_not_merged', 'openapi_inferred_example_labelled_not_observed', 'openapi_operation_id_collision_resolution_stable', 'openapi_duplicate_method_path_is_reported_not_merged', 'openapi_alternates_keep_their_standalone_projection_in_scope_order', 'openapi_passes_structural_31_validator', 'structural_validator_rejects_broken_documents', 'unavailable_claims_are_stated_not_guessed', 'openapi_carries_observation_markers')),
+              ('export_golden_postman', ['-p', 'xtrace-export', '--test', 'golden_postman'], [], ('postman_golden_and_repeatable', 'postman_shape_and_no_secrets')),
+              ('exercise_pure', ['-p', 'xtrace-exercise', '--test', 'plan_tests'], [], ('plan_hash_stable_under_input_order', 'plan_hash_changes_on_any_field_change', 'value_priority_scenario_then_claim_then_default_then_unresolved', 'candidate_never_invents_credentials', 'effect_unknown_for_conflicting_evidence', 'default_selection_is_new_changed_unobserved', 'plan_preview_makes_zero_requests', 'crate_source_has_no_networking_code', 'preview_reports_unresolved_and_credentials', 'item_ids_are_uuid_text_and_differ_between_plans', 'target_with_userinfo_rejected', 'target_with_query_secret_rejected', 'non_http_scheme_rejected', 'selection_reason_does_not_claim_unknown_observation', 'target_differentials_rejected', 'target_host_classification')),
+              ('canonical_compatibility', ['-p', 'xtrace-export', '--lib'], ['canonical::tests::'], ('canonical::tests::keys_are_sorted_in_json_and_yaml', 'canonical::tests::yaml_quotes_reserved_words_and_paths', 'canonical::tests::pretty_json_is_stable')),
+              ('daemon_current_route_guard', ['-p', 'xtrace-daemon', '--lib'], ['--exact', 'viewer::tests::authenticated_owner_plan_review_has_a_closed_body_and_show_is_read_only'], ('viewer::tests::authenticated_owner_plan_review_has_a_closed_body_and_show_is_read_only',)),
+              ('daemon_five_authenticated_routes', ['-p', 'xtrace-daemon', '--lib'], ['--exact', 'viewer::exercise::tests::authenticated_five_plan_routes_preserve_exact_actions_and_private_responses'], ('viewer::exercise::tests::authenticated_five_plan_routes_preserve_exact_actions_and_private_responses',)),
+          )
+          def need(value):
+              if not value:
+                  raise ValueError('fixture count mismatch')
+          rows = {label: dict(expected=len(names), passed=0, status='unreached')
+                  for label, _, _, names in cases}
+          receipt = dict(schemaVersion=1, kind='owner_plan_source_contracts',
+                         sourceSha=os.environ['PRODUCT'], sourceTree=os.environ['PRODUCT_TREE'],
+                         wrapperSha=os.environ['GITHUB_SHA'], runId=int(os.environ['GITHUB_RUN_ID']),
+                         attempt=int(os.environ['GITHUB_RUN_ATTEMPT']),
+                         releaseAcceptance=False, packaged=False, genuineApplicationCapture=False,
+                         status='failed', stages=rows)
+          def save():
+              tmp = root/'safe'/'receipt.tmp'
+              tmp.write_text(json.dumps(receipt, sort_keys=True)+'\n')
+              tmp.replace(root/'safe'/'counts.json')
+          try:
+              need(re.fullmatch('[0-9a-f]{40}', receipt['wrapperSha']))
+              save()
+              for label, target, selected, names in cases:
+                  row = rows[label]
+                  row['status'] = 'failed'
+                  save()
+                  out = root/'logs'/(label+'.stdout')
+                  err = root/'logs'/(label+'.stderr')
+                  with out.open('xb') as stdout, err.open('xb') as stderr:
+                      rc = subprocess.run(['cargo', '+1.97.1', 'test', '--locked', *target,
+                                           '--', *selected, '--test-threads=1', '--format', 'pretty',
+                                           '--color', 'never'], stdin=subprocess.DEVNULL,
+                                          stdout=stdout, stderr=stderr, check=False).returncode
+                  need(0 <= out.stat().st_size <= 8*1024*1024)
+                  body = out.read_bytes()
+                  passed = re.findall(rb'^test ([A-Za-z_0-9:]+) \.\.\. ok$', body, re.M)
+                  expected = [name.encode('ascii') for name in names]
+                  row['passed'] = len(set(passed).intersection(expected))
+                  save()
+                  need(rc == 0 and sorted(passed) == sorted(expected))
+                  need(re.findall(rb'^running ([0-9]+) tests?$', body, re.M) == [str(len(names)).encode()])
+                  summary = re.findall(rb'^test result: ok\. ([0-9]+) passed; 0 failed; 0 ignored; 0 measured; ([0-9]+) filtered out;', body, re.M)
+                  need(len(summary) == 1 and int(summary[0][0]) == len(names))
+                  if label == 'application':
+                      need(int(summary[0][1]) == 0)
+                  row['status'] = 'passed'
+                  save()
+              receipt['status'] = 'passed'
+              save()
+          except Exception:
+              print('Private exercise fixture proof failed. Inspect the fixed stage counts.')
+              sys.exit(1)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && (steps.fixtures.outcome == 'failure' || steps.fixtures.outcome == 'success') }}
+        with:
+          name: owner-plan-source-contract-counts
+          path: ${{ env.PROOF }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 7
