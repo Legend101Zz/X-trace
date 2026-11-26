@@ -1,0 +1,108 @@
+name: Build the corrected first-use viewer assets
+on:
+  push:
+    branches: [codex/proof-first-use-layout-assets-118]
+permissions:
+  contents: read
+jobs:
+  assets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PRODUCT: '8bca2efd9e57065342f7ffd822357fb898b71493'
+      PARENT: '10e83a00e052d7349eb3daa7e1d18e75f23696e0'
+      SOURCE_TREE: '976b3ce4780ac5044d79c4fa3bd8d4e512ff7db0'
+      SOURCE_PATCH: 'f1be1d5dd78576872e20b5954014a78dc0fefe0289b43358811e69d8c4e92c8c'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Verify source and workflow ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REPOSITORY" = Legend101Zz/X-trace
+          test "$GITHUB_REF" = refs/heads/codex/proof-first-use-layout-assets-118
+          test "$GITHUB_EVENT_NAME" = push && test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT"
+          test "$(git show -s --format=%P "$PRODUCT")" = "$PARENT"
+          test "$(git rev-parse "$PRODUCT^{tree}")" = "$SOURCE_TREE"
+          test "$(git diff --no-ext-diff --no-textconv --no-color --binary --full-index "$PARENT" "$PRODUCT" | sha256sum | cut -d' ' -f1)" = "$SOURCE_PATCH"
+          test "$(git diff --name-status --no-renames "$PRODUCT" HEAD)" = $'A\t.github/workflows/first-use-layout-assets.yml'
+          test "$(git ls-tree HEAD -- .github/workflows/first-use-layout-assets.yml | cut -d' ' -f1)" = 100644
+          git checkout --quiet --detach "$PRODUCT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          proof="$RUNNER_TEMP/xfu118"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$proof"
+          mkdir -m 700 "$proof/logs" "$proof/generated"
+          printf '%s\n' "PROOF=$proof" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Install locked viewer dependencies
+        working-directory: web/app
+        run: npm ci --ignore-scripts --no-audit --no-fund >"$PROOF/logs/npm" 2>&1
+      - name: Check types API browser syntax and contrast
+        working-directory: web/app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check:api >"$PROOF/logs/api" 2>&1
+          npm run typecheck >"$PROOF/logs/types" 2>&1
+          node --check scripts/browser-journey.mjs
+          node --check scripts/first-recording-journey.mjs
+          node --check scripts/first-recording-layout.mjs
+          node scripts/check-contrast.mjs >"$PROOF/logs/contrast" 2>&1
+      - name: Build embed and verify distribution parity
+        working-directory: web/app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build >"$PROOF/logs/build" 2>&1
+          npm run embed >"$PROOF/logs/embed" 2>&1
+          npm run check:embedded >"$PROOF/logs/parity" 2>&1
+      - name: Verify seven generated entries against the distribution and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import hashlib, os, subprocess
+          from pathlib import Path
+          from tools.release.private_roots import atomic_write_private
+          ui = Path('crates/xtrace-daemon/assets/ui')
+          target = Path(os.environ['PROOF']) / 'generated'
+          files = ('index.html','app.js','index.css','fonts/chivo-latin-400-normal.woff2',
+                   'fonts/chivo-latin-600-normal.woff2','fonts/azeret-mono-latin-400-normal.woff2')
+          names = set(files) | {'assets.sha256'}
+          entries = list(ui.rglob('*'))
+          assert all(not entry.is_symlink() and (entry.is_file() or entry.is_dir()) for entry in entries)
+          assert {entry.relative_to(ui).as_posix() for entry in entries if entry.is_file()} == names
+          expected = []
+          (target/'fonts').mkdir(mode=0o700)
+          for name in files:
+              dist_name = 'assets/' + name if name.startswith('fonts/') else name
+              file = ui / name
+              assert 0 < file.stat().st_size <= 20 * 1024 * 1024
+              data = file.read_bytes()
+              assert data == (Path('web/app/dist') / dist_name).read_bytes()
+              expected.append(hashlib.sha256(data).hexdigest() + '  ' + dist_name + '\n')
+              atomic_write_private(target/name, data)
+          manifest = ''.join(expected).encode()
+          assert manifest == (ui/'assets.sha256').read_bytes()
+          atomic_write_private(target/'assets.sha256', manifest)
+          dirty = set(subprocess.check_output(['git','diff','--name-only','HEAD'], text=True).splitlines())
+          assert {str(ui/name) for name in ('app.js','index.css','assets.sha256')} <= dirty
+          assert dirty <= {str(ui/name) for name in names}
+          assert not subprocess.check_output(['git','ls-files','--others','--exclude-standard'])
+          PY
+      - name: Upload exact generated files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: first-use-layout-generated-assets
+          path: ${{ env.PROOF }}/generated/
+          if-no-files-found: error
+          retention-days: 7
