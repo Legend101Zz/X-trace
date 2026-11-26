@@ -499,6 +499,8 @@ fn record_directory_probe(path: &Path) {
 struct DirectorySnapshot {
     metadata: std::fs::Metadata,
     #[cfg(target_os = "linux")]
+    state: DirectoryState,
+    #[cfg(target_os = "linux")]
     race: Option<AdmissionContext>,
 }
 
@@ -529,9 +531,13 @@ fn directory_metadata(
             operation.record_failure(AdmissionFailure::check(Step::Identity));
             return None;
         }
-        if DirectoryState::of(&named, role) == DirectoryState::of(&opened, role) {
+        let named_state = DirectoryState::of(&named, role);
+        let opened_state = DirectoryState::of(&opened, role);
+        if named_state == opened_state {
             return Some(DirectorySnapshot {
                 metadata: opened,
+                #[cfg(target_os = "linux")]
+                state: opened_state,
                 #[cfg(target_os = "linux")]
                 race,
             });
@@ -582,11 +588,15 @@ pub(crate) fn directory_acl_admits(
     if operation.expired() {
         return false;
     }
-    let Some(DirectorySnapshot { metadata: before, .. }) =
+    let Some(before) =
         directory_metadata(operation, path, directory, expected, role, AdmissionSite::Snapshot)
     else {
         return false;
     };
+    #[cfg(target_os = "linux")]
+    let state = before.state;
+    let before = before.metadata;
+    #[cfg(not(target_os = "linux"))]
     let state = DirectoryState::of(&before, role);
     let key = operation.directory_key(state, directory);
     #[cfg(all(target_os = "macos", test))]
@@ -640,6 +650,9 @@ pub(crate) fn directory_acl_admits(
     }
     // A changed state invalidates this verdict: the listing may predate an ACL grant. Child
     // activity requires fresh, identical ACL evidence bracketed by an unchanged precise state.
+    #[cfg(target_os = "linux")]
+    let changed = after.state != state;
+    #[cfg(not(target_os = "linux"))]
     let changed = DirectoryState::of(&after.metadata, role) != state;
     #[cfg(target_os = "linux")]
     let invalidated = changed || after.race.is_some();
@@ -833,7 +846,7 @@ fn recheck_linux_directory_acl(
     race: AdmissionContext,
 ) -> bool {
     loop {
-        let Some(DirectorySnapshot { metadata: before, .. }) = directory_metadata(
+        let Some(before) = directory_metadata(
             operation,
             path,
             directory,
@@ -869,13 +882,13 @@ fn recheck_linux_directory_acl(
         if operation.expired() {
             return false;
         }
-        if DirectoryState::of(&before, role) == DirectoryState::of(&after.metadata, role) {
+        if before.state == after.state {
             if after.race.is_none() {
                 return true;
             }
             continue;
         }
-        if !linux_directory_can_recheck(operation, directory, &before, &after.metadata) {
+        if !linux_directory_can_recheck(operation, directory, &before.metadata, &after.metadata) {
             diagnostic::observe_context(
                 Step::AclState,
                 operation.note_directory_refusal(
