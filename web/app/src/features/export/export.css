@@ -127,7 +127,7 @@
   .short-export-summary { display: block; }
 }
 
-.request-branch > .export-trigger, #recordings-panel > .export-trigger { margin: .25rem .65rem; }
+.request-branch > .export-trigger, .catalog-start-actions > .export-trigger { margin: .25rem .65rem; }
 .export-trigger, .recording-more summary { min-height: 44px; min-width: 44px; }
 .recording-more { flex-shrink: 0; margin-inline-start: auto; }
 .recording-more summary { display: grid; place-items: center; cursor: pointer; list-style: none; }

@@ -91,8 +91,35 @@
   background: var(--surface);
 }
 .first-recording-command code { font: 13px/1.5 var(--mono); color: var(--text); }
-.workspace-requests > .pane:has(> .first-recording) { overflow-y: auto; }
-.workspace-requests > .pane:has(> .first-recording) > * { flex-shrink: 0; }
+.workspace-requests > .pane:has(.first-recording) { overflow-y: auto; }
+.catalog-start-actions { display: contents; }
+.workspace-requests > .pane:has(.first-recording) > *,
+.catalog-start-actions:has(.first-recording) > * { flex-shrink: 0; }
+
+#recordings-panel:has(.first-recording) :is(button, input) {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+/* Leave room for the endpoint choices and the drawer's evidence note after Copy adds feedback. */
+@media (max-width: 699px), (min-width: 861px) and (max-width: 1199px) {
+  .first-recording { gap: 6px; padding-block: 10px; }
+  .first-recording-command { gap: 6px; padding-block: 8px; }
+}
+@media (min-width: 861px) and (max-width: 1199px) {
+  #recordings-panel:has(.first-recording) {
+    & .pane-head { min-height: 52px; padding-block: 4px; }
+    & .request-search { margin-block: 4px 2px; }
+    & .catalog-switch { padding-block: 4px; }
+    & .request-tree:empty { margin-block: 0; }
+    & aside.context-note { padding-block: 6px; margin-block-end: 6px; }
+  }
+}
+@media (min-width: 861px) and (pointer: coarse) {
+  /* A 44px splitter extends 18px into the Requests pane. */
+  #recordings-panel:has(.first-recording) :is(.pane-head, .catalog-switch) { padding-inline-end: 20px; }
+  #recordings-panel:has(.first-recording) :is(.request-search-input, .export-trigger, aside.context-note) { margin-inline-end: 20px; }
+}
 @media (max-width: 860px) {
   .viewer-tour { inset-block-end: 104px; }
 }
