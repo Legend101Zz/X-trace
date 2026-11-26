@@ -1,0 +1,50 @@
+name: Verify the CLI mode in ordinary package archives
+on:
+  push:
+    branches: [codex/proof-ordinary-archive-mode-119]
+permissions:
+  contents: read
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PRODUCT: 4ccaabee7f26d20ade9d06e095433a9da6a3c99a
+      PRODUCT_TREE: b0596c8d1ec4859d7babf32f067bcc49d4a32bfd
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify the selected source and workflow-only change
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD^)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^^{tree}')" = "$PRODUCT_TREE"
+          test "$(git diff --name-status HEAD^ HEAD)" = $'A\t.github/workflows/ordinary-archive-mode.yml'
+      - name: Check the CLI header and optional manifest declaration
+        run: |
+          set -euo pipefail
+          umask 077
+          scratch="$(mktemp -d "$RUNNER_TEMP/archive-mode.XXXXXX")"
+          export TMPDIR="$scratch"
+          PYTHONPATH=packaging/test python3 -B - <<'PY'
+          import io
+          import unittest
+          names = [
+              "test_verify_package.VerifyPackage.test_archive_cli_mode_is_checked_before_extraction",
+              "test_verify_package.VerifyPackage.test_archive_cli_manifest_mode_must_agree_with_header",
+          ]
+          for name in names:
+              suite = unittest.defaultTestLoader.loadTestsFromName(name)
+              case, = suite
+              if case.id() != name:
+                  raise SystemExit("Archive case identity did not match")
+              result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+              if (result.testsRun != 1 or not result.wasSuccessful() or result.skipped
+                      or result.expectedFailures or result.unexpectedSuccesses):
+                  raise SystemExit("Archive case failed: " + name)
+              print("Passed " + name)
+          PY
