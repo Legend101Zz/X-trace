@@ -2908,10 +2908,13 @@ fn load_frame_honesty(
 
     let counts = connection
         .query_row(
-            "SELECT count(*), coalesce(sum(indexed_v = 1), 0), \
-             coalesce(sum((honesty_flags & ?2) != 0), 0), coalesce(sum((honesty_flags & ?3) != 0), 0), \
-             coalesce(sum((honesty_flags & ?4) != 0), 0), coalesce(sum((honesty_flags & ?5) != 0), 0), \
-             coalesce(sum((honesty_flags & ?6) != 0), 0), coalesce(sum((honesty_flags & ?7) != 0), 0) \
+            "SELECT count(*), count(*) FILTER (WHERE indexed_v = 1), \
+             count(*) FILTER (WHERE (honesty_flags & ?2) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?3) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?4) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?5) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?6) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?7) != 0) \
              FROM recording_frame_index WHERE recording_id = ?1",
             rusqlite::params![
                 recording_id.as_uuid().as_bytes().to_vec(),
@@ -9638,6 +9641,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_honesty_aggregate_preserves_signed_sql_masks() {
+        let fixture = on_disk_store("frame-honesty-signed-mask");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        view.commit_segment(&segment_request(project_id, anchor.recording_id, 0, &[2]))
+            .expect("write one frame");
+
+        let connection = fixture.store.lock().expect("connection");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE recording_frame_index SET honesty_flags = -1 WHERE recording_id = ?1",
+                    [anchor.recording_id.as_uuid().as_bytes().as_slice()],
+                )
+                .expect("write a synthetic signed SQLite mask"),
+            1
+        );
+        let correlation = CorrelationId::new();
+        assert_eq!(
+            load_frame_honesty(&connection, anchor.recording_id, correlation).expect("aggregate"),
+            Some(xtrace_application::FrameHonestyCounts {
+                gap: 1,
+                redacted: 1,
+                truncated: 1,
+                unavailable: 1,
+                dropped: 1,
+                orphan_parent: 1,
+            })
+        );
+        // SQL can represent a signed mask, while navigation must reject it
+        // as corrupt rather than decoding it as a valid u32 flag set.
+        assert!(matches!(
+            load_indexed_frame(&connection, anchor.recording_id, 2, correlation),
+            Err(error) if error.kind() == RecordingStoreErrorKind::Corruption
+        ));
     }
 
     #[cfg(unix)]
