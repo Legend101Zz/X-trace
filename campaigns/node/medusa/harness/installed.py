@@ -1,5 +1,5 @@
 """Hosted coordinator for two real Medusa commerce legs and installed readback."""
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import errno
 import hashlib
 import importlib.util
@@ -201,23 +201,27 @@ class Process:
                     pass
                 os.close(handle)
 
-    def ready(self, read, seconds):
+    def ready(self, read, seconds, *, include_stderr=False):
         deadline = time.monotonic() + seconds
-        pending = b""
-        with self.stdout.open("rb") as stream:
+        with ExitStack() as stack:
+            streams = {"stdout": stack.enter_context(self.stdout.open("rb"))}
+            if include_stderr:
+                streams["stderr"] = stack.enter_context(self.stderr.open("rb"))
+            pending = dict.fromkeys(streams, b"")
             while time.monotonic() < deadline:
                 code = self.child.poll()
                 if code is not None:
                     raise LifecycleProcessExit(code)
-                pending += stream.read(65536)
-                require(len(pending) <= 4 * 1024 * 1024 and stream.tell() <= 4 * 1024 * 1024)
-                complete = pending.split(b"\n")
-                pending = complete.pop()
-                for line in complete:
-                    value = read(line.decode("utf-8", "replace"))
-                    if value is not None:
-                        self.observe_children()
-                        return value, deadline
+                for name, stream in streams.items():
+                    buffered = pending[name] + stream.read(65536)
+                    require(len(buffered) <= 4 * 1024 * 1024 and stream.tell() <= 4 * 1024 * 1024)
+                    complete = buffered.split(b"\n")
+                    pending[name] = complete.pop()
+                    for line in complete:
+                        value = read(line.decode("utf-8", "replace"))
+                        if value is not None:
+                            self.observe_children()
+                            return value, name
                 time.sleep(0.05)
         raise TimeoutError("process readiness deadline")
 
@@ -291,6 +295,7 @@ class Proof:
             "stages": {}, "workload": None, "capture": None, "unmatched": None,
             "localTransport": {"baseline": None, "installed": None},
             "lifecycle": {"baseline": {}, "installed": {}},
+            "medusaReadinessLogStream": {"baseline": None, "installed": None},
             "perRequestAttribution": "unverified", "concurrentRecordingAttribution": "unverified",
         }
 
@@ -545,8 +550,9 @@ class Proof:
                 with self.phase(name, "spawn"):
                     process = Process(notes, command, backend, env, descendants=True)
                 with self.phase(name, "await-readiness-log"):
-                    process.ready(lambda line: True if "Server is ready on port: 9000" in line else None,
-                                  remaining(deadline))
+                    # Medusa's pinned development reporter uses Ora, whose success line is on stderr.
+                    _, stream = process.ready(medusa_ready_line, remaining(deadline), include_stderr=True)
+                    self.summary["medusaReadinessLogStream"][name] = stream
                 with self.phase(name, "identify-server-process"):
                     require(process.child.poll() is None)
                     if name == "installed":
@@ -713,6 +719,12 @@ def owned_id(path):
         return None
     value = path.read_text().strip()
     return value if re.fullmatch("[0-9a-f]{64}", value) else None
+
+
+def medusa_ready_line(line):
+    if re.search(r"\bServer is ready on port: 9000(?![0-9])", line):
+        return True
+    return None
 
 
 def remaining(deadline):
