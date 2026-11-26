@@ -53,6 +53,12 @@ copies the data home to `<prefix>/backups/<utc>-pre-<version>/` before the new v
 previous version for rollback, refuses downgrades without `--allow-downgrade`, and refuses a prefix inside the data
 home. Uninstall removes program files only and prints where data and backups are. The product itself runs store
 migrations at first use; the installer cannot migrate (and does not stop a running daemon: stop it first).
+The package includes the Spring static analyzer and its Java runtime libraries outside the agent pack.
+With Java 17 available, an initialized project can run
+`xtrace scan --project-dir "$project_dir" --source "$project_dir/src/main/java" --framework spring-mvc`.
+The installed CLI finds the analyzer alongside its own versioned payload. `--analyzer` and
+`XTRACE_JAVA_ANALYZER` still take precedence.
+
 `packaging/test/install_test.sh dist/<platform>` exercises fresh install, upgrade, tamper/downgrade refusal and uninstall, and
 the lifecycle on the installed binary (`init`, `record`, `stop`, and `restart` after the upgrade).
 
