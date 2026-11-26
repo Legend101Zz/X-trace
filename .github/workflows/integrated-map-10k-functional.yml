@@ -1,0 +1,180 @@
+name: integrated-map-10k-functional
+on:
+  push:
+    branches: [codex/proof-integrated-map-10k]
+permissions:
+  contents: read
+jobs:
+  map:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE: '48ae5e2306829a52de9c5c054932430fe522bb76'
+      SOURCE_TREE: '8bc2201d0abe56c767d0e42bcb5546bd1cf25863'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Admit exact direct wrapper and private root
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_REF" = refs/heads/codex/proof-integrated-map-10k
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$SOURCE"
+          test "$(git rev-parse "$SOURCE^{tree}")" = "$SOURCE_TREE"
+          test "$(git diff --name-status "$SOURCE" HEAD)" = $'A\t.github/workflows/integrated-map-10k-functional.yml'
+          test "$(git ls-tree HEAD -- .github/workflows/integrated-map-10k-functional.yml | cut -d' ' -f1)" = 100644
+          test "$(git rev-parse HEAD:tools/qa/replay_scale_browser.mjs)" = b2e50e98964d5f0ea3f4fe9fd942ed7e105a29f8
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="${RUNNER_TEMP:?}/xt-map-10k"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/diag" "$root/safe"
+          echo "XTRACE_MAP_ROOT=$root" >> "$GITHUB_ENV"
+          git checkout --detach "$SOURCE"
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+          printf admission > "$root/priv/phase"
+      - name: Verify web and build source viewer
+        working-directory: web/app
+        run: |
+          set -euo pipefail
+          umask 077
+          printf web > "$XTRACE_MAP_ROOT/priv/phase"
+          trap 'rc=$?; printf "%s" "$rc" > "$XTRACE_MAP_ROOT/priv/exit"' EXIT
+          exec > "$XTRACE_MAP_ROOT/diag/web.log" 2>&1
+          npm ci
+          npm run typecheck
+          npm test
+          node scripts/check-contrast.mjs
+          npm run build
+          npm run embed
+          npm run check:embedded
+          npx --no-install playwright install --with-deps chromium
+      - name: Seed real persisted 10000-frame synthetic fixture
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_MAP_ROOT"
+          export TMPDIR="$root/tmp" XTRACE_TEST_PRIVATE_SCRATCH="$root/priv" XTRACE_SCALE_FIXTURE_MANIFEST="$root/priv/manifest.json"
+          printf fixture > "$root/priv/phase"
+          trap 'rc=$?; printf "%s" "$rc" > "$root/priv/exit"' EXIT
+          if ! cargo test --locked -p xtrace-cli --test replay_scale synthetic_ten_thousand_frames_are_complete_ordered_and_navigable -- --exact > "$root/diag/fixture.log" 2>&1; then
+            echo 'Fixture failed or timed out'; exit 1
+          fi
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$root/diag/fixture.log"
+      - name: Check persisted Map navigation and bounded receipt
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_MAP_ROOT"
+          printf browser > "$root/priv/phase"
+          temporary=tools/qa/.integrated-map-10k-private.mjs
+          test ! -e "$temporary"
+          trap 'rc=$?; printf "%s" "$rc" > "$root/priv/exit"; rm -f "$temporary"' EXIT
+          test "$(sha256sum tools/qa/replay_scale_browser.mjs | cut -d' ' -f1)" = fb4de19e757c30228addbc595306ebb24500b26b364e4221fb587311672f7359
+          python3 -B - "$temporary" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path('tools/qa/replay_scale_browser.mjs')
+          source = p.read_text()
+          before = "      const initialKey = await activeKey();"
+          after = "      result.actions.push('bounded_later_map_keyboard_end', 'bounded_later_map_keyboard_up', 'bounded_later_map_keyboard_home');"
+          assert source.count(before) == source.count(after) == 1
+          source = source.replace(before, "      const requestsBeforeMapKeys = totalRequests;\n" + before)
+          source = source.replace(after, "      check(totalRequests === requestsBeforeMapKeys);\n      result.actions.push('bounded_map_keys_no_requests');\n" + after)
+          pathlib.Path(sys.argv[1]).write_text(source)
+          PY
+          test "$(sha256sum "$temporary" | cut -d' ' -f1)" = 1ca0f88fd0541bec2ae8957df203182ef1d1c84e7633bbd87f2f1eec1f45420f
+          if ! node "$temporary" --verify-map-tree-window --one-map-tree-sample --manifest "$root/priv/manifest.json" --xtrace "$GITHUB_WORKSPACE/target/debug/xtrace" --source-sha "$SOURCE" --provenance source-built --later-pages 12 --out "$root/priv/map.json" > "$root/diag/browser.log" 2>&1; then
+            echo 'Map journey failed or timed out'; exit 1
+          fi
+          python3 -B - "$root/priv/map.json" "$root/safe/counts.json" <<'PY'
+          import json, os, pathlib, re, sys
+          p = pathlib.Path(sys.argv[1]); assert p.is_file() and p.stat().st_size <= 262144
+          r = json.loads(p.read_bytes()); c = r['conditions']; prov = r['provenance']
+          assert r['schemaVersion'] == 1 and r['kind'] == 'synthetic_replay_scale_browser' and r['synthetic'] is True
+          assert prov['distribution'] == 'source-built' and prov['declaredSourceSha'] == os.environ['SOURCE']
+          assert re.fullmatch('[0-9a-f]{64}', prov['binarySha256']) and prov['declaredPackageSha256'] is None
+          assert c['samples'] == 1 and c['fixtureFrames'] == 10000 and c['laterPages'] == 12 and c['verifyMapTreeWindow'] is True
+          s, = r['samples']; assert s['status'] == 'exercised' and s['initial'] is None and not s['failures']
+          assert r['summary']['functionalFailures'] == 0 and r['summary']['completeJourneySamples'] == 1 and r['summary']['validInitialSamples'] == 0
+          required = {'initial_steps_and_details_identity_matched', 'constrained_map_dock_next', 'constrained_map_dock_back', 'bounded_later_map_keyboard_end', 'bounded_later_map_keyboard_up', 'bounded_later_map_keyboard_home', 'bounded_map_keys_no_requests'}
+          assert required <= set(s['actions'])
+          end, = [d for d in s['dom'] if d['phase'] == 'bounded_later_map_end']
+          assert type(end['visibleMapTreeRows']) is int and type(end['mapTreeRows']) is int and 0 < end['visibleMapTreeRows'] <= end['mapTreeRows'] <= 80
+          out = {'schemaVersion': 1, 'status': 'passed', 'releaseAcceptance': False, 'kind': 'persisted-map-10k-functional', 'sourceSha': os.environ['SOURCE'], 'sourceTree': os.environ['SOURCE_TREE'], 'wrapperSha': os.environ['GITHUB_SHA'], 'runId': int(os.environ['GITHUB_RUN_ID']), 'attempt': 1, 'binarySha256': prov['binarySha256'], 'frames': 10000, 'samples': 1, 'laterPages': 12, 'mountedAtEnd': end['mapTreeRows'], 'visibleAtEnd': end['visibleMapTreeRows'], 'navigationChecks': 3, 'navigationExtraRequests': 0, 'timingMeasured': False, 'proofScriptSha256': '1ca0f88fd0541bec2ae8957df203182ef1d1c84e7633bbd87f2f1eec1f45420f'}
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(out, sort_keys=True) + '\n')
+          PY
+      - name: Preserve bounded failure phase and reached observations
+        if: ${{ always() && env.XTRACE_MAP_ROOT != '' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import json, os, pathlib, re
+          root = pathlib.Path(os.environ['XTRACE_MAP_ROOT'])
+          out = root / 'safe/counts.json'
+          if out.exists(): raise SystemExit(0)
+          phasefile = root / 'priv/phase'
+          phase = phasefile.read_text() if phasefile.exists() else 'admission'
+          if phase not in ('admission', 'web', 'fixture', 'browser'): phase = 'unknown'
+          result = {'schemaVersion': 1, 'status': 'failed', 'releaseAcceptance': False,
+              'sourceSha': os.environ['SOURCE'], 'sourceTree': os.environ['SOURCE_TREE'],
+              'wrapperSha': os.environ['GITHUB_SHA'], 'runId': int(os.environ['GITHUB_RUN_ID']),
+              'attempt': 1, 'phase': phase, 'driverReached': False}
+          fixture = root / 'diag/fixture.log'
+          if fixture.is_file() and fixture.stat().st_size <= 4194304:
+              data = fixture.read_bytes()
+              match = re.search(rb'test result: (?:ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored;', data)
+              if match:
+                  values = [int(value) for value in match.groups()]
+                  if all(0 <= value <= 1000 for value in values): result['fixtureCounts'] = values
+          path = root / 'priv/map.json'
+          if path.is_file() and path.stat().st_size <= 262144:
+              try:
+                  doc = json.loads(path.read_bytes())
+                  samples = doc.get('samples', [])
+                  if len(samples) == 1 and type(samples[0]) is dict:
+                      sample = samples[0]
+                      allowed = {'viewer_start','browser_start','catalog','initial_click_response','initial_steps_visible','initial_visible_paint_opportunity','initial_steps','initial_map','initial_steps_return','constrained_map_dock','later_steps','later_steps_return','bounded_later_map','bounded_later_map_keyboard','page_observations','complete','browser_cleanup','viewer_cleanup'}
+                      stage = sample.get('stage')
+                      if stage not in allowed and not (isinstance(stage, str) and re.fullmatch(r'load_later_(?:[1-9]|1[0-2])', stage)): stage = 'other'
+                      sub = sample.get('substage')
+                      if sub not in (None,'default_inspector','details_identity','dom_snapshot','mode_click','next_event_lookup','geometry','detail_response','focused_selection','end','arrow_up','home'): sub = 'other'
+                      result.update(driverReached=True, stage=stage, substage=sub)
+                      actions = sample.get('actions', [])
+                      if type(actions) is list:
+                          allowed_actions = ('bounded_later_map_keyboard_end', 'bounded_later_map_keyboard_up', 'bounded_later_map_keyboard_home', 'bounded_map_keys_no_requests')
+                          result['completedKeyActions'] = [name for name in allowed_actions if name in actions]
+                      for key in ('pageErrors', 'externalRequests'):
+                          value = sample.get(key)
+                          if type(value) is int and 0 <= value <= 100000: result[key] = value
+                      for row in sample.get('dom', []):
+                          if row.get('phase') == 'bounded_later_map_end':
+                              for key in ('mapTreeRows', 'visibleMapTreeRows', 'apiEventsReturnedCumulative'):
+                                  value = row.get(key)
+                                  if type(value) is int and 0 <= value <= 10000: result[key] = value
+              except (ValueError, TypeError, KeyError): pass
+          out.write_text(json.dumps(result, sort_keys=True) + '\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ success() }}
+        with:
+          name: integrated-map-generated-viewer
+          path: crates/xtrace-daemon/assets/ui/
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && env.XTRACE_MAP_ROOT != '' }}
+        with:
+          name: integrated-map-10k-bounded-counts
+          path: ${{ env.XTRACE_MAP_ROOT }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 7
