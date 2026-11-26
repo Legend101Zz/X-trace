@@ -198,7 +198,7 @@ pub(crate) fn returned_error(id: CorrelationId, facts: Option<Observation>) {
 pub(crate) fn observe_acknowledgement<T>(
     iteration: u64,
     call: impl FnOnce() -> Result<T, xtrace_application::PortError>,
-    fail: impl FnOnce(String),
+    fail: impl FnOnce(&'static str, String),
 ) -> Result<T, xtrace_application::PortError> {
     struct Restore(Option<AdmissionResult>);
     impl Drop for Restore {
@@ -209,13 +209,17 @@ pub(crate) fn observe_acknowledgement<T>(
     let _restore = Restore(ADMISSION.with(|slot| slot.replace(Some(AdmissionResult::NoError))));
     let result = call();
     if let Err(error) = &result
-        && error.message().starts_with("XTR-PRIVATE-STORAGE-UNAVAILABLE: ")
+        && let Some(code) = match error.message().split_once(": ").map(|(code, _)| code) {
+            Some("XTR-PRIVATE-STORAGE-UNAVAILABLE") => Some("admission"),
+            Some("XTR-STORE-OBJECT-IO") => Some("object io"),
+            _ => None,
+        }
     {
         let facts = match ADMISSION.with(Cell::get) {
             Some(AdmissionResult::One(id, facts)) if id == error.correlation_id() => facts,
             _ => None,
         };
-        fail(facts.unwrap_or_default().report(iteration));
+        fail(code, facts.unwrap_or_default().report(iteration));
     }
     result
 }
@@ -240,7 +244,13 @@ pub(super) fn private<T>(
     call: impl FnOnce() -> Result<T, PrivateStorageError>,
 ) -> Result<T, RecordingStoreError> {
     if !FIRST.with(|slot| matches!(slot.get(), Some(None))) {
-        return call().map_err(|_| mapped_error(correlation_id));
+        // The singleton observer attaches the returned error's own facts. A
+        // generic private error has no causal errno once the call returns.
+        return call().map_err(|error| {
+            let mut mapped = mapped_error(correlation_id);
+            mapped.admission_facts = Some(Observation::admission(site, error));
+            mapped
+        });
     }
     let (result, discarded) = PrivateStorageError::with_io_diagnostic(call);
     result.map_err(|error| {
@@ -248,8 +258,12 @@ pub(super) fn private<T>(
             PrivateStorageError::Admission(failure) => (failure.kind, failure.raw_os_error),
             _ => discarded.map_or((None, None), |(kind, errno)| (Some(kind), errno)),
         };
+        let mut mapped = mapped_error(correlation_id);
+        // The legacy first-observed report may use the call-scoped discarded
+        // I/O signal. The correlated returned error uses only owned facts.
+        mapped.admission_facts = Some(Observation::admission(site, error));
         observe(Observation { site: Some(site), private_error: Some(error), kind, errno });
-        mapped_error(correlation_id)
+        mapped
     })
 }
 
@@ -261,13 +275,15 @@ pub(super) fn direct<T, E: Into<io::Error>>(
 ) -> Result<T, RecordingStoreError> {
     call().map_err(|error| {
         let error = error.into();
-        observe(Observation {
-            site: Some(site),
-            kind: Some(error.kind()),
-            errno: error.raw_os_error(),
-            ..Observation::default()
-        });
-        mapped_error(correlation_id)
+        attach(
+            mapped_error(correlation_id),
+            Observation {
+                site: Some(site),
+                kind: Some(error.kind()),
+                errno: error.raw_os_error(),
+                ..Observation::default()
+            },
+        )
     })
 }
 
@@ -278,9 +294,17 @@ pub(super) fn missing<T, E>(
     call: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, RecordingStoreError> {
     call().map_err(|_| {
-        observe(Observation { site: Some(site), ..Observation::default() });
-        mapped_error(correlation_id)
+        attach(
+            mapped_error(correlation_id),
+            Observation { site: Some(site), ..Observation::default() },
+        )
     })
+}
+
+fn attach(mut error: RecordingStoreError, facts: Observation) -> RecordingStoreError {
+    observe(facts);
+    error.admission_facts = Some(facts);
+    error
 }
 
 pub(super) fn observe_failpoint() {
@@ -385,7 +409,10 @@ mod tests {
                     }
                     Err::<(), _>(failure())
                 },
-                |line| report = line,
+                |code, line| {
+                    assert_eq!(code, "admission");
+                    report = line;
+                },
             );
             assert!(result.is_err());
             assert_eq!(report.contains("operation=BindingRootOpen error=InvalidName"), known);

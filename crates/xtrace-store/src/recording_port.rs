@@ -2168,15 +2168,17 @@ mod tests {
         iteration: u64,
     ) -> T {
         if error.message().starts_with("XTR-STORE-OBJECT-IO: ") {
-            let diagnostic = scope.report(iteration);
-            panic!("acknowledgement object io {diagnostic}");
+            fail_bounded_acknowledgement("object io", scope.report(iteration));
         }
         acknowledgement_failed(error)
     }
 
     #[cfg(all(unix, debug_assertions))]
-    #[allow(clippy::panic, reason = "failed test reports only bounded admission facts")]
-    fn fail_singleton_admission(diagnostic: String) {
+    #[allow(clippy::panic, reason = "failed test reports only bounded acknowledgement facts")]
+    fn fail_bounded_acknowledgement(code: &'static str, diagnostic: String) -> ! {
+        if code == "object io" {
+            panic!("acknowledgement object io {diagnostic}");
+        }
         panic!("acknowledgement admission {diagnostic}");
     }
 
@@ -2389,7 +2391,7 @@ mod tests {
             let receipt = crate::recording_store::object_diagnostic::observe_acknowledgement(
                 index as u64 + 1,
                 record,
-                fail_singleton_admission,
+                |code, diagnostic| fail_bounded_acknowledgement(code, diagnostic),
             );
             #[cfg(not(all(unix, debug_assertions)))]
             let receipt = record();
