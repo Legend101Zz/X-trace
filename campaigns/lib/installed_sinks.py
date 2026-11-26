@@ -14,6 +14,7 @@ import subprocess
 import time
 import zipfile
 
+import fineract_detail_evidence
 from private_sinks import AdmittedSinks
 
 MAX_PAGES = 40
@@ -73,7 +74,7 @@ def collect(root, project, capture, *, env=None):
     source = root / "campaign/java/fineract/src"
     output = root / "sinks/cli"
     output.mkdir(parents=True, mode=0o700, exist_ok=False)
-    status = dict(schema="xtrace-fineract-cli-sinks/2", complete=False, artifactComplete=False,
+    status = dict(schema="xtrace-fineract-cli-sinks/3", complete=False, artifactComplete=False,
                   listCommands=0, detailCommands=0, recordings=0, completedDetails=0, commandExits=[], firstFailure=None)
     env = {**(os.environ if env is None else env), "XTRACE_DATA_HOME": str(root / "data"), "TMPDIR": str(root / "tmp")}
     deadline = time.monotonic() + TOTAL_SECONDS
@@ -107,8 +108,9 @@ def collect(root, project, capture, *, env=None):
         return doc
 
     stage = "list"
+    first_incomplete = None
     try:
-        ids, after, seen = [], None, set()
+        listed_ranges, after, seen = {}, None, set()
         for page in range(MAX_PAGES):
             args = ["list", "--limit", "100"] + (["--after", after] if after else [])
             status["listCommands"] += 1
@@ -120,11 +122,11 @@ def collect(root, project, capture, *, env=None):
                 rid = row.get("recording_id") if isinstance(row, dict) else None
                 if not isinstance(rid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", rid):
                     raise CollectionFailure("invalid-identity")
-                if rid in ids:
+                if rid in listed_ranges:
                     raise CollectionFailure("duplicate-identity")
-                ids.append(rid)
-            status["recordings"] = len(ids)
-            if len(ids) > MAX_RECORDINGS:
+                listed_ranges[rid] = fineract_detail_evidence.listed_range(doc, row, after, api=False)
+            status["recordings"] = len(listed_ranges)
+            if len(listed_ranges) > MAX_RECORDINGS:
                 raise CollectionFailure("recording-limit")
             if "next_after" not in doc:
                 raise CollectionFailure("missing-cursor")
@@ -136,11 +138,12 @@ def collect(root, project, capture, *, env=None):
             seen.add(after)
         else:
             raise CollectionFailure("pagination-limit")
-        if not ids:
+        if not listed_ranges:
             raise CollectionFailure("no-recordings")
         stage = "detail"
-        for index, rid in enumerate(ids):
+        for index, rid in enumerate(listed_ranges):
             cursor, seen = None, set()
+            pages = fineract_detail_evidence.DetailPages(api=False, listed=listed_ranges[rid])
             for page in range(MAX_PAGES):
                 args = ["show", rid, "--limit", "1000"] + (["--cursor", cursor] if cursor else [])
                 status["detailCommands"] += 1
@@ -151,8 +154,10 @@ def collect(root, project, capture, *, env=None):
                     raise CollectionFailure("invalid-schema")
                 if "next_cursor" not in doc:
                     raise CollectionFailure("missing-cursor")
+                pages.add(doc, rid, cursor)
                 if doc.get("incomplete_evidence"):
                     status["firstEvidenceClasses"] = evidence_classes(doc["incomplete_evidence"])
+                    first_incomplete = (rid, pages, doc)
                     raise CollectionFailure("incomplete-evidence")
                 cursor = doc["next_cursor"]
                 if cursor is None:
@@ -168,6 +173,12 @@ def collect(root, project, capture, *, env=None):
         status["firstFailure"] = {"stage": stage, "reason": error.reason, "exitCode": error.exit_code}
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
         status["firstFailure"] = {"stage": stage, "reason": "io-error", "exitCode": None}
+    if first_incomplete is not None:
+        rid, pages, doc = first_incomplete
+        try:
+            status["firstIncomplete"] = fineract_detail_evidence.first_pair(capture / "api", rid, pages, doc, MAX_OUTPUT)
+        except (OSError, ValueError, TypeError, RecursionError):
+            status["firstIncomplete"] = fineract_detail_evidence.unavailable_pair("unavailable")
     try:
         inventory = admitted.inventory([capture / "api"])
         files = inventory["files"]

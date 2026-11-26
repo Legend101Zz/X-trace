@@ -23,6 +23,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 import boundary_diagnostics
+import fineract_detail_evidence
 import private_diagnostic
 
 # matched against the class part of a frame symbol such as `OwnerController.findOwner`
@@ -233,7 +234,8 @@ def detail_read_incomplete(detail: dict | None) -> bool:
     return detail is None or "_detailReadGap" in detail or "_http" in detail
 
 
-def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int = 400) -> dict[str, Any]:
+def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int = 400,
+                *, fineract_pair=False) -> dict[str, Any]:
     """Save observed pages. Success requires a complete listing and every listed detail."""
     out_dir.mkdir(parents=True, exist_ok=True)
     listing: list[dict] = []
@@ -243,6 +245,7 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
     list_gap = ""
     problem = None
     live_timeout = False
+    listed_ranges = {}
     read_failure = None
 
     def failed(stage, reason):
@@ -278,6 +281,9 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             break
         listed_ids.update(page_ids)
         listing.extend(rows)
+        if fineract_pair:
+            for row in rows:
+                listed_ranges[row["recordingId"]] = fineract_detail_evidence.listed_range(doc, row, after, api=True)
         try:
             after = _next_page(doc, "nextAfter", seen, bool(rows))
         except (KeyError, ValueError):
@@ -307,6 +313,7 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
         first: dict | None = None
         detail_gap = None
         incomplete_evidence: dict[str, None] = {}
+        evidence = fineract_detail_evidence.DetailPages(api=True, listed=listed_ranges[rid]) if fineract_pair else None
         for _ in range(40):
             q = f"/api/v1/recordings/{rid}?limit=1000" + (f"&cursor={quote(cursor, safe='')}" if cursor else "")
             try:
@@ -326,9 +333,13 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             if (not isinstance(rows, list) or (cursor is not None and not rows)
                     or any(not isinstance(row, dict) for row in rows)
                     or doc.get("recordingId", rid) != rid):
+                if evidence is not None:
+                    evidence.rejected = True
                 detail_gap = "detail malformed page"
                 failed("detail", "schema")
                 break
+            if evidence is not None:
+                evidence.add(doc, rid, cursor)
             if first is None:
                 first = {k: v for k, v in doc.items() if k != "events"}
             events.extend(rows)
@@ -358,6 +369,9 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
             d.setdefault("sessionContext", rec["sessionContext"])
         if rec.get("openedAt") is not None:  # kept for time-window attribution of recordings to scenarios
             d.setdefault("_openedAt", rec["openedAt"])
+        if evidence is not None:
+            d[fineract_detail_evidence.API_EVIDENCE] = evidence.api_evidence(
+                detail_gap, first is not None and "sessionContext" in first)
         if not first_detail_gap and detail_read_incomplete(d):
             first_detail_gap = detail_gap or "recording detail read incomplete"
         details[rid] = d
@@ -1338,7 +1352,10 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if not token:
             raise RuntimeError("no bootstrap token in viewer url")
         client.exchange(token)
-        api = collect_api(client, out_dir / "api")
+        if project == "fineract" and ordered_campaign is not None:
+            api = collect_api(client, out_dir / "api", fineract_pair=True)
+        else:
+            api = collect_api(client, out_dir / "api")
         api["recordings"] = [r for r in api["recordings"] if r["recordingId"] not in before_ids]
         api["details"] = {rid: d for rid, d in api["details"].items() if rid not in before_ids}
     except Exception as exc:

@@ -1,5 +1,6 @@
 """Finite diagnostic projections from the installed Fineract campaign, independent of acceptance."""
 import boundary_diagnostics
+import fineract_detail_evidence
 import installed_sinks
 from campaigns.java.fineract.harness.recording_evidence import EXPECT, required_observations
 
@@ -34,8 +35,9 @@ def boundary_manifest(doc):
 
 def cli_diagnostics(doc):
     """Project the first CLI failure only from a consistent bounded collection manifest."""
-    if not isinstance(doc, dict) or doc.get("schema") != "xtrace-fineract-cli-sinks/2":
+    if not isinstance(doc, dict) or doc.get("schema") not in ("xtrace-fineract-cli-sinks/2", "xtrace-fineract-cli-sinks/3"):
         return None
+    current = doc["schema"] == "xtrace-fineract-cli-sinks/3"
     keys = ("listCommands", "detailCommands", "recordings", "completedDetails")
     if any(not bounded(doc.get(key)) for key in keys) or type(doc.get("complete")) is not bool:
         return None
@@ -80,7 +82,43 @@ def cli_diagnostics(doc):
                 or set(markers) != set(installed_sinks.EVIDENCE_CLASSES)
                 or any(not bounded(value) for value in markers.values()) or not 0 < sum(markers.values()) <= 4096):
             return None
-    return {**{key: doc[key] for key in keys}, "firstFailure": failure, "evidenceClasses": markers}
+    result = {**{key: doc[key] for key in keys}, "firstFailure": failure, "evidenceClasses": markers}
+    require_pair = current and reason == "incomplete-evidence"
+    if current:
+        fields = {"schema", "complete", "artifactComplete", "commandExits", "firstFailure", *keys}
+        if require_pair:
+            fields.update(("firstIncomplete", "firstEvidenceClasses"))
+        if set(doc) != fields or type(doc["artifactComplete"]) is not bool:
+            return None
+    if ("firstIncomplete" in doc) != require_pair:
+        return None
+    if require_pair:
+        pair = fineract_detail_evidence.public_pair(doc["firstIncomplete"])
+        if pair is None:
+            return None
+        cli = pair["cli"]
+        if cli is not None:
+            census = cli["markers"]
+            if (census["state"] == "observed") != (markers is not None):
+                return None
+            if markers is not None:
+                counts, total = census["counts"], sum(markers.values())
+                if (sum(counts.values()) != min(total, fineract_detail_evidence.MARKER_LIMIT)
+                        or census["truncated"] != (total > fineract_detail_evidence.MARKER_LIMIT)):
+                    return None
+                # Literal categories agree between the two classifiers. Newer range
+                # validation can move a legacy gap or pending-tail marker to 'other'.
+                for kind in ("persisted-partial", "persisted-invalid", "verification-budget", "gap-event", "pending-tail"):
+                    if counts[kind] > markers[kind]:
+                        return None
+                    if kind in ("persisted-partial", "persisted-invalid", "verification-budget"):
+                        if not census["truncated"] and counts[kind] != markers[kind]:
+                            return None
+                flexible = ("other", "gap-event", "pending-tail")
+                if sum(counts[k] for k in flexible) > sum(markers[k] for k in flexible):
+                    return None
+        result["firstIncomplete"] = pair
+    return result
 
 
 def scenario_observations(sid, row):
