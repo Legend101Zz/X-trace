@@ -1,0 +1,170 @@
+name: Vendure v6 preparation helper checks
+on:
+  push:
+    branches: [codex/proof-vendure-preparation-v6-125]
+permissions:
+  contents: read
+jobs:
+  helpers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PRODUCT: 'd73c63e657082f2d66c273d579da672ab0beca75'
+      PRODUCT_TREE: '9c27d09f5291b48c8c18329f850c084b0aeeb663'
+      PRODUCT_PARENT: '4c3002a5200448bdc4ab64038e726aa1dec5beae'
+      PATCH_SHA256: '6c01d044ce4810d063501e949c1a6be4e892c5fe9f6424313289a80c5c567508'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Verify wrapper and exact source before selecting the product
+        id: admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REPOSITORY" = 'Legend101Zz/X-trace'
+          test "$GITHUB_REF" = 'refs/heads/codex/proof-vendure-preparation-v6-125'
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PRODUCT"
+          test "$(git show -s --format=%P "$PRODUCT")" = "$PRODUCT_PARENT"
+          test "$(git rev-parse "$PRODUCT^{tree}")" = "$PRODUCT_TREE"
+          workflow='.github/workflows/vendure-preparation-v6-helpers.yml'
+          test "$(git diff --name-status --no-renames "$PRODUCT" HEAD)" = $'A\t'"$workflow"
+          test "$(git ls-tree HEAD -- "$workflow" | cut -d' ' -f1)" = 100644
+          test "$(git diff --no-ext-diff --no-textconv --no-color --binary --full-index "$PRODUCT_PARENT" "$PRODUCT" | sha256sum | cut -d' ' -f1)" = "$PATCH_SHA256"
+          git checkout --detach --quiet "$PRODUCT"
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          proof="$RUNNER_TEMP/vendure-helper-125-v6"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$proof"
+          mkdir -m 700 "$proof/logs" "$proof/private" "$proof/safe"
+          printf '%s\n' "PROOF=$proof" "TMPDIR=$proof/tmp" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        id: node_setup
+        with:
+          node-version: 24.21.0
+      - name: Check the exact Node helper census against its TAP output
+        id: node_cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(node -p process.versions.node)" = '24.21.0'
+          python3 -B - <<'PY' >"$PROOF/logs/node-driver.stdout" 2>"$PROOF/logs/node-driver.stderr"
+          import json, os, pathlib, re, subprocess
+          from tools.release.private_roots import atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          expected = ['staging uses the tracked adapted lock without changing private scaffold inputs', 'staging replaces a shared scaffold entry without modifying its other link or mode', 'seed output requires a fresh destination and preserves existing bytes', 'changed dependencies and source bytes fail without being repaired', 'extra compiled sources and linked inputs are rejected', 'a completed workspace cannot be restaged over its build identity', 'alternate CLI build configurations fail without removing their contents', 'compilation claims a fresh dist and refuses stale output before either compiler writes', 'a redirected compiler output or application root cannot change another directory', 'normal three-file output identity excludes migrations and every other dist artifact', 'linked, directory and special dist entries are refused without following them', 'only the exact unchanged seed helper is admitted after the build phase', 'rechecking a sealed build refuses later migrations despite unchanged entry hashes', 'all declared build provenance must survive through seed admission', 'seed metadata is a fresh closed digest-only projection', 'added top-level and nested private seed fields cannot enter baseline metadata', 'seed projection refuses malformed digests, counts, identities and bindings', 'well-formed asset counts and tree hashes must match the independent archive observation', 'database restore consumes the exact admitted dump bound to both baseline hashes', 'a restore diagnostic cannot serialize private dump data into a failed baseline receipt', 'changed preparation before startup rejects both the start and the restore', "seed admission requires the campaign's private regular dump and receipt", 'the fresh workspace is separate from an existing checkout and cannot be reused or redirected', 'only a zero generator exit lets preparation continue', 'private errors during initial seed admission are reported with fixed categories', 'private verifier and parsing errors during revalidation reach neither startup nor restore']
+          assert len(expected) == len(set(expected)) == 26
+          out = root/'logs/node.tap'
+          with out.open('xb') as stdout, (root/'logs/node.stderr').open('xb') as stderr:
+              code = subprocess.run(['node','--test','--test-reporter=tap','campaigns/node/vendure/harness/preparation.test.mjs'],
+                                    stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,check=False).returncode
+          counts = None
+          exact = False
+          if out.stat().st_size <= 4 * 1024 * 1024:
+              tap = out.read_text(encoding='utf8', errors='replace')
+              fields = ('tests','pass','fail','cancelled','skipped','todo')
+              matched = {key: re.findall(r'(?m)^# ' + key + r' ([0-9]{1,5})[ \t]*$',tap) for key in fields}
+              if all(len(values)==1 for values in matched.values()):
+                  counts = {key:int(values[0]) for key,values in matched.items()}
+              rows = re.findall(r'(?m)^(ok|not ok) ([0-9]{1,5}) - ([^\r\n]+)$',tap)
+              exact = rows == [('ok',str(i),name) for i,name in enumerate(expected,1)]
+          passed = code==0 and exact and counts=={'tests':26,'pass':26,'fail':0,'cancelled':0,'skipped':0,'todo':0}
+          row = dict(status='passed' if passed else 'failed', exitCode=code, counts=counts, exactPassingCaseInventory=exact)
+          atomic_write_private(root/'private/node.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Check all seven Python archive-helper cases in private scratch
+        id: python_cases
+        if: ${{ always() && steps.admission.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY' >"$PROOF/logs/python-driver.stdout" 2>"$PROOF/logs/python-driver.stderr"
+          import json, os, pathlib, sys, unittest
+          from tools.release.private_roots import atomic_write_private
+          from tools.qa.unittest_run import StructuredRunner
+          root = pathlib.Path(os.environ['PROOF'])
+          sys.path.insert(0, str(pathlib.Path('campaigns/node/vendure/harness').resolve()))
+          import test_seed_assets
+          expected = ['test_retention_requires_a_fresh_regular_destination_and_preserves_its_bytes', 'test_wrong_source_pin_leaves_no_retained_archive', 'test_exact_regular_inputs_are_verified_with_hashes_only', 'test_changed_missing_extra_and_linked_inputs_fail', 'test_changed_archive_fails_before_extraction', 'test_unsafe_and_duplicate_archive_names_fail', 'test_links_in_archive_and_existing_destination_are_not_followed']
+          assert len(set(expected)) == len(expected) == 7
+          observed = unittest.defaultTestLoader.getTestCaseNames(test_seed_assets.SeedAssets)
+          suite = unittest.defaultTestLoader.loadTestsFromModule(test_seed_assets)
+          exact = sorted(expected)==observed and suite.countTestCases()==7
+          counts = None
+          passed = False
+          if exact:
+              with (root/'logs/python-suite.private').open('x') as log:
+                  result = StructuredRunner(stream=log,verbosity=2).run(suite)
+              counts = result.summary()['counts']
+              passed = result.wasSuccessful() and counts==dict(testsRun=7,failures=0,errors=0,skipped=0,expectedFailures=0,unexpectedSuccesses=0)
+          row = dict(status='passed' if passed else 'failed', counts=counts, exactCaseInventory=exact)
+          atomic_write_private(root/'private/python.json',(json.dumps(row,sort_keys=True)+'\n').encode())
+          raise SystemExit(0 if passed else 1)
+          PY
+      - name: Publish counts from reached stages
+        id: counts
+        if: ${{ always() && steps.admission.outcome == 'success' }}
+        env:
+          NODE_OUTCOME: ${{ steps.node_cases.outcome }}
+          PYTHON_OUTCOME: ${{ steps.python_cases.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import json,os,pathlib,subprocess
+          from tools.release.private_roots import atomic_write_private, read_private_json
+          root = pathlib.Path(os.environ['PROOF'])
+          def stage(label,outcome,expected_fields):
+              if outcome == 'skipped':
+                  return dict(status='not-reached',counts=None)
+              if outcome not in ('success','failure','cancelled'):
+                  raise ValueError('unrecognized outcome')
+              file = root/'private'/(label+'.json')
+              if not file.exists():
+                  if outcome == 'success': raise ValueError('missing passing receipt')
+                  return dict(status='receipt-unavailable',counts=None)
+              row = read_private_json(file,maximum_bytes=16*1024)
+              keys = ({'status','counts','exactPassingCaseInventory','exitCode'} if label=='node'
+                      else {'status','counts','exactCaseInventory'})
+              if set(row)!=keys or row['status'] not in ('passed','failed'): raise ValueError('invalid receipt')
+              exact = row['exactPassingCaseInventory' if label=='node' else 'exactCaseInventory']
+              if type(exact) is not bool: raise ValueError('invalid census')
+              if label=='node' and (type(row['exitCode']) is not int or not -255<=row['exitCode']<=255): raise ValueError('invalid exit')
+              counts = row['counts']
+              if counts is not None and (not isinstance(counts,dict) or set(counts)!=set(expected_fields)
+                   or any(type(x) is not int or not 0<=x<=99999 for x in counts.values())): raise ValueError('invalid counts')
+              if row['status']=='passed' and (not exact or counts!=expected_fields or (label=='node' and row['exitCode']!=0)):
+                  raise ValueError('passing census mismatch')
+              if (outcome=='success')!=(row['status']=='passed'): raise ValueError('stage outcome mismatch')
+              return row
+          node = stage('node',os.environ['NODE_OUTCOME'],{'tests':26,'pass':26,'fail':0,'cancelled':0,'skipped':0,'todo':0})
+          python = stage('python',os.environ['PYTHON_OUTCOME'],dict(testsRun=7,failures=0,errors=0,skipped=0,expectedFailures=0,unexpectedSuccesses=0))
+          clean = not subprocess.check_output(['git','status','--porcelain','--untracked-files=all'])
+          passed = node['status']==python['status']=='passed' and clean
+          receipt = dict(schemaVersion=1,kind='vendure-preparation-helper-v6',status='passed' if passed else 'failed',
+              releaseAcceptance=False,sourceSha=os.environ['PRODUCT'],sourceTree=os.environ['PRODUCT_TREE'],sourceParent=os.environ['PRODUCT_PARENT'],
+              sourcePatchSha256=os.environ['PATCH_SHA256'],wrapperSha=os.environ['GITHUB_SHA'],runId=int(os.environ['GITHUB_RUN_ID']),
+              attempt=int(os.environ['GITHUB_RUN_ATTEMPT']),sourceClean=clean,node=node,python=python,
+              applicationBuild='not-run',applicationSeed='not-run',installedApplication='not-run',campaign='not-run')
+          atomic_write_private(root/'safe/counts.json',(json.dumps(receipt,sort_keys=True)+'\n').encode())
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out: print('ready=true',file=out)
+          raise SystemExit(0 if passed else 1)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.counts.outputs.ready == 'true' }}
+        with:
+          name: vendure-preparation-v6-helper-counts
+          path: ${{ env.PROOF }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 7
