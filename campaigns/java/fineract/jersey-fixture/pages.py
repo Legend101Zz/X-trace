@@ -80,9 +80,8 @@ def bound_cursor(project_id, rid, sequence):
     return "v1." + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def detail_pages(fetch, api, project_id, rid, event_count, listed_range):
+def checked_detail_pages(fetch, api, project_id, rid):
     cursor, previous = None, -1
-    events, first = [], None
     for number in range(1, MAX_PAGES + 1):
         doc = fetch(cursor)
         common(doc, api, project_id, DETAIL_LIMIT)
@@ -103,17 +102,23 @@ def detail_pages(fetch, api, project_id, rid, event_count, listed_range):
                 and (doc["outcome"] is None or isinstance(doc["outcome"], dict))
                 and isinstance(incomplete, list) and all(isinstance(code, str) for code in incomplete),
                 "detail completion evidence")
-        if first is None:
-            first = doc
-        for key in ("completion", "outcome", name("incomplete_evidence", api)):
-            require(doc[key] == first[key], "post-shutdown recording evidence drift")
-        events.extend(rows)
         nxt = doc[name("next_cursor", api)]
+        if nxt is not None:
+            require(rows and nxt == bound_cursor(project_id, rid, previous), "detail continuation")
+        yield doc
         if nxt is None:
-            require(len(events) == event_count, "listed and collected event counts differ")
-            endpoints = (events[0]["sequence"], events[-1]["sequence"]) if events else (None, None)
-            require(endpoints == listed_range, "listed and collected sequence endpoints")
-            return {**first, "events": events}, number
-        require(rows and nxt == bound_cursor(project_id, rid, previous), "detail continuation")
+            return
         cursor = nxt
     raise ValueError("recording detail pagination bound")
+
+
+def detail_pages(fetch, api, project_id, rid, event_count, listed_range):
+    pages = list(checked_detail_pages(fetch, api, project_id, rid))
+    for page in pages[1:]:
+        for key in ("completion", "outcome", name("incomplete_evidence", api)):
+            require(page[key] == pages[0][key], "post-shutdown recording evidence drift")
+    events = [event for page in pages for event in page["events"]]
+    require(len(events) == event_count, "listed and collected event counts differ")
+    endpoints = (events[0]["sequence"], events[-1]["sequence"]) if events else (None, None)
+    require(endpoints == listed_range, "listed and collected sequence endpoints")
+    return {**pages[0], "events": events}, len(pages)

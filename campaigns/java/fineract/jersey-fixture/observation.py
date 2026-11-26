@@ -1,6 +1,7 @@
 """Check a complete authenticated fixture read against the same installed CLI event pages."""
 import json
 import subprocess
+import time
 
 from urllib.parse import urlencode
 
@@ -10,16 +11,19 @@ from verify_fixture import require
 SERVICE = "org.glassfish.jersey.servlet.ServletContainer.service"
 APPLY = "org.glassfish.jersey.server.model.ResourceMethodInvoker.apply"
 ITEM = "/scope/effective/groups/{group}/items/{id}"
+LIFECYCLE = "/scope/effective/groups/{group}/lifecycle"
 DEFERRED = "/scope/effective/groups/{group}/deferred"
 
 
-def cli_reader(cli, project, env, canaries):
+def cli_reader(cli, project, env, canaries, *, deadline=None):
     def read(rid, cursor):
         args = ["list"] if rid is None else ["show", rid]
         args += ["--project-dir", str(project), "--limit", str(LIST_LIMIT if rid is None else DETAIL_LIMIT)]
         if cursor is not None:
             args += ["--after" if rid is None else "--cursor", cursor]
-        result = subprocess.run([cli, "recording", *args], env=env, capture_output=True, check=True, timeout=60)
+        remaining = 60 if deadline is None else deadline - time.monotonic()
+        require(remaining > 0, "fixture CLI read deadline")
+        result = subprocess.run([cli, "recording", *args], env=env, capture_output=True, check=True, timeout=min(60, remaining))
         require(all(c.encode() not in result.stdout for c in canaries), "fixture input visible in CLI")
         return json.loads(result.stdout)
     return read
@@ -42,7 +46,7 @@ def api_reader(client, canaries):
 def compare_inventory(cli, api, project_id, supported):
     cli_ids, cli_lists = list_pages(lambda after: cli(None, after), False, project_id)
     api_ids, api_lists = list_pages(lambda after: api(None, after), True, project_id)
-    expected = 4 if supported else 1
+    expected = 5 if supported else 1
     require(list(cli_ids.items()) == list(api_ids.items()) and len(api_ids) == expected
             and cli_lists == api_lists == expected, "installed recording list inventory")
     details, count, matched_pages = {}, 0, (0, 0)
@@ -86,6 +90,7 @@ def judge(details, version):
     expected = {"http.request GET": (403, None, "filter-refusal")}
     if supported:
         expected.update({f"http.request GET {ITEM}": (200, "read", "mapped-read"),
+                         f"http.request GET {LIFECYCLE}": (200, "lifecycle", "mapped-read-lifecycle"),
                          f"http.request POST {ITEM}": (404, None, "conversion"),
                          f"http.request GET {DEFERRED}": (None, "deferred", "deferred")})
     observed = set()
@@ -111,7 +116,7 @@ def judge(details, version):
         enters = [e for e in events if e["kind"] == "recording_event_kind:frame_enter"]
         services = [e for e in enters if e["symbol"] == SERVICE]
         invokers = [e for e in enters if e["symbol"] == APPLY]
-        resources = [e for e in enters if e["symbol"] in {"Items.read", "Items.convert", "Items.deferred", "Items.context"}]
+        resources = [e for e in enters if e["symbol"] in {"Items.read", "Items.convert", "Items.deferred", "Items.context", "Items.lifecycle"}]
         require(len(services) == len(invokers) == int(route), "executed Jersey entry inventory")
         require(not any(e["symbol"] in {"jakarta.servlet.http.HttpServlet.service", "javax.servlet.http.HttpServlet.service"}
                         for e in enters), "unexecuted parent service recorded")

@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from observation import OutcomeMismatch, api_reader, cli_reader, compare_inventory, judge
 from pages import list_pages
+import lifecycle
 from verify_fixture import require, verify_fixture
 
 HERE = Path(__file__).resolve().parent
@@ -29,7 +30,7 @@ import xinstr
 def failure_site(error):
     # Source is pinned by the hosted wrapper. Only a reviewed file label and line number
     # leave the private traceback; exception text and frame locals can contain fixture input.
-    files = {HERE / name: name for name in ("installed_journey.py", "observation.py", "pages.py", "verify_fixture.py")}
+    files = {HERE / name: name for name in ("installed_journey.py", "observation.py", "pages.py", "verify_fixture.py", "lifecycle.py")}
     files[REPO / "campaigns/lib/xinstr.py"] = "xinstr.py"
     site = None
     for frame, line in traceback.walk_tb(error.__traceback__):
@@ -131,11 +132,28 @@ def leg(root, jar, version, cli, agent, java, progress):
            str(java), "-Dxtrace.jersey.probeEvidence=true", "-Dfixture.control=" + str(control), "-jar", str(fixture),
            "--server.address=127.0.0.1", "--server.port=0", "--server.servlet.context-path=/scope",
            "--spring.jersey.application-path=/effective"]
+    live = None
     progress["phase"] = "installed-launch"
     with (root / "launch.log").open("xb") as log:
         proc = subprocess.Popen(cmd, cwd=project, env=env, stdout=log, stderr=log)
         try:
             workload(proc, control, canaries, progress)
+            if version == "3.1.11":
+                progress["phase"] = "lifecycle-viewer-readiness"
+                live_viewer, live_ready = xinstr.start_viewer(cli, project, env, root / "live-viewer.log")
+                try:
+                    origin = urlsplit(live_ready["origin"])
+                    require(origin.scheme == "http" and origin.hostname == "127.0.0.1" and origin.port
+                            and live_ready["url"].startswith(live_ready["origin"] + "/"), "live viewer loopback origin")
+                    live_client = xinstr.ViewerClient(live_ready["origin"])
+                    token = xinstr.bootstrap_token(live_ready["url"])
+                    require(token, "live viewer credential missing")
+                    live_client.exchange(token)
+                    live = lifecycle.observe(proc, control, canaries, project_id, live_client,
+                                             cli, project, env, progress)
+                finally:
+                    with cleanup(progress, "live-viewer-shutdown"):
+                        xinstr.stop_process_group(live_viewer, wait=30)
         finally:
             with cleanup(progress, "recording-shutdown"):
                 stop_recording(proc, control / "stop")
@@ -191,6 +209,8 @@ def leg(root, jar, version, cli, agent, java, progress):
             xinstr.stop_process_group(viewer, wait=30)
     progress["phase"] = "recording-judgment"
     recordings = judge(details, version)
+    if live is not None:
+        lifecycle.after_stop(live, details, progress)
     return {"httpResponses": progress["responsesVerified"], "recordings": recordings, "probeDecisions": decisions,
             **notices, **counts}
 
