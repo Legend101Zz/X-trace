@@ -240,7 +240,9 @@ export function ExportSheet({ endpoint, onClose, onPhaseChange }: {
     <footer className="export-actions export-footer" onFocus={revealFooterAction}>
       {phase === 'Choose' && <><span>Nothing is saved yet. You always see a preview first.</span><button type="button" className="export-primary" disabled={busy}
         onClick={() => void submit('preview')}>Preview</button></>}
-      {phase === 'Preview' && <><span>Files will be saved on this machine only. Nothing will be sent anywhere.</span><button type="button" onClick={choose}>Back</button>
+      {phase === 'Preview' && <>{preview && <strong className="short-export-summary">
+        {preview.download.filename} · {preview.files.length} {preview.files.length === 1 ? 'file' : 'files'}
+      </strong>}<span>Files will be saved on this machine only. Nothing will be sent anywhere.</span><button type="button" onClick={choose}>Back</button>
         <button type="button" onClick={() => void copyCommand()}>Copy terminal command</button><button type="button" className="export-primary"
         disabled={busy} onClick={() => void submit(stale ? 'preview' : 'save')}>{stale ? 'Refresh preview' : 'Save file'}</button></>}
       {phase === 'Save' && <><button type="button" onClick={choose}>Export something else</button>

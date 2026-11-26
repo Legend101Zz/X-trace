@@ -284,6 +284,12 @@ async function shortPreviewProbes(page, dialog, row, out, preview) {
       await page.screenshot({ path: join(out, `preview-keyboard-${height}.png`) });
       assert.ok(reached, 'short-preview-primary-keyboard-reachable');
       await primaryActionVisible(dialog, 'Save file');
+      if (row.width === 320 && height === 260) {
+        const summary = dialog.locator('.short-export-summary');
+        const count = preview.files.length;
+        await expect(summary).toHaveText(`${preview.download.filename} · ${count} ${count === 1 ? 'file' : 'files'}`);
+        assert.ok(await summary.evaluate(visibleControl), 'short-preview-download-identity-visible');
+      }
       probe.checks.keyboardAction = 'pass'; checkpoint();
       passed = true;
     } catch (error) {

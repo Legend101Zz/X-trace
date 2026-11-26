@@ -66,6 +66,7 @@
 .export-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
 .export-footer { padding: .7rem 1rem; justify-content: end; background: var(--panel); border-top: 1px solid var(--line); }
 .export-footer span { margin-inline-end: auto; color: var(--muted); }
+.short-export-summary { display: none; }
 .export-feedback:not(:empty) { max-height: 20dvh; overflow: auto; padding: .5rem 1rem; }
 .export-preview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; }
 .export-preview > *, .export-files button, .export-command { min-width: 0; }
@@ -113,6 +114,17 @@
   .export-footer { position: sticky; bottom: 0; z-index: 1; }
   .export-footer > span { flex: 1 1 10rem; min-width: 0; }
   .viewer-dialog:has(.export-sheet) .viewer-dialog-body { scroll-padding-block-end: 4.5rem; }
+}
+
+@media (max-width: 40rem) and (max-height: 17rem) {
+  /* When focus scrolls the actions into view, keep the download identity beside them. */
+  .export-footer:has(.short-export-summary) {
+    display: grid;
+    grid-template-columns: minmax(44px, 1fr) minmax(44px, 1.6fr) minmax(44px, 1fr);
+    gap: .25rem .5rem;
+  }
+  .short-export-summary, .short-export-summary + span { grid-column: 1 / -1; }
+  .short-export-summary { display: block; }
 }
 
 .request-branch > .export-trigger, #recordings-panel > .export-trigger { margin: .25rem .65rem; }
