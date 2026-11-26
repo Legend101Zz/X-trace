@@ -1,0 +1,23 @@
+{
+  "artifact": "first-use-layout-generated-assets",
+  "assetChanges": [
+    "app.js",
+    "assets.sha256",
+    "index.css"
+  ],
+  "branch": "codex/proof-first-use-layout-assets-118",
+  "parent": "10e83a00e052d7349eb3daa7e1d18e75f23696e0",
+  "path": ".github/workflows/first-use-layout-assets.yml",
+  "source": "8bca2efd9e57065342f7ffd822357fb898b71493",
+  "sourceChanges": [
+    "M\tweb/app/scripts/first-recording-journey.mjs",
+    "A\tweb/app/scripts/first-recording-layout.mjs",
+    "M\tweb/app/src/features/catalog/CatalogPanel.tsx",
+    "M\tweb/app/src/features/export/export.css",
+    "M\tweb/app/src/features/shell/viewer-dialog.css",
+    "M\tweb/app/src/features/shell/workspace.css"
+  ],
+  "tree": "976b3ce4780ac5044d79c4fa3bd8d4e512ff7db0",
+  "workflowDigest": "92b032f0a9e32a71f280ab517d7b7b99df99773b9e2bfe743316cca305f78818",
+  "wrapper": "5174e85cd6d9f359c1762b0248681f03d06b78da"
+}
