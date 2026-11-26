@@ -1,0 +1,150 @@
+name: Medusa native direct-child proof
+on:
+  push:
+    branches: [codex/proof-medusa-native-direct-child-120]
+permissions:
+  contents: read
+concurrency:
+  group: medusa-installed-120
+  cancel-in-progress: false
+jobs:
+  ownership:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      MEDUSA_PRODUCT_SHA: 137c744c7afea7ac8e227acad22062d5e07789ba
+      MEDUSA_PRODUCT_TREE: d59cf8da09b29af3a647c769ed3547bdf560aaaa
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Admit source and private directories
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$MEDUSA_PRODUCT_SHA"
+          git checkout --detach "$MEDUSA_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$MEDUSA_PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          owner="$(mktemp -d "$RUNNER_TEMP/medusa-owned-proof.XXXXXXXX")"
+          root="$owner/proof"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/outer" "$root/safe"
+          printf '%s\n' "MEDUSA_ROOT=$root" "CARGO_TARGET_DIR=$root/target" "CARGO_TERM_COLOR=never" "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+          printf '%s\n' 'admitted=true' >> "$GITHUB_OUTPUT"
+      - name: Run four native cases and compile the CLI
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          cat >"$MEDUSA_ROOT/outer/controller.py" <<'MEDUSA_CONTROLLER'
+          """Qualify native direct-child behavior and compile the CLI against that API."""
+          import json
+          from pathlib import Path
+          import os
+          import re
+          import subprocess
+          import sys
+
+          from tools.release.private_roots import admit_directory, atomic_write_private
+
+          root = Path(os.environ["MEDUSA_ROOT"])
+          admit_directory(root)
+          sys.path.insert(0, str(Path("campaigns/node/medusa/harness").resolve()))
+          from installed_process import contain_children, verify_children_gone
+
+          suites = {
+              "direct-child": (
+                  "node::tests::termination_",
+                  {"node::tests::termination_reaps_direct_child_and_leaves_same_group_descendant_unsignaled",
+                   "node::tests::termination_of_an_exited_direct_child_still_reaps"},
+              ),
+              "native-preflight": (
+                  "node::tests::native_version_probe_",
+                  {"node::tests::native_version_probe_accepts_bounded_node_version_output",
+                   "node::tests::native_version_probe_bounds_pipe_drain_when_detached_descendant_holds_pipes"},
+              ),
+          }
+          receipt = {
+              "schemaVersion": 1, "kind": "medusa-native-direct-child-120", "status": "failed",
+              "sourceSha": os.environ["MEDUSA_PRODUCT_SHA"], "sourceTree": os.environ["MEDUSA_PRODUCT_TREE"],
+              "wrapperSha": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "stages": {name: {"command": "unreached", "exitCode": None, "cleanup": "unreached", "passedTests": None}
+                         for name in (*suites, "cli-check")},
+          }
+
+
+          def save():
+              atomic_write_private(root / "safe/receipt.json", (json.dumps(receipt, sort_keys=True) + "\n").encode())
+
+
+          def run(name, argv, expected=None):
+              row = receipt["stages"][name]
+              stdout = root / "outer" / (name + ".stdout")
+              stderr = stdout.with_suffix(".stderr")
+              try:
+                  with stdout.open("xb") as out, stderr.open("xb") as err:
+                      child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+                      try:
+                          row["exitCode"] = child.wait(timeout=900)
+                          row["command"] = "exited"
+                      except subprocess.TimeoutExpired:
+                          row["command"] = "deadline"
+                          if child.poll() is None:
+                              child.kill()
+                          try:
+                              child.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              row["command"] = "unreaped"
+              except OSError:
+                  row["command"] = "spawn-or-io"
+              finally:
+                  row["cleanup"] = "failed"
+                  save()
+                  try:
+                      verify_children_gone()
+                  except TimeoutError:
+                      pass
+                  else:
+                      row["cleanup"] = "passed"
+                      save()
+              if expected is not None and stdout.is_file() and 0 < stdout.stat().st_size <= 65536:
+                  output = stdout.read_text()
+                  passed = re.findall(r"^test (node::tests::[a-z_]+) \.\.\. ok$", output, re.M)
+                  summary = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+                                       r"(\d+) measured; \d+ filtered out;", output, re.M)
+                  if len(passed) == len(expected) and set(passed) == expected and summary == [("2", "0", "0", "0")]:
+                      row["passedTests"] = len(passed)
+                      save()
+              return (row["command"] == "exited" and row["exitCode"] == 0 and row["cleanup"] == "passed"
+                      and (expected is None or row["passedTests"] == len(expected)))
+
+
+          save()
+          contain_children()
+          for name, (filter_prefix, expected) in suites.items():
+              if not run(name, ["cargo", "test", "--locked", "-p", "xtrace-runtime", "--lib", filter_prefix,
+                                "--", "--test-threads=1"], expected):
+                  sys.exit(1)
+          if not run("cli-check", ["cargo", "check", "--locked", "-p", "xtrace-cli"]):
+              sys.exit(1)
+          receipt["status"] = "passed"
+          save()
+          MEDUSA_CONTROLLER
+          printf '%s  %s\n' '40973a119402b983d41c0d378156fb31c02080b0b6d6d5b643c03795c4311d45' "$MEDUSA_ROOT/outer/controller.py" | sha256sum --check --status
+          PYTHONPATH="$PWD" python3 -B "$MEDUSA_ROOT/outer/controller.py" >"$MEDUSA_ROOT/outer/controller.log" 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && steps.root.outputs.admitted == 'true'
+        with:
+          name: medusa-120-native-direct-child-counts
+          path: ${{ env.MEDUSA_ROOT }}/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
