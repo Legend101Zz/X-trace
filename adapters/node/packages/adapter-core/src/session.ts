@@ -1,4 +1,4 @@
-import { create } from "@bufbuild/protobuf";
+import { create, toBinary } from "@bufbuild/protobuf";
 import { blake3 } from "hash-wasm";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -24,6 +24,9 @@ export interface AuthenticatedXtpSession {
   readonly runtimeSessionId: Uint8Array;
   /** Negotiated maximum length of one encoded protobuf envelope. */
   readonly maxEnvelopeBytes: number;
+  readonly maxBatchEvents: number;
+  /** True if the complete envelope fits regardless of the sequence and timestamp at send time. */
+  fitsEnvelope(messageId: string, payload: AgentEnvelope["payload"], correlationToken?: string): boolean;
   /**
    * Sends one envelope in invocation order and waits for its contiguous Staged acknowledgement.
    * Up to 64 send calls may be pending at once.
@@ -151,6 +154,24 @@ export async function openXtpSession(
     let closed = false;
     let closePromise: Promise<void> | undefined;
     const sendQueue = new BoundedSendQueue(64);
+    function makeEnvelope(
+      sessionSeq: bigint,
+      sentMonotonicNs: bigint,
+      messageId: string,
+      payload: AgentEnvelope["payload"],
+      correlationToken: string,
+    ): AgentEnvelope {
+      return create(AgentEnvelopeSchema, {
+        protocolMajor: daemonHello.protocolMajor,
+        protocolMinor: daemonHello.protocolMinor,
+        runtimeSessionId,
+        sessionSeq,
+        sentMonotonicNs,
+        messageId,
+        correlationToken,
+        payload,
+      });
+    }
     async function send(
       messageId: string,
       payload: AgentEnvelope["payload"],
@@ -160,16 +181,7 @@ export async function openXtpSession(
       if (messageId.length === 0) throw new XtraceClientError("XTR-NODE-ENVELOPE", "message ID must not be empty");
       return sendQueue.enqueue(async () => {
         const seq = nextSeq;
-        const envelope = create(AgentEnvelopeSchema, {
-          protocolMajor: daemonHello.protocolMajor,
-          protocolMinor: daemonHello.protocolMinor,
-          runtimeSessionId,
-          sessionSeq: seq,
-          sentMonotonicNs: process.hrtime.bigint(),
-          messageId,
-          correlationToken,
-          payload,
-        });
+        const envelope = makeEnvelope(seq, process.hrtime.bigint(), messageId, payload, correlationToken);
         try {
           await writeEnvelope(activeSocket, envelope, maxBytes);
           const response = await nextAck(frames);
@@ -196,6 +208,13 @@ export async function openXtpSession(
       protocolMinor: daemonHello.protocolMinor,
       runtimeSessionId,
       maxEnvelopeBytes: maxBytes,
+      maxBatchEvents: daemonHello.maxBatchEvents,
+      fitsEnvelope(messageId, payload, correlationToken = "") {
+        // uint64 sequence may expand in the send queue. A nonzero fixed64 timestamp
+        // occupies its full wire width. The normal encoder checks the actual frame again.
+        const upperBound = makeEnvelope(0xffff_ffff_ffff_ffffn, 1n, messageId, payload, correlationToken);
+        return toBinary(AgentEnvelopeSchema, upperBound).length <= maxBytes;
+      },
       send,
       async close() {
         if (closePromise) return closePromise;

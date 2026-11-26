@@ -4,7 +4,7 @@ import type { CaptureEvent } from "./events.cjs";
 
 export type { CaptureEvent };
 
-const MAX_IN_FLIGHT_MESSAGES = 64;
+export const MAX_IN_FLIGHT_MESSAGES = 64;
 const MAX_ACTIVE_RECORDINGS = 64;
 
 export const workerCounters = { startStaged: 0, finishStaged: 1, failed: 2, expressHandlerStaged: 3 } as const;

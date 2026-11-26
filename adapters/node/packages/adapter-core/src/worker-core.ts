@@ -23,9 +23,10 @@ import {
   RecordingFinishedSchema,
   RecordingStartedSchema,
   type AgentEnvelope,
+  type RecordingEvent,
 } from "@xtrace/protocol";
 import type { CaptureEventKind, ExceptionFacts, GapFacts, InteractionFacts, SourceBindingName, SourceFacts } from "./runtime/events.cjs";
-import type { RecordingSummary } from "./runtime/transport.cjs";
+import { MAX_IN_FLIGHT_MESSAGES, type RecordingSummary } from "./runtime/transport.cjs";
 
 export interface InputMessage {
   type: "start" | "event" | "finish" | "close" | "route";
@@ -71,7 +72,6 @@ interface RecordingState {
   eventIds: string[];
   method: string;
   startedAtNs: bigint;
-  hold: boolean;
   /** RecordingStarted has been sent. */
   started: boolean;
   held: InputMessage[];
@@ -80,6 +80,7 @@ interface RecordingState {
   /** Route template announced while the request ran (framework match time); wins over the finish summary. */
   route?: string;
   timer?: ReturnType<typeof setTimeout>;
+  releasing?: Promise<void>;
 }
 
 /** Config the handshake advertises per capability name; unknown names are never advertised. */
@@ -241,8 +242,32 @@ export function capabilitySetFor(names: readonly string[]) {
   return create(CapabilitySetSchema, { capabilities });
 }
 
+/** Gap markers, missing identities and discontinuous sequence numbers remain wire boundaries. */
+export function adjacentEvents(previous: InputMessage, next: InputMessage): boolean {
+  return previous.type === "event" && next.type === "event" &&
+    previous.kind !== "gap" && next.kind !== "gap" && previous.gap === undefined && next.gap === undefined &&
+    typeof previous.recordingId === "string" && previous.recordingId === next.recordingId &&
+    typeof previous.eventId === "string" && previous.eventId !== "" &&
+    typeof next.eventId === "string" && next.eventId !== "" &&
+    typeof previous.sequence === "bigint" && next.sequence === previous.sequence + 1n;
+}
+
+type Credit = (count: number) => void;
+
+interface BatchLimits {
+  maxBatchEvents: number;
+  fitsEnvelope(messageId: string, payload: AgentEnvelope["payload"], correlationToken: string): boolean;
+}
+
+/** The producer's existing logical message cap also bounds a candidate batch in memory. */
+function eventBatchLimit(limits?: BatchLimits): number {
+  return limits ? Math.min(limits.maxBatchEvents, MAX_IN_FLIGHT_MESSAGES) : 1;
+}
+
 export interface RecordingAssembler {
   handle(message: InputMessage): Promise<boolean>;
+  /** Handles an adjacent same-recording run selected by the delivery queue. */
+  handleEvents(messages: readonly InputMessage[], credit?: Credit): Promise<boolean>;
   /** Sends held starts and their events for recordings that never finished (worker closing). */
   flushHeld(): Promise<void>;
 }
@@ -251,6 +276,8 @@ export function createRecordingAssembler(
   send: SendFn,
   now: () => bigint = () => process.hrtime.bigint(),
   holdMs: number = HOLD_START_MS,
+  batch?: BatchLimits,
+  onFailure?: () => void,
 ): RecordingAssembler {
   const recordings = new Map<string, RecordingState>();
 
@@ -273,30 +300,93 @@ export function createRecordingAssembler(
     state.started = true;
   }
 
-  async function sendEvent(recordingId: string, state: RecordingState, message: InputMessage): Promise<void> {
-    if (typeof message.eventId !== "string" || typeof message.sequence !== "bigint") return;
-    await send(`node-http-${recordingId}-event-${message.sequence}`, {
-      case: "eventBatch",
-      value: create(EventBatchSchema, { recordingId: state.bytes, events: [encodeEvent({ ...message, monotonicNs: message.monotonicNs ?? now() })] }),
-    }, recordingId);
-    state.eventIds.push(message.eventId);
+  async function sendBatch(
+    recordingId: string, state: RecordingState, events: RecordingEvent[], credit?: Credit,
+  ): Promise<void> {
+    const id = `node-http-${recordingId}-event-${events[0]!.recordingSeq}`;
+    const payload = { case: "eventBatch", value: create(EventBatchSchema, { recordingId: state.bytes, events }) } as const;
+    if (events.length > 1 && batch && !batch.fitsEnvelope(id, payload, recordingId)) {
+      // Split in wire order. A singleton follows the original encoder and failure path.
+      const middle = Math.floor(events.length / 2);
+      await sendBatch(recordingId, state, events.slice(0, middle), credit);
+      await sendBatch(recordingId, state, events.slice(middle), credit);
+      return;
+    }
+    await send(id, payload, recordingId);
+    for (const event of events) state.eventIds.push(event.eventId);
+    credit?.(events.length);
   }
 
-  async function release(recordingId: string, state: RecordingState, summary?: RecordingSummary): Promise<void> {
-    if (state.timer) clearTimeout(state.timer);
-    if (!state.started) {
-      state.routeLost = summary === undefined;
-      await sendStart(recordingId, state, summary);
+  async function sendEvents(
+    recordingId: string, state: RecordingState, messages: readonly InputMessage[], credit?: Credit,
+  ): Promise<void> {
+    const limit = eventBatchLimit(batch);
+    let index = 0;
+    while (index < messages.length) {
+      const first = index++;
+      const message = messages[first]!;
+      if (typeof message.eventId !== "string" || typeof message.sequence !== "bigint") {
+        credit?.(1); // Preserve the prior handling of a malformed event without sending it.
+        continue;
+      }
+      while (index < messages.length && index - first < limit && adjacentEvents(messages[index - 1]!, messages[index]!)) index += 1;
+      const events = messages.slice(first, index).map((item) => encodeEvent({ ...item, monotonicNs: item.monotonicNs ?? now() }));
+      await sendBatch(recordingId, state, events, credit);
     }
-    for (const held of state.held.splice(0)) await sendEvent(recordingId, state, held);
+  }
+
+  function release(recordingId: string, state: RecordingState, summary?: RecordingSummary): Promise<void> {
+    if (state.timer) clearTimeout(state.timer);
+    // The expiry timer can run while delivery is waiting on a staged ACK.
+    // Later messages must wait for both the start and its held prefix.
+    return state.releasing ??= (async () => {
+      if (!state.started) {
+        state.routeLost = summary === undefined;
+        await sendStart(recordingId, state, summary);
+      }
+      await sendEvents(recordingId, state, state.held.splice(0));
+    })();
+  }
+
+  function recordingIdentity(message: InputMessage) {
+    const id = message.recordingId;
+    if (typeof id !== "string") throw new Error("recording identity absent");
+    const bytes = Buffer.from(id.replaceAll("-", ""), "hex");
+    if (bytes.length !== 16) throw new Error("recording identity invalid");
+    return { id, bytes };
+  }
+
+  async function handleEvents(messages: readonly InputMessage[], credit?: Credit): Promise<boolean> {
+    if (messages.length === 0) return false;
+    const { id } = recordingIdentity(messages[0]!);
+    const state = recordings.get(id);
+    if (!state) {
+      credit?.(messages.length);
+      return false;
+    }
+    if (state.releasing) await state.releasing;
+    if (state.started) {
+      await sendEvents(id, state, messages, credit);
+      return true;
+    }
+    const holding = Math.min(MAX_HELD_EVENTS - state.held.length, messages.length);
+    if (holding > 0) {
+      state.held.push(...messages.slice(0, holding));
+      // Held events return their original worker-handoff credit at local acceptance.
+      // Their later wire send must not refund that credit again.
+      credit?.(holding);
+    }
+    if (holding < messages.length) {
+      await release(id, state);
+      await sendEvents(id, state, messages.slice(holding), credit);
+    }
+    return true;
   }
 
   return {
     async handle(message) {
-      const recordingId = message.recordingId;
-      if (typeof recordingId !== "string") throw new Error("recording identity absent");
-      const bytes = Buffer.from(recordingId.replaceAll("-", ""), "hex");
-      if (bytes.length !== 16) throw new Error("recording identity invalid");
+      if (message.type === "event") return handleEvents([message]);
+      const { id: recordingId, bytes } = recordingIdentity(message);
 
       if (message.type === "start") {
         const state: RecordingState = {
@@ -304,7 +394,6 @@ export function createRecordingAssembler(
           eventIds: [],
           method: message.method ?? "",
           startedAtNs: message.startedAtNs ?? now(),
-          hold: message.holdStart === true,
           started: false,
           held: [],
           routeLost: false,
@@ -312,10 +401,12 @@ export function createRecordingAssembler(
         recordings.set(recordingId, state);
         // Without a module that can still resolve a route the start goes out immediately, so an
         // interrupted request is visible (and reopens as partial) instead of vanishing.
-        if (!state.hold) await sendStart(recordingId, state);
+        if (!message.holdStart) await sendStart(recordingId, state);
         else {
           state.timer = setTimeout(() => {
-            if (recordings.get(recordingId) === state && !state.started) void release(recordingId, state).catch(() => undefined);
+            if (recordings.get(recordingId) === state && !state.started) {
+              void release(recordingId, state).catch(() => onFailure?.());
+            }
           }, holdMs);
           state.timer.unref?.();
         }
@@ -323,21 +414,13 @@ export function createRecordingAssembler(
       }
       const state = recordings.get(recordingId);
       if (!state) return false;
+      if (state.releasing) await state.releasing;
       if (message.type === "route") {
         // The route is known at match time: release the held start now so a long request is visible
         // with its template. Only the first announcement counts, and only before the start went out.
         if (typeof message.route === "string" && message.route !== "" && !state.started && state.route === undefined) {
           state.route = message.route.slice(0, 1024);
           await release(recordingId, state, { route: state.route });
-        }
-        return true;
-      }
-      if (message.type === "event") {
-        if (state.started) await sendEvent(recordingId, state, message);
-        else if (state.held.length < MAX_HELD_EVENTS) state.held.push(message);
-        else {
-          await release(recordingId, state);
-          await sendEvent(recordingId, state, message);
         }
         return true;
       }
@@ -366,9 +449,10 @@ export function createRecordingAssembler(
       }
       return false;
     },
+    handleEvents,
     async flushHeld() {
       for (const [recordingId, state] of recordings) {
-        if (!state.started || state.held.length > 0) await release(recordingId, state);
+        if (state.releasing || !state.started || state.held.length > 0) await release(recordingId, state);
       }
     },
   };

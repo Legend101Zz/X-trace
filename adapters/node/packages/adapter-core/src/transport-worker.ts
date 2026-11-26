@@ -3,6 +3,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
 import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
+import { createWorkerDelivery } from "./worker-delivery.js";
 
 interface StartupData {
   bootstrapPath: string;
@@ -17,12 +18,11 @@ const data = workerData as StartupData;
 const startup = new Int32Array(data.startupBarrier);
 const diagnostic = data.diagnosticBuffer && new Uint32Array(data.diagnosticBuffer);
 let session: AuthenticatedXtpSession | undefined;
-let delivery = Promise.resolve();
+let delivery: ReturnType<typeof createWorkerDelivery> | undefined;
 let shuttingDown = false;
-let closingRequested = false;
 
 const send: SendFn = (id, payload, token) => session!.send(id, payload, token);
-const assembler = createRecordingAssembler(diagnostic ? async (id, payload, token) => {
+const observedSend: SendFn = diagnostic ? async (id, payload, token) => {
   const result = await send(id, payload, token);
   if (payload.case === "recordingStarted") Atomics.add(diagnostic, workerCounters.startStaged, 1);
   if (payload.case === "recordingFinished") Atomics.add(diagnostic, workerCounters.finishStaged, 1);
@@ -34,7 +34,7 @@ const assembler = createRecordingAssembler(diagnostic ? async (id, payload, toke
     }
   }
   return result;
-} : send);
+} : send;
 
 function setStartup(state: 1 | 2): void {
   Atomics.store(startup, 0, state);
@@ -43,17 +43,16 @@ function setStartup(state: 1 | 2): void {
 }
 
 function fail(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  delivery?.abort();
   if (diagnostic) Atomics.store(diagnostic, workerCounters.failed, 1);
   setStartup(2);
   parentPort?.postMessage({ type: "failure" });
-  shuttingDown = true;
+  // A queued close may already have referenced this worker. Abort discards that
+  // queue, so close the message port here as well as the authenticated session.
+  parentPort?.close();
   void session?.close().catch(() => undefined);
-}
-
-async function deliver(message: InputMessage): Promise<void> {
-  if (!session || shuttingDown) return;
-  await assembler.handle(message);
-  parentPort?.postMessage({ type: "staged" });
 }
 
 async function initialize(): Promise<void> {
@@ -71,23 +70,19 @@ async function initialize(): Promise<void> {
     case: "capabilitySet",
     value: capabilitySetFor(data.capabilities ?? ["http.server.request_root", "async_correlation"]),
   });
+  const assembler = createRecordingAssembler(observedSend, undefined, undefined, session, fail);
+  delivery = createWorkerDelivery(assembler, {
+    staged: () => parentPort?.postMessage({ type: "staged" }),
+    async close() {
+      await session!.close();
+      parentPort?.close();
+      shuttingDown = true;
+    },
+    fail,
+  });
   setStartup(1);
 }
 
-parentPort?.on("message", (message: InputMessage) => {
-  if (message.type === "close") {
-    closingRequested = true;
-    delivery = delivery.then(async () => {
-      // Held starts are released so an unfinished request reopens as partial instead of vanishing.
-      if (session && !shuttingDown) await assembler.flushHeld();
-      shuttingDown = true;
-      await session?.close();
-      parentPort?.close();
-    }).catch(() => fail());
-    return;
-  }
-  if (closingRequested) return;
-  delivery = delivery.then(() => deliver(message)).catch(() => fail());
-});
+parentPort?.on("message", (message: InputMessage) => delivery?.enqueue(message));
 
 void initialize().catch(() => fail());
