@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import type { components } from './api.generated';
 import { api, ApiError, failureMessage } from './api';
 import { AppShell } from './app-shell';
@@ -10,7 +10,7 @@ import { initialReplayState, replayReducer } from './replay/state';
 import type { NavAction } from './replay/navigation';
 import { useLane } from './state/lane';
 import { MAX_RETAINED_EVENTS, MAX_RETAINED_ROWS } from './types';
-import type { AuthState, CatalogMode, Detail, Endpoint, Pane, Recording } from './types';
+import type { AuthState, CatalogMode, Detail, Endpoint, Pane, Recording, ReplayEvent } from './types';
 import './style.css';
 
 /** Read-only local browser for bounded observed endpoints and persisted recordings. */
@@ -18,19 +18,17 @@ export default function App() {
   const [auth, setAuth] = useState<AuthState>('checking');
   const [authError, setAuthError] = useState('');
   const [replay, dispatchReplay] = useReducer(replayReducer, initialReplayState);
+  const { operationId: selectedOperation, recordingId: selectedRecording } = replay;
   const [catalogMode, setCatalogMode] = useState<CatalogMode>('endpoints');
   const [activePane, setActivePane] = useState<Pane>('recordings');
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [endpointCursor, setEndpointCursor] = useState<string | null>(null);
-  const [selectedOperation, setSelectedOperation] = useState('');
   const [selectedEndpointSnapshot, setSelectedEndpointSnapshot] = useState<Endpoint | null>(null);
   const [linked, setLinked] = useState<Recording[]>([]);
   const [linkedCursor, setLinkedCursor] = useState<string | null>(null);
   const [unmatched, setUnmatched] = useState<Recording[]>([]);
   const [unmatchedCursor, setUnmatchedCursor] = useState<string | null>(null);
-  const [selectedRecording, setSelectedRecording] = useState('');
   const [detail, setDetail] = useState<Detail | null>(null);
-  const [selectedEvent, setSelectedEvent] = useState(0);
   const [olderEndpointsReleased, setOlderEndpointsReleased] = useState(false);
   const [olderLinkedReleased, setOlderLinkedReleased] = useState(false);
   const [olderUnmatchedReleased, setOlderUnmatchedReleased] = useState(false);
@@ -163,8 +161,8 @@ export default function App() {
       detailRef.current = updated;
       setDetail(updated);
       setOlderEventsReleased(result.released > 0);
-      if (!append) setSelectedEvent(0);
-      else if (result.released > 0) setSelectedEvent((current) => Math.max(0, current - result.released));
+      const first = result.items[0];
+      if (first) dispatchReplay({ type: 'initialize-selection', recordingId, frameId: first.frameId ?? null, sequence: first.sequence });
       setAnnouncement(`${next.events.length} events available for selection`);
     } catch (error) {
       if (!detailLane.isCurrent(generation) || selectedRecordingRef.current !== recordingId) return;
@@ -180,7 +178,7 @@ export default function App() {
   function selectRecording(recordingId: string) {
     const changed = selectedRecordingRef.current !== recordingId;
     selectedRecordingRef.current = recordingId;
-    setSelectedRecording(recordingId);
+    dispatchReplay({ type: 'select-recording', recordingId });
     setActivePane('events');
     if (changed) {
       detailLane.invalidate();
@@ -188,7 +186,6 @@ export default function App() {
       setDetail(null);
       setDetailError('');
       setDetailBusy(false);
-      setSelectedEvent(0);
       setOlderEventsReleased(false);
       void loadDetail(recordingId);
     }
@@ -227,17 +224,23 @@ export default function App() {
   const currentRows = catalogMode === 'linked' ? linked : unmatched;
   const currentRecording = currentRows.find((item) => item.recordingId === selectedRecording);
   const currentStatus = currentRecording?.status ?? (detail?.recordingId === selectedRecording ? detail.status : 'no selection');
-  const eventCount = useMemo(() => detail?.events.length ?? 0, [detail]);
+  const eventCount = detail?.events.length ?? 0;
+  // A refreshed window can move or omit the selected event without changing its identity.
+  const selectedEvent = detail && detail.recordingId === selectedRecording && replay.sequence !== null
+    ? detail.events.findIndex((item) => item.sequence === replay.sequence && (item.frameId ?? null) === replay.frameId)
+    : -1;
   const event = detail?.events[selectedEvent];
+  const selectionUnavailable = detail && replay.sequence !== null && selectedEvent < 0
+    ? 'Selected event is not in the loaded window.'
+    : null;
 
   const moveEvent = useCallback((delta: number) => {
-    if (eventCount === 0) return;
-    setSelectedEvent((current) => {
-      const next = Math.max(0, Math.min(eventCount - 1, current + delta));
-      if (next !== current) setAnnouncement(`Event ${detail?.events[next]?.sequence ?? ''} selected`);
-      return next;
-    });
-  }, [detail, eventCount]);
+    if (!detail || selectedEvent < 0) return;
+    const next = detail.events[selectedEvent + delta];
+    if (!next) return;
+    dispatchReplay({ type: 'select-frame', frameId: next.frameId ?? null, sequence: next.sequence });
+    setAnnouncement(`Event ${next.sequence} selected`);
+  }, [detail, selectedEvent]);
 
   useEffect(() => {
     const onKeyDown = (keyboard: KeyboardEvent) => {
@@ -255,14 +258,14 @@ export default function App() {
     catalogModeRef.current = 'linked';
     selectedOperationRef.current = endpoint.operationId;
     selectedRecordingRef.current = '';
-    setSelectedOperation(endpoint.operationId);
+    dispatchReplay({ type: 'select-operation', operationId: endpoint.operationId });
     setSelectedEndpointSnapshot(endpoint);
-    setSelectedRecording('');
+    dispatchReplay({ type: 'select-recording', recordingId: '' });
     setCatalogMode('linked');
     setLinked([]); linkedRef.current = []; setLinkedCursor(null); setLinkedError('');
     linkedLane.invalidate(); setLinkedBusy(false);
     detailLane.invalidate(); setDetailBusy(false); setDetailError('');
-    detailRef.current = null; setDetail(null); setSelectedEvent(0);
+    detailRef.current = null; setDetail(null);
     setOlderEventsReleased(false);
     setOlderLinkedReleased(false);
     void loadLinked(endpoint.operationId);
@@ -274,14 +277,14 @@ export default function App() {
     catalogModeRef.current = 'unmatched';
     selectedOperationRef.current = '';
     selectedRecordingRef.current = '';
-    setSelectedOperation('');
+    dispatchReplay({ type: 'select-operation', operationId: '' });
     setSelectedEndpointSnapshot(null);
-    setSelectedRecording('');
+    dispatchReplay({ type: 'select-recording', recordingId: '' });
     setCatalogMode('unmatched');
     setUnmatched([]); unmatchedRef.current = []; setUnmatchedCursor(null); setUnmatchedError('');
     unmatchedLane.invalidate(); setUnmatchedBusy(false);
     detailLane.invalidate(); setDetailBusy(false); setDetailError('');
-    detailRef.current = null; setDetail(null); setSelectedEvent(0);
+    detailRef.current = null; setDetail(null);
     setOlderEventsReleased(false);
     setOlderUnmatchedReleased(false);
     void loadUnmatched();
@@ -292,10 +295,12 @@ export default function App() {
     unmatchedLane.invalidate(); setUnmatchedBusy(false); setUnmatchedError('');
     catalogModeRef.current = 'endpoints';
     selectedOperationRef.current = ''; selectedRecordingRef.current = '';
-    setSelectedOperation(''); setSelectedEndpointSnapshot(null); setSelectedRecording(''); setCatalogMode('endpoints');
+    dispatchReplay({ type: 'select-operation', operationId: '' });
+    dispatchReplay({ type: 'select-recording', recordingId: '' });
+    setSelectedEndpointSnapshot(null); setCatalogMode('endpoints');
     setLinked([]); linkedRef.current = []; setLinkedCursor(null);
     detailLane.invalidate(); setDetailBusy(false); setDetailError('');
-    detailRef.current = null; setDetail(null); setSelectedEvent(0);
+    detailRef.current = null; setDetail(null);
     setOlderEventsReleased(false);
     if (!endpointHasLoaded.current) void loadEndpoints();
   }
@@ -307,23 +312,26 @@ export default function App() {
 
   const refreshCatalog = () => catalogMode === 'endpoints' ? void loadEndpoints() : catalogMode === 'linked' ? void loadLinked(selectedOperation) : void loadUnmatched();
   const refreshDetail = () => selectedRecording && void loadDetail(selectedRecording);
-  const pickEvent = (index: number) => {
-    setSelectedEvent(index);
+  const pickEvent = (item: ReplayEvent) => {
+    dispatchReplay({ type: 'select-frame', frameId: item.frameId ?? null, sequence: item.sequence });
     setActivePane('evidence');
-    setAnnouncement(`Event ${detail?.events[index]?.sequence ?? ''} selected`);
+    setAnnouncement(`Event ${item.sequence} selected`);
   };
 
   const navigateToFrame = (action: string, frameId: string) => {
-    const index = detail?.events.findIndex((item) => item.frameId === frameId) ?? -1;
-    if (index < 0) {
+    const target = detail?.events.find((item) => item.frameId === frameId);
+    if (!target) {
       setAnnouncement(`${action}: the target frame is outside the loaded window. Load more events to reach it; paging backward is not available yet.`);
       return;
     }
-    setSelectedEvent(index);
-    setAnnouncement(`Selected event ${detail?.events[index]?.sequence ?? ''}`);
+    dispatchReplay({ type: 'select-frame', frameId, sequence: target.sequence });
+    setAnnouncement(`Selected event ${target.sequence}`);
   };
 
-  const selectFrame = (frameId: string) => navigateToFrame('select', frameId);
+  const selectFrame = (frameId: string) => {
+    // A Map node represents a frame and can stand for more than one recorded event.
+    if (event?.frameId !== frameId) navigateToFrame('select', frameId);
+  };
   const navigateKey = (action: NavAction) => {
     const result = (event?.navigation as Partial<Record<NavAction, { state: string; frameId?: string }>> | undefined)?.[action];
     if (result?.state === 'target' && result.frameId) navigateToFrame(action, result.frameId);
@@ -357,7 +365,8 @@ export default function App() {
       detail={detail}
       detailBusy={detailBusy}
       detailError={detailError}
-      selectedEvent={selectedEvent}
+      selectedEvent={event}
+      selectionUnavailable={selectionUnavailable}
       olderEventsReleased={olderEventsReleased}
       onRefresh={refreshDetail}
       onPickEvent={pickEvent}
@@ -367,6 +376,6 @@ export default function App() {
       onSelectFrame={selectFrame}
       onNavigateKey={navigateKey}
     />
-    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectedEvent={selectedEvent} eventCount={eventCount} onMoveEvent={moveEvent} onNavigate={navigateToFrame} />
+    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectionUnavailable={selectionUnavailable} selectedEvent={selectedEvent} eventCount={eventCount} onMoveEvent={moveEvent} onNavigate={navigateToFrame} />
   </AppShell>;
 }

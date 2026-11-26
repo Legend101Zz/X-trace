@@ -9,6 +9,7 @@ export interface EvidencePanelProps {
   currentStatus: string;
   detail: Detail | null;
   event: ReplayEvent | undefined;
+  selectionUnavailable: string | null;
   selectedEvent: number;
   eventCount: number;
   onMoveEvent: (delta: number) => void;
@@ -20,7 +21,7 @@ function valuesText(event: { bindings?: unknown[] }): string {
   return count > 0 ? `${count} value binding${count === 1 ? '' : 's'} recorded; value display is not implemented in this build` : 'No value bindings were recorded for this event';
 }
 
-export function EvidencePanel({ active, currentStatus, detail, event, selectedEvent, eventCount, onMoveEvent, onNavigate }: EvidencePanelProps) {
+export function EvidencePanel({ active, currentStatus, detail, event, selectionUnavailable, selectedEvent, eventCount, onMoveEvent, onNavigate }: EvidencePanelProps) {
   const loadedFrameIds = new Set((detail?.events ?? []).flatMap((item) => item.frameId ? [item.frameId] : []));
   return <section className="pane" role="tabpanel" id="evidence-panel" aria-labelledby="evidence-tab" data-active={active} aria-label="Evidence inspector">
         <div className="pane-head"><div><div className="eyebrow">Persisted facts</div><h1>Evidence inspector</h1></div><span className="top-meta">{currentStatus}</span></div>
@@ -37,7 +38,7 @@ export function EvidencePanel({ active, currentStatus, detail, event, selectedEv
             <div className="inspector-section"><div className="inspector-label">Timing</div><div className="inspector-value">Monotonic timestamp: <span className="mono">{event.monotonicNs} ns</span></div><div className="evidence-state">Per-event duration is not recorded</div></div>
             <NavigationControls navigation={event.navigation as NavFrameNavigation} loadedFrameIds={loadedFrameIds} onNavigate={onNavigate} />
             <div className="page-controls"><button className="button" onClick={() => onMoveEvent(-1)} disabled={selectedEvent <= 0}>Previous</button><button className="button" onClick={() => onMoveEvent(1)} disabled={selectedEvent >= eventCount - 1}>Next</button></div>
-          </> : <div className="empty"><strong>Select an event</strong><p>Event selection synchronizes this evidence inspector.</p></div>}
+          </> : <div className="empty"><strong>Select an event</strong><p>{selectionUnavailable ?? "Event selection synchronizes this evidence inspector."}</p></div>}
         </div>
       </section>;
 }
