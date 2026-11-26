@@ -1,0 +1,152 @@
+name: Node finish queue and credit proof
+on:
+  push:
+    branches: [codex/proof-medusa-finish-queue-credit-120]
+permissions:
+  contents: read
+concurrency:
+  group: medusa-installed-120
+  cancel-in-progress: false
+jobs:
+  ownership:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MEDUSA_PRODUCT_SHA: fda933c9b37ad0b9b2c838b0f328e9f8cd0a4772
+      MEDUSA_PRODUCT_TREE: 6bf451f2ac2680e5d6eab9498204fcfc018c7bfc
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.21.0
+      - name: Admit source and private directories
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$MEDUSA_PRODUCT_SHA"
+          git checkout --detach "$MEDUSA_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$MEDUSA_PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          owner="$(mktemp -d "$RUNNER_TEMP/medusa-owned-proof.XXXXXXXX")"
+          root="$owner/proof"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/outer" "$root/safe"
+          printf '%s\n' "MEDUSA_ROOT=$root" >> "$GITHUB_ENV"
+          printf '%s\n' 'admitted=true' >> "$GITHUB_OUTPUT"
+      - name: Run the 18 named worker, credit and exit cases
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          cat >"$MEDUSA_ROOT/outer/controller.py" <<'MEDUSA_CONTROLLER'
+          """Run the existing worker batching, credit and exit fixtures and emit finite evidence."""
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          from tools.release.private_roots import admit_directory, atomic_write_private
+
+          root = Path(os.environ["MEDUSA_ROOT"])
+          admit_directory(root)
+          sys.path.insert(0, str(Path("campaigns/node/medusa/harness").resolve()))
+          from installed_process import contain_children, verify_children_gone
+
+          commands = {
+              "locked-dependencies": (["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], 300),
+              "protocol-compile": (["npm", "run", "build:protocol"], 120),
+              "adapter-compile": (["npm", "run", "build:core"], 120),
+          }
+          suites = {'batch': 'worker-event-batch', 'credit': 'worker-credit-visibility', 'exit': 'worker-exit-boundary'}
+          expected_names = {'batch': ['queued adjacent events batch in wire order across interleaved recordings and route, gap and finish boundaries', 'count and full-envelope byte limits split batches without changing event order', 'a split batch returns credits only for acknowledged constituents and stops at a rejection', 'an empty event identity cannot make its valid neighbor part of a rejected batch', 'app thread still charges all 64 logical messages and preserves the reserved finish', 'timed release keeps held events before later same-recording events and credits them once', 'route release combines the staged held prefix with consecutive queued handler events', 'route release preserves a control boundary and falls back at the negotiated byte limit', 'a rejected folded route batch refunds neither the route nor its queued events', 'the worker batches adjacent port messages without crossing gaps, finish or close'], 'credit': ['a real worker returns charged capacity before main-thread credit notifications run', 'a notification alone cannot refund capacity and unsigned credit wrap still preserves the bound'], 'exit': ['an admission refusal never enters the worker while the reserved finish still drains', 'explicit exit can leave an admitted finish unstaged while natural exit drains it', 'cooperative drain stages the finish before explicit exit and preserves the requested exit code', "the caller's abort releases an outstanding cooperative drain without claiming staging", 'an already exited worker cannot start or confirm a cooperative drain', 'owned close drains a second finish queued behind an outstanding ACK']}
+          for stage, filename in suites.items():
+              commands[stage] = (["node", "--test", "--test-reporter=tap",
+                                  f"packages/adapter-core/dist/test/{filename}.test.js"], 30)
+          receipt = {
+              "schemaVersion": 1, "kind": "medusa-finish-queue-credit-120", "status": "failed",
+              "sourceSha": os.environ["MEDUSA_PRODUCT_SHA"], "sourceTree": os.environ["MEDUSA_PRODUCT_TREE"],
+              "wrapperSha": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "counts": dict.fromkeys(suites),
+              "stages": {stage: {"command": "unreached", "exitCode": None, "cleanup": "unreached"}
+                         for stage in commands},
+          }
+
+
+          def save():
+              atomic_write_private(root / "safe/receipt.json", (json.dumps(receipt, sort_keys=True) + "\n").encode())
+
+
+          def command(stage, argv, seconds):
+              row = receipt["stages"][stage]
+              out = root / "outer" / (stage + ".stdout")
+              with out.open("xb") as stdout, out.with_suffix(".stderr").open("xb") as stderr:
+                  try:
+                      env = dict(os.environ, npm_config_cache=str(root / "npm-cache"))
+                      child = subprocess.Popen(argv, cwd="adapters/node", env=env, stdin=subprocess.DEVNULL,
+                                               stdout=stdout, stderr=stderr)
+                      try:
+                          row["exitCode"] = child.wait(timeout=seconds)
+                          row["command"] = "exited"
+                      except subprocess.TimeoutExpired:
+                          row["command"] = "deadline"
+                          if child.poll() is None:
+                              child.kill()
+                          try:
+                              child.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              row["command"] = "unreaped"
+                  except OSError:
+                      row["command"] = "spawn-or-io"
+                  finally:
+                      row["cleanup"] = "failed"
+                      save()
+                      try:
+                          verify_children_gone()
+                      except TimeoutError:
+                          pass
+                      else:
+                          row["cleanup"] = "passed"
+                          save()
+              return row == {"command": "exited", "exitCode": 0, "cleanup": "passed"}
+
+
+          save()
+          contain_children()
+          for step, (argv, seconds) in commands.items():
+              if not command(step, argv, seconds):
+                  sys.exit(1)
+              if step not in suites:
+                  continue
+              output = root / "outer" / (step + ".stdout")
+              assert 0 < output.stat().st_size <= 65536
+              tap = output.read_text()
+              names = [(str(index), name) for index, name in enumerate(expected_names[step], 1)]
+              assert re.findall(r"^ok ([0-9]+) - ([^\n]+)$", tap, re.M) == names
+              expected = {"tests": len(names), "pass": len(names), "fail": 0, "cancelled": 0, "skipped": 0, "todo": 0}
+              counts = {}
+              for key in expected:
+                  value, = re.findall(rf"^# {key} ([0-9]{{1,3}})$", tap, re.M)
+                  counts[key] = int(value)
+              assert counts == expected
+              receipt["counts"][step] = counts
+              save()
+          receipt["status"] = "passed"
+          save()
+          MEDUSA_CONTROLLER
+          printf '%s  %s\n' 'd6646e48200df60f80c396926fd28f13807980dadb3ac9717f1c28634e729bd7' "$MEDUSA_ROOT/outer/controller.py" | sha256sum --check --status
+          PYTHONPATH="$PWD" python3 -B "$MEDUSA_ROOT/outer/controller.py" >"$MEDUSA_ROOT/outer/controller.log" 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && steps.root.outputs.admitted == 'true'
+        with:
+          name: medusa-120-finish-queue-credit-counts
+          path: ${{ env.MEDUSA_ROOT }}/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
