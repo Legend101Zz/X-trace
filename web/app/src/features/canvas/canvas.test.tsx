@@ -1,10 +1,12 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { useState } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ReplayEvent } from '../../types';
 import { CanvasView } from './CanvasView';
+import { MAP_TREE_ROW_LIMIT } from './useMapTreeWindow';
 import { StepsList } from '../events/StepsList';
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 const nav = { previous: { state: 'unavailable' }, next: { state: 'unavailable' }, into: { state: 'unavailable' }, over: { state: 'unavailable' }, out: { state: 'unavailable' } };
 const ev = (n: number, parent: string | null, symbol: string) => ({ sequence: String(n), frameId: `f${n}`, navigation: nav, monotonicNs: String(n), kind: 'method', symbol, parentFrameId: parent, sourceBinding: 'unspecified', fieldTruncations: [] }) as unknown as ReplayEvent;
@@ -27,6 +29,54 @@ function mockScrollGeometry() {
     if (this.matches('.canvas-tree, .event-rail')) return 120;
     return this.matches('.canvas-scroll') ? 100 : 0;
   });
+}
+
+// JSDOM does not lay out rows. This model gives spacers and wrapped cards
+// independent heights and moves every rectangle with its own scrollport.
+function mockWrappedMapLayout() {
+  let width = 280;
+  const callbacks = new Set<ResizeObserverCallback>();
+  vi.stubGlobal('ResizeObserver', class {
+    constructor(private callback: ResizeObserverCallback) { callbacks.add(callback); }
+    observe() {}
+    disconnect() { callbacks.delete(this.callback); }
+  });
+  const height = (item: Element) => item.classList.contains('canvas-tree-spacer')
+    ? Number.parseFloat((item as HTMLElement).style.height)
+    : (item.textContent?.includes('Wrap') ? (width < 200 ? 86 : 60) : 28) + 2;
+  vi.spyOn(Element.prototype, 'clientWidth', 'get').mockImplementation(function (this: Element) {
+    return this.matches('.canvas-tree') ? width : 0;
+  });
+  vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (this: Element) {
+    return this.matches('.canvas-tree') ? 124 : 0;
+  });
+  vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+    if (this.matches('.canvas-tree')) return new DOMRect(100, 300, width, 124);
+    const tree = this.parentElement;
+    if (!tree?.matches('.canvas-tree')) return new DOMRect();
+    let top = 300 - tree.scrollTop;
+    for (const item of tree.children) {
+      if (item === this) break;
+      top += height(item);
+    }
+    return new DOMRect(100, top, width, height(this) - 2);
+  });
+  return (nextWidth: number) => {
+    width = nextWidth;
+    act(() => {
+      for (const callback of [...callbacks]) callback([], {} as ResizeObserver);
+    });
+  };
+}
+
+function firstVisibleMapRow(tree: HTMLElement) {
+  const viewport = tree.getBoundingClientRect();
+  const row = [...tree.querySelectorAll<HTMLElement>('[role="treeitem"]')].find((item) => {
+    const box = item.getBoundingClientRect();
+    return box.bottom > viewport.top && box.top < viewport.bottom;
+  });
+  if (!row) throw new Error('no mounted tree row intersects the viewport');
+  return { key: row.dataset.key, offset: row.getBoundingClientRect().top - viewport.top };
 }
 
 describe('canvas view', () => {
@@ -149,15 +199,111 @@ describe('canvas view', () => {
     expect(focus).toHaveBeenCalledWith({ preventScroll: true });
   });
 
-  it('retains the entire tree and its selection when the selected node is outside the unchanged drawing cap', () => {
-    const large = Array.from({ length: 450 }, (_, index) => ev(index + 1, null, `Call${index + 1}`));
-    const { container } = render(<CanvasView events={large} selectedFrameId="f450" onSelectFrame={() => undefined} onNavigate={() => undefined} />);
+  it('bounds mounted rows while retaining selection beyond the unchanged drawing cap', () => {
+    const large = Array.from({ length: 2_000 }, (_, index) => ev(index + 1, null, `Call${index + 1}`));
+    const { container } = render(<CanvasView events={large} selectedFrameId="f2000" onSelectFrame={() => undefined} onNavigate={() => undefined} />);
     const items = screen.getAllByRole('treeitem');
-    expect(items).toHaveLength(450);
-    expect(items.filter((item) => item.getAttribute('aria-selected') === 'true')).toEqual([items[449]]);
-    expect(items[449]).toHaveAttribute('data-key', 'f450');
+    expect(items.length).toBeLessThanOrEqual(MAP_TREE_ROW_LIMIT);
+    const selected = screen.getByRole('treeitem', { selected: true });
+    expect(selected).toHaveAttribute('data-key', 'f2000');
+    expect(selected).toHaveAttribute('aria-level', '1');
+    expect(selected).toHaveAttribute('aria-posinset', '2000');
+    expect(selected).toHaveAttribute('aria-setsize', '2000');
+    expect(items.filter((item) => item.tabIndex === 0)).toEqual([selected]);
     expect(container.querySelectorAll('.canvas-node')).toHaveLength(400);
     expect(container.querySelector('.canvas-node[data-selected="true"]')).toBeNull();
+  });
+
+  it('keeps a focused row mounted during manual scroll and transfers focus to an offscreen keyboard target', () => {
+    const large = Array.from({ length: 2_000 }, (_, index) => ev(index + 1, null, `Call${index + 1}`));
+    function Controlled() {
+      const [frame, setFrame] = useState('f1');
+      return <CanvasView events={large} selectedFrameId={frame} onSelectFrame={setFrame} onNavigate={() => undefined} />;
+    }
+    mockScrollGeometry();
+    render(<Controlled />);
+    const tree = screen.getByRole('tree');
+    const first = screen.getByRole('treeitem', { selected: true });
+    fireEvent.click(first);
+    first.focus();
+    tree.scrollTop = 44 * 1_000;
+    fireEvent.scroll(tree);
+    expect(first).toHaveFocus();
+    expect(screen.getByRole('treeitem', { name: 'Call1001' })).toBeInTheDocument();
+    expect(screen.getAllByRole('treeitem').length).toBeLessThanOrEqual(MAP_TREE_ROW_LIMIT);
+    expect(screen.queryByRole('treeitem', { name: 'Call2000' })).not.toBeInTheDocument();
+
+    fireEvent.keyDown(first, { key: 'End' });
+    const last = screen.getByRole('treeitem', { selected: true });
+    expect(last).toHaveAttribute('data-key', 'f2000');
+    expect(last).toHaveFocus();
+    fireEvent.keyDown(last, { key: 'ArrowUp' });
+    expect(screen.getByRole('treeitem', { selected: true })).toHaveAttribute('data-key', 'f1999');
+    expect(screen.getByRole('treeitem', { selected: true })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole('treeitem', { selected: true }), { key: 'Home' });
+    expect(screen.getByRole('treeitem', { selected: true })).toHaveAttribute('data-key', 'f1');
+    expect(screen.getByRole('treeitem', { selected: true })).toHaveFocus();
+    expect(document.documentElement.scrollTop).toBe(0);
+  });
+
+  it('holds the visible wrapped row and focused item through a ResizeObserver width change', () => {
+    const resize = mockWrappedMapLayout();
+    const many = Array.from({ length: 2_000 }, (_, index) => ev(index + 1, null, `Wrap frame ${index + 1}`));
+    render(<CanvasView events={many} selectedFrameId="f1" onSelectFrame={() => undefined} onNavigate={() => undefined} />);
+    const tree = screen.getByRole('tree');
+    const selected = screen.getByRole('treeitem', { selected: true });
+    selected.focus();
+    tree.scrollTop = 44 * 1_000 + 12;
+    fireEvent.scroll(tree);
+    resize(280);
+    const anchor = firstVisibleMapRow(tree);
+    expect(anchor.key).not.toBe('f1');
+    const priorHeight = screen.getByRole('treeitem', { name: `Wrap frame ${anchor.key?.slice(1)}` }).getBoundingClientRect().height;
+
+    resize(160);
+    expect(firstVisibleMapRow(tree)).toEqual(anchor);
+    expect(screen.getByRole('treeitem', { name: `Wrap frame ${anchor.key?.slice(1)}` }).getBoundingClientRect().height).toBeGreaterThan(priorHeight);
+    expect(selected).toHaveFocus();
+    expect(screen.getAllByRole('treeitem').length).toBeLessThanOrEqual(MAP_TREE_ROW_LIMIT);
+  });
+
+  it('keeps the scrolled Expand button focused through expansion and collapse', () => {
+    const resize = mockWrappedMapLayout();
+    const many = Array.from({ length: 2_000 }, (_, index) =>
+      ev(index + 1, null, index === 1_000 || index === 1_001 ? 'Wrap repeated' : `Call ${index + 1}`));
+    render(<CanvasView events={many} selectedFrameId="f1002" onSelectFrame={() => undefined} onNavigate={() => undefined} />);
+    const tree = screen.getByRole('tree');
+    resize(280);
+    const button = screen.getByRole('button', { name: /Expand 2 repeated calls of Wrap repeated/ });
+    button.focus();
+    expect(tree.scrollTop).toBeGreaterThan(0);
+    fireEvent.click(button);
+    expect(button).toHaveFocus();
+    expect(screen.getByRole('treeitem', { selected: true })).toHaveAttribute('data-key', 'f1001/f1002');
+    expect(button.closest('[role="treeitem"]')).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(button);
+    expect(button).toHaveFocus();
+    expect(screen.getByRole('treeitem', { selected: true })).toHaveAttribute('data-key', 'f1001');
+    expect(button.closest('[role="treeitem"]')).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getAllByRole('treeitem').length).toBeLessThanOrEqual(MAP_TREE_ROW_LIMIT);
+  });
+
+  it('navigates both rows when a repeated group and its first member share a frame id', () => {
+    function Controlled() {
+      const [frame, setFrame] = useState('f2');
+      return <CanvasView events={events} selectedFrameId={frame} onSelectFrame={setFrame} onNavigate={() => undefined} />;
+    }
+    render(<Controlled />);
+    fireEvent.click(screen.getByRole('button', { name: /Expand 2 repeated calls of Repo/ }));
+    const group = screen.getByRole('treeitem', { selected: true });
+    expect(group).toHaveAttribute('data-key', 'f2');
+    group.focus();
+    fireEvent.keyDown(group, { key: 'ArrowDown' });
+    const first = screen.getByRole('treeitem', { selected: true });
+    expect(first).toHaveAttribute('data-key', 'f2/f2');
+    expect(first).toHaveFocus();
+    fireEvent.keyDown(first, { key: 'ArrowDown' });
+    expect(screen.getByRole('treeitem', { selected: true })).toHaveAttribute('data-key', 'f2/f3');
   });
 
   it('keeps every evidence note in a named keyboard-reachable region when several limitations apply', () => {

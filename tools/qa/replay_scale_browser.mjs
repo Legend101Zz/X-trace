@@ -7,9 +7,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
-const SAMPLES = 5;
+const DEFAULT_SAMPLES = 5;
 const VIEWPORT = { width: 1440, height: 900 };
 const ACTION_TIMEOUT = 10_000;
+const MAP_TREE_ROW_LIMIT = 80;
+const RETAINED_EVENT_LIMIT = 2_000;
 const DIAGNOSTIC_TIMEOUT = 2_000;
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const check = (condition) => { if (!condition) throw new Error('measurement condition failed'); };
@@ -108,8 +110,8 @@ function installClickClock({ recordingId }) {
   }, { capture: true });
 }
 
-async function waitSelection(page, mode, event, recordingId) {
-  await page.waitForFunction(({ mode, sequence, frameId, eventId, recordingId }) => {
+async function waitSelection(page, mode, event, recordingId, { requireInspectorIdentity = true } = {}) {
+  await page.waitForFunction(({ mode, sequence, frameId, eventId, recordingId, requireInspectorIdentity }) => {
     if (document.querySelector('#events-panel h1')?.textContent !== recordingId) return false;
     if (document.querySelector('.recording[aria-current="true"] .recording-title')?.textContent !== recordingId) return false;
     const row = mode === 'steps'
@@ -118,15 +120,17 @@ async function waitSelection(page, mode, event, recordingId) {
     if (!row || !row.checkVisibility()) return false;
     if (mode === 'steps' && row.querySelector('.event-seq')?.textContent !== sequence) return false;
     if (mode === 'map' && row.getAttribute('data-key') !== frameId) return false;
-    const section = Array.from(document.querySelectorAll('.inspector-section')).find((node) =>
-      node.querySelector('.inspector-label')?.textContent === 'Event identity');
-    if (section?.querySelector('.inspector-value.mono')?.textContent !== eventId) return false;
+    if (requireInspectorIdentity) {
+      const section = Array.from(document.querySelectorAll('.inspector-section')).find((node) =>
+        node.querySelector('.inspector-label')?.textContent === 'Event identity');
+      if (section?.querySelector('.inspector-value.mono')?.textContent !== eventId) return false;
+    }
     const rect = row.getBoundingClientRect();
     const x = (Math.max(rect.left, 0) + Math.min(rect.right, innerWidth)) / 2;
     const y = (Math.max(rect.top, 0) + Math.min(rect.bottom, innerHeight)) / 2;
     return rect.width > 0 && rect.height > 0 && x >= 0 && x < innerWidth && y >= 0 && y < innerHeight
       && row.contains(document.elementFromPoint(x, y));
-  }, { mode, sequence: event.sequence, frameId: event.frameId, eventId: event.eventId, recordingId });
+  }, { mode, sequence: event.sequence, frameId: event.frameId, eventId: event.eventId, recordingId, requireInspectorIdentity });
 }
 
 async function domSample(page, phase, apiState, heap) {
@@ -183,7 +187,8 @@ async function selectionDiagnostic(page, mode, event, recordingId) {
       documentRoot: document.documentElement, body: document.body,
       shell: document.querySelector('.shell'), workspace: document.querySelector('.viewer-workspace'),
       stepsAndCode: document.querySelector('.steps-and-code'), codePanel: document.querySelector('#code-panel'),
-      eventsPanel: document.querySelector('#events-panel'), eventRail: document.querySelector('.event-rail'),
+      eventsPanel: document.querySelector('#events-panel'), stepsContent: document.querySelector('#events-panel > .steps-content'),
+      eventRail: document.querySelector('.event-rail'),
       mapView: document.querySelector('.canvas-view'), mapScroll: document.querySelector('.canvas-scroll'),
       mapSvg: document.querySelector('.canvas-svg'), mapTree: document.querySelector('.canvas-tree'),
       inspector: document.querySelector('.inspector'), inspectorWorkspace: document.querySelector('.workspace-inspector'),
@@ -232,6 +237,8 @@ async function selectionDiagnostic(page, mode, event, recordingId) {
       inspectorIdentitySectionCount: sections.length,
       inspectorIdentityMatchCount: sections.filter((node) => node.querySelector('.inspector-value.mono')?.textContent === eventId).length,
       selectedStepRowCount: steps.length, selectedStepSequenceMatchCount: selectedStepMatches.length,
+      selectedStepOwnsFocus: steps[0] === document.activeElement,
+      stepsModeButtonOwnsFocus: stepsButtons[0] === document.activeElement,
       selectedTreeRowCount: tree.length, selectedTreeKeyMatchCount: selectedTreeMatches.length,
       expectedTreeKeyMatchCount: matchingTree.length, selectedSvgNodeCount: svg.length,
       // SVG exposes selection only, with no frame-key attribute. Do not infer identity from it.
@@ -309,7 +316,21 @@ async function measureSample(index, options, manifest, chromium) {
     externalRequests = 0;
     page.on('pageerror', () => { pageErrors += 1; });
     page.on('request', (request) => { if (new URL(request.url()).origin !== new URL(url).origin) externalRequests += 1; });
-    await page.addInitScript(installClickClock, { recordingId: manifest.recording_id });
+    const functionalMapOnly = options['one-map-tree-sample'];
+    let totalRequests = 0;
+    let detailRequests = 0;
+    if (functionalMapOnly) {
+      const origin = new URL(url).origin;
+      page.on('request', (request) => {
+        const destination = new URL(request.url());
+        totalRequests += 1;
+        if (destination.origin === origin && destination.pathname === `/api/v1/recordings/${manifest.recording_id}`) detailRequests += 1;
+      });
+    }
+    const jumpToLoadedSequence = functionalMapOnly
+      ? (await import('../../web/app/scripts/replay-window-journey.mjs')).jumpToLoadedSequence
+      : null;
+    if (!functionalMapOnly) await page.addInitScript(installClickClock, { recordingId: manifest.recording_id });
     setStage('catalog');
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.getByRole('button', { name: 'Not linked to an endpoint', exact: true }).click();
@@ -323,14 +344,28 @@ async function measureSample(index, options, manifest, chromium) {
     let selected = detail.events[0];
     expectedSelection = selected;
     cumulative = detail.events.length;
-    setStage('initial_visible_paint_opportunity');
-    await page.waitForFunction(() => window.__xtraceScale?.completed === true);
-    const clock = await page.evaluate(() => ({ ...window.__xtraceScale }));
-    check(clock.trusted && clock.sequence === selected.sequence && Number.isFinite(clock.elapsedMs));
-    await waitSelection(page, 'steps', selected, manifest.recording_id);
-    result.initial = { elapsedMs: clock.elapsedMs, over1500Ms: clock.elapsedMs > 1500,
-      apiFirstPageEvents: detail.events.length, selectedIdentitySha256: identity(selected),
-      responseAndUiIdentityMatched: true, trustedClickCaptured: true, paintOpportunityObserved: true };
+    if (functionalMapOnly) {
+      setStage('initial_steps_visible', 'default_inspector');
+      await waitSelection(page, 'steps', selected, manifest.recording_id, { requireInspectorIdentity: false });
+      setStage('initial_steps_visible', 'details_identity');
+      const inspector = page.getByRole('tablist', { name: 'Inspector evidence', exact: true });
+      const details = inspector.getByRole('tab', { name: 'Details', exact: true });
+      await details.click();
+      check(await details.getAttribute('aria-selected') === 'true');
+      await waitSelection(page, 'steps', selected, manifest.recording_id);
+      result.actions.push('initial_steps_and_details_identity_matched');
+    } else {
+      setStage('initial_visible_paint_opportunity');
+      await page.waitForFunction(() => window.__xtraceScale?.completed === true);
+      const clock = await page.evaluate(() => ({ ...window.__xtraceScale }));
+      check(clock.trusted && clock.sequence === selected.sequence && Number.isFinite(clock.elapsedMs));
+      await waitSelection(page, 'steps', selected, manifest.recording_id);
+      result.initial = { elapsedMs: clock.elapsedMs, over1500Ms: clock.elapsedMs > 1500,
+        apiFirstPageEvents: detail.events.length, selectedIdentitySha256: identity(selected),
+        responseAndUiIdentityMatched: true, trustedClickCaptured: true, paintOpportunityObserved: true };
+    }
+    const mapWindowFrames = new Map(options['verify-map-tree-window'] ? detail.events.map((event) => [event.frameId, event]) : []);
+    const mapPages = options['verify-map-tree-window'] ? [detail.events] : [];
     let lastSequence = BigInt(detail.events.at(-1).sequence);
     setStage('initial_steps', 'dom_snapshot');
     result.dom.push(await domSample(page, 'initial_steps', apiState(), options['cdp-heap']));
@@ -380,24 +415,79 @@ async function measureSample(index, options, manifest, chromium) {
     await navigateBoth('steps', detail.events, 'initial_steps_navigation');
     await switchMode('map', 'initial_map');
     await navigateBoth('map', detail.events, 'initial_map_navigation');
+    if (options['verify-map-tree-window']) {
+      setStage('constrained_map_dock', 'geometry');
+      const splitter = page.getByRole('separator', { name: 'Resize Inspector', exact: true });
+      check(await splitter.getAttribute('aria-orientation') === 'horizontal');
+      const geometry = () => page.evaluate(() => {
+        const host = document.querySelector('#events-panel > .steps-content');
+        const tree = host?.querySelector('.canvas-tree');
+        const drawing = host?.querySelector('.canvas-scroll');
+        if (!host || !tree || !drawing) return null;
+        const hostBox = host.getBoundingClientRect();
+        const viewportTop = hostBox.top + host.clientTop;
+        const viewportBottom = viewportTop + host.clientHeight;
+        const fits = (element) => {
+          const box = element.getBoundingClientRect();
+          // clientHeight is rounded to whole CSS pixels.
+          return element.clientHeight > 0 && box.top >= viewportTop - 1 && box.bottom <= viewportBottom + 1;
+        };
+        return { fit: fits(tree) && fits(drawing), height: host.clientHeight,
+          hostScroll: host.scrollTop, pageScroll: document.scrollingElement?.scrollTop };
+      });
+      const originalGeometry = await geometry();
+      check(originalGeometry?.fit);
+      const originalSize = await splitter.getAttribute('aria-valuenow');
+      await splitter.press('ArrowUp');
+      await splitter.press('ArrowUp');
+      check(await splitter.getAttribute('aria-valuenow') !== originalSize);
+      const constrained = await geometry();
+      check(constrained?.fit && constrained.height < originalGeometry.height);
+      await navigateBoth('map', detail.events, 'constrained_map_dock');
+      const afterNavigation = await geometry();
+      check(afterNavigation?.fit && afterNavigation.hostScroll === constrained.hostScroll
+        && afterNavigation.pageScroll === constrained.pageScroll);
+      await splitter.press('ArrowDown');
+      await splitter.press('ArrowDown');
+      check(await splitter.getAttribute('aria-valuenow') === originalSize);
+    }
     await switchMode('steps', 'initial_steps_return');
 
     for (let later = 1; later <= options['later-pages']; later += 1) {
       setStage(`load_later_${later}`, 'detail_response');
       check(typeof detail.nextCursor === 'string');
-      detail = await detailFromAction(page, manifest, detail.nextCursor,
-        () => page.getByRole('button', { name: 'Load next window', exact: true }).click());
+      const loadLater = functionalMapOnly
+        ? page.getByRole('region', { name: 'Loaded event window', exact: true })
+          .getByRole('button', { name: 'Load later', exact: true })
+        : page.getByRole('button', { name: 'Load next window', exact: true });
+      const beforePage = detailRequests;
+      detail = await detailFromAction(page, manifest, detail.nextCursor, () => loadLater.click());
       for (const event of detail.events) { check(BigInt(event.sequence) === lastSequence + 1n); lastSequence += 1n; }
       cumulative += detail.events.length;
+      if (options['verify-map-tree-window']) {
+        mapPages.push(detail.events);
+        for (const event of detail.events) mapWindowFrames.set(event.frameId, event);
+      }
       selected = detail.events[0];
       expectedSelection = selected;
-      const row = page.locator('.event-rail .event').filter({
-        has: page.locator('.event-seq').filter({ hasText: new RegExp(`^${selected.sequence}$`) }),
-      });
-      result.substage = 'row_click';
-      await row.click();
-      result.substage = 'selection_wait';
-      await waitSelection(page, 'steps', selected, manifest.recording_id);
+      if (jumpToLoadedSequence) {
+        result.substage = 'loaded_sequence_jump';
+        await page.waitForFunction(() =>
+          document.querySelector('#events-panel .replay-window-count > span:first-child')?.getAttribute('aria-hidden') === 'false');
+        const beforeJump = totalRequests;
+        await jumpToLoadedSequence(page, selected.sequence);
+        result.substage = 'selection_wait';
+        await waitSelection(page, 'steps', selected, manifest.recording_id);
+        check(detailRequests === beforePage + 1 && totalRequests === beforeJump);
+      } else {
+        const row = page.locator('.event-rail .event').filter({
+          has: page.locator('.event-seq').filter({ hasText: new RegExp(`^${selected.sequence}$`) }),
+        });
+        result.substage = 'row_click';
+        await row.click();
+        result.substage = 'selection_wait';
+        await waitSelection(page, 'steps', selected, manifest.recording_id);
+      }
       result.actions.push(`load_later_${later}`);
     }
     setStage('later_steps', 'dom_snapshot');
@@ -405,7 +495,92 @@ async function measureSample(index, options, manifest, chromium) {
     await navigateBoth('steps', detail.events, 'later_steps_navigation');
     await switchMode('map', 'later_map');
     await navigateBoth('map', detail.events, 'later_map_navigation');
+    const beforeReturn = totalRequests;
+    const pageBeforeReturn = functionalMapOnly ? await page.evaluate(() => document.scrollingElement?.scrollTop) : null;
     await switchMode('steps', 'later_steps_return');
+    if (functionalMapOnly) {
+      setStage('later_steps_return', 'focused_selection');
+      await page.waitForFunction((sequence) => {
+        const row = document.querySelector('#events-panel .event[aria-current="true"]');
+        return row === document.activeElement && row?.querySelector('.event-seq')?.textContent === sequence;
+      }, selected.sequence);
+      check(totalRequests === beforeReturn && await page.evaluate(() => document.scrollingElement?.scrollTop) === pageBeforeReturn);
+      result.actions.push('later_steps_return_focus_without_requests');
+    }
+    if (options['verify-map-tree-window']) {
+      await switchMode('map', 'bounded_later_map');
+      setStage('bounded_later_map_keyboard', 'end');
+      const tree = page.getByRole('tree');
+      const items = tree.getByRole('treeitem');
+      const roving = tree.locator('[role="treeitem"][tabindex="0"]');
+      const activeKey = () => roving.getAttribute('data-key');
+      const treePosition = () => tree.evaluate((element) => element.scrollTop);
+      const documentPosition = () => page.evaluate(() => document.scrollingElement?.scrollTop);
+      const initialKey = await activeKey();
+      const initiallyMounted = new Set(await items.evaluateAll((rows) => rows.map((row) => row.getAttribute('data-key'))));
+      const scrollHeight = await tree.evaluate((element) => element.scrollHeight);
+      const initialTop = await treePosition();
+      const initialPage = await documentPosition();
+      const firstCounts = await domSample(page, 'bounded_later_map_before_keyboard', apiState(), false);
+      check(mapWindowFrames.size > MAP_TREE_ROW_LIMIT * 2 && scrollHeight > MAP_TREE_ROW_LIMIT * 24);
+      check(firstCounts.mapTreeRows > 0 && firstCounts.mapTreeRows <= MAP_TREE_ROW_LIMIT);
+      // The viewer evicts whole earlier pages. This fixture's explicit call trees
+      // are recorded in preorder and contain no coalescible sibling leaves.
+      let retainedCount = cumulative;
+      let firstPage = 0;
+      while (retainedCount > RETAINED_EVENT_LIMIT) {
+        retainedCount -= mapPages[firstPage].length;
+        firstPage += 1;
+      }
+      const retained = mapPages.slice(firstPage).flat();
+      check(mapWindowFrames.size === cumulative && retained.length === retainedCount && retained.length >= 3);
+      const homeEvent = retained[0];
+      const penultimateEvent = retained.at(-2);
+      const endEvent = retained.at(-1);
+      await roving.evaluate((element) => element.focus({ preventScroll: true }));
+      expectedSelection = endEvent;
+      await page.keyboard.press('End');
+      await page.waitForFunction((key) => {
+        const row = document.querySelector('.canvas-tree [aria-selected="true"][tabindex="0"]');
+        return row && row === document.activeElement && row.getAttribute('data-key') !== key;
+      }, initialKey);
+      const endKey = await activeKey();
+      check(!initiallyMounted.has(endKey));
+      check(endKey === endEvent.frameId && mapWindowFrames.get(endKey) === endEvent);
+      check(await treePosition() > initialTop && await documentPosition() === initialPage);
+      await waitSelection(page, 'map', expectedSelection, manifest.recording_id);
+      const endCounts = await domSample(page, 'bounded_later_map_end', apiState(), false);
+      result.dom.push(endCounts);
+      check(endCounts.visibleMapTreeRows > 0 && endCounts.mapTreeRows <= MAP_TREE_ROW_LIMIT);
+
+      setStage('bounded_later_map_keyboard', 'arrow_up');
+      expectedSelection = penultimateEvent;
+      await page.keyboard.press('ArrowUp');
+      await page.waitForFunction((key) => {
+        const row = document.querySelector('.canvas-tree [aria-selected="true"][tabindex="0"]');
+        return row && row === document.activeElement && row.getAttribute('data-key') !== key;
+      }, endKey);
+      const upKey = await activeKey();
+      check(upKey === penultimateEvent.frameId && mapWindowFrames.get(upKey) === penultimateEvent);
+      check(await documentPosition() === initialPage);
+      await waitSelection(page, 'map', expectedSelection, manifest.recording_id);
+      check(await items.count() <= MAP_TREE_ROW_LIMIT && await roving.count() === 1);
+      const beforeHomeKey = await activeKey();
+      const beforeHomeTop = await treePosition();
+      setStage('bounded_later_map_keyboard', 'home');
+      expectedSelection = homeEvent;
+      await page.keyboard.press('Home');
+      await page.waitForFunction((key) => {
+        const row = document.querySelector('.canvas-tree [aria-selected="true"][tabindex="0"]');
+        return row && row === document.activeElement && row.getAttribute('data-key') !== key;
+      }, beforeHomeKey);
+      const homeKey = await activeKey();
+      check(homeKey === homeEvent.frameId && mapWindowFrames.get(homeKey) === homeEvent);
+      check(await treePosition() < beforeHomeTop && await documentPosition() === initialPage);
+      await waitSelection(page, 'map', expectedSelection, manifest.recording_id);
+      check(await items.count() <= MAP_TREE_ROW_LIMIT && await roving.count() === 1);
+      result.actions.push('bounded_later_map_keyboard_end', 'bounded_later_map_keyboard_up', 'bounded_later_map_keyboard_home');
+    }
     setStage('page_observations');
     check(pageErrors === 0 && externalRequests === 0);
     result.status = 'exercised';
@@ -446,7 +621,11 @@ async function main() {
     'source-sha': { type: 'string' }, provenance: { type: 'string' },
     'package-sha256': { type: 'string' }, 'later-pages': { type: 'string', default: '12' },
     'cdp-heap': { type: 'boolean', default: false },
+    'verify-map-tree-window': { type: 'boolean', default: false },
+    'one-map-tree-sample': { type: 'boolean', default: false },
   } });
+  check(!options['one-map-tree-sample'] || options['verify-map-tree-window']);
+  const samples = options['one-map-tree-sample'] ? 1 : DEFAULT_SAMPLES;
   check(options.manifest && options.xtrace && options.out && /^[a-f0-9]{40}$/.test(options['source-sha']));
   check(['source-built', 'installed'].includes(options.provenance));
   if (options['package-sha256']) check(/^[a-f0-9]{64}$/.test(options['package-sha256']));
@@ -470,25 +649,27 @@ async function main() {
     schemaVersion: 1, kind: 'synthetic_replay_scale_browser', synthetic: true,
     provenance: { declaredSourceSha: options['source-sha'], distribution: options.provenance,
       binarySha256: sha256(await readFile(options.xtrace)), declaredPackageSha256: options['package-sha256'] ?? null },
-    conditions: { samples: SAMPLES, viewport: VIEWPORT, headless: true, deviceScaleFactor: 1,
+    conditions: { samples, viewport: VIEWPORT, headless: true, deviceScaleFactor: 1,
       locale: 'en-US', timezone: 'UTC', colorScheme: 'light', reducedMotion: 'no-preference',
       freshBrowserProcessContextAndViewerPerSample: true, cpuOrNetworkThrottling: 'none',
       osAndFilesystemCaches: 'uncontrolled; may be warm', fixtureFrames: 10_000, laterPages: options['later-pages'],
-      timing: 'trusted recording-click capture to visible selected first row after intervening rAF paint opportunity; no physical-display claim',
-      excludedFromTiming: ['fixture seeding', 'viewer startup', 'catalog loading'],
+      verifyMapTreeWindow: options['verify-map-tree-window'],
+      timing: options['one-map-tree-sample'] ? 'not measured in the functional Map journey'
+        : 'trusted recording-click capture to visible selected first row after intervening rAF paint opportunity; no physical-display claim',
+      excludedFromTiming: options['one-map-tree-sample'] ? [] : ['fixture seeding', 'viewer startup', 'catalog loading'],
       domScope: 'mounted current document; visible counts require viewport hit-test; Map SVG and accessible tree counted separately',
       runner: { platform: os.platform(), release: os.release(), arch: os.arch(), cpuModel: os.cpus()[0]?.model ?? 'unavailable', cpuCount: os.cpus().length },
     }, samples: [],
   };
   try {
-    for (let index = 1; index <= SAMPLES; index += 1) report.samples.push(await measureSample(index, options, manifest, chromium));
+    for (let index = 1; index <= samples; index += 1) report.samples.push(await measureSample(index, options, manifest, chromium));
     // A later functional failure cannot erase an already valid initial observation.
     const times = report.samples.filter((sample) => sample.initial !== null).map((sample) => sample.initial.elapsedMs).sort((a, b) => a - b);
     const middle = Math.floor(times.length / 2);
     report.summary = { functionalFailures: report.samples.filter((sample) => sample.status !== 'exercised').length,
       completeJourneySamples: report.samples.filter((sample) => sample.status === 'exercised').length,
       validInitialSamples: times.length, medianMs: times.length ? (times[middle] + times[Math.floor((times.length - 1) / 2)]) / 2 : null,
-      maxMs: times.length ? times.at(-1) : null, samplesOver1500Ms: times.filter((value) => value > 1500).length,
+      maxMs: times.length ? times.at(-1) : null, samplesOver1500Ms: options['one-map-tree-sample'] ? null : times.filter((value) => value > 1500).length,
       aggregationDecision: 'unsettled; descriptive statistics only', memoryThreshold: 'unsettled' };
     await output.writeFile(`${JSON.stringify(report, null, 2)}\n`);
     console.log(JSON.stringify(report));
