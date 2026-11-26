@@ -1,0 +1,593 @@
+name: Installed Jersey mapped-read lifecycle and fixture ownership
+on:
+  push:
+    branches: [codex/proof-mapped-lifecycle-jersey-117]
+permissions:
+  contents: read
+jobs:
+  installed-fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PRODUCT: 'e8a27e863b2f54e7189a47a92a5c3ccb6ed3543f'
+      PRODUCT_TREE: e40a95948b7f09cc27c9cc1fd8c55fe009f213ae
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_TERM_COLOR: never
+    steps:
+      - id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - id: java17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Admit exact source and fresh private package roots
+        id: admit
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$GITHUB_REPOSITORY" = 'Legend101Zz/X-trace'
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$GITHUB_REF" = 'refs/heads/codex/proof-mapped-lifecycle-jersey-117'
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git show -s --format=%P HEAD)" = '2242f05cc26d58c753ad681dfdc9f2649eb1ff28'
+          test "$(git rev-parse 'HEAD~1^{tree}')" = '23f33467a53915a4ee7e756b8a1bf1f2a7e045ab'
+          test "$(git show -s --format=%P HEAD~1)" = 'db3bbeffc4cd49d8a3dcd7acfdf1f078a794d16a'
+          test "$(git rev-parse 'HEAD~2^{tree}')" = '31d8e360aa8cfed8d8964ac9c68cc90f81276f9a'
+          test "$(git show -s --format=%P HEAD~2)" = 'f35f25511a4a0070b01fc581a6f8a6b6b85e6539'
+          patch_digest() {
+            git diff --no-ext-diff --no-textconv --no-color --binary --full-index "$1" "$2" | sha256sum | cut -d' ' -f1
+          }
+          test "$(patch_digest HEAD~3 HEAD~2)" = 'f4df0dc19ba32ffa1574ca4e36065b3715b6f82cb571cde122213f46f8841a2a'
+          test "$(patch_digest HEAD~2 HEAD~1)" = 'bf5700b2f6ed6125da55a8bf70b835293eaaa0f75b9d2e2eed6e808174d8e590'
+          test "$(patch_digest HEAD~1 HEAD)" = 'f049908bb68518ac12847ce1f297c4fe8305cd91e7a6b706eb12c3bbb0d86e4a'
+          test "$(git show -s --format=%P "$GITHUB_SHA")" = "$PRODUCT"
+          python3 -B - <<'WRAPPER'
+          import os,subprocess
+          path='.github/workflows/mapped-lifecycle-jersey-117.yml'
+          def git(*args):return subprocess.check_output(['git',*args],text=True).splitlines()
+          if git('diff','--name-status',os.environ['PRODUCT'],os.environ['GITHUB_SHA'])!=['A\t'+path]:
+              raise SystemExit('unexpected wrapper paths')
+          entry,=git('ls-tree',os.environ['GITHUB_SHA'],'--',path)
+          if not entry.startswith('100644 blob '):
+              raise SystemExit('unexpected wrapper mode')
+          WRAPPER
+          root="$RUNNER_TEMP/xj117"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/logs" "$root/cache" "$root/home" "$root/evidence" "$root/safe"
+          PYTHONPATH=campaigns/lib python3 -B - "$root" <<'PY'
+          from installed_java import private_dir
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[1])
+          for name in ('logs', 'cache', 'home', 'tmp', 'evidence', 'safe'):
+              private_dir(root/name)
+          PY
+          printf '%s\n' "PROOF=$root" "TMPDIR=$root/tmp" "GRADLE_USER_HOME=$root/cache/gradle" "npm_config_cache=$root/cache/npm" "CARGO_HOME=$root/cache/cargo" "RUSTUP_HOME=$(rustup show home)" >> "$GITHUB_ENV"
+      - name: Verify read, recording, progress, outcome and servlet coverage cases
+        id: bridge
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH=campaigns/java/fineract/jersey-fixture python3 -B -m tools.qa.unittest_run --result "$PROOF/logs/pages.json" \
+            test_pages.PagesTest.test_both_shapes_follow_actual_next_values_and_complete_in_order \
+            test_pages.PagesTest.test_list_identity_cursor_limit_and_continuation \
+            test_pages.PagesTest.test_list_rejects_duplicates_time_order_and_noncanonical_identifiers \
+            test_pages.PagesTest.test_detail_project_recording_cursor_and_evidence_bound_on_every_page \
+            test_pages.PagesTest.test_detail_endpoints_must_match_the_independent_listing_even_at_equal_count \
+            test_pages.PagesTest.test_negative_filter_recording_requires_complete_capture \
+            test_pages.PagesTest.test_detail_order_canonical_sequence_and_total \
+            test_pages.PagesTest.test_detail_next_cursor_must_bind_project_id_recording_id_and_last_sequence \
+            test_progress.ProgressTest.test_source_location_identifies_the_fixture_assertion_without_exception_data \
+            test_progress.ProgressTest.test_cleanup_preserves_primary_failure_and_attributes_ordinary_teardown_failure \
+            test_progress.ProgressTest.test_outcome_mismatch_exports_only_the_fixed_comparison \
+            test_progress.ProgressTest.test_failed_first_leg_preserves_its_failure_and_attempts_the_second \
+            > "$PROOF/logs/pages.stdout" 2> "$PROOF/logs/pages.stderr"
+          (cd adapters/java && ./gradlew --no-daemon --dependency-verification strict :agent-bootstrap:test \
+            --tests dev.xtrace.agent.bootstrap.JerseyBridgeTest \
+            --tests dev.xtrace.agent.bootstrap.SpringMvcBridgeTest.mappedJerseyDispatchThrowUsesStatusAtNormalOuterReturn \
+            --tests dev.xtrace.agent.bootstrap.SpringMvcBridgeTest.normalNullJerseyDispatchKeepsOuterStatusProvisional) > "$PROOF/logs/bridge.stdout" 2> "$PROOF/logs/bridge.stderr"
+          python3 -B - <<'PYGATE'
+          import os, pathlib, xml.etree.ElementTree as ET
+          from tools.qa.unittest_summary import read_result, summarize
+          root = pathlib.Path(os.environ['PROOF'])
+          result = read_result(root/'logs/pages.json')
+          summarize(result)
+          assert result['counts']['testsRun'] == 12 and all(n == 0 for k, n in result['counts'].items() if k != 'testsRun')
+          name = 'dev.xtrace.agent.bootstrap.JerseyBridgeTest'
+          suite = ET.parse(pathlib.Path('adapters/java/agent-bootstrap/build/test-results/test')/f'TEST-{name}.xml').getroot()
+          cases = suite.findall('testcase')
+          assert suite.get('name') == name and len(cases) == 4 and all(c.get('classname') == name for c in cases)
+          assert {c.get('name').removesuffix('()') for c in cases} == {
+              'unreadableDispatcherRaisesFixedCoverageNotice', 'unreadableAsyncStateRaisesFixedCoverageNotice',
+              'knownRedispatchKindsDoNotReportAGetterFailure', 'activeAsyncRequestIsDeliberatelyExcluded'}
+          assert suite.get('tests') == '4' and all(suite.get(k) == '0' for k in ('failures', 'errors', 'skipped'))
+          assert all(c.find(k) is None for c in cases for k in ('failure', 'error', 'skipped'))
+          name = 'dev.xtrace.agent.bootstrap.SpringMvcBridgeTest'
+          suite = ET.parse(pathlib.Path('adapters/java/agent-bootstrap/build/test-results/test')/f'TEST-{name}.xml').getroot()
+          cases = suite.findall('testcase')
+          assert suite.get('name') == name and suite.get('tests') == '2' and len(cases) == 2
+          assert all(suite.get(k) == '0' for k in ('failures', 'errors', 'skipped'))
+          assert all(c.get('classname') == name and all(c.find(k) is None for k in ('failure', 'error', 'skipped')) for c in cases)
+          assert {c.get('name').removesuffix('()') for c in cases} == {
+              'mappedJerseyDispatchThrowUsesStatusAtNormalOuterReturn', 'normalNullJerseyDispatchKeepsOuterStatusProvisional'}
+          print('readAndRecordingTests=8 progressTests=4 bridgeTests=4 jerseyOutcomeTests=2')
+          PYGATE
+      - name: Verify the exact mocked Java ownership, baseline and shutdown marker cases
+        id: ownership
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH=campaigns/lib:campaigns/java/fineract/jersey-fixture python3 -B - > "$PROOF/logs/owned-mocks.stdout" 2> "$PROOF/logs/owned-mocks.stderr" <<'MOCKS'
+          import os,sys,unittest
+          from pathlib import Path
+          # These focused files use mock handles and a fresh temporary directory. Refuse
+          # actual launches, signals and service connections from this test partition.
+          denied=[]
+          def audit(event,args):
+              if event in {'subprocess.Popen','os.exec','os.spawn','os.posix_spawn','os.system','os.fork',
+                           'os.kill','os.killpg','socket.bind','socket.connect','socket.getaddrinfo'}:
+                  denied.append(event)
+                  raise RuntimeError('unexpected operation in mocked fixture tests')
+          sys.addaudithook(audit)
+          groups={
+              'owned': (
+                  'test_owned_fixture.Containers.test_collision_does_not_remove_any_constructed_name',
+                  'test_owned_fixture.Containers.test_partial_run_failure_keeps_its_private_creation_id_for_cleanup',
+                  'test_owned_fixture.Containers.test_successful_detached_run_binds_both_receipts_and_fresh_paths',
+                  'test_owned_fixture.Containers.test_empty_failed_create_receipt_never_adopts_a_foreign_name',
+                  'test_owned_fixture.Containers.test_missing_or_disagreeing_success_receipts_fail_closed',
+                  'test_owned_fixture.Containers.test_conflicting_app_identity_cannot_be_removed_during_partial_stack_rollback',
+                  'test_owned_fixture.Containers.test_baseline_collision_never_reads_logs_for_an_unacquired_application',
+                  'test_owned_fixture.Containers.test_linked_and_nonregular_creation_receipts_are_not_followed',
+                  'test_owned_fixture.Containers.test_failed_cleanup_retains_only_failed_ids_and_retries_them',
+                  'test_owned_fixture.Containers.test_already_auto_removed_owned_id_is_idempotent_but_other_errors_fail',
+                  'test_owned_fixture.Containers.test_network_cleanup_failure_is_retryable_without_releasing_other_invocations',
+                  'test_owned_fixture.Containers.test_ordinary_stack_success_tears_down_its_exact_ids_in_reverse_order',
+                  'test_owned_fixture.Containers.test_partial_stack_startup_removes_only_successfully_created_objects',
+                  'test_owned_fixture.Containers.test_network_collision_never_runs_any_cleanup_command',
+                  'test_owned_fixture.Containers.test_build_timeout_releases_only_its_cid_and_keeps_original_timeout',
+                  'test_owned_fixture.Containers.test_build_collision_never_removes_the_existing_named_container',
+                  'test_owned_fixture.Containers.test_build_cleanup_failure_retains_the_owned_handle_for_explicit_retry',
+                  'test_owned_fixture.Processes.test_graceful_stop_keeps_full_original_wait_and_reaps_only_direct_child',
+                  'test_owned_fixture.Processes.test_forced_shutdown_reaps_direct_child_but_never_passes',
+                  'test_owned_fixture.Processes.test_unreaped_child_handle_remains_available_for_explicit_stack_cleanup',
+                  'test_owned_fixture.Processes.test_already_exited_child_is_reaped_without_signalling',
+                  'test_owned_fixture.Processes.test_all_cleanup_callbacks_run_and_all_failures_remain_visible',
+                  'test_owned_fixture.Processes.test_viewer_early_exit_reaps_and_closes_pipe_before_returning_failure',
+                  'test_owned_fixture.Processes.test_partial_viewer_line_expires_at_original_deadline_and_reaps_owned_child',
+                  'test_owned_fixture.Processes.test_coalesced_viewer_lines_are_consumed_before_another_pipe_wait',
+                  'test_owned_fixture.Processes.test_barrier_timeout_reaps_only_its_direct_exec_and_stays_failed',
+              ),
+              'xcamp': (
+                  'test_xcamp.Ports.test_bound_port_requires_a_started_server_message',
+                  'test_xcamp.Ports.test_host_starts_with_zero_and_discovers_actual_port_before_http',
+                  'test_xcamp.Ports.test_docker_allocates_both_host_bindings',
+                  'test_xcamp.Ports.test_docker_binding_must_be_one_valid_loopback_port',
+                  'test_xcamp.Ports.test_database_readiness_requires_tcp_query_not_init_socket',
+                  'test_xcamp.Ports.test_pacing_precedes_request_and_never_delays_observed_completion',
+                  'test_xcamp.Ports.test_owner_write_barrier_requires_lock_acknowledgement_and_releases_on_error',
+                  'test_xcamp.Ports.test_owner_write_barrier_silence_never_admits_a_request',
+                  'test_xcamp.Ports.test_owner_write_barrier_rejects_other_campaign_databases',
+              ),
+              'marker': (
+                  'test_progress.ProgressTest.test_marker_publication_failure_releases_the_direct_child_and_remains_failure',
+              ),
+          }
+          def output(key,value):
+              with open(os.environ['GITHUB_OUTPUT'],'a') as stream:
+                  stream.write(f'{key}={value}\n')
+          for name,expected in groups.items():
+              output('activeGroup',name)
+              suite=unittest.defaultTestLoader.loadTestsFromNames(expected)
+              def tests(node):
+                  if isinstance(node,unittest.TestSuite):
+                      for child in node:yield from tests(child)
+                  else:yield node
+              if tuple(case.id() for case in tests(suite))!=expected:
+                  raise SystemExit('mocked case inventory mismatch')
+              result=unittest.TextTestRunner(verbosity=2).run(suite)
+              if (denied or result.testsRun!=len(expected) or not result.wasSuccessful() or result.skipped or
+                      result.expectedFailures or result.unexpectedSuccesses):
+                  raise SystemExit('mocked case verification failed')
+              output(name,'passed')
+          MOCKS
+      - name: Verify six direct JavaScript ChildProcess handle cases
+        id: child_js
+        run: |
+          set -euo pipefail
+          umask 077
+          node --test --test-reporter=tap tools/qa/campaign_child.test.mjs > "$PROOF/logs/child-tests.tap" 2> "$PROOF/logs/child-tests.stderr"
+          python3 -B - <<'CHILD'
+          import os,re
+          from pathlib import Path
+          data=(Path(os.environ['PROOF'])/'logs/child-tests.tap').read_bytes()
+          if len(data)>65536:raise SystemExit('invalid child TAP size')
+          lines=data.decode('utf-8').splitlines()
+          expected=(
+              'graceful stop signals only the supplied handle and retains the full viewer wait',
+              'an already exited or unstarted handle is never signalled',
+              'forced direct-handle kill remains failure even after final reap',
+              'an unreaped owned child remains an explicit cleanup failure',
+              'an observed exit before escalation cannot receive a stale PID signal',
+              'exit observation releases its timer and listener on the real emitted signal',
+          )
+          passes=[line for line in lines if re.match(r'^(?:not )?ok [0-9]+ ',line)]
+          if passes!=[f'ok {i} - {title}' for i,title in enumerate(expected,1)]:
+              raise SystemExit('incorrect child cases')
+          totals={'tests':6,'suites':0,'pass':6,'fail':0,'cancelled':0,'skipped':0,'todo':0}
+          if (lines.count('1..6')!=1 or any([line for line in lines if line.startswith('# '+key+' ')]!=[f'# {key} {n}']
+                                              for key,n in totals.items())):
+              raise SystemExit('incorrect child result totals')
+          CHILD
+      - name: Verify the eleven finite Fineract first-incomplete source cases
+        id: first_pair
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$PROOF/logs/first-pair"
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$root.json" \
+            test_fineract_first_partial_pair \
+            > "$root.stdout" 2> "$root.stderr"
+          python3 -B -m tools.qa.unittest_summary "$root.json"
+          python3 -B - "$root.json" <<'PAIR'
+          import json,sys
+          counts=json.load(open(sys.argv[1]))['counts']
+          if counts['testsRun'] != 11 or any(n for k,n in counts.items() if k != 'testsRun'):
+              raise SystemExit(1)
+          PAIR
+      - name: Verify sixteen same-recording live and stop phase source cases
+        id: phases
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$PROOF/logs/phase-evidence"
+          PYTHONPATH=campaigns/lib python3 -B -m tools.qa.unittest_run --result "$root.json" \
+            test_fineract_phase_evidence \
+            > "$root.stdout" 2> "$root.stderr"
+          python3 -B -m tools.qa.unittest_summary "$root.json"
+          python3 -B - "$root.json" <<'PHASE'
+          import json,sys
+          counts=json.load(open(sys.argv[1]))['counts']
+          if counts['testsRun'] != 16 or any(n for k,n in counts.items() if k != 'testsRun'):
+              raise SystemExit(1)
+          PHASE
+      - name: Verify nine mapped-read lifecycle regressions
+        id: lifecycle_source
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$PROOF/logs/mapped-lifecycle"
+          PYTHONPATH=campaigns/java/fineract/jersey-fixture python3 -B -m tools.qa.unittest_run --result "$root.json" \
+            test_lifecycle.LifecycleTest.test_open_prefix_remains_unavailable \
+            test_lifecycle.LifecycleTest.test_responded_partial_retains_gap_and_drop \
+            test_lifecycle.LifecycleTest.test_nonfinite_or_malformed_projection_fails \
+            test_lifecycle.LifecycleTest.test_owned_stop_requires_same_identity_terminal_and_events \
+            test_lifecycle.LifecycleTest.test_prefix_keeps_recorded_facts_when_navigation_gains_a_target \
+            test_lifecycle.LifecycleTest.test_open_discovery_validates_pages_without_assuming_a_final_count \
+            test_lifecycle.LifecycleTest.test_observation_finishing_after_deadline_fails \
+            test_lifecycle.LifecycleTest.test_known_frame_metadata_cannot_change_or_disappear \
+            test_lifecycle.LifecycleTest.test_parent_links_require_recorded_distinct_event_ids \
+            > "$root.stdout" 2> "$root.stderr"
+          python3 -B -m tools.qa.unittest_summary "$root.json"
+          python3 -B - "$root.json" <<'CASES'
+          import json, sys
+          doc = json.load(open(sys.argv[1]))
+          assert doc['counts'] == {'testsRun': 9, 'failures': 0, 'errors': 0, 'skipped': 0,
+                                   'expectedFailures': 0, 'unexpectedSuccesses': 0}
+          assert not doc['identities']
+          CASES
+      - name: Build and verify one Linux archive and fresh official installation
+        id: package
+        run: |
+          set -euo pipefail
+          umask 077
+          export XTRACE_DATA_HOME="$PROOF/installer-data"
+          (
+            env HOME="$PROOF/home" python3 -B packaging/build.py --platform linux-x86_64 --out "$PROOF/dist" --work "$PROOF/build"
+            PYTHONPATH=campaigns/lib python3 -B - <<'PY'
+          import hashlib, os, pathlib, subprocess
+          import installed_java
+          root = pathlib.Path(os.environ['PROOF'])
+          repo = pathlib.Path.cwd()
+          installed_java.clean_checkout(repo, os.environ['PRODUCT'])
+          archives = list((root/'dist/linux-x86_64').glob('xtrace-*-linux-x86_64.tar.gz'))
+          assert len(archives) == 1 and archives[0].name == 'xtrace-0.0.1-linux-x86_64.tar.gz'
+          archive = archives[0]
+          with archive.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          subprocess.run(['sh', 'packaging/install.sh', 'verify-dist', str(archive.parent)], check=True)
+          verifier = installed_java.verifier()
+          report = verifier.verify(archive, repo=repo, run=True)
+          assert report['ok'] is True and report['package']['sourceCommit'] == os.environ['PRODUCT']
+          assert report['package']['platform'] == 'linux-x86_64'
+          prefix = root/'installed'
+          assert not prefix.exists()
+          unpacked = verifier.resolve_root(archive, root/'unpacked')
+          subprocess.run(['sh', str(unpacked/'install.sh'), '--prefix', str(prefix), '--data-home', str(root/'installer-data')], check=True)
+          subprocess.run(['sh', str(prefix/'current/install.sh'), 'verify', '--prefix', str(prefix)], check=True)
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write(f'ARCHIVE={archive}\nARCHIVE_SHA={digest}\n')
+          PY
+          ) > "$PROOF/logs/package.stdout" 2> "$PROOF/logs/package.stderr"
+      - id: java21
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Build two pinned ordinary fixture jars from the same application
+        id: jars
+        run: |
+          set -euo pipefail
+          umask 077
+          for version in 3.1.11 3.1.10; do
+            target="$PROOF/fixture-$version"
+            cp -R campaigns/java/fineract/jersey-fixture "$target"
+            (cd "$target" && env HOME="$PROOF/home" MAVEN_OPTS="-Duser.home=$PROOF/home" mvn --batch-mode --no-transfer-progress \
+              -Dmaven.repo.local="$PROOF/cache/maven" -Djersey.version="$version" clean package) \
+              > "$PROOF/logs/maven-$version.stdout" 2> "$PROOF/logs/maven-$version.stderr"
+            test -s "$target/target/jersey-observation-1.jar"
+          done
+      - name: Verify native package and observe both ordinary loopback legs
+        id: journey
+        run: |
+          set -euo pipefail
+          umask 077
+          env HOME="$PROOF/home" python3 -B campaigns/java/fineract/jersey-fixture/installed_journey.py \
+            --root "$PROOF/evidence" --prefix "$PROOF/installed" --archive "$ARCHIVE" --archive-sha "$ARCHIVE_SHA" \
+            --source-sha "$PRODUCT" --java "$JAVA_HOME/bin/java" \
+            --supported "$PROOF/fixture-3.1.11/target/jersey-observation-1.jar" \
+            --unsupported "$PROOF/fixture-3.1.10/target/jersey-observation-1.jar" \
+            > "$PROOF/logs/journey.stdout" 2> "$PROOF/logs/journey.stderr"
+      - name: Admit only the bounded report and cross-check its immutable identity
+        id: counts
+        if: ${{ always() && (steps.journey.outcome == 'failure' || steps.journey.outcome == 'success') }}
+        env:
+          JOURNEY_OUTCOME: ${{ steps.journey.outcome }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          from tools.release.private_roots import read_private_json, atomic_write_private
+          root = pathlib.Path(os.environ['PROOF'])
+          src = read_private_json(root/'evidence/counts.json', maximum_bytes=4096)
+          assert src['releaseAcceptance'] is False and src['status'] in ('failed', 'passed')
+          assert (src['status'] == 'passed') == (os.environ['JOURNEY_OUTCOME'] == 'success')
+          stages = ('package', 'fixture-identity', 'installed-legs', 'complete')
+          assert src['stage'] in stages and set(src['legs']) <= {'3.1.11', '3.1.10'}
+          phases = ('fixture-setup', 'project-init', 'empty-cli-inventory', 'installed-launch', 'fixture-readiness',
+                    'http-workload', 'lifecycle-viewer-readiness', 'lifecycle-live-prefix', 'lifecycle-live-terminal',
+                    'live-viewer-shutdown', 'recording-shutdown', 'probe-inputs', 'probe-decisions', 'probe-notices',
+                    'viewer-readiness', 'viewer-auth', 'recording-inventory', 'viewer-shutdown',
+                    'recording-judgment', 'complete')
+          versions = {'3.1.11', '3.1.10'}
+          progress = src['legProgress']
+          assert set(progress) == (versions if src['stage'] in ('installed-legs', 'complete') else set())
+          assert set(src['legs']) <= set(progress)
+          assert (src['status'] == 'passed') == (src['stage'] == 'complete') == (set(src['legs']) == versions)
+          fixture = pathlib.Path('campaigns/java/fineract/jersey-fixture')
+          files = {name: fixture/name for name in ('installed_journey.py', 'pages.py', 'observation.py', 'verify_fixture.py', 'lifecycle.py')}
+          files['xinstr.py'] = pathlib.Path('campaigns/lib/xinstr.py')
+          def lifecycle_rows(current, version, completed):
+              lifecycle = current.get('lifecycle', {})
+              assert isinstance(lifecycle, dict)
+              keys = set(lifecycle)
+              assert keys in (set(), {'prefix'}, {'prefix', 'liveTerminal'}, {'prefix', 'liveTerminal', 'afterStop'})
+              phase = current['phase']
+              if version == '3.1.11':
+                  if phase == 'lifecycle-live-prefix':
+                      assert keys in (set(), {'prefix'})
+                  elif phase == 'lifecycle-live-terminal':
+                      assert keys in ({'prefix'}, {'prefix', 'liveTerminal'})
+                  elif phase in ('live-viewer-shutdown', 'recording-shutdown', 'probe-inputs', 'probe-decisions',
+                                 'probe-notices', 'viewer-readiness', 'viewer-auth', 'recording-inventory',
+                                 'viewer-shutdown', 'recording-judgment'):
+                      assert keys == {'prefix', 'liveTerminal'}
+                  elif phase != 'complete':
+                      assert not keys
+              if version != '3.1.11' or not keys:
+                  assert 'lifecycle' not in current and (version != '3.1.11' or not completed)
+                  return
+              assert 'lifecycle' in current
+              for row in lifecycle.values():
+                  assert set(row) == {'status', 'completion', 'events', 'responses', 'gaps', 'positiveDropBuckets',
+                                      'durationPresent', 'outcome', 'capacityPresent'}
+                  assert row['status'] in ('recording', 'finalizing', 'complete', 'partial', 'invalid')
+                  assert row['completion'] in ('unavailable', 'complete', 'partial', 'invalid')
+                  assert row['outcome'] in ('unavailable','responded','exception_propagated','client_aborted','unobserved')
+                  assert all(type(row[k]) is int for k in ('events', 'responses', 'gaps', 'positiveDropBuckets'))
+                  assert 0 <= row['responses'] + row['gaps'] <= row['events'] <= 128
+                  assert min(row['responses'], row['gaps']) >= 0 and 0 <= row['positiveDropBuckets'] <= 256
+                  assert all(type(row[k]) is bool for k in ('durationPresent', 'capacityPresent'))
+              if completed:
+                  assert keys == {'prefix', 'liveTerminal', 'afterStop'}
+                  prefix, terminal = lifecycle['prefix'], lifecycle['liveTerminal']
+                  assert prefix['status'] in ('recording','finalizing') and prefix['completion'] == 'unavailable'
+                  assert prefix['outcome'] == 'unavailable' and prefix['responses'] == prefix['gaps'] == 0
+                  assert not prefix['durationPresent'] and not prefix['capacityPresent']
+                  assert terminal['status'] == terminal['completion'] == 'complete'
+                  assert terminal['responses'] == 1 and terminal['gaps'] == terminal['positiveDropBuckets'] == 0
+                  assert terminal['durationPresent'] and terminal['outcome'] == 'responded'
+                  assert 4 <= prefix['events'] < terminal['events']
+                  assert lifecycle['afterStop'] == terminal
+          for version, current in progress.items():
+              lifecycle_rows(current, version, version in src['legs'])
+              assert set(current) - {'lifecycle'} == {'phase', 'responsesVerified', 'differentHttpStatus', 'failureSite',
+                                      'cleanupFailure', 'probeDecisions', 'outcomeMismatch'}
+              phase, responses = current['phase'], current['responsesVerified']
+              assert phase in phases and type(responses) is int
+              if phases.index(phase) < phases.index('http-workload'):
+                  assert responses == 0
+              elif phase == 'http-workload':
+                  assert 0 <= responses < 5
+              elif phase in ('lifecycle-viewer-readiness', 'lifecycle-live-prefix'):
+                  assert version == '3.1.11' and responses == 5
+              elif phase in ('lifecycle-live-terminal', 'live-viewer-shutdown'):
+                  assert version == '3.1.11' and responses == 6
+              else:
+                  assert responses == (6 if version == '3.1.11' else 5)
+              observed = current['probeDecisions']
+              expected = ({'service': 'qualified', 'component': 'qualified', 'invoker': 'qualified'} if version == '3.1.11'
+                          else {'service': 'version-excluded', 'component': 'image-and-version-excluded',
+                                'invoker': 'version-excluded'})
+              assert isinstance(observed, dict) and observed.keys() <= expected.keys()
+              assert all(value in ('qualified', 'version-excluded', 'image-excluded', 'image-and-version-excluded')
+                         for value in observed.values())
+              if phases.index(phase) < phases.index('probe-inputs'):
+                  assert not observed
+              if phases.index(phase) > phases.index('probe-decisions'):
+                  assert observed == expected
+              status = current['differentHttpStatus']
+              if status is not None:
+                  assert phase == 'http-workload' and type(status) is int and 100 <= status <= 599
+                  assert status != (200, 404, 200, 403, 200)[responses]
+              assert current['cleanupFailure'] is None or (
+                  current['cleanupFailure'] == 'recording-shutdown' and phase in
+                  ('fixture-readiness', 'http-workload', 'lifecycle-viewer-readiness', 'lifecycle-live-prefix',
+                   'lifecycle-live-terminal', 'live-viewer-shutdown')
+                  or current['cleanupFailure'] == 'live-viewer-shutdown' and phase in
+                  ('lifecycle-viewer-readiness', 'lifecycle-live-prefix', 'lifecycle-live-terminal')
+                  or current['cleanupFailure'] == 'viewer-shutdown' and phase in ('viewer-auth', 'recording-inventory'))
+              site = current['failureSite']
+              if version in src['legs']:
+                  assert phase == 'complete' and site is None and current['cleanupFailure'] is None
+              else:
+                  assert phase != 'complete' and isinstance(site, dict) and set(site) == {'file', 'line'}
+                  assert site['file'] in files and type(site['line']) is int
+                  assert 1 <= site['line'] <= len(files[site['file']].read_bytes().splitlines())
+              mismatch = current['outcomeMismatch']
+              comparison_failed = bool(site and site['file'] == 'observation.py' and
+                  files[site['file']].read_text().splitlines()[site['line'] - 1].strip().startswith('raise OutcomeMismatch('))
+              assert comparison_failed == (mismatch is not None)
+              if mismatch is not None:
+                  assert phase == 'recording-judgment' and version not in src['legs']
+                  assert set(mismatch) == {'requestClass', 'expectedKind', 'expectedStatus', 'observedKind', 'observedStatus'}
+                  pairs = {'filter-refusal': ('responded', 403)}
+                  if version == '3.1.11':
+                      pairs.update({'mapped-read': ('responded', 200), 'mapped-read-lifecycle': ('responded', 200),
+                                    'conversion': ('responded', 404),
+                                    'deferred': ('unobserved', None)})
+                  expected_pair = pairs[mismatch['requestClass']]
+                  assert mismatch['expectedKind'] == expected_pair[0]
+                  assert type(mismatch['expectedStatus']) is type(expected_pair[1]) and mismatch['expectedStatus'] == expected_pair[1]
+                  kind, status = mismatch['observedKind'], mismatch['observedStatus']
+                  assert kind in ('responded', 'exception_propagated', 'client_aborted', 'unobserved', 'unavailable')
+                  assert status is None or status == 'unavailable' or type(status) is int and 100 <= status <= 599
+                  assert (kind, status) != expected_pair
+          base = {'status', 'stage', 'legs', 'releaseAcceptance', 'legProgress'}
+          hashes = {'sourceSha', 'archiveSha256'}
+          assert set(src) in (base, base | hashes)
+          assert src['stage'] == 'package' or hashes <= set(src)
+          if hashes <= set(src):
+              assert src['sourceSha'] == os.environ['PRODUCT'] and src['archiveSha256'] == os.environ['ARCHIVE_SHA']
+          for version, row in src['legs'].items():
+              assert set(row) == {'httpResponses', 'recordings', 'observationNotices', 'comparedEvents',
+                                  'cliListPages', 'apiListPages', 'mappedCliDetailPages', 'mappedApiDetailPages',
+                                  'unqualifiedNotices', 'probeFailureNotices', 'applicationProbeNotices', 'probeDecisions'}
+              assert all(type(n) is int for key, n in row.items() if key != 'probeDecisions')
+              supported = version == '3.1.11'
+              expected_recordings = 5 if supported else 1
+              assert row['httpResponses'] == (6 if supported else 5) and row['recordings'] == expected_recordings
+              assert row['observationNotices'] == int(supported) and row['unqualifiedNotices'] == int(not supported)
+              assert row['probeFailureNotices'] == row['applicationProbeNotices'] == 0
+              decisions = ({'service': 'qualified', 'component': 'qualified', 'invoker': 'qualified'} if supported
+                           else {'service': 'version-excluded', 'component': 'image-and-version-excluded',
+                                 'invoker': 'version-excluded'})
+              assert row['probeDecisions'] == decisions == progress[version]['probeDecisions']
+              assert row['cliListPages'] == row['apiListPages'] == expected_recordings
+              pages = row['mappedCliDetailPages']
+              assert pages == row['mappedApiDetailPages'] and (2 <= pages <= 64 if supported else pages == 0)
+              assert 1 <= row['comparedEvents'] <= expected_recordings * 128
+          if src['status'] == 'passed':
+              assert src['stage'] == 'complete' and set(src['legs']) == {'3.1.11', '3.1.10'} and hashes <= set(src)
+          src.update(wrapperSha=os.environ['GITHUB_SHA'], runId=int(os.environ['GITHUB_RUN_ID']), attempt=int(os.environ['GITHUB_RUN_ATTEMPT']))
+          atomic_write_private(root/'safe/counts.json', (json.dumps(src, sort_keys=True)+'\n').encode())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('ready=true\n')
+          PY
+      - id: jersey_upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.counts.outputs.ready == 'true' }}
+        with:
+          name: jersey-ordinary-installed-counts
+          path: ${{ env.PROOF }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Record bounded stage outcomes even when the ordinary fixture was unreached
+        id: stage_receipt
+        if: ${{ always() }}
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          NODE_OUTCOME: ${{ steps.node.outcome }}
+          JAVA17_OUTCOME: ${{ steps.java17.outcome }}
+          ADMIT_OUTCOME: ${{ steps.admit.outcome }}
+          BRIDGE_OUTCOME: ${{ steps.bridge.outcome }}
+          OWNERSHIP_OUTCOME: ${{ steps.ownership.outcome }}
+          CHILD_JS_OUTCOME: ${{ steps.child_js.outcome }}
+          FIRST_PAIR_OUTCOME: ${{ steps.first_pair.outcome }}
+          PHASES_OUTCOME: ${{ steps.phases.outcome }}
+          LIFECYCLE_SOURCE_OUTCOME: ${{ steps.lifecycle_source.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          JAVA21_OUTCOME: ${{ steps.java21.outcome }}
+          JARS_OUTCOME: ${{ steps.jars.outcome }}
+          JOURNEY_OUTCOME: ${{ steps.journey.outcome }}
+          COUNTS_OUTCOME: ${{ steps.counts.outcome }}
+          JERSEY_UPLOAD_OUTCOME: ${{ steps.jersey_upload.outcome }}
+          MOCK_ACTIVEGROUP: ${{ steps.ownership.outputs.activeGroup }}
+          MOCK_OWNED: ${{ steps.ownership.outputs.owned }}
+          MOCK_XCAMP: ${{ steps.ownership.outputs.xcamp }}
+          MOCK_MARKER: ${{ steps.ownership.outputs.marker }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'STAGES'
+          import json,os,re
+          from pathlib import Path
+          labels=('checkout', 'node', 'java17', 'admit', 'bridge', 'ownership', 'child_js', 'first_pair', 'phases', 'lifecycle_source', 'package', 'java21', 'jars', 'journey', 'counts', 'jersey_upload')
+          stages={key:os.environ[key.upper()+'_OUTCOME'] for key in labels}
+          if any(value not in {'success','failure','cancelled','skipped'} for value in stages.values()):
+              raise SystemExit('invalid hosted step verdict')
+          groups={}
+          for group,count in [('owned',26),('xcamp',9),('marker',1)]:
+              flag=os.environ['MOCK_'+group.upper()]
+              if flag not in ('','passed'):raise SystemExit('invalid mocked case status')
+              groups[group]=count if flag=='passed' else None
+          active=os.environ['MOCK_ACTIVEGROUP'] or None
+          if active not in (None,'owned','xcamp','marker'):raise SystemExit('invalid active mock group')
+          if stages['ownership']=='success' and groups!={'owned':26,'xcamp':9,'marker':1}:
+              raise SystemExit('incomplete mocked case inventory')
+          if not re.fullmatch(r'[0-9a-f]{40}',os.environ['GITHUB_SHA']):
+              raise SystemExit('invalid wrapper identity')
+          complete=all(seen=='success' for seen in stages.values())
+          report=dict(schemaVersion=1, kind='owned-java-jersey-stage-outcomes', releaseAcceptance=False,
+                      product=os.environ['PRODUCT'], tree=os.environ['PRODUCT_TREE'], wrapper=os.environ['GITHUB_SHA'],
+                      runId=int(os.environ['GITHUB_RUN_ID']),attempt=int(os.environ['GITHUB_RUN_ATTEMPT']),
+                      status='passed' if complete else 'incomplete',stages=stages,productVerified=stages['admit']=='success',
+                      firstUnsuccessful=next((k for k in labels if stages[k]!='success'),None),activeMockGroup=active,
+                      passedMockCases=groups,passedJsCases=6 if stages['child_js']=='success' else None,
+                      passedLifecycleCases=9 if stages['lifecycle_source']=='success' else None)
+          target=Path(os.environ['RUNNER_TEMP'])/'x127stages'
+          target.mkdir(mode=0o700,exist_ok=False)
+          with (target/'stages.json').open('x') as stream:json.dump(report,stream,sort_keys=True);stream.write('\n')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:out.write('ready=true\n')
+          if not complete:raise SystemExit('unreached or unsuccessful prerequisite')
+          STAGES
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.stage_receipt.outputs.ready == 'true' }}
+        with:
+          name: owned-java-jersey-stage-outcomes
+          path: ${{ runner.temp }}/x127stages/stages.json
+          if-no-files-found: error
+          retention-days: 7
