@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -43,9 +44,15 @@ class JHipsterEvidence(unittest.TestCase):
                     "XCAMP_APP_MODE": "host", "XCAMP_JAVA": "java", "TMPDIR": tmp,
                     "XCAMP_LAUNCH_PREFIX": ""}):
                     stack = harness.make_stack(name, prefix)
+                    network_id = "a" * 64
+                    database_id = "b" * 64
+                    creations = [
+                        subprocess.CompletedProcess([], 0, network_id),
+                        subprocess.CompletedProcess([], 0, database_id),
+                    ]
                     with mock.patch.object(stack, "down"), mock.patch.object(stack, "_wait_db"), \
-                            mock.patch.object(xcamp, "docker"), \
-                            mock.patch.object(xcamp, "published_port", return_value=39452), \
+                            mock.patch.object(xcamp, "docker", side_effect=creations) as docker, \
+                            mock.patch.object(xcamp, "published_port", return_value=39452) as published_port, \
                             mock.patch.object(xcamp.subprocess, "Popen") as launch, \
                             mock.patch.object(stack, "logs", return_value=(
                                 "org.springframework.boot.tomcat.TomcatWebServer : "
@@ -54,6 +61,11 @@ class JHipsterEvidence(unittest.TestCase):
                                 "status": 200, "body": b'{"status":"UP"}'}) as request:
                         launch.return_value.poll.return_value = None
                         stack.up()
+                    network, database = docker.call_args_list
+                    self.assertEqual(network, mock.call("network", "create", stack.net))
+                    self.assertEqual(database.args[0], "run")
+                    self.assertEqual(database.args[database.args.index("--network") + 1], network_id)
+                    published_port.assert_called_once_with(database_id, 5432)
                     argv = launch.call_args.args[0]
                     self.assertIn("--server.port=0", argv)
                     self.assertIn("--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO", argv)
