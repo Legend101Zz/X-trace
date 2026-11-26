@@ -266,14 +266,15 @@ test("database restore consumes the exact admitted dump bound to both baseline h
   assert.deepEqual(seed.metadata, { preparation: receipt, seedSha256: digest(bytes) });
   assert.deepEqual(JSON.parse(JSON.stringify(seed)), { metadata: seed.metadata });
   const calls = [];
-  await seed.startAndRestore({ container: "fixture-db", username: "xtrace", database: "vendure" }, async () => {
+  await seed.startAndRestore({ username: "xtrace", database: "vendure" }, async () => {
     calls.push("start");
     const file = path.join(root, "seed.sql");
     fs.renameSync(file, file + ".admitted");
     writeFreshSeed(root, "replacement after admission");
+    return "a".repeat(64);
   }, (argv, options) => {
     calls.push("restore");
-    assert.deepEqual(argv, ["exec", "-i", "fixture-db", "psql", "-U", "xtrace", "-d", "vendure", "-q", "-v", "ON_ERROR_STOP=1"]);
+    assert.deepEqual(argv, ["exec", "-i", "a".repeat(64), "psql", "-U", "xtrace", "-d", "vendure", "-q", "-v", "ON_ERROR_STOP=1"]);
     assert.deepEqual(Object.keys(options), ["input"]);
     assert.ok(Buffer.isBuffer(options.input));
     assert.deepEqual(options.input, bytes);
@@ -287,8 +288,8 @@ test("database restore consumes the exact admitted dump bound to both baseline h
 test("a restore diagnostic cannot serialize private dump data into a failed baseline receipt", async t => {
   const { root, receipt } = baselineInputs(t);
   const seed = prepareBaselineSeed(root, () => receipt.assets);
-  await assert.rejects(seed.startAndRestore({ container: "fixture", username: "fixture", database: "fixture" },
-    () => {}, (_args, { input }) => { throw new Error(input.toString()); }),
+  await assert.rejects(seed.startAndRestore({ username: "fixture", database: "fixture" },
+    () => "a".repeat(64), (_args, { input }) => { throw new Error(input.toString()); }),
   { message: "Vendure checked seed restore failed" });
 });
 
@@ -298,7 +299,7 @@ test("changed preparation before startup rejects both the start and the restore"
   const seed = prepareBaselineSeed(root, () => assets);
   assets.files += 1;
   const calls = [];
-  await assert.rejects(seed.startAndRestore({ container: "fixture", username: "fixture", database: "fixture" },
+  await assert.rejects(seed.startAndRestore({ username: "fixture", database: "fixture" },
     () => calls.push("start"), () => calls.push("restore")), /seed input identity changed/);
   assert.deepEqual(calls, []);
 });
@@ -365,8 +366,17 @@ test("private verifier and parsing errors during revalidation reach neither star
       fs.writeFileSync(path.join(root, "xtrace-build-inputs.sha256"), digest(invalid) + "\n");
     }
     const calls = [];
-    await assert.rejects(seed.startAndRestore({ container: "fixture", username: "fixture", database: "fixture" },
+    await assert.rejects(seed.startAndRestore({ username: "fixture", database: "fixture" },
       () => calls.push("start"), () => calls.push("restore")), { message: "Vendure seed input identity changed" });
     assert.deepEqual(calls, []);
+  }
+});
+
+test("database restore refuses a missing or name-only startup identity", async t => {
+  const { root, receipt } = baselineInputs(t);
+  const seed = prepareBaselineSeed(root, () => receipt.assets);
+  for (const value of [undefined, "fixture-db"]) {
+    await assert.rejects(seed.startAndRestore({ username: "fixture", database: "fixture" },
+      () => value, () => assert.fail("unexpected restore")), /created database identity/);
   }
 });

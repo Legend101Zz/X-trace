@@ -8,8 +8,8 @@ export function names(project, tag) {
   return { net: t + "-net", db: t + "-db", app: t + "-app" };
 }
 
-export async function startPostgres({ netName, dbName, database, user = "xtrace", password }) {
-  container.runDetached(dbName, [
+export async function startPostgres({ netName, dbName, database, user = "xtrace", password }, containers = container, pause = sleep) {
+  containers.runDetached(dbName, [
     "--network", netName,
     "--network-alias", "db",
     "--tmpfs", "/var/lib/postgresql",
@@ -22,14 +22,14 @@ export async function startPostgres({ netName, dbName, database, user = "xtrace"
   ]);
   const deadline = Date.now() + 90000;
   for (;;) {
-    const r = container.exec(dbName, ["pg_isready", "-U", user, "-d", database], { allowFail: true });
+    const r = containers.exec(dbName, ["pg_isready", "-U", user, "-d", database], { allowFail: true });
     if (r.status === 0) {
       // the entrypoint restarts postgres once after init; confirm with a real query twice
-      const q = container.exec(dbName, ["psql", "-U", user, "-d", database, "-Atc", "select 1"], { allowFail: true });
-      if (q.status === 0) { await sleep(1500); const q2 = container.exec(dbName, ["psql", "-U", user, "-d", database, "-Atc", "select 1"], { allowFail: true }); if (q2.status === 0) return; }
+      const q = containers.exec(dbName, ["psql", "-U", user, "-d", database, "-Atc", "select 1"], { allowFail: true });
+      if (q.status === 0) { await pause(1500); const q2 = containers.exec(dbName, ["psql", "-U", user, "-d", database, "-Atc", "select 1"], { allowFail: true }); if (q2.status === 0) return; }
     }
     if (Date.now() > deadline) throw new Error("postgres readiness deadline");
-    await sleep(500);
+    await pause(500);
   }
 }
 

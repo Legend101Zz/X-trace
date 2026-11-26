@@ -1,5 +1,6 @@
 // Thin docker CLI wrapper. Every object this harness creates is prefixed
 // `xtrace-camp-node-` (inside the shared `xtrace-camp-` namespace); it refuses to remove anything without that prefix.
+import fs from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 
 export const PREFIX = "xtrace-camp-node-";
@@ -44,6 +45,20 @@ export function dockerLogged(args, logPath, { timeoutMs = 3600000 } = {}) {
       resolve(code);
     });
   });
+}
+
+// A foreground fixture has a separately owned container ID. On timeout, reap only
+// the direct CLI process so the owner can still release that exact container.
+export function dockerAttached(args, logPath, { timeoutMs }) {
+  const out = fs.openSync(logPath, "a", 0o600);
+  try {
+    const child = spawnSync("docker", [...baseArgs(), ...args], {
+      stdio: ["ignore", out, out], timeout: timeoutMs, killSignal: "SIGKILL",
+    });
+    return child.error || child.signal ? null : child.status;
+  } finally {
+    fs.closeSync(out);
+  }
 }
 
 export const net = {

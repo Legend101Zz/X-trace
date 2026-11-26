@@ -12,6 +12,7 @@ case "$XTRACE_CAMP_NODE_ROOT" in "${RUNNER_TEMP:?}"/*) ;; *) echo "XTRACE_CAMP_N
 export XCAMP_PLATFORM="${XCAMP_PLATFORM:-linux/amd64}"
 root="$XTRACE_CAMP_NODE_ROOT/$P"
 if [ "$P" = vendure ]; then
+  umask 077
   # The existing campaign directory may already contain the upstream checkout. Never mount or chown it.
   XTRACE_VENDURE_PREPARATION_PARENT=$(mktemp -d "$RUNNER_TEMP/xtrace-vendure.XXXXXXXX")
   export XTRACE_VENDURE_PREPARATION_PARENT
@@ -22,7 +23,11 @@ fi
 nv=$(python3 -B -c "import json,sys;print(json.load(open('campaigns/node/$P/campaign.json'))['runtime']['nodeImageVersion'])")
 plat_tag=$(echo "$XCAMP_PLATFORM" | cut -d/ -f2)
 img="xtrace-camp-node:$nv-$plat_tag"
-docker build --platform "$XCAMP_PLATFORM" --build-arg NODE_VERSION="$nv" -t "$img" campaigns/node/lib/docker
+if [ "$P" = vendure ]; then
+  docker build --platform "$XCAMP_PLATFORM" --build-arg NODE_VERSION="$nv" --iidfile "$XTRACE_VENDURE_PREPARATION_PARENT/vendure-image.id" campaigns/node/lib/docker
+else
+  docker build --platform "$XCAMP_PLATFORM" --build-arg NODE_VERSION="$nv" -t "$img" campaigns/node/lib/docker
+fi
 run="campaigns/node/$P/harness/run.mjs"
 # Containers run as root and leave root-owned files in the bind-mounted workspace; the host harness must read and patch them.
 # No sudo: ownership is repaired inside a throwaway container that is already root.

@@ -12,10 +12,11 @@ export function randomSecret(bytes = 24) {
   return crypto.randomBytes(bytes).toString("hex");
 }
 
-export async function runBaseline({ project, n, root, buildStack, scenarios, meta = {}, keep = false }) {
+export async function runBaseline({ project, n, root, buildStack, scenarios, meta = {}, keep = false, fixture }) {
   const outDir = path.join(root, `baseline-${n}`);
   if (fs.existsSync(outDir)) throw new Error(`${outDir} exists; baselines are write-once (pick a new number)`);
-  fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(outDir, { mode: 0o700 });
   const tag = `b${n}`;
   const names = { net: `${PREFIX}${project}-${tag}-net`, db: `${PREFIX}${project}-${tag}-db`, app: `${PREFIX}${project}-${tag}-app`, worker: `${PREFIX}${project}-${tag}-worker`, dep: `${PREFIX}${project}-${tag}-dep` };
   const startedAt = Date.now();
@@ -24,30 +25,46 @@ export async function runBaseline({ project, n, root, buildStack, scenarios, met
   let status = "failed";
   let failure;
   try {
-    net.create(names.net);
+    if (fixture) fixture.createNetwork(names.net);
+    else net.create(names.net);
     ctx = await buildStack({ names, outDir });
     const readyMs = Date.now() - startedAt;
     summary = await runScenarios({ project, baseUrl: ctx.baseUrl, outDir, scenarios: scenarios(ctx), ctxExtra: ctx.extra || {} });
-    status = summary.result;
     fs.writeFileSync(path.join(outDir, "run.json"), JSON.stringify({ ...meta, readyMs, totalMs: Date.now() - startedAt }, null, 2) + "\n", { mode: 0o600 });
+    status = summary.result;
   } catch (e) {
-    failure = String(e && e.message).slice(0, 800);
+    failure = fixture ? "Owned baseline operation failed" : String(e && e.message).slice(0, 800);
     console.error("baseline failed:", failure);
   } finally {
-    const logs = container.logs(names.app);
-    fs.writeFileSync(path.join(outDir, "app.log"), (logs.stdout || "") + (logs.stderr || ""), { mode: 0o600 });
-    for (const extra of ["worker", "dep"]) {
-      const l = container.logs(names[extra]);
-      if ((l.stdout || l.stderr)) fs.writeFileSync(path.join(outDir, `${extra}.log`), (l.stdout || "") + (l.stderr || ""), { mode: 0o600 });
+    let exit;
+    if (fixture) {
+      try {
+        exit = fixture.collect(names, outDir);
+      } catch {
+        status = "failed";
+        failure ??= "Owned baseline collection failed";
+        exit = null;
+      }
+      if (keep && status === "passed") {
+        try {
+          fixture.recordKeptHandles(outDir);
+        } catch {
+          status = "failed";
+          failure = "Owned baseline retention receipt unavailable";
+        }
+      }
+      if (!keep || status !== "passed") {
+        try {
+          fixture.cleanup();
+        } catch {
+          status = "failed";
+          failure ??= "Owned baseline cleanup failed";
+        }
+      }
+    } else {
+      exit = finishLegacyBaseline(names, outDir, keep);
     }
-    const exit = docker(["inspect", "-f", "{{.State.ExitCode}}", names.app], { allowFail: true }).stdout.trim();
-    if (!keep) {
-      container.rm(names.worker);
-      container.rm(names.dep);
-      container.rm(names.app);
-      container.rm(names.db);
-      net.rm(names.net);
-    }
+    const appLog = path.join(outDir, "app.log");
     const receipt = {
       schemaVersion: 1,
       project,
@@ -58,7 +75,7 @@ export async function runBaseline({ project, n, root, buildStack, scenarios, met
       status,
       failure,
       appContainerExitCodeAtTeardown: exit,
-      appLogSha256: sha256Hex(fs.readFileSync(path.join(outDir, "app.log"))),
+      appLogSha256: fs.existsSync(appLog) ? sha256Hex(fs.readFileSync(appLog)) : null,
       fingerprints: summary ? Object.fromEntries(summary.scenarios.map((s) => [s.id, s.semanticEffectFingerprint ?? null])) : null,
       ...meta,
     };
@@ -67,6 +84,24 @@ export async function runBaseline({ project, n, root, buildStack, scenarios, met
   }
   if (status !== "passed") process.exitCode = 1;
   return { outDir, status };
+}
+
+function finishLegacyBaseline(names, outDir, keep) {
+  const logs = container.logs(names.app);
+  fs.writeFileSync(path.join(outDir, "app.log"), (logs.stdout || "") + (logs.stderr || ""), { mode: 0o600 });
+  for (const extra of ["worker", "dep"]) {
+    const l = container.logs(names[extra]);
+    if ((l.stdout || l.stderr)) fs.writeFileSync(path.join(outDir, `${extra}.log`), (l.stdout || "") + (l.stderr || ""), { mode: 0o600 });
+  }
+  const exit = docker(["inspect", "-f", "{{.State.ExitCode}}", names.app], { allowFail: true }).stdout.trim();
+  if (!keep) {
+    container.rm(names.worker);
+    container.rm(names.dep);
+    container.rm(names.app);
+    container.rm(names.db);
+    net.rm(names.net);
+  }
+  return exit;
 }
 
 export function imageId(image) {

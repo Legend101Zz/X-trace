@@ -279,11 +279,14 @@ export function prepareBaselineSeed(app, verifiedAssets) {
   Object.freeze(initial);
   return {
     metadata: Object.freeze({ preparation: initial, seedSha256 }),
-    async startAndRestore({ container, username, database }, start, run) {
+    async startAndRestore({ username, database }, start, run) {
       if (JSON.stringify(preparation()) !== JSON.stringify(initial)) {
         throw new Error("Vendure baseline preparation changed before database startup");
       }
-      await start();
+      const container = await start();
+      if (typeof container !== "string" || !/^[a-f0-9]{64}$/.test(container)) {
+        throw new Error("Vendure checked seed restore requires the created database identity");
+      }
       try {
         run(["exec", "-i", container, "psql", "-U", username, "-d", database, "-q", "-v", "ON_ERROR_STOP=1"],
           { input: dump });

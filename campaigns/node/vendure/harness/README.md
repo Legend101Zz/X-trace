@@ -36,7 +36,14 @@ the invoking UID/GID with a private writable HOME. The Vendure branch skips the 
 The generator must exit with code zero before build and seed proceed. A signal or unavailable code fails preparation.
 For standalone use, create claims a fresh preparation child under the project directory. Reuse of a completed
 workspace requires its matching preparation inputs; create always refuses an existing preparation child.
-The existing container image is not promoted to a new immutable image pin by this change.
+The hosted shell records its own image build with Docker's `--iidfile` into `vendure-image.id` in the private
+preparation parent. Standalone preparation also requires this file from its own image build. Each step reads
+the recorded image ID. This identifies that build. The upstream base image retains its existing version selection. The fixture tracks
+the network and each database, population, server and worker container by its own creation receipt. Debug
+logs, readiness checks, restore and final cleanup use those identities. A partial setup cannot authorize
+reading or removing a pre-existing container with the same name. A successful explicit `baseline <n> --keep`
+writes `kept-fixture.json` in the private baseline output directory with the network ID and container IDs
+retained for the operator. The ordinary hosted baseline releases its fixture.
 
 The existing shell entry verifies the official create tarball SHA-256, retains its verified bytes in an exclusively created private file, and extracts only
 regular `assets/` inputs with safe unique names. Before seeding, all extracted files (including initial data, products
