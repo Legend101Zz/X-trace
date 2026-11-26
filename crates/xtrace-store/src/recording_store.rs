@@ -2908,10 +2908,13 @@ fn load_frame_honesty(
 
     let counts = connection
         .query_row(
-            "SELECT count(*), coalesce(sum(indexed_v = 1), 0), \
-             coalesce(sum((honesty_flags & ?2) != 0), 0), coalesce(sum((honesty_flags & ?3) != 0), 0), \
-             coalesce(sum((honesty_flags & ?4) != 0), 0), coalesce(sum((honesty_flags & ?5) != 0), 0), \
-             coalesce(sum((honesty_flags & ?6) != 0), 0), coalesce(sum((honesty_flags & ?7) != 0), 0) \
+            "SELECT count(*), count(*) FILTER (WHERE indexed_v = 1), \
+             count(*) FILTER (WHERE (honesty_flags & ?2) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?3) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?4) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?5) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?6) != 0), \
+             count(*) FILTER (WHERE (honesty_flags & ?7) != 0) \
              FROM recording_frame_index WHERE recording_id = ?1",
             rusqlite::params![
                 recording_id.as_uuid().as_bytes().to_vec(),

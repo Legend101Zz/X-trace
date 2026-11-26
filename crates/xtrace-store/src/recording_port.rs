@@ -3759,6 +3759,60 @@ mod tests {
     }
 
     #[test]
+    fn frame_honesty_aggregate_counts_signed_masks_unknown_bits_and_empty_recordings() {
+        let empty = persist(&[], 4, false);
+        assert_eq!(
+            window(&empty, 1, None).frame_honesty,
+            Some(xtrace_application::FrameHonestyCounts::default()),
+        );
+
+        let persisted = persist(&tree(), 4, true);
+        {
+            let connection = persisted.store.lock().expect("connection");
+            // Include the sign bit, all unmapped bits, and independently varied
+            // known flags in the actual migrated frame index.
+            for (sequence, mask) in [(2_u64, -1_i64), (3, (1_i64 << 61) | 3)] {
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE recording_frame_index SET honesty_flags = ?1 \
+                             WHERE recording_seq = ?2",
+                            rusqlite::params![mask, sequence.to_be_bytes().as_slice()],
+                        )
+                        .expect("update indexed flags"),
+                    1
+                );
+            }
+        }
+        assert_eq!(
+            window(&persisted, 1, None).frame_honesty,
+            Some(xtrace_application::FrameHonestyCounts {
+                gap: 2,
+                redacted: 2,
+                truncated: 1,
+                unavailable: 1,
+                dropped: 1,
+                orphan_parent: 2,
+            }),
+        );
+
+        assert_eq!(
+            persisted
+                .store
+                .lock()
+                .expect("connection")
+                .execute(
+                    "UPDATE recording_frame_index SET indexed_v = 0, depth = 0 \
+                     WHERE recording_seq = ?1",
+                    rusqlite::params![3_u64.to_be_bytes().as_slice()],
+                )
+                .expect("mark frame outside the returned page unindexed"),
+            1
+        );
+        assert_eq!(window(&persisted, 1, None).frame_honesty, None);
+    }
+
+    #[test]
     fn bindings_gap_and_line_are_projected_from_stored_events() {
         use xtrace_protocol::generated::agent::{
             BindingRole, CapturedValue as Wire, CapturedValueCaptured, CapturedValueDropped,
