@@ -1,6 +1,9 @@
 """Hosted checks for the finite Medusa startup and cleanup projection."""
 import subprocess
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
 
 from installed import LifecycleProcessExit, Proof, lifecycle_failure
 from installed_evidence import EvidenceError
@@ -39,3 +42,26 @@ class InstalledLifecycle(unittest.TestCase):
             },
             "installed": {},
         })
+
+
+    def test_unverified_cleanup_blocks_the_next_leg_or_readback(self):
+        for failed_leg, expected_legs in (("baseline", ["baseline"]), ("installed", ["baseline", "installed"])):
+            with self.subTest(leg=failed_leg), TemporaryDirectory() as root:
+                proof = Proof.__new__(Proof)
+                proof.summary = {"stages": {}}
+                proof.project = Path(root) / "project"
+                proof.cli = Path(root) / "cli"
+                proof.install = Mock()
+                proof.command = Mock()
+                proof.save = Mock()
+                proof.readback = Mock()
+
+                def leg(name):
+                    proof.summary["stages"][f"{name}:cleanup"] = "failed" if name == failed_leg else "passed"
+                    return None, None
+
+                proof.leg = Mock(side_effect=leg)
+                with patch("installed.verify_children_gone"), self.assertRaises(EvidenceError):
+                    proof.run()
+                self.assertEqual([call.args[0] for call in proof.leg.call_args_list], expected_legs)
+                proof.readback.assert_not_called()

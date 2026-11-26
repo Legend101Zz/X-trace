@@ -735,7 +735,9 @@ class Proof:
         with self.stage("init"):
             self.command([str(self.cli), "init", "--project-dir", str(self.project)])
         _, baseline = self.leg("baseline")
+        require(self.summary["stages"].get("baseline:cleanup") == "passed")
         ready_id, installed = self.leg("installed")
+        require(self.summary["stages"].get("installed:cleanup") == "passed")
         self.summary["stages"]["workload-comparison"] = "failed"
         self.save()
         facts, statuses = workload(read_json(baseline), read_json(installed), EXPECTED)
