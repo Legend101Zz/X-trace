@@ -130,7 +130,35 @@ done
     "$version" "$prev" "$data_home" "$backup_dir"
 } > "$prefix/install-receipt.json"
 
-"$prefix/bin/xtrace" --version >/dev/null 2>&1 || die "installed binary failed to run"
+# Keep the version probe single-shot. Its diagnostic can contain local paths.
+# Descriptor 3 carries the exit status past the pipe. The reader retains only
+# the first 4 KiB and drains the rest before reporting its fixed category.
+classify_version_stderr() {
+  prefix_text=$(dd bs=1 count=4096 2>/dev/null | LC_ALL=C tr -cd '[:print:]\n')
+  cat >/dev/null
+  case "$prefix_text" in
+    *"error while loading shared libraries:"*) category=shared_library_error ;;
+    *"version "*GLIBC_*"not found"*) category=libc_version_error ;;
+    *"symbol lookup error:"*) category=symbol_lookup_error ;;
+    *"panicked at "*) category=panic_reported ;;
+    "") category=no_text_in_prefix ;;
+    *) category=other_diagnostic ;;
+  esac
+  printf '%s' "$category"
+}
+version_check=$(
+  exec 3>&1
+  {
+    version_status=0
+    "$prefix/bin/xtrace" --version 3>&- 2>&1 >/dev/null || version_status=$?
+    printf '%s ' "$version_status" >&3
+  } | classify_version_stderr 3>&-
+)
+version_status=${version_check%% *}
+if [ "$version_status" != 0 ]; then
+  printf 'install.sh: version check: status=%s category=%s\n' "$version_status" "${version_check#* }" >&2
+  die "installed binary failed to run"
+fi
 say "installed X-trace $version into $prefix"
 [ -n "$prev" ] && say "upgraded from $prev; user data was left in place ($data_home)"
 [ -n "$backup_dir" ] && say "pre-upgrade data backup: $backup_dir"
