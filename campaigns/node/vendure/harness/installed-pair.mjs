@@ -12,6 +12,7 @@ import { runOrdinaryVendureWorkload, compareVendureWorkloads } from "./installed
 import { cleanupPairFixture, installedReadbackReceipt, installedCaptureDisposition, launcherObservations } from "./installed-lifecycle.mjs";
 import { judgeInstalledVendurePrivacy } from "./installed-privacy.mjs";
 import { installVendurePackage } from "./installed-package.mjs";
+import { preflightExitVerdict, readPreflightObservation, readPreflightReceipt } from "./installed-preflight-observation.mjs";
 import { PLATFORM, PREFIX } from "../../lib/docker.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -77,13 +78,18 @@ export async function runInstalledVendurePair({ repo, workspaceParent, outDir, a
           const preflight = path.join(control, "preflight-input.json");
           write(preflight, { ...packageInfo, nodeVersion: campaign.runtime.nodeImageVersion,
             uid: process.getuid(), project, control });
-          state.preflight = "failed";
-          const code = await fixture.runLogged(`${PREFIX}vendure-pair-installed-preflight`, [
+          state.preflight = "running";
+          checkpoint();
+          const observed = await fixture.runObserved(`${PREFIX}vendure-pair-installed-preflight`, [
             "--user", `${process.getuid()}:${process.getgid()}`, "--network", "none", ...mounts, image,
             "/usr/local/bin/node", "/xtrace-vendure-harness/installed-preflight.mjs", preflight,
           ], path.join(directory, "preflight.log"));
-          const admitted = JSON.parse(fs.readFileSync(path.join(control, "preflight.json"), "utf8"));
-          need(code === 0 && admitted.passed === true);
+          state.preflightAttachExit = observed.attachExit;
+          state.preflightProcessExit = observed.processExit;
+          state.preflightObservation = readPreflightObservation(path.join(control, "preflight-observation.json"));
+          checkpoint();
+          const admitted = readPreflightReceipt(path.join(control, "preflight.json"));
+          need(preflightExitVerdict(observed, admitted, state.preflightObservation));
           projectId = admitted.projectId;
           state.preflight = "passed";
           checkpoint();
@@ -116,6 +122,10 @@ export async function runInstalledVendurePair({ repo, workspaceParent, outDir, a
         state.workload = results[leg].passed ? "passed" : "failed";
         checkpoint();
       } catch {
+        if (state.preflight === "running") {
+          state.preflight = "failed";
+          state.preflightObservation = readPreflightObservation(path.join(control, "preflight-observation.json"));
+        }
         // Raw command output is private; the bounded stage statuses identify where execution stopped.
       } finally {
         try {
