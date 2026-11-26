@@ -165,6 +165,35 @@ class VerifyPackage(unittest.TestCase):
         self.assertTrue(v["manifest_hashes"])
         self.assertFalse(v["payload_hashes"])
 
+    def test_archive_cli_mode_is_checked_before_extraction(self):
+        build(self.root)
+        archive = self.tmp / "xtrace-0.0.1-linux-x86_64.tar.gz"
+        member = self.root / "bin/xtrace"
+        for mode in (0o755, 0o644, 0o775):
+            with self.subTest(mode=mode):
+                member.chmod(mode)
+                with tarfile.open(archive, "w:gz") as tf:
+                    tf.add(self.root, arcname=self.root.name)
+                if mode == 0o755:
+                    self.assertTrue(vp.verify(archive)["ok"])
+                else:
+                    with self.assertRaisesRegex(SystemExit, "regular bin/xtrace at mode 0755"):
+                        vp.verify(archive)
+
+    def test_archive_cli_manifest_mode_must_agree_with_header(self):
+        build(self.root)
+        path = self.root / vp.MANIFEST_REL
+        manifest = json.loads(path.read_text())
+        cli_row, = (row for row in manifest["files"] if row["path"] == "bin/xtrace")
+        archive = self.tmp / "xtrace-0.0.1-linux-x86_64.tar.gz"
+        for declared in ("0755", "0644"):
+            with self.subTest(declared=declared):
+                cli_row["mode"] = declared
+                path.write_text(json.dumps(manifest))
+                with tarfile.open(archive, "w:gz") as tf:
+                    tf.add(self.root, arcname=self.root.name)
+                self.assertEqual(verdict(vp.verify(archive))["manifest_schema"], declared == "0755")
+
     def test_archive_with_a_fifo_member_is_rejected(self):
         build(self.root)
         archive = self.tmp / "xtrace-0.0.1-linux-x86_64.tar.gz"

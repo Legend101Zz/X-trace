@@ -103,10 +103,17 @@ def resolve_root(package, scratch):
         raise SystemExit(f"no {MANIFEST_REL} under {package}")
     if package.is_file() and package.name.endswith(".tar.gz"):
         with tarfile.open(package, "r:gz") as tf:
+            cli_members = []
             for m in tf.getmembers():
                 parts = Path(m.name).parts
+                if len(parts) == 3 and parts[1:] == ("bin", "xtrace"):
+                    cli_members.append(m)
                 if m.name.startswith("/") or ".." in parts or not (m.isfile() or m.isdir()):
                     raise SystemExit(f"unsafe archive member: {m.name}")
+            # Extraction filters can normalize permissions. Check the CLI's actual
+            # header before extraction so unchanged payload bytes cannot mask a bad mode.
+            if len(cli_members) != 1 or not cli_members[0].isfile() or cli_members[0].mode != 0o755:
+                raise SystemExit("archive must contain one regular bin/xtrace at mode 0755")
             if hasattr(tarfile, "data_filter"):
                 tf.extractall(scratch, filter="data")
             else:
@@ -153,6 +160,9 @@ def read_manifest(root, rep):
                     and isinstance(f.get("sha256"), str) and len(f["sha256"]) == 64
                     and isinstance(f.get("size"), int)):
                 problems.append(f"malformed file row {f!r}")
+                break
+            if f["path"] == "bin/xtrace" and "mode" in f and f["mode"] != "0755":
+                problems.append("bin/xtrace declares a mode other than 0755")
                 break
             p = Path(f["path"])
             if p.is_absolute() or ".." in p.parts:
