@@ -50,6 +50,8 @@ mod daemon_lock;
 mod doctor;
 mod error;
 mod exercise;
+#[cfg(unix)]
+mod exercise_store;
 mod export;
 mod export_cmd;
 mod lifecycle;

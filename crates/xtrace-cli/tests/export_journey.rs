@@ -1746,3 +1746,423 @@ fn all_formats_report_unknown_policy_digest_without_revision_provenance() {
         assert_eq!(file["blake3"], blake3::hash(&bytes).to_hex().to_string());
     }
 }
+
+// These exercise checks reuse this file's public recording API and real catalog
+// fixture. They prove CLI/storage plumbing only, not a real application or sender.
+fn exercise_command(fx: &Fx, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .arg("exercise")
+        .args(args)
+        .arg("--project-dir")
+        .arg(&fx.repo)
+        .arg("--json")
+        .env("XTRACE_DATA_HOME", &fx.data_home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("exercise CLI")
+}
+
+fn exercise_selection(fx: &Fx, target: &str) -> Value {
+    use xtrace_application::catalog_discovery::history::CatalogHistoryService;
+    use xtrace_application::observed_endpoint_queries::ObservedEndpointReadPort;
+    use xtrace_domain::ProjectId;
+    use xtrace_store::{OpenOptions, SqliteStore};
+    let store =
+        SqliteStore::open(&fx.database(), OpenOptions::default().with_must_exist(true)).unwrap();
+    let project = ProjectId::from_uuid(uuid::Uuid::parse_str(&fx.project_id).unwrap());
+    let history = CatalogHistoryService::new(
+        xtrace_store::catalog_history_store::SqliteCatalogHistoryStore::new(store.clone()),
+    );
+    let (revision, operations) = history.operations(project, None).unwrap();
+    let operation =
+        operations.iter().find(|op| op.method == "POST" && op.route_template == "/orders").unwrap();
+    let reader = xtrace_store::recording_port::SqliteRecordingReader::new(
+        store,
+        fx.database().parent().unwrap(),
+    );
+    let (recordings, _) =
+        reader.list_operation_recordings(project, operation.operation_id, None, 50).unwrap();
+    serde_json::json!({
+        "revision_id": revision.revision_id,
+        "operation_id": operation.operation_id,
+        "selected_operation_version_id": operation.operation_version_id,
+        "recording_id": recordings[0].metadata.recording_id,
+        "target": { "base_url": target, "operator_owned_development": true },
+        "inputs": [],
+        "body": { "source": "empty_by_operator" },
+        "lifetime_seconds": 900
+    })
+}
+
+fn exercise_input(fx: &Fx, target: &str) -> (PathBuf, Value) {
+    let input = exercise_selection(fx, target);
+    let private = xtrace_private_storage::AdmittedPrivateRoot::open(fx._root.path()).unwrap();
+    let file = fx._root.path().join("exercise-input.json");
+    let mut descriptor = private.create_private_file("exercise-input.json").unwrap();
+    use std::io::Write as _;
+    descriptor.write_all(&serde_json::to_vec(&input).unwrap()).unwrap();
+    descriptor.sync_all().unwrap();
+    (file, input)
+}
+
+#[test]
+fn exercise_real_cli_plan_review_and_item_approval_send_zero_requests() {
+    use std::net::TcpListener;
+    let fx = project_with_catalog(TRANSCRIPT);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = format!("http://{}", listener.local_addr().unwrap());
+    let (input, _) = exercise_input(&fx, &target);
+    let created = exercise_command(&fx, &["plan", "--input", input.to_str().unwrap()]);
+    assert!(created.status.success(), "{created:?}");
+    let document = json(&created);
+    let hash = document["plan_hash"].as_str().unwrap();
+    let plan_id = document["plan_id"].as_str().unwrap();
+    let item = document["preview"]["items"][0]["item_id"].as_str().unwrap();
+    assert_eq!(document["phase"]["phase"], "draft");
+    assert_eq!(document["ready_for_approval"], false);
+    assert_eq!(document["preview"]["items_needing_approval"], 1);
+    assert_eq!(document["requests_sent"], 0);
+    assert_eq!(document["execution_available"], false);
+    assert_eq!(document["preview"]["items"][0]["effect"], "mutating");
+    let premature = exercise_command(
+        &fx,
+        &[
+            "approve",
+            "--plan-hash",
+            hash,
+            "--plan-id",
+            plan_id,
+            "--item",
+            item,
+            "--confirm-owned-development-target",
+        ],
+    );
+    assert!(!premature.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&premature.stderr).unwrap()["code"],
+        "XTR-EXERCISE-APPROVAL"
+    );
+    let shown = exercise_command(&fx, &["show", "--plan-hash", hash]);
+    assert!(shown.status.success());
+    assert_eq!(json(&shown)["phase"]["phase"], "draft");
+    let reviewed = exercise_command(&fx, &["review", "--plan-hash", hash]);
+    assert!(reviewed.status.success(), "{reviewed:?}");
+    assert_eq!(json(&reviewed)["phase"]["phase"], "reviewed");
+    assert_eq!(json(&reviewed)["ready_for_approval"], true);
+    let missing_item = exercise_command(
+        &fx,
+        &[
+            "approve",
+            "--plan-hash",
+            hash,
+            "--plan-id",
+            plan_id,
+            "--confirm-owned-development-target",
+        ],
+    );
+    assert!(!missing_item.status.success());
+    let approved = exercise_command(
+        &fx,
+        &[
+            "approve",
+            "--plan-hash",
+            hash,
+            "--plan-id",
+            plan_id,
+            "--item",
+            item,
+            "--confirm-owned-development-target",
+        ],
+    );
+    assert!(approved.status.success(), "{approved:?}");
+    assert_eq!(json(&approved)["phase"]["phase"], "approved");
+    assert_eq!(json(&approved)["ready_for_approval"], false);
+    assert_eq!(json(&approved)["requests_sent"], 0);
+    let restored = exercise_command(&fx, &["show", "--plan-hash", hash]);
+    assert!(restored.status.success());
+    assert_eq!(json(&restored)["phase"]["phase"], "approved");
+    let running = exercise_command(&fx, &["run"]);
+    assert_eq!(running.status.code(), Some(9));
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    let plan_file =
+        fx.database().parent().unwrap().join("exercise-plans").join(format!("{hash}.json"));
+    assert_eq!(fs::metadata(plan_file).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn exercise_private_input_binding_and_unrecorded_body_fail_closed() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    let (path, mut input) = exercise_input(&fx, "http://127.0.0.1:8080");
+    input["body"] = serde_json::json!({ "source": "not_recorded" });
+    fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+    let draft = exercise_command(&fx, &["plan", "--input", path.to_str().unwrap()]);
+    assert!(draft.status.success(), "{draft:?}");
+    let document = json(&draft);
+    assert_eq!(document["body"]["source"], "not_recorded");
+    assert_eq!(document["ready_for_approval"], false);
+    let hash = document["plan_hash"].as_str().unwrap();
+    let plan_id = document["plan_id"].as_str().unwrap();
+    let item = document["preview"]["items"][0]["item_id"].as_str().unwrap();
+    assert!(exercise_command(&fx, &["review", "--plan-hash", hash]).status.success());
+    let approval = exercise_command(
+        &fx,
+        &[
+            "approve",
+            "--plan-hash",
+            hash,
+            "--plan-id",
+            plan_id,
+            "--item",
+            item,
+            "--confirm-owned-development-target",
+        ],
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&approval.stderr).unwrap()["code"],
+        "XTR-EXERCISE-UNRESOLVED"
+    );
+    input["recording_id"] = serde_json::json!(xtrace_domain::RecordingId::new());
+    fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+    let unobserved = exercise_command(&fx, &["plan", "--input", path.to_str().unwrap()]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&unobserved.stderr).unwrap()["code"],
+        "XTR-EXERCISE-BINDING"
+    );
+    fs::write(&path, b"{\"private-fixture-literal\": unparseable}").unwrap();
+    let malformed = exercise_command(&fx, &["plan", "--input", path.to_str().unwrap()]);
+    assert!(!malformed.status.success());
+    assert!(!String::from_utf8_lossy(&malformed.stderr).contains("private-fixture-literal"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let public_input = exercise_command(&fx, &["plan", "--input", path.to_str().unwrap()]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&public_input.stderr).unwrap()["code"],
+        "XTR-PRIVATE-STORAGE-UNAVAILABLE"
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("missing-private-input", &path).unwrap();
+    let symlinked = exercise_command(&fx, &["plan", "--input", path.to_str().unwrap()]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&symlinked.stderr).unwrap()["code"],
+        "XTR-PRIVATE-STORAGE-UNAVAILABLE"
+    );
+}
+
+#[test]
+fn exercise_one_observed_operation_and_two_distinct_catalog_versions() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    let target = "http://127.0.0.1:8080";
+    let (path, first) = exercise_input(&fx, target);
+    let next = TRANSCRIPT.replace("OrderController.create", "OrderController.createUpdated");
+    let scan = fx.scan(&fx.write_analyzer(&next));
+    assert!(scan.status.success(), "{scan:?}");
+    let second = exercise_selection(&fx, target);
+    assert_eq!(first["operation_id"], second["operation_id"]);
+    assert_eq!(first["recording_id"], second["recording_id"]);
+    assert_ne!(first["revision_id"], second["revision_id"]);
+    assert_ne!(first["selected_operation_version_id"], second["selected_operation_version_id"]);
+    let plan = |input: &Value| {
+        fs::write(&path, serde_json::to_vec(input).unwrap()).unwrap();
+        exercise_command(&fx, &["plan", "--input", path.to_str().unwrap()])
+    };
+
+    let mut wrong = second.clone();
+    wrong["selected_operation_version_id"] = first["selected_operation_version_id"].clone();
+    let rejected = plan(&wrong);
+    assert!(!rejected.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&rejected.stderr).unwrap()["code"],
+        "XTR-EXERCISE-BINDING"
+    );
+    let mut missing = second.clone();
+    missing.as_object_mut().unwrap().remove("selected_operation_version_id");
+    assert!(!plan(&missing).status.success());
+    for (field, value) in [
+        ("recorded_operation_version_id", &first["selected_operation_version_id"]),
+        ("recorded_catalog_revision_id", &first["revision_id"]),
+    ] {
+        let mut unsupported = second.clone();
+        unsupported[field] = value.clone();
+        let denied = plan(&unsupported);
+        assert!(!denied.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&denied.stderr).unwrap()["code"],
+            "XTR-EXERCISE-INPUT"
+        );
+    }
+    for chosen in [&first, &second] {
+        let draft = plan(chosen);
+        assert!(draft.status.success(), "{draft:?}");
+        let document = json(&draft);
+        let hash = document["plan_hash"].as_str().unwrap();
+        let reviewed = exercise_command(&fx, &["review", "--plan-hash", hash]);
+        assert!(reviewed.status.success(), "{reviewed:?}");
+        let view = json(&reviewed);
+        let observed = &view["observed_recording"];
+        assert_eq!(observed["recording_id"], first["recording_id"]);
+        assert_eq!(observed["operation_id"], first["operation_id"]);
+        assert_eq!(observed["version_evidence"], "not_observed");
+        assert_eq!(observed.get("operation_version_id"), Some(&Value::Null));
+        assert_eq!(observed.get("catalog_revision_id"), Some(&Value::Null));
+        let selection = &view["selected_catalog_operation"];
+        assert_eq!(selection["selection_basis"], "operator_selected_catalog_version");
+        assert_eq!(selection["operation_id"], chosen["operation_id"]);
+        assert_eq!(selection["catalog"]["revision_id"], chosen["revision_id"]);
+        assert_eq!(
+            selection["catalog"]["operation_version_id"],
+            chosen["selected_operation_version_id"]
+        );
+        let approved = exercise_command(
+            &fx,
+            &[
+                "approve",
+                "--plan-hash",
+                hash,
+                "--plan-id",
+                view["plan_id"].as_str().unwrap(),
+                "--item",
+                view["preview"]["items"][0]["item_id"].as_str().unwrap(),
+                "--confirm-owned-development-target",
+            ],
+        );
+        assert!(approved.status.success(), "{approved:?}");
+        assert_eq!(json(&approved)["phase"]["phase"], "approved");
+        assert_eq!(json(&approved)["requests_sent"], 0);
+    }
+}
+
+#[test]
+fn exercise_no_payload_sources_refuse_extra_fields_before_publication() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    let (path, original) = exercise_input(&fx, "http://127.0.0.1:8080");
+    let plan = |input: &Value| {
+        fs::write(&path, serde_json::to_vec(input).unwrap()).unwrap();
+        exercise_command(&fx, &["plan", "--input", path.to_str().unwrap()])
+    };
+    let input_with = |field: &str, source: &str| {
+        let mut input = original.clone();
+        let tagged = serde_json::json!({ "source": source });
+        if field == "body" {
+            input["body"] = tagged;
+        } else {
+            input["inputs"] = serde_json::json!([{
+                "name": "quantity", "location": "query", "required": true, "value": tagged
+            }]);
+        }
+        input
+    };
+    for (field, source, surplus) in [
+        ("body", "empty_by_operator", "content"),
+        ("body", "not_recorded", "content_type"),
+        ("value", "unresolved", "reference"),
+    ] {
+        let mut input = input_with(field, source);
+        let tagged =
+            if field == "body" { &mut input["body"] } else { &mut input["inputs"][0]["value"] };
+        tagged[surplus] = serde_json::json!("private-contradictory-instruction");
+        let rejected = plan(&input);
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rejected.stderr).unwrap()["code"],
+            "XTR-EXERCISE-INPUT"
+        );
+        assert!(
+            !String::from_utf8_lossy(&rejected.stderr)
+                .contains("private-contradictory-instruction")
+        );
+    }
+    assert!(!fx.database().parent().unwrap().join("exercise-plans").try_exists().unwrap());
+    for (field, source, ready) in [
+        ("body", "empty_by_operator", true),
+        ("body", "not_recorded", false),
+        ("value", "unresolved", false),
+    ] {
+        let input = input_with(field, source);
+        let draft = plan(&input);
+        assert!(draft.status.success(), "{draft:?}");
+        let draft = json(&draft);
+        let reviewed =
+            exercise_command(&fx, &["review", "--plan-hash", draft["plan_hash"].as_str().unwrap()]);
+        assert!(reviewed.status.success(), "{reviewed:?}");
+        let review = json(&reviewed);
+        assert_eq!(review["body"], input["body"]);
+        assert_eq!(review["inputs"], input["inputs"]);
+        assert_eq!(review["ready_for_approval"], ready);
+        assert_eq!(review["requests_sent"], 0);
+    }
+}
+
+#[test]
+fn exercise_rejects_duplicate_body_keys_and_preserves_unique_body_text() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    let (path, mut input) = exercise_input(&fx, "http://127.0.0.1:8080");
+    let mut create = |body: &str| {
+        input["body"] = serde_json::json!({
+            "source": "operator", "content_type": "application/json", "content": body
+        });
+        fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+        exercise_command(&fx, &["plan", "--input", path.to_str().unwrap()])
+    };
+    let directory = fx.database().parent().unwrap().join("exercise-plans");
+    for body in
+        [r#"{"quantity": 1, "quantity": 2}"#, r#"{"items": [{"quantity": 1, "qu\u0061ntity": 2}]}"#]
+    {
+        let denied = create(body);
+        assert!(!denied.status.success());
+        assert!(denied.stdout.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&denied.stderr).unwrap()["code"],
+            "XTR-EXERCISE-INPUT"
+        );
+        assert!(!String::from_utf8_lossy(&denied.stderr).contains("quantity"));
+        assert!(fs::read_dir(&directory).unwrap().next().is_none());
+    }
+    let body =
+        r#"{ "items": [{"quantity": -1.5}, {"qu\u0061ntity": 2}], "ready": true, "note": null }"#;
+    let created = create(body);
+    assert!(created.status.success(), "{created:?}");
+    let document = json(&created);
+    let reviewed =
+        exercise_command(&fx, &["review", "--plan-hash", document["plan_hash"].as_str().unwrap()]);
+    assert!(reviewed.status.success(), "{reviewed:?}");
+    let reviewed = json(&reviewed);
+    assert_eq!(reviewed["body"]["content"], body);
+    assert_eq!(reviewed["ready_for_approval"], true);
+    assert_eq!(reviewed["requests_sent"], 0);
+}
+
+#[test]
+fn exercise_rejects_surplus_draft_phase_fields_without_replacing_private_bytes() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    let (input, _) = exercise_input(&fx, "http://127.0.0.1:8080");
+    let created = exercise_command(&fx, &["plan", "--input", input.to_str().unwrap()]);
+    assert!(created.status.success(), "{created:?}");
+    let document = json(&created);
+    let hash = document["plan_hash"].as_str().unwrap();
+    let path = fx.database().parent().unwrap().join("exercise-plans").join(format!("{hash}.json"));
+    let original = fs::read(&path).unwrap();
+    let mut malformed: Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(malformed["phase"], serde_json::json!({ "phase": "draft" }));
+    malformed["phase"]["observation"] = serde_json::json!("private-unexpected-member");
+    let modified = serde_json::to_vec(&malformed).unwrap();
+    fs::write(&path, &modified).unwrap();
+    for action in ["show", "review"] {
+        let rejected = exercise_command(&fx, &[action, "--plan-hash", hash]);
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rejected.stderr).unwrap()["code"],
+            "XTR-EXERCISE-STORAGE"
+        );
+        assert!(!String::from_utf8_lossy(&rejected.stderr).contains("private-unexpected-member"));
+        assert_eq!(fs::read(&path).unwrap(), modified);
+    }
+    fs::write(&path, original).unwrap();
+    let review = exercise_command(&fx, &["review", "--plan-hash", hash]);
+    assert!(review.status.success(), "{review:?}");
+    let document = json(&review);
+    assert_eq!(document["phase"]["phase"], "reviewed");
+    assert_eq!(document["requests_sent"], 0);
+}

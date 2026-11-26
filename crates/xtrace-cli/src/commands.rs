@@ -93,7 +93,7 @@ pub enum XtraceCommand {
     Doctor(crate::doctor::DoctorArgs),
     /// Export catalog operations as OpenAPI, Postman or cURL files.
     Export(crate::export::ExportArgs),
-    /// Plan and run exercises (not implemented yet).
+    /// Plan, review and approve local exercises (executor not implemented).
     Exercise {
         #[command(subcommand)]
         command: crate::exercise::ExerciseCommand,

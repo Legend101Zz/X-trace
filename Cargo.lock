@@ -1557,6 +1557,7 @@ dependencies = [
  "tracing",
  "uuid",
  "xtrace-domain",
+ "xtrace-exercise",
 ]
 
 [[package]]
