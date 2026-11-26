@@ -13,7 +13,6 @@ import json
 import os
 import pathlib
 import re
-import signal
 import subprocess
 import time
 from collections import Counter
@@ -25,6 +24,10 @@ from urllib.parse import quote
 import boundary_diagnostics
 import fineract_detail_evidence
 import private_diagnostic
+if __package__:
+    from .owned_fixture import cleanup_all, stop_child
+else:
+    from owned_fixture import cleanup_all, stop_child
 
 # matched against the class part of a frame symbol such as `OwnerController.findOwner`
 LAYER_PATTERNS = {
@@ -186,38 +189,57 @@ def start_viewer(xtrace: str, project_dir: pathlib.Path, env: dict[str, str], lo
     with open(log, "wb") as errlog:  # the child holds its own descriptor; this handle does not leak
         proc = subprocess.Popen([xtrace, "open", "--project-dir", str(project_dir), "--viewer", "--no-browser"],
                                 stdout=subprocess.PIPE, stderr=errlog, env=env, text=True, start_new_session=True)
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     assert proc.stdout is not None
-    while time.time() < deadline:
-        # select first: a viewer that is alive but silent must not block past the deadline
-        ready_fds, _, _ = select.select([proc.stdout], [], [], 1.0)
-        if not ready_fds:
-            if proc.poll() is not None:
-                raise RuntimeError(f"viewer exited early with {proc.returncode}")
-            continue
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                raise RuntimeError(f"viewer exited early with {proc.returncode}")
-            continue
-        ready = parse_readiness(line)
-        if ready:
-            return proc, ready
-    stop_process_group(proc)
-    raise RuntimeError("viewer readiness line not seen")
+    try:
+        if proc.poll() is not None:
+            raise RuntimeError(f"viewer exited early with {proc.returncode}")
+        fd = proc.stdout.fileno()
+        os.set_blocking(fd, False)
+        pending = bytearray()
+        dropping_line = False
+        while (remaining := deadline - time.monotonic()) > 0:
+            readable, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
+            if not readable:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"viewer exited early with {proc.returncode}")
+                continue
+            # Consume all coalesced lines before waiting; a partial line never blocks.
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                raise RuntimeError("viewer readiness stream closed")
+            if dropping_line:
+                _, newline, chunk = chunk.partition(b"\n")
+                if not newline:
+                    continue
+                dropping_line = False
+            pending.extend(chunk)
+            *lines, pending = pending.split(b"\n")
+            if len(pending) > 1024 * 1024:
+                pending.clear()
+                dropping_line = True
+            for line in lines:
+                if len(line) > 1024 * 1024:
+                    continue
+                ready = parse_readiness(line.decode("utf-8", errors="replace"))
+                if ready and time.monotonic() < deadline and proc.poll() is None:
+                    return proc, ready
+        raise RuntimeError("viewer readiness line not seen")
+    except BaseException:
+        stop_process_group(proc)
+        raise
 
 
 def stop_process_group(proc: subprocess.Popen, wait: float = 15.0) -> None:
-    """Signal only the process group this harness started."""
-    if proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=wait)
-        except Exception:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                pass
+    """Compatibility name: signal/reap only this direct child, never its group."""
+    try:
+        stop_child(proc, wait)
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
 
 
 def _next_page(doc: dict, key: str, seen: set[str], has_rows: bool) -> str | None:
@@ -1333,16 +1355,23 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             notes["canaryRequests"] = send_canary_requests(stack.base, canaries, extra_canary_paths, pace=PACE_SECONDS)
             sent_log.extend((None, m, pth) for m, pth in extra_canary_paths)  # non-scenario traffic, still recorded by the product
     finally:
-        if live_viewer is not None:
-            stop_process_group(live_viewer)
-        stack.down()  # SIGTERM to the launcher we started; `xtrace run` forwards it and drains the daemon
-        try:  # after the stop, so the launcher's own closing diagnostics are in the log
-            (out_dir / "application.log").write_text(stack.logs())
-        except Exception:
-            pass
-        xcamp.REQUEST_HOOK = None
-        xcamp.SENT_LOG = None
-        xcamp.REQUEST_PACE_S = 0.0
+        def save_application_log():
+            try:
+                (out_dir / "application.log").write_text(stack.logs())
+            except Exception:
+                pass
+
+        docker_app = getattr(stack, "mode", "host") == "docker"
+        try:
+            if docker_app:
+                save_application_log()  # the container ID is readable only before its release
+            cleanup_all(*([lambda: stop_process_group(live_viewer)] if live_viewer is not None else []), stack.down)
+        finally:
+            if not docker_app:
+                save_application_log()  # includes the host launcher's closing diagnostics
+            xcamp.REQUEST_HOOK = None
+            xcamp.SENT_LOG = None
+            xcamp.REQUEST_PACE_S = 0.0
     notes["launcherExitCode"] = getattr(stack, "launcher_exit", None)
 
     # product lifecycle commands that exist in the CLI surface: exit code 9 means "not implemented yet"

@@ -89,6 +89,20 @@ def workload(proc, root, canaries, progress):
         progress["responsesVerified"] += 1
 
 
+def stop_recording(proc, marker):
+    try:
+        marker.touch(exist_ok=False)
+        proc.wait(timeout=60)
+    except BaseException as primary:
+        # A failed marker cannot arrange cooperative shutdown. Keep both failures if release fails.
+        try:
+            xinstr.stop_process_group(proc, wait=30)
+        except Exception as release:
+            raise xcamp.CleanupFailure((primary, release), proc) from primary
+        raise
+    require(proc.returncode == 0, "installed recording shutdown")
+
+
 def leg(root, jar, version, cli, agent, java, progress):
     root.mkdir(mode=0o700)
     project, control = root / "project", root / "control"
@@ -124,14 +138,7 @@ def leg(root, jar, version, cli, agent, java, progress):
             workload(proc, control, canaries, progress)
         finally:
             with cleanup(progress, "recording-shutdown"):
-                (control / "stop").touch(exist_ok=False)
-                try:
-                    proc.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    proc.terminate()
-                    proc.wait(timeout=30)
-                    raise
-                require(proc.returncode == 0, "installed recording shutdown")
+                stop_recording(proc, control / "stop")
 
     progress["phase"] = "probe-inputs"
     messages = {
@@ -181,9 +188,7 @@ def leg(root, jar, version, cli, agent, java, progress):
         details, counts = compare_inventory(read_cli, api_reader(client, canaries), project_id, supported)
     finally:
         with cleanup(progress, "viewer-shutdown"):
-            if viewer.poll() is None:
-                viewer.terminate()
-            viewer.wait(timeout=30)
+            xinstr.stop_process_group(viewer, wait=30)
     progress["phase"] = "recording-judgment"
     recordings = judge(details, version)
     return {"httpResponses": progress["responsesVerified"], "recordings": recordings, "probeDecisions": decisions,

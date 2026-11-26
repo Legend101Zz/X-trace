@@ -571,9 +571,7 @@ class Flows:
                 stop_rc, _, _ = self._record("stop", timeout=90)
                 gone = isinstance(pid, int) and wait_gone(pid)
         finally:
-            if stack is not None:
-                stack.down()
-            self._stop_daemon_quietly()
+            xinstr.cleanup_all(*([stack.down] if stack is not None else []), self._stop_daemon_quietly)
         if rc == 0 and bootstrap and stop_rc == 0:
             api = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-record-stop")
             new = {k: v for k, v in api["details"].items() if k not in before_ids}
@@ -660,14 +658,12 @@ class Flows:
                     os.kill(proc.pid, signal.SIGKILL)  # the application pid this harness started, nothing else
                     proc.wait(timeout=30)
         finally:
-            if sock is not None:
-                sock.close()
-            barriers.close()
-            if stack is not None:
-                stack.down()
-            if rc == 0 and bootstrap:
-                stop_rc, stop_doc, _ = self._record("stop", timeout=90)
-            self._stop_daemon_quietly()
+            def stop_capture():
+                nonlocal stop_rc, stop_doc
+                if rc == 0 and bootstrap:
+                    stop_rc, stop_doc, _ = self._record("stop", timeout=90)
+            xinstr.cleanup_all(*([sock.close] if sock is not None else []), barriers.close,
+                               *([stack.down] if stack is not None else []), stop_capture, self._stop_daemon_quietly)
         if rc != 0 or not bootstrap:
             self._set("partial-recording-reopen", judge_partial(record_rc=rc, stop_rc=stop_rc, stop_doc=stop_doc,
                                                                 control_details=[], new_details={}, stalled=("POST", "/owners/new")))

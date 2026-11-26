@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { stopViewer } from "./campaign_child.mjs";
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, a, i, arr) => (a.startsWith("--") ? [...acc, [a.slice(2), arr[i + 1]]] : acc), []));
 for (const k of ["xtrace", "project-dir", "out"]) {
@@ -37,16 +38,21 @@ function findReady(obj) {
   return null;
 }
 
-// Signals only the process group this script started.
-function stopViewer(p) { try { process.kill(-p.pid, "SIGTERM"); } catch { /* already gone */ } }
-
 function startViewer() {
   return new Promise((resolve, reject) => {
     const p = spawn(args.xtrace, ["open", "--project-dir", args["project-dir"], "--viewer", "--no-browser"], { stdio: ["ignore", "pipe", "ignore"], detached: true });
     let buf = "";
-    const t = setTimeout(() => { stopViewer(p); reject(new Error("viewer readiness timeout")); }, 60000);
-    p.once("error", (error) => { clearTimeout(t); stopViewer(p); reject(error); });
-    p.once("exit", () => { clearTimeout(t); reject(new Error("viewer exited before readiness")); });
+    let settled = false;
+    const fail = async error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      try { await stopViewer(p); } catch (cleanup) { error = new Error("viewer startup cleanup failed", { cause: [error, cleanup] }); }
+      reject(error);
+    };
+    const t = setTimeout(() => { void fail(new Error("viewer readiness timeout")); }, 60000);
+    p.once("error", error => { void fail(error); });
+    p.once("exit", () => { void fail(new Error("viewer exited before readiness")); });
     p.stdout.setEncoding("utf8").on("data", (d) => {
       buf += d;
       const lines = buf.split("\n");
@@ -54,7 +60,7 @@ function startViewer() {
       for (const line of lines) {
         let ready;
         try { ready = findReady(JSON.parse(line)); } catch { continue; }
-        if (ready) { clearTimeout(t); resolve({ p, ready }); return; }
+        if (ready && !settled) { settled = true; clearTimeout(t); resolve({ p, ready }); return; }
       }
     });
   });
@@ -189,7 +195,9 @@ async function runWidth(browser, width) {
   } catch {
     row.steps[phase] = { status: "fail" };
   } finally {
-    if (viewer) stopViewer(viewer.p);
+    if (viewer) {
+      try { await stopViewer(viewer.p); } catch { row.steps.cleanup = { status: "fail" }; }
+    }
     if (ctx) {
       try { await ctx.close(); } catch { row.steps.cleanup = { status: "fail" }; }
     }

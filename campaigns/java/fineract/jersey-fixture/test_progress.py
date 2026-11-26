@@ -3,14 +3,25 @@ import inspect
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from installed_journey import cleanup, failure_site, observe_legs
+from installed_journey import cleanup, failure_site, observe_legs, stop_recording
 from observation import OutcomeMismatch, judge
 from pages import decimal
 
 
 class ProgressTest(unittest.TestCase):
+    def test_marker_publication_failure_releases_the_direct_child_and_remains_failure(self):
+        marker, child = Mock(), Mock(stdout=None)
+        marker.touch.side_effect = FileExistsError("marker already exists")
+        child.poll.return_value = None
+        with self.assertRaises(FileExistsError):
+            stop_recording(child, marker)
+        marker.touch.assert_called_once_with(exist_ok=False)
+        child.terminate.assert_called_once_with()
+        child.wait.assert_called_once_with(timeout=30)
+        child.kill.assert_not_called()
+
     def test_source_location_identifies_the_fixture_assertion_without_exception_data(self):
         lines, start = inspect.getsourcelines(decimal)
         assertions = [start + offset for offset, line in enumerate(lines) if 'require(' in line]
