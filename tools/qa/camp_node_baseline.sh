@@ -11,7 +11,14 @@ P="${1:?project}"
 case "$XTRACE_CAMP_NODE_ROOT" in "${RUNNER_TEMP:?}"/*) ;; *) echo "XTRACE_CAMP_NODE_ROOT must be under RUNNER_TEMP"; exit 2 ;; esac
 export XCAMP_PLATFORM="${XCAMP_PLATFORM:-linux/amd64}"
 root="$XTRACE_CAMP_NODE_ROOT/$P"
-mkdir -p "$root"
+if [ "$P" = vendure ]; then
+  # The existing campaign directory may already contain the upstream checkout. Never mount or chown it.
+  XTRACE_VENDURE_PREPARATION_PARENT=$(mktemp -d "$RUNNER_TEMP/xtrace-vendure.XXXXXXXX")
+  export XTRACE_VENDURE_PREPARATION_PARENT
+  root="$XTRACE_VENDURE_PREPARATION_PARENT/preparation"
+else
+  mkdir -p "$root"
+fi
 nv=$(python3 -B -c "import json,sys;print(json.load(open('campaigns/node/$P/campaign.json'))['runtime']['nodeImageVersion'])")
 plat_tag=$(echo "$XCAMP_PLATFORM" | cut -d/ -f2)
 img="xtrace-camp-node:$nv-$plat_tag"
@@ -32,7 +39,7 @@ case "$P" in
     node "$run" prepare; own
     ;;
   vendure)
-    node "$run" create; own
+    node "$run" create
     # The seed step reads the create package's assets (initial-data.json, products.csv, images): take them from the pinned,
     # hash-verified npm tarball, exactly the artifact campaign.json pins.
     ver=$(python3 -B -c "import json;print(json.load(open('campaigns/node/vendure/campaign.json'))['starter']['package']['version'])")
@@ -41,12 +48,12 @@ case "$P" in
     (cd "$tmp" && npm pack "@vendure/create@$ver" --silent >/dev/null)
     got=$(sha256sum "$tmp"/vendure-create-*.tgz | cut -d' ' -f1)
     [ "$got" = "$want" ] || { echo "vendure create tarball sha256 does not match the pin"; exit 1; }
-    mkdir -p "$tmp/x" && tar -xzf "$tmp"/vendure-create-*.tgz -C "$tmp/x"
-    rm -rf "$root/create-assets" && cp -R "$tmp/x/package/assets" "$root/create-assets"
-    node "$run" build; own
-    node "$run" seed; own
+    python3 -B campaigns/node/vendure/harness/seed_assets.py retain "$tmp"/vendure-create-*.tgz "$root/create-assets.tgz"
+    python3 -B campaigns/node/vendure/harness/seed_assets.py prepare "$root/create-assets.tgz" "$root/create-assets"
+    node "$run" build
+    node "$run" seed
     ;;
   *) echo "unknown node project"; exit 2 ;;
 esac
 node "$run" baseline 1
-own
+if [ "$P" != vendure ]; then own; fi

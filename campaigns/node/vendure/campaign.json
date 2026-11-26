@@ -53,11 +53,11 @@
     "version": "bundled with Node 24.21.0 image",
     "lockfile": "package-lock.json",
     "lockfileSha256": "69ae4bacac622bb849d31834279df8696ef84be5bf343e55bcc43fc116c3ae64",
-    "install": "performed by @vendure/create --ci --use-npm (npm install in the generated app); build: `npm run build:server && npm run build:worker` (tsc via vendure CLI); dashboard not built"
+    "install": "The historical create step generates the scaffold. Preparation explicitly stages the tracked PostgreSQL starter, verifies the pinned package-lock.json, runs npm ci, and rejects source/package/lock changes before and after the unchanged server and worker builds."
   },
   "buildAdaptations": [
     "Dashboard (vite) build skipped; only `vendure build server|worker` (tsc). npm cache on the bind-mounted workspace.",
-    "Dependencies: `npm uninstall better-sqlite3 && npm install --save-exact pg` (pg 8.23.1), as the create template does for postgres."
+    "The tracked PostgreSQL snapshot already contains exact pg 8.23.1 and excludes better-sqlite3. Build uses that snapshot and npm ci; it never uninstalls or installs a floating dependency to repair the scaffold."
   ],
   "configAdaptations": [
     "SQLite -> PostgreSQL (root decision, round 2): src/vendure-config.ts dbConnectionOptions changed to exactly what the pinned create template (templates/vendure-config.hbs) renders for `--db postgres` (type 'postgres', database/schema/host/port/username/password from DB_NAME/DB_SCHEMA/DB_HOST/DB_PORT/DB_USERNAME/DB_PASSWORD); src/environment.d.ts gains the matching DB_* declarations. sha256 of vendure-config.ts 61af4d02... -> 765f8c96...; no other source file changed.",
