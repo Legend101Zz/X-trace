@@ -1,0 +1,161 @@
+# Private development proof; bind only after exact source qualification and asset authentication.
+name: Installed owner Plan same-capture lifecycle
+on:
+  push:
+    branches: [codex/proof-owner-plan-installed-121]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  installed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    env:
+      PRODUCT: d0882b896f2d56e8a8f0167f8378335475e51ab9
+      PRODUCT_TREE: 9d867c72d60b0b0e339cf58dc8401c7bf8a5ea44
+      VERIFIED_SOURCE_RUN_ID: 45792966132
+      EXPECTED_UI_MANIFEST_SHA256: 8194a02d9ae76b44fa45a052e42f54bfe0aa8905c0795c94e11455173b168d85
+      SOURCE_COUNTS_ARTIFACT_ID: 15103328603
+      SOURCE_COUNTS_ARCHIVE_SIZE: 1743
+      SOURCE_COUNTS_ARCHIVE_SHA256: 6b032154a4b8ce7e885e17d664e69310bf5303df54fb5e9dbd77d373c8b0d279
+      SOURCE_ASSETS_ARTIFACT_ID: 15104296460
+      SOURCE_ASSETS_ARCHIVE_SIZE: 160599
+      SOURCE_ASSETS_ARCHIVE_SHA256: 77b68d047b94ddf64b18948336403f93a8afa5a130f79abebbd271f26ce721f5
+      ASSEMBLED_SOURCE_SHA: 4e61efab2030be38fac58bb14205549794a94fa1
+      ASSEMBLED_SOURCE_TREE: c90c3d8c0bd1c08e23cc648eed5d5c89507fc005
+      VERIFIED_SOURCE_WRAPPER: e4740022d3a74049c7c2eb7332e231c74c2334e4
+      INSTALLER_FIX_SHA: 1e630befb04c451ca085d3a8b0d3324525271460
+      INSTALL_SCRIPT_SHA256: 7623373412edeb406deab5bbf672d8d5653b4a363ec4aa8b850380608f2e0425
+      INSTALL_TEST_SHA256: c251607d61e391251eb50e62cb5ca156c89815e31890e2b1276b5f4012d603b8
+      REPLAY_SOURCE_BLOB: 68ea032a08544c8e72f26e0237a997f460939b2b
+      REPLAY_TOOLS_BLOB: bfbcd6a8717887cc7ce68bb6336b6fee425b7f5f
+      REPLAY_PLAYBACK_BLOB: 6fe9ed6edd9cc96fe6a216628d2c36f586e87594
+      REPLAY_REPORT_BLOB: 24466b1e4d57ade43142d028355029f498e471f4
+      TOUR_SOURCE_BLOB: ec51faf4ef09003a5be5fe9680372c3cbf056c5a
+      JOURNEY_BLOB: 3cb043bdaa47b1a88d220d21ff56d3119256c184
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.PRODUCT }}
+          path: product
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: wrapper
+          sparse-checkout: .github/proof/owner-plan-installed-121
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.97.1
+      - name: Verify closed wrapper helpers and admit original private fixture scratch
+        id: admit
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git -C ../wrapper rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C ../wrapper show -s --format=%P HEAD)" = "$PRODUCT"
+          scripts="$GITHUB_WORKSPACE/wrapper/.github/proof/owner-plan-installed-121"
+          test "$(sha256sum "$scripts/SHA256SUMS" | cut -d' ' -f1)" = 'd76f2040e122ff4d7c3cbc1662a60f262ce0f34f06c50dc084e2457f3b879d0a'
+          (cd "$scripts" && sha256sum --check --status SHA256SUMS)
+          python3 -B - <<'INVENTORY'
+          import os, subprocess
+          expected=['A\t.github/proof/owner-plan-installed-121/SHA256SUMS', 'A\t.github/proof/owner-plan-installed-121/installed.py', 'A\t.github/proof/owner-plan-installed-121/owner-plan-browser.mjs', 'A\t.github/proof/owner-plan-installed-121/owner_plan.py', 'A\t.github/proof/owner-plan-installed-121/qualification.py', 'A\t.github/proof/owner-plan-installed-121/run-plan.py', 'A\t.github/workflows/owner-plan-installed.yml']
+          actual=subprocess.check_output(['git','-C','../wrapper','diff','--name-status',os.environ['PRODUCT'],os.environ['GITHUB_SHA']],text=True).splitlines()
+          assert actual==expected
+          INVENTORY
+          root="$RUNNER_TEMP/xp121"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/private" "$root/public" "$root/logs"
+          printf '%s\n' "PROOF_SCRIPTS=$scripts" "TMPDIR=$root/tmp" "XTRACE_TEST_PRIVATE_SCRATCH=$root/private" "PLAYWRIGHT_BROWSERS_PATH=$root/chromium" >> "$GITHUB_ENV"
+      - name: Require exact contracts and source runs, authenticated generated files and direct child
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B "$PROOF_SCRIPTS/qualification.py" > "$RUNNER_TEMP/xp121/logs/qualification.stdout" 2> "$RUNNER_TEMP/xp121/logs/qualification.stderr"
+      - name: Prepare only pinned owner browser dependencies
+        run: |
+          set -euo pipefail
+          umask 077
+          timeout 3000 npm ci --prefix web/app --ignore-scripts --no-audit --no-fund > "$RUNNER_TEMP/xp121/logs/browser-install.stdout" 2> "$RUNNER_TEMP/xp121/logs/browser-install.stderr"
+          (cd web/app && timeout 3000 npm exec -- playwright install chromium) > "$RUNNER_TEMP/xp121/logs/chromium.stdout" 2> "$RUNNER_TEMP/xp121/logs/chromium.stderr"
+      - name: One official installed archive, original33 CLI stages and same-capture real owner Plan browser
+        env:
+          RECIPIENT_CERT: |
+            -----BEGIN CERTIFICATE-----
+            MIIERzCCAq+gAwIBAgIUJgaIGZvHvTO1qz7A91QyCXVCBLwwDQYJKoZIhvcNAQEL
+            BQAwMzExMC8GA1UEAwwoWC10cmFjZSBkZXZlbG9wbWVudCB2aWV3ZXIgdmlzdWFs
+            IHJldmlldzAeFw0yNjExMjUxNzQ1MjdaFw0yNjEyMDkxNzQ1MjdaMDMxMTAvBgNV
+            BAMMKFgtdHJhY2UgZGV2ZWxvcG1lbnQgdmlld2VyIHZpc3VhbCByZXZpZXcwggGi
+            MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDUCDMtoLNBiFxpd01HnkpFVMon
+            DCZYbJiETXhyeSC/ecpMarzXEZ4ju0nd4LZwjL/A4Mx9T4JBA4pdFAQDPlnOfG6N
+            J+CQToj6WgpXFWUHpJp3yqfWqRRNj2LC10+slMqtzfcMRORiIYzzco9Uavy4a4zL
+            2jtcP3ShaaD6m/AsBFkCJMmZ94cJUeTgHwdDm9ERrPU0Eo1O31CWp0Oc/lmzvLFe
+            LpjJkdXSGZYrfQfc1n+iSNu1OO2ARxd2gkJPyTSE8dS7Zxwzcpm9izZkIyx5Z3Xm
+            l11t8C3QPDcJ4lRiTI9jF81lmxKak9eIl2PmnWNg5D19nynsboEUxfkr9IWQDYt/
+            JJ36+LyBi/mRph2c7jG3IE7GqoViW+7zd6ImzoiQZajii5PPo8ZRyvVNAZ44UbsL
+            E5djCSUrPH7slC5Cu+eV3YePq8+izZDSGcfwlzrzWGQRt2+kojpy4bPX/qxWB/sO
+            F9C85rrfrjsWWczag8SZdrvBgXWm1d0gAofhGYUCAwEAAaNTMFEwHQYDVR0OBBYE
+            FKT8KNtbCqB4oRqvV+kmEM1sK0ghMB8GA1UdIwQYMBaAFKT8KNtbCqB4oRqvV+km
+            EM1sK0ghMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAH2nbGzx
+            vLlE1JVO27hw10iq3kC66kTbvwM2I4MIkaPfRQ3unmLr+f0uZ5JMJpDzQU7DyN9P
+            i8zsBRqGcA8cnvIC26SbNTX77RYzzEELsr7hl1N/Gjv+xls4IARMfrSKg5uZfPa0
+            raN7oFbJsbh45Z0296AWQ4o9uh/DmHvEo+d1frE+LbQcV6GHQwMjHlzgSjgieFfR
+            8MgJ9YxUfYnFUSdSRq2v/M2WVut9k5IaDBpFcphwUsqXbzE+maJqjGrn+wHBgqVQ
+            hLPNyiQExu/6xUExTFyz4meSDRCaK6N4DJHqWa0lRPG6dhv9jAyOC7Freh2FshLk
+            5ZvJRuUHdhKSA3VbAhr2grL/9f3z1QshohE13qgn25XIr1Vx88N0jJDcbgumqSWf
+            KBU//gL8IFFFfL15nOhhDkGgzHnV/IKeaMJVBC7D/aW5tRUWWzESBQHJR7lvu+sR
+            2eYyRl07aS451CmcdJNQg+KnIflBiYQFgPh6dAjNm2QAoH5ROQLW7Ah+TA==
+            -----END CERTIFICATE-----
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B "$PROOF_SCRIPTS/run-plan.py" > "$RUNNER_TEMP/xp121/logs/outer.stdout" 2> "$RUNNER_TEMP/xp121/logs/outer.stderr"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.admit.outcome == 'success' }}
+        with:
+          name: installed-exercise-atomic-counts
+          path: ${{ runner.temp }}/xp121/public/counts.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.admit.outcome == 'success' }}
+        with:
+          name: installed-owner-plan-browser-counts
+          path: ${{ runner.temp }}/xp121ui/safe/counts.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.admit.outcome == 'success' }}
+        with:
+          name: installed-owner-plan-encrypted-visuals
+          path: ${{ runner.temp }}/xp121ui/encrypted/visuals.cms
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.admit.outcome == 'success' }}
+        with:
+          name: owner-plan-installed-prerequisites
+          path: ${{ runner.temp }}/xq121/safe/qualification.json
+          if-no-files-found: error
+          retention-days: 7
