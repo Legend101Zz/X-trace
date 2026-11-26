@@ -2,7 +2,7 @@
 import json
 import unittest
 
-from installed_capture_diagnostic import PREFIX, project_capture_diagnostic
+from installed_capture_diagnostic import DAEMON_PREFIX, PREFIX, project_capture_diagnostic, project_daemon_finish
 
 
 class InstalledCaptureDiagnostic(unittest.TestCase):
@@ -17,7 +17,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
                         "routeBeforeCreditNotification": 0},
                     expressEvidence=dict(invoked=0, withContext=0, posted=0, anyLayerStaged=0),
                     routeFoldEvidence=dict(batches=2, events=3),
-                    finishProgress=dict(received=12, dispatched=10, submitted=9, written=9, staged=8),
+                    finishProgress=dict(received=12, dispatched=10, submitted=9, written=9, staged=8, active="route"),
                     startStaged=9, finishStaged=8, workerFailed=False, transportFailed=False,
                     closeRequested=False) | overrides
 
@@ -64,6 +64,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
                           {"finishProgress": progress | {"received": 4096}},
                           {"finishProgress": progress | {"received": True}},
                           {"finishProgress": progress | {"private": "example"}},
+                          {"finishProgress": progress | {"active": "/private/example"}},
                           {"examplePath": "/private/example"}, {"scope": "/private/example"},
                           {"finishStaged": 13}, {"startStaged": 13}, {"workerFailed": 1},
                           {"routeFoldEvidence": {"batches": 0, "events": 1}},
@@ -73,3 +74,17 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
                           {"counts": self.snapshot()["counts"] | {"startBeforeCreditNotification": 13}},
                           {"counts": self.snapshot()["counts"] | {"eventBeforeCreditNotification": "private"}}):
             self.assertEqual(project_capture_diagnostic(self.line(**overrides), self.nonce), {"status": "invalid"})
+
+    def test_daemon_finish_reports_only_closed_authenticated_aggregate(self):
+        data = dict(nonce=self.nonce, sessions=1, decoded=12, admitted=12, ackReady=11, ackQueued=11, ackFlushed=10)
+        def line(values):
+            return DAEMON_PREFIX + json.dumps(values).encode() + b"\n"
+        good = line(data)
+        self.assertEqual(project_daemon_finish(self.line() + good, self.nonce),
+                         {"status": "observed", **{k: v for k, v in data.items() if k != "nonce"}})
+        self.assertEqual(project_daemon_finish(self.line(), self.nonce), {"status": "missing"})
+        self.assertIsNone(project_daemon_finish(good, None))
+        for bad in (good * 2, good.rstrip(b"\n"), line(data | {"ackFlushed": 12}),
+                    line(data | {"nonce": "b" * 48}), line(data | {"decoded": True}),
+                    line(data | {"sessions": 0}), line(data | {"requestId": "/private/example"})):
+            self.assertEqual(project_daemon_finish(bad, self.nonce), {"status": "invalid"})

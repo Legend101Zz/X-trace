@@ -3,7 +3,7 @@ import { parentPort, receiveMessageOnPort, workerData } from "node:worker_thread
 import { returnCaptureCredit, routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
 import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
-import { finishProgressDiagnosticOffset, noteFinishProgress } from "./runtime/finish-progress.cjs";
+import { finishProgressDiagnosticOffset, noteFinishProgress, noteFinishWork } from "./runtime/finish-progress.cjs";
 import { createWorkerDelivery } from "./worker-delivery.js";
 
 interface StartupData {
@@ -88,8 +88,10 @@ async function initialize(): Promise<void> {
       ? receiveMessageOnPort(parentPort)?.message as InputMessage | undefined
       : undefined,
     staged: () => returnCaptureCredit(data.credits, notify),
-    ...(finishProgress ? { finishProgress: (boundary: "received" | "dispatched") =>
-      noteFinishProgress(finishProgress, boundary) } : {}),
+    ...(finishProgress ? {
+      finishProgress: (boundary: "received" | "dispatched") => noteFinishProgress(finishProgress, boundary),
+      activeWork: (type: InputMessage["type"] | "idle") => noteFinishWork(finishProgress, type),
+    } : {}),
     ...(routeFolds ? {
       routeFoldStaged(events: number) {
         // One atomic pair so the exit snapshot cannot observe half a fold.

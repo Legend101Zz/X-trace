@@ -18,7 +18,7 @@ import time
 import traceback
 from urllib.parse import urlencode
 
-from installed_capture_diagnostic import project_capture_diagnostic
+from installed_capture_diagnostic import project_capture_diagnostic, project_daemon_finish
 from installed_evidence import EvidenceError, capture, detail, keys, pages, require, workload
 from installed_process import contain_children, reap_exited_group_children, verify_children_gone
 
@@ -329,7 +329,7 @@ class Proof:
             "medusaReadinessLogStream": {"baseline": None, "installed": None},
             "reapedAdoptedGroupExits": {"baseline": None, "installed": None},
             "stopRecoveryReasons": {"baseline": None, "installed": None},
-            "nodeCaptureDiagnostic": None, "nodeDescendantShutdown": None,
+            "nodeCaptureDiagnostic": None, "daemonFinishDiagnostic": None, "nodeDescendantShutdown": None,
             "perRequestAttribution": "unverified", "concurrentRecordingAttribution": "unverified",
         }
 
@@ -583,6 +583,7 @@ class Proof:
                     diagnostic_nonce = secret()
                     env["XTRACE_MEDUSA_CAPTURE_DIAGNOSTIC"] = diagnostic_nonce
                     self.summary["nodeCaptureDiagnostic"] = {"status": "unreached"}
+                    self.summary["daemonFinishDiagnostic"] = {"status": "unreached"}
                 with self.phase(name, "spawn"):
                     process = Process(notes, command, backend, env, descendants=True)
                 env.pop("XTRACE_MEDUSA_CAPTURE_DIAGNOSTIC", None)
@@ -652,6 +653,7 @@ class Proof:
                                 require(stderr.splitlines().count(notice) == 1)
                                 self.summary["nodeDescendantShutdown"] = "unverified"
                                 self.summary["nodeCaptureDiagnostic"] = project_capture_diagnostic(stderr, diagnostic_nonce)
+                                self.summary["daemonFinishDiagnostic"] = project_daemon_finish(stderr, diagnostic_nonce)
                                 require(b"XTR-RUN-CAPTURE-INCOMPLETE" not in stderr)
             except Exception:
                 traceback.print_exc()

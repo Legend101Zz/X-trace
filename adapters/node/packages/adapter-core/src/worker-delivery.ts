@@ -5,6 +5,7 @@ interface DeliveryHooks {
   /** Takes the oldest already queued message from the same port, without waiting. */
   receivePending?(): InputMessage | undefined;
   finishProgress?(boundary: "received" | "dispatched"): void;
+  activeWork?(type: InputMessage["type"] | "idle"): void;
   staged(): void;
   routeFoldStaged?(events: number): void;
   close(): Promise<void>;
@@ -47,6 +48,7 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
     try {
       while (pending.length > 0) {
         const message = pending.shift()!;
+        hooks.activeWork?.(message.type);
         if (message.type === "close") {
           await assembler.flushHeld();
           await hooks.close();
@@ -83,6 +85,7 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
       stop();
       hooks.fail();
     } finally {
+      hooks.activeWork?.("idle");
       draining = false;
     }
   }

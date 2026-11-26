@@ -5,7 +5,10 @@ import re
 
 from installed_evidence import require
 
-PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V5 "
+PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V6 "
+DAEMON_PREFIX = b"XTR-MEDUSA-DAEMON-FINISH-V1 "
+DAEMON_FIELDS = ("sessions", "decoded", "admitted", "ackReady", "ackQueued", "ackFlushed")
+ACTIVE_WORK = frozenset(("idle", "start", "event", "route", "finish", "close"))
 COUNTERS = frozenset({
     "startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
     "finishPosted", "finishRejected", "eventRejected", "routeRejected",
@@ -31,23 +34,46 @@ def bounded(value, maximum):
     return type(value) is int and 0 <= value <= maximum
 
 
+def read_snapshot(log, nonce, prefix):
+    matches = re.finditer(rb"(?m)^" + re.escape(prefix), log)
+    marker = next(matches, None)
+    if marker is None:
+        return None
+    require(next(matches, None) is None)
+    end = log.find(b"\n", marker.end(), marker.start() + 2049)
+    require(end >= 0)
+    obj = json.loads(log[marker.end():end], object_pairs_hook=unique)
+    require(isinstance(obj, dict))
+    token = obj.get("nonce")
+    require(isinstance(token, str) and re.fullmatch("[a-f0-9]{48}", token))
+    require(hmac.compare_digest(token, nonce))
+    return obj
+
+
+def project_daemon_finish(log, nonce):
+    if nonce is None:
+        return None
+    try:
+        obj = read_snapshot(log, nonce, DAEMON_PREFIX)
+        if obj is None:
+            return {"status": "missing"}
+        require(set(obj) == {*DAEMON_FIELDS, "nonce"})
+        require(all(bounded(obj[key], 4095) for key in DAEMON_FIELDS))
+        require(obj["sessions"] > 0 or obj["decoded"] == 0)
+        require(obj["ackFlushed"] <= obj["ackQueued"] <= obj["ackReady"] <= obj["admitted"] <= obj["decoded"])
+    except (TypeError, ValueError, RecursionError):
+        return {"status": "invalid"}
+    return {"status": "observed", **{key: obj[key] for key in DAEMON_FIELDS}}
+
+
 def project_capture_diagnostic(log, nonce):
     if nonce is None:
         return None
-    matches = re.finditer(rb"(?m)^" + re.escape(PREFIX), log)
-    marker = next(matches, None)
-    if marker is None:
-        return {"status": "missing"}
-    if next(matches, None) is not None:
-        return {"status": "invalid"}
-    end = log.find(b"\n", marker.end(), marker.start() + 2049)
-    if end == -1:
-        return {"status": "invalid"}
     try:
-        obj = json.loads(log[marker.end():end], object_pairs_hook=unique)
-        require(isinstance(obj, dict) and set(obj) == FIELDS)
-        require(isinstance(obj["nonce"], str) and re.fullmatch("[a-f0-9]{48}", obj["nonce"]))
-        require(hmac.compare_digest(obj["nonce"], nonce))
+        obj = read_snapshot(log, nonce, PREFIX)
+        if obj is None:
+            return {"status": "missing"}
+        require(set(obj) == FIELDS)
         require(obj["scope"] in SCOPES and obj["express"] in EXPRESS)
         require(bounded(obj["exitCode"], 255))
         require(all(type(obj[key]) is bool for key in SWITCHES))
@@ -73,8 +99,9 @@ def project_capture_diagnostic(log, nonce):
             require(counts["finishPosted"] >= 4096)
         else:
             require(isinstance(progress, dict) and set(progress) ==
-                    {"received", "dispatched", "submitted", "written", "staged"})
-            require(all(bounded(value, 4095) for value in progress.values()))
+                    {"received", "dispatched", "submitted", "written", "staged", "active"})
+            require(progress["active"] in ACTIVE_WORK)
+            require(all(bounded(value, 4095) for key, value in progress.items() if key != "active"))
             require(obj["finishStaged"] == progress["staged"] <= progress["written"] <= progress["submitted"]
                     <= progress["dispatched"] <= progress["received"] <= counts["finishPosted"])
     except (TypeError, ValueError, RecursionError):

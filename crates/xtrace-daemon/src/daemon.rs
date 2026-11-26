@@ -52,6 +52,9 @@ use crate::secret::SessionSecret;
 use crate::session::{HandshakeInputs, HandshakeRole, Session, SessionError};
 use crate::tls::TlsServerMaterials;
 
+mod finish_census;
+use finish_census::FinishCensus;
+
 /// Length in bytes of the TLS exporter keying material the daemon
 /// requests from rustls after the handshake completes. The value
 /// matches the XTP-Agent transcript proof tag size so the entire
@@ -195,6 +198,13 @@ impl ConnectionCancel {
 /// Frame the writer task serializes onto the wire.
 struct OutboundFrame {
     payload: PayloadOneof,
+    finish_ack: Option<Arc<FinishCensus>>,
+}
+
+impl OutboundFrame {
+    fn new(payload: PayloadOneof) -> Self {
+        Self { payload, finish_ack: None }
+    }
 }
 
 /// Dedicated writer task. The task owns the encoder exclusively and
@@ -243,6 +253,9 @@ async fn run_outbound_writer<W>(
                     let write = shutdown.write_while_running(encoder.write_envelope(&envelope)).await;
                     if !matches!(write, Some(Ok(()))) {
                         break;
+                    }
+                    if let Some(census) = frame.finish_ack {
+                        FinishCensus::count(&census.ack_flushed);
                     }
                 }
                 None => break,
@@ -349,6 +362,8 @@ impl BoundDaemon {
         let expected_repository_fingerprint = self.expected_repository_fingerprint;
         let bootstrap = self.bootstrap;
         let recording_pipeline = self.recording_pipeline;
+        let finish_census =
+            recording_pipeline.as_ref().and_then(|_| FinishCensus::from_env()).map(Arc::new);
 
         let (shutdown_tx, mut shutdown_signal) = shared_shutdown_channel();
         // Keep an extra sender in scope so a listener-level failure
@@ -366,6 +381,7 @@ impl BoundDaemon {
             shutdown: shutdown_signal_inner,
             bootstrap: bootstrap.clone(),
             recording_pipeline,
+            finish_census: finish_census.clone(),
         };
 
         // One daemon-scoped monotonic clock for every timestamp the
@@ -472,6 +488,9 @@ impl BoundDaemon {
         // error — is the one the caller sees.
         if let Some(err) = drain_connections(&mut connections).await {
             return Err(err);
+        }
+        if let Some(census) = finish_census {
+            census.emit();
         }
         Ok(())
     }
@@ -640,6 +659,9 @@ async fn handle_connection(
     // Now split the stream and hand the write half to a dedicated
     // task. The reader keeps the read half and the session state;
     // helper tasks (health, ACK) post frames into the same channel.
+    if let Some(census) = &ctx.finish_census {
+        FinishCensus::count(&census.sessions);
+    }
     let (read_half, write_half) = tokio::io::split(tls_stream);
     let mut decoder = EnvelopeAsyncDecoder::new(read_half, max_envelope_bytes);
     let writer = EnvelopeAsyncEncoder::new(write_half, max_envelope_bytes);
@@ -691,7 +713,7 @@ async fn handle_connection(
                         resident_bytes: 0,
                         status: "ok".to_string(),
                     });
-                    let frame = OutboundFrame { payload };
+                    let frame = OutboundFrame::new(payload);
                     if health_tx.send(frame).await.is_err() {
                         break;
                     }
@@ -718,8 +740,17 @@ async fn handle_connection(
                             ));
                         }
                     };
+                    let finish_census = ctx.finish_census.as_ref().filter(|_| {
+                        matches!(envelope.payload.as_ref(), Some(PayloadOneof::RecordingFinished(_)))
+                    });
+                    if let Some(census) = finish_census {
+                        FinishCensus::count(&census.decoded);
+                    }
                     match post_hello_session.accept_post_hello(&envelope) {
                         Ok(admission) => {
+                            if let Some(census) = finish_census {
+                                FinishCensus::count(&census.admitted);
+                            }
                             for code in &admission.limitations {
                                 warn!(
                                     limitation = *code,
@@ -756,14 +787,12 @@ async fn handle_connection(
                                         return Ok(());
                                     }
                                     log_recording_pipeline_error(&err);
-                                    let frame = OutboundFrame {
-                                        payload: PayloadOneof::ProtocolError(
+                                    let frame = OutboundFrame::new(PayloadOneof::ProtocolError(
                                             crate::runtime::build_protocol_error(
                                                 ProtocolErrorCode::Transport.as_str(),
                                                 "recording capture operation failed",
                                             ),
-                                        ),
-                                    };
+                                        ));
                                     if post_hello_tx.send(frame).await.is_err() {
                                         return Ok(());
                                     }
@@ -782,25 +811,29 @@ async fn handle_connection(
                                         ?err,
                                         "recording capture staged-front release failed",
                                     );
-                                    let frame = OutboundFrame {
-                                        payload: PayloadOneof::ProtocolError(
+                                    let frame = OutboundFrame::new(PayloadOneof::ProtocolError(
                                             crate::runtime::build_protocol_error(
                                                 ProtocolErrorCode::SessionSequence.as_str(),
                                                 "staged capture admission could not be released",
                                             ),
-                                        ),
-                                    };
+                                        ));
                                     if post_hello_tx.send(frame).await.is_err() {
                                         return Ok(());
                                     }
                                     return Ok(());
                                 }
                             }
-                            let frame = OutboundFrame {
-                                payload: admission.command.into_envelope_payload(),
-                            };
+                            let payload = admission.command.into_envelope_payload();
+                            let finish_ack = finish_census.filter(|_| matches!(&payload, PayloadOneof::Ack(_)));
+                            if let Some(census) = finish_ack {
+                                FinishCensus::count(&census.ack_ready);
+                            }
+                            let frame = OutboundFrame { payload, finish_ack: finish_ack.cloned() };
                             if post_hello_tx.send(frame).await.is_err() {
                                 return Ok(());
+                            }
+                            if let Some(census) = finish_ack {
+                                FinishCensus::count(&census.ack_queued);
                             }
                         }
                         Err(err) => {
@@ -830,9 +863,7 @@ async fn handle_connection(
                             let recoverable_ingest = err
                                 .ingest_error()
                                 .is_some_and(|ingest| !ingest.is_session_fatal());
-                            let frame = OutboundFrame {
-                                payload: PayloadOneof::ProtocolError(err.to_protocol_error()),
-                            };
+                            let frame = OutboundFrame::new(PayloadOneof::ProtocolError(err.to_protocol_error()));
                             if post_hello_tx.send(frame).await.is_err() {
                                 return Ok(());
                             }
@@ -1117,6 +1148,7 @@ struct SupervisorContext {
     bootstrap: Option<Arc<BootstrapArtifact>>,
     /// Optional daemon-scoped application recording pipeline.
     recording_pipeline: Option<RecordingPipeline>,
+    finish_census: Option<Arc<FinishCensus>>,
 }
 
 /// Outcome of inspecting a single [`JoinSet`] completion. The
@@ -1436,9 +1468,12 @@ mod tests {
 
         let (shutdown_tx, shutdown) = shared_shutdown_channel();
         let (tx, rx) = mpsc::channel(1);
-        tx.send(OutboundFrame { payload: PayloadOneof::Ack(Default::default()) })
-            .await
-            .expect("queue ACK");
+        let census = Arc::new(FinishCensus::default());
+        let frame = || OutboundFrame {
+            payload: PayloadOneof::Ack(Default::default()),
+            finish_ack: Some(Arc::clone(&census)),
+        };
+        tx.send(frame()).await.expect("queue ACK");
         let flushing = Arc::new(tokio::sync::Notify::new());
         let writer =
             BufferedWriter { hold_flush: Some(Arc::clone(&flushing)), ..Default::default() };
@@ -1458,6 +1493,26 @@ mod tests {
         tokio::time::timeout(StdDuration::from_secs(5), async { tokio::join!(write, stop) })
             .await
             .expect("global shutdown preempts pending flush with the frame channel still open");
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(census.ack_flushed.load(Relaxed), 0);
+
+        let (_shutdown_tx, shutdown) = shared_shutdown_channel();
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(frame()).await.expect("queue finish ACK");
+        drop(tx);
+        let write = run_outbound_writer(
+            EnvelopeAsyncEncoder::new(BufferedWriter::default(), 1024),
+            rx,
+            1,
+            0,
+            [0; 16],
+            MonotonicClock::new(),
+            shutdown,
+        );
+        tokio::time::timeout(StdDuration::from_secs(5), write)
+            .await
+            .expect("successfully flushed ACK is observed before writer returns");
+        assert_eq!(census.ack_flushed.load(Relaxed), 1);
     }
 
     #[tokio::test]

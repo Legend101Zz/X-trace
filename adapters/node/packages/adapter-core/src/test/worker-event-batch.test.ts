@@ -8,7 +8,7 @@ import { AgentEnvelopeSchema, RecordingEventKind, type AgentEnvelope } from "@xt
 import { createCaptureCredits, createHttpCaptureTransport } from "../runtime/transport.cjs";
 import { createRecordingAssembler, HOLD_START_MS, type InputMessage, type SendFn } from "../worker-core.js";
 import { createWorkerDelivery } from "../worker-delivery.js";
-import { noteFinishProgress, readFinishProgress, type FinishBoundary } from "../runtime/finish-progress.cjs";
+import { noteFinishProgress, noteFinishWork, readFinishProgress, type FinishBoundary, type FinishWork } from "../runtime/finish-progress.cjs";
 
 const A = "01900000-0000-7000-8000-000000000001";
 const B = "01900000-0000-7000-8000-000000000002";
@@ -41,6 +41,7 @@ function createHarness(
   fitsEnvelope: NonNullable<Parameters<typeof createRecordingAssembler>[3]>["fitsEnvelope"] = () => true,
   receivePending?: () => InputMessage | undefined,
   finishProgress?: (boundary: "received" | "dispatched") => void,
+  activeWork?: (type: FinishWork) => void,
 ) {
   const assembler = createRecordingAssembler(send, () => 5n, undefined, { maxBatchEvents, fitsEnvelope });
   const done = deferred();
@@ -50,6 +51,7 @@ function createHarness(
   const delivery = createWorkerDelivery(assembler, {
     ...(receivePending ? { receivePending } : {}),
     ...(finishProgress ? { finishProgress } : {}),
+    ...(activeWork ? { activeWork } : {}),
     staged: () => { credits += 1; },
     routeFoldStaged: (events) => { stagedFolds.push(events); },
     close: async () => done.resolve(),
@@ -336,11 +338,12 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
       await firstBatchAck.promise;
     } else if (payload.case === "recordingFinished") {
       assert.deepEqual(readFinishProgress(progress),
-        { received: 1, dispatched: 1, submitted: 0, written: 0, staged: 0 });
+        { received: 1, dispatched: 1, submitted: 0, written: 0, staged: 0, active: "finish" });
       note("submitted");
       note("written");
     }
-  }, 64, undefined, () => receiveMessageOnPort(port1)?.message as InputMessage | undefined, note);
+  }, 64, undefined, () => receiveMessageOnPort(port1)?.message as InputMessage | undefined, note,
+  (type) => noteFinishWork(progress, type));
 
   h.delivery.enqueue(start(A, true));
   h.delivery.enqueue(event(2));
@@ -355,6 +358,7 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
   startAck.resolve();
   await firstBatchSent.promise;
   assert.deepEqual(wireEvents(payloads[1]!), [2n, 3n, 4n]);
+  assert.equal(readFinishProgress(progress)?.active, "route");
   assert.equal(h.credits(), 2, "only the held start and prefix have returned credit");
   assert.deepEqual(h.stagedFolds, []);
   port1.on("message", (message: InputMessage) => h.delivery.enqueue(message));
@@ -365,7 +369,7 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
   assert.equal(h.credits(), 9);
   assert.deepEqual(h.stagedFolds, [2]);
   assert.deepEqual(readFinishProgress(progress),
-    { received: 1, dispatched: 1, submitted: 1, written: 1, staged: 0 });
+    { received: 1, dispatched: 1, submitted: 1, written: 1, staged: 0, active: "idle" });
   note("staged");
   assert.equal(readFinishProgress(progress)?.staged, 1);
   Atomics.store(progress, 0, 4095n);
