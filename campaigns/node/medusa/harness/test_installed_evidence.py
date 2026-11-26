@@ -22,8 +22,12 @@ def event(symbol, event_id, parent=None):
             "eventId": event_id, "parentEventId": parent}
 
 
+def capacity(drops=None, *, at_cap="0"):
+    return {"eventCap": 64, "eventCount": 64, "capacityDroppedEvents": at_cap, "dropsByPriority": drops or {}}
+
+
 def recording(status=200, completion="complete"):
-    return {"completion": completion, "outcome": {"kind": "responded", "httpStatus": status},
+    return {"completion": completion, "outcome": {"kind": "responded", "httpStatus": status}, "terminal": capacity(),
             "events": [event("node:http.Server.request", "root"), event("express.handler:private-marker", "handler", "root")]}
 
 
@@ -110,10 +114,46 @@ finally:
 
     def test_paged_detail_refuses_a_different_terminal_outcome(self):
         rid = "018f0000-0000-7000-8000-000000000001"
-        docs = [{"recordingId": rid, "completion": "complete", "outcome": {"httpStatus": value}, "events": []}
+        docs = [{"recordingId": rid, "completion": "complete", "outcome": {"httpStatus": value}, "events": [],
+                 "capacity": capacity(), "dropCountsByPriority": {}}
                 for value in (200, 400)]
         with self.assertRaises(EvidenceError):
             detail(docs, rid, api=True)
+
+    def test_terminal_capacity_requires_closed_values_and_stable_pages(self):
+        rid = "018f0000-0000-7000-8000-000000000001"
+        common = {"completion": "partial", "outcome": None, "events": []}
+        terminal = capacity({"1": "2"}, at_cap="1")
+        cli = {"recording_id": rid, "capacity": terminal, "drop_counts_by_priority": {"1": "2"}} | common
+        api = {"recordingId": rid, "capacity": terminal, "dropCountsByPriority": {"1": "2"}} | common
+        self.assertEqual(detail([cli], rid, api=False), detail([api], rid, api=True))
+        self.assertIsNone(detail([api | {"capacity": None, "dropCountsByPriority": {}}], rid, api=True)["terminal"])
+        for changed in (api | {"capacity": None},
+                        api | {"capacity": terminal | {"capacityDroppedEvents": "3"}},
+                        api | {"capacity": terminal | {"eventCount": True}},
+                        api | {"capacity": terminal | {"private": "raw"}},
+                        api | {"capacity": terminal | {"dropsByPriority": {"1": "3"}}},
+                        api | {"capacity": terminal | {"dropsByPriority": {"1": "00"}}, "dropCountsByPriority": {"1": "00"}}):
+            with self.subTest(changed=changed), self.assertRaises(EvidenceError):
+                detail([changed], rid, api=True)
+        with self.assertRaises(EvidenceError):
+            detail([api, api | {"capacity": terminal | {"capacityDroppedEvents": "0"}}], rid, api=True)
+
+    def test_terminal_census_distinguishes_absence_and_drops_without_emitting_buckets(self):
+        details = {
+            "ready": recording(), "complete": recording(), "other": recording(completion="partial"),
+            "no-terminal": recording(completion="partial") | {"terminal": None, "outcome": None},
+            "reported": recording(completion="partial") | {"terminal": capacity({"17": "27"})},
+            "store": recording(completion="partial") | {"terminal": capacity({"17": "28"}, at_cap="2")},
+        }
+        result = capture(details, "ready", Counter({200: 5}))
+        self.assertFalse(result["passed"])
+        census = result["terminalEvidence"]
+        self.assertEqual(census, {"absent": 1, "complete": 1, "withReportedDrops": 2,
+                                  "otherIncomplete": 1, "withStoreCapDrops": 1})
+        self.assertTrue(all(type(value) is int for value in census.values()))
+        self.assertNotIn("17", json.dumps(census))
+        self.assertNotIn("27", json.dumps(census))
 
     def test_readiness_never_masks_missing_or_wrong_outcome(self):
         details = {"ready": recording(), "work": recording(401)}

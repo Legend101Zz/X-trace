@@ -54,10 +54,43 @@ def keys(paged, rows_key, key):
     return set(ids)
 
 
+def decimal(value, maximum):
+    require(isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]{0,19}", value) is not None)
+    number = int(value)
+    require(number <= maximum)
+    return number
+
+
+def terminal_capacity(doc, *, api):
+    """Read the finish-backed capacity projection, independently of HTTP outcome."""
+    key = "dropCountsByPriority" if api else "drop_counts_by_priority"
+    require("capacity" in doc and key in doc)
+    terminal = doc["capacity"]
+    drops = doc[key]
+    require(isinstance(drops, dict) and len(drops) <= 256)
+    if terminal is None:
+        require(not drops and doc.get("outcome") is None)
+        return None
+    require(isinstance(terminal, dict) and set(terminal) ==
+            {"eventCap", "eventCount", "capacityDroppedEvents", "dropsByPriority"})
+    require(terminal["dropsByPriority"] == drops)
+    limit, observed = terminal["eventCap"], terminal["eventCount"]
+    require(type(limit) is int and type(observed) is int and 0 <= observed <= limit <= 0xffff_ffff and limit > 0)
+    total = 0
+    for priority, count in drops.items():
+        decimal(priority, 0xffff_ffff)
+        total += decimal(count, 0xffff_ffff_ffff_ffff)
+    store_drops = decimal(terminal["capacityDroppedEvents"], 0xffff_ffff_ffff_ffff)
+    require(store_drops <= total)
+    require(not store_drops or observed == limit)
+    return terminal
+
+
 def detail(paged, rid, *, api):
     id_key = "recordingId" if api else "recording_id"
     completion = None
     outcome = None
+    terminal = None
     events = []
     previous = -1
     for doc in paged:
@@ -65,6 +98,9 @@ def detail(paged, rid, *, api):
         if completion is None:
             completion = doc["completion"]
             outcome = doc.get("outcome")
+            terminal = terminal_capacity(doc, api=api)
+        else:
+            require(terminal_capacity(doc, api=api) == terminal)
         require(doc["completion"] == completion and "outcome" in doc and doc["outcome"] == outcome)
         for raw in doc["events"]:
             sequence = raw.get("sequence")
@@ -83,7 +119,7 @@ def detail(paged, rid, *, api):
                 require(key in raw)
                 event[camel] = raw[key]
             events.append(event)
-    return {"completion": completion, "outcome": outcome, "events": events}
+    return {"completion": completion, "outcome": outcome, "events": events, "terminal": terminal}
 
 
 def workload(baseline, installed, expected):
@@ -124,12 +160,25 @@ def capture(details, readiness_id, http):
     statuses = Counter()
     counts = dict(recordings=0, complete=0, requestRoots=0, expressHandlers=0, responded=0,
                   absentOutcome=0, orphanParents=0)
+    terminal_evidence = dict(absent=0, complete=0, withReportedDrops=0, otherIncomplete=0, withStoreCapDrops=0)
     for rid, row in details.items():
         if rid == readiness_id:
             continue
         counts["recordings"] += 1
-        if row["completion"] == "complete":
-            counts["complete"] += 1
+        complete = row["completion"] == "complete"
+        counts["complete"] += int(complete)
+        terminal = row["terminal"]
+        has_drops = terminal is not None and any(int(value) for value in terminal["dropsByPriority"].values())
+        require(not complete or terminal is not None and not has_drops)
+        if terminal is None:
+            terminal_evidence["absent"] += 1
+        elif complete:
+            terminal_evidence["complete"] += 1
+        elif has_drops:
+            terminal_evidence["withReportedDrops"] += 1
+            terminal_evidence["withStoreCapDrops"] += int(int(terminal["capacityDroppedEvents"]) > 0)
+        else:
+            terminal_evidence["otherIncomplete"] += 1
         entries = [event for event in row["events"] if event["kind"] == "recording_event_kind:frame_enter"]
         roots = [event for event in entries if event["symbol"] == "node:http.Server.request"]
         ids = {event["eventId"] for event in row["events"] if event["eventId"] is not None}
@@ -150,4 +199,5 @@ def capture(details, readiness_id, http):
                         and counts["requestRoots"] == counts["recordings"] and counts["expressHandlers"] > 0
                         and counts["absentOutcome"] == 0 and counts["orphanParents"] == 0
                         and counts["responseStatusMultisetMatches"])
+    counts["terminalEvidence"] = terminal_evidence
     return counts
