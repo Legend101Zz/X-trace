@@ -1,0 +1,137 @@
+name: Private exercise lifecycle fixture proof
+on:
+  push:
+    branches: [codex/proof-exercise-plan-121]
+permissions:
+  contents: read
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PRODUCT: 7d1bdf4b1fa114a6381cc9cf4cef973b8a51c2c3
+      PRODUCT_TREE: 21368fbef18f62f93977f9f5bbd792ffab1fedb3
+      BASE: 4c3002a5200448bdc4ab64038e726aa1dec5beae
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Admit exact source and private test directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$PRODUCT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$PRODUCT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test "$(git rev-parse 'HEAD^')" = "$BASE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          root="${RUNNER_TEMP:?}/xp121"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/priv" "$root/logs" "$root/safe"
+          printf '%s\n' "PROOF=$root" "TMPDIR=$root/tmp" "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.97.1
+      - name: Check 20 named application store CLI and fallback cases
+        id: fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path(os.environ['PROOF'])
+          cases = (
+              ('application', ['-p', 'xtrace-application', '--test', 'exercise_plan'], [],
+               ('actual_synthesis_review_and_explicit_per_item_consent_for_every_effect',
+                'body_and_inputs_stay_explicitly_unresolved_and_block_consent',
+                'edits_new_instances_and_tampering_never_inherit_approval',
+                'exclusive_expiry_and_clock_rollback_fail_closed_without_renewal',
+                'private_values_are_not_debug_logged_and_credentials_are_only_handles',
+                'invalid_targets_bounds_and_unobserved_bindings_fail_without_storage',
+                'concurrent_reservation_has_one_winner_and_never_rearms_unknown_delivery',
+                'bounded_bodies_and_transport_control_cannot_enter_a_plan',
+                'corrupted_phase_evidence_never_authorizes_a_reservation',
+                'admitted_drafts_have_space_for_exact_approval_at_the_document_limit')),
+              ('private_store', ['-p', 'xtrace-cli', '--bin', 'xtrace'], ['exercise_store::tests::'],
+               ('exercise_store::tests::expiry_during_staging_cleans_only_owned_staging_and_never_rolls_back_published_state',
+                'exercise_store::tests::actual_private_port_refuses_contending_and_stale_revision_writers',
+                'exercise_store::tests::occupied_staging_blocks_writes_until_owner_preserves_it')),
+              ('real_cli_seeded_recording', ['-p', 'xtrace-cli', '--test', 'export_journey'], ['exercise_'],
+               ('exercise_real_cli_plan_review_and_item_approval_send_zero_requests',
+                'exercise_private_input_binding_and_unrecorded_body_fail_closed',
+                'exercise_one_observed_operation_and_two_distinct_catalog_versions',
+                'exercise_no_payload_sources_refuse_extra_fields_before_publication',
+                'exercise_rejects_duplicate_body_keys_and_preserves_unique_body_text',
+                'exercise_rejects_surplus_draft_phase_fields_without_replacing_private_bytes')),
+              ('legacy_fallback', ['-p', 'xtrace-cli', '--test', 'stub_commands'],
+               ['--exact', 'unimplemented_command_exits_nine_with_stable_message_for_each'],
+               ('unimplemented_command_exits_nine_with_stable_message_for_each',)),
+          )
+          def need(value):
+              if not value:
+                  raise ValueError('fixture count mismatch')
+          rows = {label: dict(expected=len(names), passed=0, status='unreached')
+                  for label, _, _, names in cases}
+          receipt = dict(schemaVersion=1, kind='exercise_plan_lifecycle_fixture',
+                         sourceSha=os.environ['PRODUCT'], sourceTree=os.environ['PRODUCT_TREE'],
+                         wrapperSha=os.environ['GITHUB_SHA'], runId=int(os.environ['GITHUB_RUN_ID']),
+                         releaseAcceptance=False, packaged=False, genuineApplicationCapture=False,
+                         status='failed', stages=rows)
+          def save():
+              tmp = root/'safe'/'receipt.tmp'
+              tmp.write_text(json.dumps(receipt, sort_keys=True)+'\n')
+              tmp.replace(root/'safe'/'counts.json')
+          try:
+              need(re.fullmatch('[0-9a-f]{40}', receipt['wrapperSha']))
+              save()
+              for label, target, selected, names in cases:
+                  row = rows[label]
+                  row['status'] = 'failed'
+                  save()
+                  out = root/'logs'/(label+'.stdout')
+                  err = root/'logs'/(label+'.stderr')
+                  with out.open('xb') as stdout, err.open('xb') as stderr:
+                      rc = subprocess.run(['cargo', '+1.97.1', 'test', '--locked', *target,
+                                           '--', *selected, '--test-threads=1', '--format', 'pretty',
+                                           '--color', 'never'], stdin=subprocess.DEVNULL,
+                                          stdout=stdout, stderr=stderr, check=False).returncode
+                  need(0 <= out.stat().st_size <= 8*1024*1024)
+                  body = out.read_bytes()
+                  passed = re.findall(rb'^test ([A-Za-z_0-9:]+) \.\.\. ok$', body, re.M)
+                  expected = [name.encode('ascii') for name in names]
+                  row['passed'] = len(set(passed).intersection(expected))
+                  save()
+                  need(rc == 0 and sorted(passed) == sorted(expected))
+                  need(re.findall(rb'^running ([0-9]+) tests?$', body, re.M) == [str(len(names)).encode()])
+                  summary = re.findall(rb'^test result: ok\. ([0-9]+) passed; 0 failed; 0 ignored; 0 measured; ([0-9]+) filtered out;', body, re.M)
+                  need(len(summary) == 1 and int(summary[0][0]) == len(names))
+                  if label == 'application':
+                      need(int(summary[0][1]) == 0)
+                  row['status'] = 'passed'
+                  save()
+              receipt['status'] = 'passed'
+              save()
+          except Exception:
+              print('Private exercise fixture proof failed. Inspect the fixed stage counts.')
+              sys.exit(1)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && (steps.fixtures.outcome == 'failure' || steps.fixtures.outcome == 'success') }}
+        with:
+          name: exercise-plan-fixture-counts
+          path: ${{ env.PROOF }}/safe/counts.json
+          if-no-files-found: error
+          retention-days: 7
