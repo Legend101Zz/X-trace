@@ -329,7 +329,7 @@ class Proof:
             "medusaReadinessLogStream": {"baseline": None, "installed": None},
             "reapedAdoptedGroupExits": {"baseline": None, "installed": None},
             "stopRecoveryReasons": {"baseline": None, "installed": None},
-            "nodeCaptureDiagnostic": None,
+            "nodeCaptureDiagnostic": None, "nodeDescendantShutdown": None,
             "perRequestAttribution": "unverified", "concurrentRecordingAttribution": "unverified",
         }
 
@@ -646,6 +646,11 @@ class Proof:
                                 log = process.stderr
                                 require(log.stat().st_size <= 16 * 1024 * 1024)
                                 stderr = log.read_bytes()
+                                notice = (b'{"kind":"descendant_shutdown_unverified",'
+                                          b'"code":"XTR-NODE-DESCENDANTS-UNVERIFIED",'
+                                          b'"message":"Node descendant shutdown is unverified"}')
+                                require(stderr.splitlines().count(notice) == 1)
+                                self.summary["nodeDescendantShutdown"] = "unverified"
                                 self.summary["nodeCaptureDiagnostic"] = project_capture_diagnostic(stderr, diagnostic_nonce)
                                 require(b"XTR-RUN-CAPTURE-INCOMPLETE" not in stderr)
             except Exception:

@@ -1,4 +1,4 @@
-//! Validated direct-Node launch and Unix process-group supervision.
+//! Validated direct-Node launch and Unix child supervision.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -238,138 +238,76 @@ impl NodeLaunch {
         command.as_std_mut().process_group(0);
         command.kill_on_drop(true);
         let child = command.spawn().map_err(|_| LaunchError::Process)?;
-        let Some(pid) = child.id() else {
-            let mut child = child;
-            if child.start_kill().is_err() {
-                // Tokio's kill_on_drop guard remains enabled for the direct child.
-            }
-            return Err(LaunchError::Process);
-        };
-        Ok(NodeChild { child, process_group: pid as i32, reaped: false })
+        Ok(NodeChild { child })
     }
 }
 
-/// A spawned Node process protected by its Unix process-group guard.
+/// A direct Node child. Its exit does not establish descendant shutdown.
 pub struct NodeChild {
     child: tokio::process::Child,
-    process_group: i32,
-    reaped: bool,
-}
-/// Whether a failed process-group signal means the group has nothing left to signal.
-///
-/// `ESRCH` always means the group is gone. On macOS, `killpg` on a group whose only remaining
-/// members are zombies (exited but not yet reaped by their parent, or by launchd once the parent
-/// died) fails with `EPERM` instead; the supervised processes share our UID, so there `EPERM` is
-/// the same "nothing alive to signal" outcome. Any other error, and `EPERM` elsewhere, is real.
-fn group_already_gone(error: rustix::io::Errno) -> bool {
-    error == rustix::io::Errno::SRCH
-        || (cfg!(target_os = "macos") && error == rustix::io::Errno::PERM)
-}
-
-/// Signals a process group, treating an already-gone group as success.
-fn signal_group(
-    group: rustix::process::Pid,
-    signal: rustix::process::Signal,
-) -> Result<(), rustix::io::Errno> {
-    match rustix::process::kill_process_group(group, signal) {
-        Err(error) if !group_already_gone(error) => Err(error),
-        _ => Ok(()),
-    }
 }
 
 impl NodeChild {
-    /// Waits for normal exit or forwards SIGINT/SIGTERM with bounded escalation.
+    /// Waits for the direct child or forwards SIGINT/SIGTERM with bounded escalation.
     pub async fn wait(
         &mut self,
         signals: &mut NodeSignals,
     ) -> Result<std::process::ExitStatus, LaunchError> {
-        use rustix::process::{Pid, Signal};
-        use tokio::time::{Duration, timeout};
-        let result = tokio::select! { result = self.child.wait() => result.map_err(|_| LaunchError::Process), _ = signals.interrupt.recv() => self.forward_and_reap(Signal::INT).await, _ = signals.terminate.recv() => self.forward_and_reap(Signal::TERM).await };
+        use rustix::process::Signal;
+
+        let result = tokio::select! {
+            result = self.child.wait() => result,
+            _ = signals.interrupt.recv() => return self.forward_and_reap(Signal::INT).await,
+            _ = signals.terminate.recv() => return self.forward_and_reap(Signal::TERM).await,
+        };
         match result {
-            Ok(status) => {
-                self.reaped = true;
-                if let Some(group) = Pid::from_raw(self.process_group) {
-                    if signal_group(group, Signal::KILL).is_err() {
-                        return Err(LaunchError::Process);
-                    }
-                }
-                Ok(status)
-            }
+            Ok(status) => Ok(status),
             Err(_) => {
-                if let Some(group) = Pid::from_raw(self.process_group) {
-                    if signal_group(group, Signal::KILL).is_err() {
-                        // Direct-child kill below is the fallback when group signalling fails.
-                    }
-                }
-                if self.child.start_kill().is_err() {
-                    // The bounded wait below still reaps an already-exited child.
-                }
-                match timeout(Duration::from_secs(10), self.child.wait()).await {
-                    Ok(Ok(_)) => {
-                        self.reaped = true;
-                        Err(LaunchError::Process)
-                    }
-                    _ => Err(LaunchError::Process),
-                }
+                let _kill_result = self.kill_and_reap().await;
+                Err(LaunchError::Process)
             }
         }
     }
+
     async fn forward_and_reap(
         &mut self,
         signal: rustix::process::Signal,
     ) -> Result<std::process::ExitStatus, LaunchError> {
-        use rustix::process::{Pid, Signal};
+        use rustix::process::{Pid, kill_process};
         use tokio::time::{Duration, timeout};
-        let mut forwarding_failed = false;
-        if let Some(group) = Pid::from_raw(self.process_group) {
-            if signal_group(group, signal).is_err() {
-                forwarding_failed = self.child.start_kill().is_err();
-            }
+
+        if let Some(status) = self.child.try_wait().map_err(|_| LaunchError::Process)? {
+            return Ok(status);
+        }
+        // While this Child is unreaped, its PID cannot be recycled. The
+        // launcher never sends positive signals to the process group.
+        let pid = self
+            .child
+            .id()
+            .and_then(|pid| Pid::from_raw(pid as i32))
+            .ok_or(LaunchError::Process)?;
+        let forwarding_failed =
+            matches!(kill_process(pid, signal), Err(error) if error != rustix::io::Errno::SRCH);
+        if forwarding_failed {
+            let _kill_result = self.kill_and_reap().await;
+            return Err(LaunchError::Process);
         }
         match timeout(Duration::from_secs(10), self.child.wait()).await {
-            Ok(Ok(status)) => {
-                self.reaped = true;
-                let cleanup_failed = Pid::from_raw(self.process_group)
-                    .is_some_and(|group| signal_group(group, Signal::KILL).is_err());
-                if forwarding_failed || cleanup_failed {
-                    Err(LaunchError::Process)
-                } else {
-                    Ok(status)
-                }
-            }
-            _ => {
-                let cleanup_failed = Pid::from_raw(self.process_group)
-                    .is_some_and(|group| signal_group(group, Signal::KILL).is_err());
-                let child_kill_failed = self.child.start_kill().is_err();
-                let result = timeout(Duration::from_secs(10), self.child.wait())
-                    .await
-                    .map_err(|_| LaunchError::Process)?
-                    .map_err(|_| LaunchError::Process)?;
-                self.reaped = true;
-                if cleanup_failed || child_kill_failed {
-                    Err(LaunchError::Process)
-                } else {
-                    Ok(result)
-                }
-            }
+            Ok(Ok(status)) => Ok(status),
+            _ => self.kill_and_reap().await,
         }
     }
-}
-impl Drop for NodeChild {
-    fn drop(&mut self) {
-        use rustix::process::{Pid, Signal, kill_process_group};
-        if !self.reaped {
-            if let Some(group) = Pid::from_raw(self.process_group) {
-                match kill_process_group(group, Signal::KILL) {
-                    Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-                    Err(_) => { /* Child::kill_on_drop remains the direct-child fallback. */ }
-                }
-            }
-            if self.child.start_kill().is_err() {
-                // Tokio's kill_on_drop guard remains enabled for the direct child.
-            }
-        }
+
+    async fn kill_and_reap(&mut self) -> Result<std::process::ExitStatus, LaunchError> {
+        use tokio::time::{Duration, timeout};
+
+        // A successful wait also covers the race where the child already
+        // exited before start_kill. kill_on_drop guards this same child.
+        let _kill_result = self.child.start_kill();
+        timeout(Duration::from_secs(10), self.child.wait())
+            .await
+            .map_err(|_| LaunchError::Process)?
+            .map_err(|_| LaunchError::Process)
     }
 }
 
@@ -657,13 +595,12 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
     let mut child = probe
         .spawn()
         .map_err(|_| LaunchError::Validation("the selected executable is not Node.js"))?;
-    let pid = child.id();
     let Some(stdout) = child.stdout.take() else {
-        terminate_probe(&mut child, pid)?;
+        terminate_probe(&mut child)?;
         return Err(LaunchError::Process);
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_probe(&mut child, pid)?;
+        terminate_probe(&mut child)?;
         return Err(LaunchError::Process);
     };
     let stdout_flags = fcntl_getfl(&stdout).map_err(|_| LaunchError::Process);
@@ -672,11 +609,11 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
         let nonblocking = fcntl_setfl(&stdout, stdout_flags | OFlags::NONBLOCK)
             .and_then(|()| fcntl_setfl(&stderr, stderr_flags | OFlags::NONBLOCK));
         if nonblocking.is_err() {
-            terminate_probe(&mut child, pid)?;
+            terminate_probe(&mut child)?;
             return Err(LaunchError::Process);
         }
     } else {
-        terminate_probe(&mut child, pid)?;
+        terminate_probe(&mut child)?;
         return Err(LaunchError::Process);
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -690,43 +627,38 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
             &mut stderr_output,
             Duration::from_millis(10),
         ) {
-            terminate_probe(&mut child, pid)?;
+            terminate_probe(&mut child)?;
             return Err(error);
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {}
             Ok(None) | Err(_) => {
-                terminate_probe(&mut child, pid)?;
+                terminate_probe(&mut child)?;
                 return Err(LaunchError::Validation(
                     "the Node version probe exceeded its time limit",
                 ));
             }
         }
     };
+    // The direct child has been reaped. A remaining writer is outside
+    // our ownership, even if it inherited the child's pipe.
     let drain_deadline = Instant::now() + Duration::from_secs(1);
     while !stdout_output.closed || !stderr_output.closed {
         if Instant::now() >= drain_deadline {
-            terminate_probe(&mut child, pid)?;
             return Err(LaunchError::Validation(
                 "the Node version probe output did not close within its time limit",
             ));
         }
-        if drain_probe_pipes(
+        drain_probe_pipes(
             &stdout,
             &stderr,
             &mut stdout_output,
             &mut stderr_output,
             Duration::from_millis(10),
-        )
-        .is_err()
-        {
-            terminate_probe(&mut child, pid)?;
-            return Err(LaunchError::Process);
-        }
+        )?;
     }
     if stdout_output.exceeded || stderr_output.exceeded {
-        terminate_probe(&mut child, pid)?;
         return Err(LaunchError::Validation(
             "the Node version probe output exceeded its size limit",
         ));
@@ -819,29 +751,22 @@ fn drain_probe_pipes(
     Ok(())
 }
 
-fn terminate_probe(child: &mut std::process::Child, pid: u32) -> Result<(), LaunchError> {
-    use rustix::process::{Pid, Signal};
+fn terminate_probe(child: &mut std::process::Child) -> Result<(), LaunchError> {
     use std::thread;
     use std::time::{Duration, Instant};
-    let group_cleanup_failed =
-        Pid::from_raw(pid as i32).is_some_and(|group| signal_group(group, Signal::KILL).is_err());
-    match child.kill() {
-        Ok(()) => {}
-        Err(_) => { /* The bounded wait below distinguishes an exit race from a surviving child. */
+
+    if child.try_wait().map_err(|_| LaunchError::Process)?.is_some() {
+        return Ok(());
+    }
+    let _kill_result = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => return Err(LaunchError::Process),
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let reaped = loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break true,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) | Err(_) => break false,
-        }
-    };
-    // An already-exited child can make `kill` report an error; that is safe
-    // only when the bounded reap confirms its exit. Group cleanup failures
-    // and an unreaped child become sanitized process failures.
-    if group_cleanup_failed || !reaped { Err(LaunchError::Process) } else { Ok(()) }
 }
 
 /// Files every launchable adapter dist must carry and hash: both preloads, the generated
@@ -1275,68 +1200,59 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let directory = tempfile::tempdir().expect("fixture directory");
-        let pid_file = directory.path().join("detached-descendant.pid");
-        let helper = compile_native_probe(directory.path(), Some(&pid_file));
+        let release = directory.path().join("release");
+        let done = directory.path().join("done");
+        let helper = compile_native_probe(directory.path(), Some((&release, &done)));
         let started = Instant::now();
         let result = verify_node_version(&helper);
-        let exceeded_time_limit = matches!(
-            result,
-            Err(LaunchError::Validation(
-                "the Node version probe output did not close within its time limit"
-            ))
-        );
-        let descendant = std::fs::read_to_string(pid_file)
-            .expect("helper recorded detached descendant")
-            .trim()
-            .parse::<i32>()
-            .expect("detached descendant PID");
-        let cleanup = ProbeFixtureCleanup(descendant);
-        let cleanup_result = cleanup.terminate();
+        let elapsed = started.elapsed();
+        std::fs::write(release, b"").expect("release fixture");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done.exists() {
+            assert!(Instant::now() < deadline, "pipe fixture did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
-            exceeded_time_limit,
+            matches!(
+                result,
+                Err(LaunchError::Validation(
+                    "the Node version probe output did not close within its time limit"
+                ))
+            ),
             "a detached inherited pipe must fail with a fixed bounded diagnostic"
         );
-        assert!(cleanup_result, "could not clean detached probe fixture");
-        assert!(started.elapsed() < Duration::from_secs(3), "version probe exceeded its bound");
-    }
-
-    struct ProbeFixtureCleanup(i32);
-
-    impl ProbeFixtureCleanup {
-        fn terminate(&self) -> bool {
-            use rustix::process::{Pid, Signal};
-            Pid::from_raw(self.0)
-                .is_none_or(|group| super::signal_group(group, Signal::KILL).is_ok())
-        }
-    }
-
-    impl Drop for ProbeFixtureCleanup {
-        fn drop(&mut self) {
-            let _cleanup_succeeded = self.terminate();
-        }
+        assert!(elapsed < Duration::from_secs(3), "version probe exceeded its bound");
     }
 
     fn compile_native_probe(
         directory: &std::path::Path,
-        descendant_pid_file: Option<&std::path::Path>,
+        pipe_fixture: Option<(&std::path::Path, &std::path::Path)>,
     ) -> std::path::PathBuf {
         use std::process::Command;
 
-        let source = match descendant_pid_file {
-            Some(pid_file) => format!(
+        let source = match pipe_fixture {
+            Some((release, done)) => format!(
                 r#"use std::os::unix::process::CommandExt as _;
+use std::time::{{Duration, Instant}};
 fn main() {{
-    let mut descendant = std::process::Command::new("/bin/sleep")
-        .arg("30")
+    if std::env::args().nth(1).as_deref() == Some("hold-pipe") {{
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !std::path::Path::new({release:?}).exists() && Instant::now() < deadline {{
+            std::thread::sleep(Duration::from_millis(10));
+        }}
+        std::fs::write({done:?}, b"").expect("finish fixture");
+        return;
+    }}
+    std::process::Command::new(std::env::current_exe().expect("fixture executable"))
+        .arg("hold-pipe")
         .process_group(0)
         .spawn()
         .expect("spawn detached pipe holder");
-    std::fs::write({:?}, descendant.id().to_string()).expect("write fixture PID");
-    drop(descendant);
     println!("v24.21.0");
 }}
 "#,
-                pid_file.to_string_lossy()
+                release = release.to_string_lossy(),
+                done = done.to_string_lossy(),
             ),
             None => "fn main() { println!(\"v24.21.0\"); }\n".to_owned(),
         };
@@ -1395,110 +1311,95 @@ fn main() {{
     }
 
     #[tokio::test]
-    async fn termination_reaps_the_direct_process_and_its_group() {
-        use std::os::unix::process::CommandExt as _;
-        use std::os::unix::process::ExitStatusExt as _;
+    async fn termination_reaps_direct_child_and_leaves_same_group_descendant_unsignaled() {
+        use std::io::Write as _;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
         use tokio::process::Command;
 
         let directory = tempfile::tempdir().expect("temporary process directory");
-        let pid_path = directory.path().join("helper.pid");
+        let (reader, mut release) = UnixStream::pair().expect("owned fixture socket pair");
+        let input = OwnedFd::from(reader);
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
-            .args(["--exact", "node::tests::group_leader_fixture", "--nocapture"])
-            .env("XTRACE_NODE_TEST_GROUP_FIXTURE", "1")
-            .env("XTRACE_NODE_TEST_GROUP_PIDFILE", &pid_path);
+            .args(["--exact", "node::tests::owned_leader_fixture"])
+            .env("XTRACE_NODE_TEST_CHILD_DIR", directory.path())
+            .stdin(Stdio::from(input));
         command.as_std_mut().process_group(0);
         command.kill_on_drop(true);
-        let child = command.spawn().expect("spawn process-group fixture");
-        let leader = child.id().expect("fixture leader PID");
+        let mut supervised = NodeChild { child: command.spawn().expect("spawn direct fixture") };
         let deadline = Instant::now() + Duration::from_secs(2);
-        let helper = loop {
-            if let Ok(value) = std::fs::read_to_string(&pid_path) {
-                if let Ok(pid) = value.trim().parse::<i32>() {
-                    break pid;
-                }
-            }
-            assert!(Instant::now() < deadline, "helper PID was not written");
+        while !directory.path().join("ready").exists() {
+            assert!(Instant::now() < deadline, "descendant did not become ready");
             tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        let mut supervised = NodeChild { child, process_group: leader as i32, reaped: false };
+        }
         let status = supervised
             .forward_and_reap(rustix::process::Signal::TERM)
             .await
-            .expect("forward and reap");
-        assert_eq!(
-            status.signal(),
-            Some(rustix::process::Signal::TERM.as_raw()),
-            "termination preserved signal exit status"
-        );
-        let helper_pid = rustix::process::Pid::from_raw(helper).expect("helper PID");
-        let gone_by = Instant::now() + Duration::from_secs(2);
-        loop {
-            let exists = !matches!(
-                rustix::process::kill_process(helper_pid, rustix::process::Signal::CONT),
-                Err(rustix::io::Errno::SRCH)
-            ) && !is_zombie(helper);
-            assert!(
-                !exists || Instant::now() < gone_by,
-                "process-group helper survived supervised termination"
-            );
-            if !exists {
-                break;
-            }
+            .expect("forward and reap direct child");
+        assert_eq!(status.signal(), Some(rustix::process::Signal::TERM.as_raw()));
+        assert!(supervised.child.id().is_none(), "runtime still has an unreaped direct child");
+        drop(supervised);
+        release.write_all(b"x").expect("release surviving descendant");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !directory.path().join("done").exists() {
+            assert!(Instant::now() < deadline, "descendant did not report cooperative exit");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
-    #[test]
-    fn group_already_gone_classifies_errors() {
-        use rustix::io::Errno;
-        assert!(super::group_already_gone(Errno::SRCH));
-        // A group of unreaped zombies reports EPERM on macOS only; elsewhere EPERM is real.
-        assert_eq!(super::group_already_gone(Errno::PERM), cfg!(target_os = "macos"));
-        assert!(!super::group_already_gone(Errno::INVAL));
-    }
-
-    /// The flake path: a group whose only member is an exited-but-unreaped leader (a zombie).
-    /// Darwin `killpg` reports `EPERM` for it; the reap paths must still succeed and reap.
     #[tokio::test]
-    async fn termination_of_a_zombie_only_group_still_reaps() {
-        use std::os::unix::process::CommandExt as _;
+    async fn termination_of_an_exited_direct_child_still_reaps() {
         use std::time::{Duration, Instant};
         use tokio::process::Command;
 
         let mut command = Command::new("true");
-        command.as_std_mut().process_group(0);
         command.kill_on_drop(true);
         let child = command.spawn().expect("spawn short-lived leader");
         let leader = child.id().expect("leader PID") as i32;
-        // Deliberately do not wait on the child: poll until it is an unreaped zombie.
         let deadline = Instant::now() + Duration::from_secs(5);
         while !is_zombie(leader) {
             assert!(Instant::now() < deadline, "leader never became a zombie");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let group = rustix::process::Pid::from_raw(leader).expect("leader PID");
-        super::signal_group(group, rustix::process::Signal::KILL)
-            .expect("signalling a zombie-only group is not a failure");
-        let mut supervised = NodeChild { child, process_group: leader, reaped: false };
+        let mut supervised = NodeChild { child };
         let status = supervised
             .forward_and_reap(rustix::process::Signal::TERM)
             .await
-            .expect("a zombie-only group is not a termination failure");
+            .expect("already-exited child still reaps");
         assert!(status.success());
-        assert!(supervised.reaped);
+        assert!(supervised.child.id().is_none());
     }
 
     #[test]
-    fn group_leader_fixture() {
-        if std::env::var_os("XTRACE_NODE_TEST_GROUP_FIXTURE").is_none() {
+    fn owned_leader_fixture() {
+        if std::env::var_os("XTRACE_NODE_TEST_CHILD_DIR").is_none() {
             return;
         }
-        let pid_path = std::env::var_os("XTRACE_NODE_TEST_GROUP_PIDFILE").expect("test PID path");
         let mut helper =
-            std::process::Command::new("sleep").arg("30").spawn().expect("spawn helper child");
-        std::fs::write(pid_path, helper.id().to_string()).expect("write helper PID");
-        let _status = helper.wait().expect("wait helper child");
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", "node::tests::owned_descendant_fixture"])
+                .spawn()
+                .expect("spawn same-group child");
+        helper.wait().expect("wait same-group child");
+    }
+
+    #[test]
+    fn owned_descendant_fixture() {
+        use std::io::Read as _;
+
+        let Some(dir) = std::env::var_os("XTRACE_NODE_TEST_CHILD_DIR") else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        std::fs::write(dir.join("ready"), b"").expect("announce readiness");
+        let mut byte = [0];
+        if std::io::stdin().read(&mut byte).expect("read fixture release") == 1 {
+            assert_eq!(byte, [b'x']);
+            std::fs::write(dir.join("done"), b"").expect("report cooperative exit");
+        }
     }
 }

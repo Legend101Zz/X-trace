@@ -147,6 +147,13 @@ async fn run_node_unix(
         }
     }
     drop(child);
+    if child_started {
+        write_run_notice(
+            "descendant_shutdown_unverified",
+            "XTR-NODE-DESCENDANTS-UNVERIFIED",
+            "Node descendant shutdown is unverified",
+        );
+    }
     if capture_incomplete && child_started && !capture_notice_written {
         write_capture_incomplete();
     }
@@ -370,22 +377,24 @@ fn child_exit_code(status: std::process::ExitStatus) -> i32 {
 
 #[cfg(unix)]
 fn write_capture_incomplete() {
-    use serde::Serialize;
+    write_run_notice(
+        "capture_incomplete",
+        "XTR-RUN-CAPTURE-INCOMPLETE",
+        "the application ran, but X-trace could not confirm complete capture",
+    );
+}
 
-    #[derive(Serialize)]
-    struct Incomplete {
+#[cfg(unix)]
+fn write_run_notice(kind: &'static str, code: &'static str, message: &'static str) {
+    #[derive(serde::Serialize)]
+    struct Notice {
         kind: &'static str,
         code: &'static str,
         message: &'static str,
     }
     let stderr = std::io::stderr();
     let mut handle = stderr.lock();
-    let document = Incomplete {
-        kind: "capture_incomplete",
-        code: "XTR-RUN-CAPTURE-INCOMPLETE",
-        message: "the application ran, but X-trace could not confirm complete capture",
-    };
-    let _ = crate::output::write_success_line(&mut handle, &document);
+    let _ = crate::output::write_success_line(&mut handle, &Notice { kind, code, message });
 }
 
 #[cfg(test)]
