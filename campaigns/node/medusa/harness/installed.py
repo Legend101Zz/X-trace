@@ -19,7 +19,7 @@ import traceback
 from urllib.parse import urlencode
 
 from installed_evidence import EvidenceError, capture, detail, keys, pages, require, workload
-from installed_process import contain_children, verify_children_gone
+from installed_process import contain_children, reap_exited_group_children, verify_children_gone
 
 
 HERE = Path(__file__).resolve().parent
@@ -114,6 +114,14 @@ class LifecycleProcessExit(RuntimeError):
         self.returncode = returncode
 
 
+class ProcessStopFailure(EvidenceError):
+    REASONS = frozenset({"descendant-exit-unverified", "process-group-present", "forced-cleanup"})
+
+    def __init__(self, reason):
+        super().__init__("Medusa process stop incomplete")
+        self.reason = reason
+
+
 HEALTH_FAILURES = {
     71: "listener-not-verified",
     72: "connection-not-verified",
@@ -137,6 +145,8 @@ def lifecycle_failure(phase, exc):
         return {"reason": "process-exited"}
     if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
         return {"reason": "deadline"}
+    if phase == "stop-process" and isinstance(exc, ProcessStopFailure) and exc.reason in ProcessStopFailure.REASONS:
+        return {"reason": exc.reason}
     if isinstance(exc, EvidenceError):
         return {"reason": "condition-failed"}
     if isinstance(exc, OSError):
@@ -159,6 +169,7 @@ class Process:
         self.owned_children = {}
         self.stopped = False
         self.cleaned = False
+        self.reaped_group_exits = None
 
     def observe_children(self):
         if not self.descendants or self.child.poll() is not None:
@@ -252,15 +263,20 @@ class Process:
                         signal.pidfd_send_signal(handle, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    require(bool(select.select([handle], [], [], 5)[0]))
+                    if not select.select([handle], [], [], 5)[0]:
+                        raise ProcessStopFailure("descendant-exit-unverified")
+            # After the leader exits, its dead children can still occupy the
+            # group until this subreaper consumes their wait status.
+            self.reaped_group_exits = reap_exited_group_children(self.child.pid)
             try:
                 os.killpg(self.child.pid, 0)
             except ProcessLookupError:
                 pass
             else:
-                require(False)
+                raise ProcessStopFailure("process-group-present")
             self.cleaned = True
-            require(not forced)
+            if forced:
+                raise ProcessStopFailure("forced-cleanup")
             return code
         finally:
             for handle in self.owned_children.values():
@@ -296,6 +312,7 @@ class Proof:
             "localTransport": {"baseline": None, "installed": None},
             "lifecycle": {"baseline": {}, "installed": {}},
             "medusaReadinessLogStream": {"baseline": None, "installed": None},
+            "reapedAdoptedGroupExits": {"baseline": None, "installed": None},
             "perRequestAttribution": "unverified", "concurrentRecordingAttribution": "unverified",
         }
 
@@ -593,7 +610,10 @@ class Proof:
                     with self.stage(f"{name}:shutdown"):
                         live = process.child.poll() is None
                         with self.phase(name, "stop-process"):
-                            require_code = process.stop()
+                            try:
+                                require_code = process.stop()
+                            finally:
+                                self.summary["reapedAdoptedGroupExits"][name] = process.reaped_group_exits
                         with self.phase(name, "check-graceful-exit"):
                             require(live)
                             if require_code != 0:

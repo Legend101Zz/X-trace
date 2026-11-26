@@ -16,6 +16,25 @@ def contain_children():
         raise OSError(ctypes.get_errno(), "could not establish child containment")
 
 
+def reap_exited_group_children(group):
+    """Reap already-exited children adopted into the supervisor from this process group."""
+    if not isinstance(group, int) or group <= 1:
+        raise ValueError("expected an owned process group")
+    reaped = 0
+    # The proof owns one launcher at a time. waitpid cannot reap a non-child,
+    # and WNOHANG cannot wait for or signal a live member. Group absence is
+    # still verified by the caller, including when this reap bound is reached.
+    for _ in range(128):
+        try:
+            child, _ = os.waitpid(-group, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if not child:
+            break
+        reaped += 1
+    return reaped
+
+
 def verify_children_gone():
     """Reap owned exits, remove adopted live children by pidfd, and fail if recovery was needed."""
     deadline = time.monotonic() + 10
