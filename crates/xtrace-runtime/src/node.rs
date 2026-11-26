@@ -1327,7 +1327,11 @@ fn main() {{
         command
             .args(["--exact", "node::tests::owned_leader_fixture"])
             .env("XTRACE_NODE_TEST_CHILD_DIR", directory.path())
-            .stdin(Stdio::from(input));
+            .stdin(Stdio::from(input))
+            // Nested libtest processes have their own summaries. Keep
+            // them out of the supervising test binary's evidence stream.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         command.as_std_mut().process_group(0);
         command.kill_on_drop(true);
         let mut supervised = NodeChild { child: command.spawn().expect("spawn direct fixture") };
