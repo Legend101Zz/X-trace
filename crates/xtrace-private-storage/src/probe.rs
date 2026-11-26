@@ -892,8 +892,12 @@ fn recheck_linux_directory_acl(
             diagnostic::observe_context(
                 Step::AclState,
                 operation.note_directory_refusal(
-                    AdmissionContext::state(AdmissionSite::RecheckState, &before, &after.metadata)
-                        .at_depth(operation.relative_depth(path)),
+                    AdmissionContext::state(
+                        AdmissionSite::RecheckState,
+                        &before.metadata,
+                        &after.metadata,
+                    )
+                    .at_depth(operation.relative_depth(path)),
                 ),
             );
             return false;
