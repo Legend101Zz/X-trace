@@ -313,6 +313,19 @@ async function measureSample(index, options, manifest, chromium) {
     page.on('pageerror', () => { pageErrors += 1; });
     page.on('request', (request) => { if (new URL(request.url()).origin !== new URL(url).origin) externalRequests += 1; });
     const functionalMapOnly = options['one-map-tree-sample'];
+    let totalRequests = 0;
+    let detailRequests = 0;
+    if (functionalMapOnly) {
+      const origin = new URL(url).origin;
+      page.on('request', (request) => {
+        const destination = new URL(request.url());
+        totalRequests += 1;
+        if (destination.origin === origin && destination.pathname === `/api/v1/recordings/${manifest.recording_id}`) detailRequests += 1;
+      });
+    }
+    const jumpToLoadedSequence = functionalMapOnly
+      ? (await import('../../web/app/scripts/replay-window-journey.mjs')).jumpToLoadedSequence
+      : null;
     if (!functionalMapOnly) await page.addInitScript(installClickClock, { recordingId: manifest.recording_id });
     setStage('catalog');
     await page.goto(url, { waitUntil: 'domcontentloaded' });
@@ -442,6 +455,7 @@ async function measureSample(index, options, manifest, chromium) {
         ? page.getByRole('region', { name: 'Loaded event window', exact: true })
           .getByRole('button', { name: 'Load later', exact: true })
         : page.getByRole('button', { name: 'Load next window', exact: true });
+      const beforePage = detailRequests;
       detail = await detailFromAction(page, manifest, detail.nextCursor, () => loadLater.click());
       for (const event of detail.events) { check(BigInt(event.sequence) === lastSequence + 1n); lastSequence += 1n; }
       cumulative += detail.events.length;
@@ -450,13 +464,24 @@ async function measureSample(index, options, manifest, chromium) {
       }
       selected = detail.events[0];
       expectedSelection = selected;
-      const row = page.locator('.event-rail .event').filter({
-        has: page.locator('.event-seq').filter({ hasText: new RegExp(`^${selected.sequence}$`) }),
-      });
-      result.substage = 'row_click';
-      await row.click();
-      result.substage = 'selection_wait';
-      await waitSelection(page, 'steps', selected, manifest.recording_id);
+      if (jumpToLoadedSequence) {
+        result.substage = 'loaded_sequence_jump';
+        await page.waitForFunction(() =>
+          document.querySelector('#events-panel .replay-window-count > span:first-child')?.getAttribute('aria-hidden') === 'false');
+        const beforeJump = totalRequests;
+        await jumpToLoadedSequence(page, selected.sequence);
+        result.substage = 'selection_wait';
+        await waitSelection(page, 'steps', selected, manifest.recording_id);
+        check(detailRequests === beforePage + 1 && totalRequests === beforeJump);
+      } else {
+        const row = page.locator('.event-rail .event').filter({
+          has: page.locator('.event-seq').filter({ hasText: new RegExp(`^${selected.sequence}$`) }),
+        });
+        result.substage = 'row_click';
+        await row.click();
+        result.substage = 'selection_wait';
+        await waitSelection(page, 'steps', selected, manifest.recording_id);
+      }
       result.actions.push(`load_later_${later}`);
     }
     setStage('later_steps', 'dom_snapshot');
