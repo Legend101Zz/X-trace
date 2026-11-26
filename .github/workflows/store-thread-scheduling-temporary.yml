@@ -1,0 +1,166 @@
+name: store-thread-scheduling-temporary
+on:
+  push:
+    branches: [codex/store-thread-scheduling-78]
+permissions:
+  contents: read
+jobs:
+  jdk17-scheduling-pairs:
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: [focused, sparse]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+      - name: Prepare owner-private diagnostic directories
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP:?}/xf"
+          [ "${#root}" -le 40 ]
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/diag" "$root/c" "$root/tmp/t" "$root/tmp/p"
+          echo "XTRACE_STORE_SCHEDULING_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Compile once before the pair
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_STORE_SCHEDULING_ROOT"
+          CARGO_TARGET_DIR="$root/cargo-target" cargo test --locked -p xtrace-store --lib --all-features --no-run > "$root/diag/build.log" 2>&1
+      - name: Compare scheduling sampler off and on on the unchanged cardinality workload
+        env:
+          WORKLOAD: ${{ matrix.workload }}
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_STORE_SCHEDULING_ROOT"
+          export CARGO_TARGET_DIR="$root/cargo-target"
+          export TMPDIR="$root/tmp/t" TMP="$root/tmp/t" TEMP="$root/tmp/t"
+          export XTRACE_TEST_SCRATCH_ROOT="$root/tmp/t" XTRACE_TEST_PRIVATE_SCRATCH="$root/tmp/p"
+          export XTRACE_TEST_CARDINALITY_SCRATCH="$root/c"
+          focused=recording_port::tests::singleton_acknowledgements_at_focused_cap_recover_with_bounded_segments_and_pages
+          sparse=recording_port::tests::sparse_acknowledged_batches_hit_admission_before_becoming_unreadable
+          run_one() {
+            local name="$1" timing="$2" test="$3"
+            local directory="$root/diag/$name"
+            mkdir -m 700 "$directory" "$directory/frag"
+            if ! XTRACE_CI_PRIVATE_ROOT="$directory" XTRACE_STORE_THREAD_TIMING="$timing" \
+              cargo test --locked -p xtrace-store --lib --all-features "$test" -- --exact > "$directory/test.log" 2>&1; then
+              echo "Cardinality diagnostic failed in $name"
+              return 1
+            fi
+            if ! grep -q '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log"; then
+              echo "Expected one passing cardinality test in $name"
+              return 1
+            fi
+            echo "Completed $name"
+          }
+          case "$WORKLOAD" in
+            focused)
+              run_one off-focused 0 "$focused"
+              run_one on-focused 1 "$focused"
+              ;;
+            sparse)
+              run_one on-sparse 1 "$sparse"
+              run_one off-sparse 0 "$sparse"
+              ;;
+            *) exit 1 ;;
+          esac
+          python3 -B - "$root/diag" "$WORKLOAD" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib
+          import re
+          import sys
+          from tools.qa.store_profiles import collect
+
+          root = pathlib.Path(sys.argv[1])
+          workload = sys.argv[2]
+          name, admissions, counted = {
+              "focused": ("focused-singletons", 131072, 1),
+              "sparse": ("sparse", 10000, 0),
+          }[workload]
+          off_dir, on_dir = (root / f"{mode}-{workload}" / "frag" for mode in ("off", "on"))
+          off, on = (collect(directory)[name] for directory in (off_dir, on_dir))
+          for report in (off, on):
+              assert report["lastReport"]["state"] == "returned"
+              assert report["workload"] == {
+                  "expected_admissions": admissions, "counted_journal_syncs": counted,
+              }
+              assert report["lastReport"]["completed"] == admissions
+
+          def seconds(nanos):
+              return nanos / 1_000_000_000
+
+          baseline, observed = (seconds(report["lastReport"]["elapsed_ns"]) for report in (off, on))
+          print(f"JDK17 {workload} phase-spanning thread timing")
+          print(f"- Sampler off {baseline:.3f}s; on {observed:.3f}s; "
+                f"paired difference {observed - baseline:+.3f}s ({(observed - baseline) / baseline:+.2%}).")
+          print("- One same-runner pair; the difference includes run-order and host variation.")
+          assert not (off_dir / f"store-{name}-thread.txt").exists()
+          timing = on_dir / f"store-{name}-thread.txt"
+          if not timing.is_file():
+              print("- Optional thread samples unavailable.")
+              raise SystemExit(0)
+
+          grammar = "phase_spanning completed=([0-9]{1,6}) " + " ".join(
+              f"{field}=(unavailable|[0-9]{{1,39}})"
+              for field in ("wall_ns", "thread_cpu_ns", "runqueue_ns", "unclassified_ns")
+          )
+          totals = [0] * 4
+          available = [0] * 4
+          valid = 0
+          # An incomplete optional write is withheld, not interpreted as a sample.
+          with timing.open("rb") as stream:
+              for line in stream.read(512 * 1024).splitlines(keepends=True):
+                  row = re.fullmatch(grammar, line[:-1].decode("ascii", errors="replace"))
+                  if row is None or not line.endswith(b"\n"):
+                      continue
+                  _, *values = row.groups()
+                  if valid == 0:
+                      assert values == ["unavailable"] * 4
+                  valid += 1
+                  for index, value in enumerate(values):
+                      if value != "unavailable":
+                          totals[index] += int(value)
+                          available[index] += 1
+          print(f"- {valid} validated phase-spanning progress sample records "
+                "(setup and final completion excluded).")
+          for label, elapsed, count in zip(
+              ("Wall", "Thread CPU", "Kernel-reported runnable wait", "Unclassified residual"),
+              totals, available,
+          ):
+              if count:
+                  print(f"- {label} {seconds(elapsed):.3f}s over {count} intervals.")
+              else:
+                  print(f"- {label} unavailable.")
+          print("- Metrics can cover different intervals. Unclassified residual is reported only "
+                "where wall, CPU and runnable wait can all be subtracted; it is not attributed to I/O.")
+          PY
+      - name: Encrypt private diagnostics
+        if: always() && env.XTRACE_STORE_SCHEDULING_ROOT != ''
+        env:
+          EVIDENCE_CERT: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVOVENDQXAyZ0F3SUJBZ0lVZkxxMVlkSWI5OVZQa1lFSUJwVUw2RVpUL2RVd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0tqRW9NQ1lHQTFVRUF3d2ZXQzEwY21GalpTQndjbWwyWVhSbElIWnBaWGRsY2lCbGRtbGtaVzVqWlRBZQpGdzB5TmpFeE1qVXhOVEV6TWpaYUZ3MHlOakV5TURreE5URXpNalphTUNveEtEQW1CZ05WQkFNTUgxZ3RkSEpoClkyVWdjSEpwZG1GMFpTQjJhV1YzWlhJZ1pYWnBaR1Z1WTJVd2dnR2lNQTBHQ1NxR1NJYjNEUUVCQVFVQUE0SUIKandBd2dnR0tBb0lCZ1FDMkJ3Mi9QdURTZWFQeWNZby9HblhUNjhKMVpVWmhvM285U2dhQ3NjR0UvdXZrRXNyTQo0OUtvcVNKeExaSmdrbUcwODRvUEs1SXhKQVkzd29jcGRBL3dUVW5UYWZTWTc1N0JBZ0dFbGVjQTh1T2lpcHZyCm9XTFloUS9YVUxOaUNaVTUrRHB3OGs5cmxWQ3lNa1FNa2NJNWRkTE1JL0MyTDFzSnExSWx3Ulo3dzBmV3MzVXoKc1hwaUxjb2VJejdGalphV2tPUzdwMHVvREowMkQ0alFaR2p1WUl2a0xwL3c3b3JtdHFYOW5tazhmWDdOK0JXeQowTnpjYlFvV1B5QzlTalYzaUNNMkNDMCtxRzBINDB2Uy9zU2s3c0RhQVVDTFVrTHFCTHduY2tWNGJ4Sk1mdE9BClZ3VUpNUSt1aUhpUUsyNnVCcXovUDNOcFBqRGFZT3BCK1ppZlN2Y0V6TjFQWndLTlM5d2JzZm1WdjlCTjg2UkYKK1VYSzdHdURSUHpKdDkrckc5RHZneHZJWG4ydWxrNXhlYStuRGR5d3k1TGRZSFNMZ1NRekZWWXpCLzVXaXA5VQpSTmdDekRPU01FTXZ4SFBibXpaSzF4QWtlbjZHK1hpbG1MMW9XNmlTU01kOUpTNU1jbXZ3bWN6RmtLU293SWQvCnFydVdVV0VmNUUzck9Gc0NBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmMKVmxpK01COEdBMVVkSXdRWU1CYUFGSzY2cE9ZZnp6TEMxengvUTNEUGJNNmNWbGkrTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dHQkFCa0ZsN3Znc05TN0tMVWp3bDFnSFlKL1BYMDEydnlpCi9VNExVM0g3eHZHZFZBSUpXejIvYjdZaHg0OFh6SWFyb0RoQ1lYNzY5ZStBODM1Si9pQ042cExmeTYyM3R1WU8KWUhVMEZUSFZqdUZ0OFVxRDVYdExpdGVmMHJuN0luam9HWmJvR3lLbXBrTWs3TkgydmFCcDY3SHA3UnV5anBTTQp6UmY3LzNPOFN3U1FxK1RxNENvaVh6OWgwdzBjV3AxRytqRGtBR2pOMXNUeU45amNrM0VnSkpia2trR2lENC9wCkw5eE5WbUFqZmhrRExqc2t0VmZaQ1hNcDVlbVZmWkJqZW9wUHpDS3YwN1NrOERTeWFNcnRFTFJhbU9JMXZUM08KSWkzNTFoaTVuNnpiamVCTUM4dmt4T0pCckxsc2FVUHV6V0M4OEpQQzRCUGk0SXVFanA3eHVFdUlLSTR3YTVuUApZVC81SDAzWUwrajJ2V3pUa2Z3UVUvS0wrMEx3NkIwNVByTC9ZRFY4dXcrU3crK1A4bG5TK2ZsaisxUi9iY0tTClg3NFVnY2g0c0tESXd2clBzemRUZXh4cVBrajlHYXpPbzk4RHRlTys5RUdvWDZKcU9ZWmVCU3VIUndoTGNqNXYKK0c5blVacDc1R1djYmlzYk1udUpIQkVOV3RQVzhFUTZQZz09Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$XTRACE_STORE_SCHEDULING_ROOT"
+          printf '%s' "$EVIDENCE_CERT" | base64 -d > "$root/evidence.crt"
+          tar -C "$root" -cf - diag | openssl cms -encrypt -binary -aes-256-cbc \
+            -outform DER -out "$root/store-scheduling.enc" "$root/evidence.crt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && env.XTRACE_STORE_SCHEDULING_ROOT != ''
+        with:
+          name: encrypted-store-scheduling-${{ matrix.workload }}
+          path: ${{ env.XTRACE_STORE_SCHEDULING_ROOT }}/store-scheduling.enc
+          if-no-files-found: error
+          retention-days: 1

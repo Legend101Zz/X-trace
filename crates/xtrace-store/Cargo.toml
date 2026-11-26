@@ -33,3 +33,6 @@ rustix = { version = "1", features = ["fs"] }
 tempfile = "3.10"
 # Test-only: counts /bin/ls spawns for the spawn-bound test. Never enabled for a release build.
 xtrace-private-storage = { path = "../xtrace-private-storage", features = ["spawn-counter"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1", features = ["time"] }

@@ -9,6 +9,10 @@ use std::time::Instant;
 
 use xtrace_private_storage::spawn_counter::ls_spawns_on_this_thread;
 
+#[cfg(target_os = "linux")]
+#[path = "recording_thread_timing.rs"]
+mod thread_timing;
+
 thread_local! {
     static PROFILE: RefCell<Option<Profile>> = const { RefCell::new(None) };
 }
@@ -30,6 +34,8 @@ struct Profile {
     phases: BTreeMap<&'static str, Measurement>,
     current: File,
     history: File,
+    #[cfg(target_os = "linux")]
+    thread_timing: Option<thread_timing::ThreadTiming>,
 }
 
 impl Profile {
@@ -116,6 +122,8 @@ impl WorkProfile {
                 phases: BTreeMap::new(),
                 current: open("active"),
                 history: open("progress"),
+                #[cfg(target_os = "linux")]
+                thread_timing: thread_timing::ThreadTiming::open(&directory, name),
             };
             writeln!(
                 profile.history,
@@ -133,6 +141,11 @@ impl WorkProfile {
             if let Some(profile) = slot.borrow_mut().as_mut() {
                 profile.completed = completed;
                 profile.report("progress");
+                #[cfg(target_os = "linux")]
+                if let Some(timing) = profile.thread_timing.as_mut() {
+                    timing.sample(completed);
+                    profile.changed = Instant::now();
+                }
             }
         });
     }
