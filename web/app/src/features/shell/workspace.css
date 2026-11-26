@@ -143,7 +143,7 @@
   .replay-context-request { gap: 6px; }
   .replay-context-event { min-height: 23px; }
   .workspace-requests > .pane { flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; }
-  .workspace-requests > .pane > * { flex-shrink: 0; }
+  .workspace-requests > .pane > *, .catalog-start-actions > * { flex-shrink: 0; }
   .workspace-requests > .pane > :is(.request-tree, .recording-list) { overflow: visible; }
   .shell .evidence-pane > .pane-head { display: none; }
   .shell .phone-back-to-step { margin: 6px 8px; font-size: 13px; }
@@ -185,11 +185,50 @@
   .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector { grid-area: 2 / 3; cursor: row-resize; }
   .viewer-workspace[data-dock='bottom'] > .workspace-inspector { grid-area: 3 / 3; }
   .viewer-workspace[data-dock='bottom'] > .workspace-inspector > .collapsed-panel { writing-mode: horizontal-tb; align-self: start; }
+  /* The shallow bottom dock has room for one control row above its scrolling facts. */
+  .viewer-workspace[data-dock='bottom'] > .workspace-inspector[data-collapsed='false'] > .evidence-pane:has(> .wide-focus-event) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .viewer-workspace[data-dock='bottom'] .wide-focus-event { align-self: center; }
+  .viewer-workspace[data-dock='bottom'] .inspector-tabs { align-items: center; }
+  .viewer-workspace[data-dock='bottom'] .evidence-content { grid-column: 1 / -1; }
   .viewer-workspace[data-tour-pane='evidence'][data-dock='bottom'] .evidence-pane > .pane-head {
     min-height: 0;
     padding-block: 4px;
   }
   .viewer-workspace[data-dock='bottom'] > .reset-panels { grid-row: 4; }
+}
+
+/* A verified empty desktop project has a Requests sidebar and one main action.
+   The tour still opens the ordinary pane layout to explain Steps and Inspector. */
+@media (min-width: 1200px) {
+  .viewer-workspace:not([data-tour-pane]):has(> .workspace-requests[data-collapsed='false'] .first-recording) {
+    grid-template-columns: minmax(0, var(--requests-size)) 8px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+
+    & > .workspace-requests, & #recordings-panel {
+      display: grid;
+      grid-column: 1 / -1;
+      grid-template-columns: subgrid;
+    }
+    & > .workspace-requests { grid-row: 1; }
+    & #recordings-panel { grid-template-rows: auto auto auto auto minmax(0, 1fr) auto; }
+    & #recordings-panel > * { grid-column: 1; }
+    & #recordings-panel > .catalog-start-actions {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: safe center;
+      grid-area: 1 / 3 / -1 / 4;
+      min-height: 0;
+      overflow: auto;
+    }
+    & > .panel-splitter--requests { grid-area: 1 / 2; z-index: 1; }
+    & > :is(.steps-and-code, .workspace-inspector, .panel-splitter--inspector) { display: none; }
+    & > .reset-panels { grid-area: 2 / 1 / 3 / -1; }
+  }
 }
 
 @media (min-width: 861px) and (max-width: 1199px) {
@@ -223,6 +262,7 @@
   .steps-and-code .replay-toolbar { padding-inline: 18px; }
   .steps-and-code .event-rail { padding-inline: 18px; }
   .viewer-workspace[data-dock='bottom'] .steps-and-code > .pane > .steps-content { margin-block-end: 18px; }
+  .viewer-workspace[data-dock='bottom'] > .workspace-inspector[data-collapsed='false']:has(.wide-focus-event) { padding-block-start: 18px; }
   .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector::before {
     inset: 50% 0 auto; transform: translateY(-50%);
   }

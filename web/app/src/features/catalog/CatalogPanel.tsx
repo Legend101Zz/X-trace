@@ -4,6 +4,7 @@ import { backToStepLabel } from '../../replay/step-sentence';
 import type { CatalogMode, Endpoint, Recording, ReplayEvent } from '../../types';
 import { ErrorState } from '../common/ErrorState';
 import { RecordingRows } from './RecordingRows';
+import { useViewport } from '../shell/viewport';
 import { FirstRecording } from './FirstRecording';
 
 /** One paged catalog lane as the panel sees it. */
@@ -51,6 +52,8 @@ export function CatalogPanel(props: CatalogPanelProps) {
   const { items: linked, cursor: linkedCursor, busy: linkedBusy, error: linkedError, released: olderLinkedReleased } = props.linkedLane;
   const { items: unmatched, cursor: unmatchedCursor, busy: unmatchedBusy, error: unmatchedError, released: olderUnmatchedReleased } = props.unmatchedLane;
   const firstUse = catalogMode === 'endpoints' && projectEmpty && endpoints.length === 0 && !endpointBusy && !endpointError;
+  const wide = useViewport('(min-width: 1200px)');
+  const separateFirstUse = firstUse && wide;
   const [search, setSearch] = useState('');
   const query = search.trim().toLocaleLowerCase();
   const matches = (...fields: (string | null | undefined)[]) =>
@@ -83,18 +86,28 @@ export function CatalogPanel(props: CatalogPanelProps) {
       </li>;
     })}
   </ul>;
+  const refresh = <button className="button" onClick={onRefresh}
+    disabled={endpointBusy || linkedBusy || unmatchedBusy}>Refresh</button>;
+  // Keep the command and its opener mounted when the tour switches the workspace layout.
+  const startActions = catalogMode === 'endpoints' ? <div className="catalog-start-actions" key="start-actions">
+    {firstUse ? <FirstRecording onAnnounce={onAnnounce} /> : null}
+    <ExportAction endpoint={null} label="Export endpoints…" />
+  </div> : null;
   return <section className="pane" role="tabpanel" id="recordings-panel" aria-labelledby="recordings-tab" data-active={active} aria-label="Recordings">
         {props.selectedStep ? <button type="button" className="button button-primary phone-back-to-step" onClick={props.onBackToStep}>{backToStepLabel(props.selectedStep)}</button> : null}
         <div className="pane-head"><div><div className="eyebrow">Requests</div><h1>{catalogMode === 'endpoints' ? 'Endpoints' : catalogMode === 'linked' ? 'Linked recordings' : 'Unmatched recordings'}</h1></div>
-          <button className="button" onClick={onRefresh} disabled={endpointBusy || linkedBusy || unmatchedBusy}>Refresh</button></div>
-        {firstUse ? <FirstRecording onAnnounce={onAnnounce} /> : null}
-        {catalogMode === 'endpoints' ? <ExportAction endpoint={null} label="Export endpoints…" /> : null}
+          {separateFirstUse ? null : refresh}</div>
+        {separateFirstUse ? null : startActions}
         <label className="request-search" id="request-search-label" htmlFor="request-search">Search loaded requests</label>
         <input type="search" id="request-search" className="request-search-input" aria-labelledby="request-search-label"
           value={search} onChange={(event) => setSearch(event.currentTarget.value)} />
         {catalogMode === 'linked' ? <div className="catalog-back"><div className="catalog-actions"><button className="button" onClick={onBack}>← Observed endpoints</button><button className="button" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button></div><span>{selectedEndpoint?.method} {selectedEndpoint?.routeTemplate}</span><small>Component: {selectedEndpoint?.applicationComponent} · Binding: {selectedEndpoint?.binding}</small></div> : null}
         {catalogMode === 'endpoints' ? <>
-          <div className="catalog-switch"><button className="button" aria-current="page">Observed endpoints</button><button className="button" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button></div>
+          <div className="catalog-switch">
+            <button className="button" aria-current="page">Observed endpoints</button>
+            <button className="button" aria-expanded={false} onClick={onOpenUnmatched}>Not linked to an endpoint</button>
+            {separateFirstUse ? refresh : null}
+          </div>
           {endpoints[0]?.observationPolicy ? <div className="policy-note"><strong>Operator-selected policy</strong><span>{endpoints[0].observationPolicy} does not attest which adapter or application produced the event.</span></div> : null}
           {endpointBusy && endpoints.length === 0 ? <div className="loading">Reading observed endpoints…</div> : null}
           {endpointError ? <ErrorState message={endpointError} onRetry={onRetryEndpoints} /> : null}
@@ -123,5 +136,6 @@ export function CatalogPanel(props: CatalogPanelProps) {
         </> : null}
         {(catalogMode === 'endpoints' ? olderEndpointsReleased : catalogMode === 'linked' ? olderLinkedReleased : olderUnmatchedReleased) ? <p className="window-retention" role="status">Earlier rows were released from memory. Continue from the current page cursor.</p> : null}
         <aside className="context-note">Only persisted endpoint and recording evidence is shown. No handler discovery or application attestation is implied.</aside>
+        {separateFirstUse ? startActions : null}
       </section>;
 }

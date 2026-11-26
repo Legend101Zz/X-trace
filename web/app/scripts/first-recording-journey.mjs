@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium, expect } from '@playwright/test';
+import { assertDesktopTourFocusRestored, assertEmptyProjectLayout, assertTextIsReadable } from './first-recording-layout.mjs';
 import { assertReadableTourStep } from './replay-tools-journey.mjs';
 
 const chunks = [];
@@ -88,6 +89,7 @@ try {
     await copy.press('Enter');
     const feedback = empty.getByText('Example command copied.');
     await expect(feedback).toBeVisible();
+    await assertEmptyProjectLayout(page, width);
     if (width === 1024) {
       const feedbackPosition = await feedback.evaluate((label) => {
         const range = document.createRange();
@@ -148,6 +150,7 @@ try {
     await page.keyboard.press('Escape');
     await expect(start).toBeFocused();
     await expect(page.getByRole('dialog')).toHaveCount(0);
+    if (width === 1440) await assertDesktopTourFocusRestored(page);
 
     const help = page.getByRole('button', { name: 'Help', exact: true });
     await help.press('Enter');
@@ -169,14 +172,4 @@ try {
   process.exitCode = 1;
 } finally {
   await browser.close();
-}
-
-async function assertTextIsReadable(locator, message) {
-  assert.ok(await locator.evaluate((element) => {
-    const range = document.createRange();
-    range.selectNodeContents(element);
-    const lines = [...range.getClientRects()].filter((line) => line.width && line.height);
-    return lines.length > 0 && lines.every((line) => [line.left + 1, line.right - 1].every((x) =>
-      element.contains(document.elementFromPoint(x, line.top + line.height / 2))));
-  }), message);
 }

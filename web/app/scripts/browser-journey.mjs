@@ -422,6 +422,32 @@ try {
     const details = page.getByRole('region', { name: 'Event details', exact: true });
     await expect(details.getByText(methodEvent.kind, { exact: true })).toBeVisible();
     if (methodEvent.eventId) await expect(details.locator('[data-event-field="event-id"]')).toHaveText(methodEvent.eventId);
+    if (width === 1440) {
+      assert.ok(methodEvent.eventId, 'the selected Spring event has a recorded identity');
+      const identity = details.locator('[data-event-field="event-id"]');
+      const readable = await identity.evaluate((field) => {
+        const port = field.closest('.evidence-content');
+        if (!port || port.scrollTop !== 0) return false;
+        const box = port.getBoundingClientRect();
+        const left = box.left + port.clientLeft;
+        const top = box.top + port.clientTop;
+        const range = document.createRange();
+        range.selectNodeContents(field);
+        const lines = Array.from(range.getClientRects());
+        return lines.length > 0 && lines.every((rect) => {
+          if (rect.width <= 0 || rect.height <= 0 || rect.left < Math.max(0, left)
+              || rect.right > Math.min(innerWidth, left + port.clientWidth) || rect.top < Math.max(0, top)
+              || rect.bottom > Math.min(innerHeight, top + port.clientHeight)) return false;
+          const dx = Math.min(0.5, rect.width / 2);
+          const dy = Math.min(0.5, rect.height / 2);
+          return [[rect.left + dx, rect.top + dy], [rect.right - dx, rect.top + dy],
+            [rect.left + dx, rect.bottom - dy], [rect.right - dx, rect.bottom - dy],
+            [rect.left + rect.width / 2, rect.top + rect.height / 2]]
+            .every(([x, y]) => field.contains(document.elementFromPoint(x, y)));
+        });
+      });
+      assert.ok(readable, 'Details opens with the full recorded Event ID readable in the default desktop dock');
+    }
     await expect(details.getByText(`${methodEvent.monotonicNs} ns`, { exact: true })).toBeVisible();
     const recording = page.getByRole('region', { name: 'Recording details', exact: true });
     if (verifiedDetail.capacity) await expect(recording.getByText(`Capacity drops · ${verifiedDetail.capacity.capacityDroppedEvents}`, { exact: true })).toBeVisible();
@@ -491,6 +517,18 @@ try {
       await expect(toolsPage.getByText('Local viewer connected', { exact: true })).toBeVisible();
       assert.equal(toolsExchanges, 0, 'the cloned session resumes without exchanging a bootstrap token');
       await openCapture();
+      if (pointer === 'coarse') {
+        const controls = toolsPage.locator('#evidence-panel .wide-focus-event, #evidence-panel [role="tab"]');
+        await expect(controls).toHaveCount(4);
+        assert.ok(await controls.evaluateAll((buttons) => buttons.every((button) => {
+          const rect = button.getBoundingClientRect();
+          const x = rect.left + rect.width / 2;
+          const y = rect.top + rect.height / 2;
+          return rect.width >= 44 && rect.height >= 44
+            && [[x, rect.top + 1], [x, rect.bottom - 1], [rect.left + 1, y], [rect.right - 1, y], [x, y]]
+              .every(([px, py]) => button.contains(document.elementFromPoint(px, py)));
+        })), 'each bottom Inspector control exposes its touch target clear of the splitter');
+      }
       const verifyRecordingSelection = async ({ sequence }) => {
         const tabs = toolsPage.getByRole('tablist', { name: 'Open recordings' });
         const historical = tabs.getByRole('tab', { name: new RegExp(legacyV4Id) });
