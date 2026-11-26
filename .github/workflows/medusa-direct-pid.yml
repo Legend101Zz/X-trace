@@ -1,0 +1,144 @@
+name: Medusa direct-owned supervisor proof
+on:
+  push:
+    branches: [codex/proof-medusa-direct-pid-120]
+permissions:
+  contents: read
+concurrency:
+  group: medusa-installed-120
+  cancel-in-progress: false
+jobs:
+  ownership:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      MEDUSA_PRODUCT_SHA: 72df3dcbecc9a8b9b36178c22a15a49911024835
+      MEDUSA_PRODUCT_TREE: 58fb7365baaffbf625834b70e17466b67e038ac1
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Admit source and private directories
+        id: root
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$MEDUSA_PRODUCT_SHA"
+          git checkout --detach "$MEDUSA_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$MEDUSA_PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          owner="$(mktemp -d "$RUNNER_TEMP/medusa-owned-proof.XXXXXXXX")"
+          root="$owner/proof"
+          python3 -B -m tools.release.ci_floor prepare-private-root --root "$root"
+          mkdir -m 700 "$root/outer" "$root/safe"
+          printf '%s\n' "MEDUSA_ROOT=$root" >> "$GITHUB_ENV"
+          printf '%s\n' 'admitted=true' >> "$GITHUB_OUTPUT"
+      - name: Run the 18 direct-child and evidence checks
+        if: steps.root.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          umask 077
+          cat >"$MEDUSA_ROOT/outer/controller.py" <<'MEDUSA_CONTROLLER'
+          """Run the three named direct-child suites and project only finite counts."""
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          from tools.qa.unittest_summary import read_result, summarize
+          from tools.release.private_roots import admit_directory, atomic_write_private
+
+          root = Path(os.environ["MEDUSA_ROOT"])
+          admit_directory(root)
+          harness = Path("campaigns/node/medusa/harness")
+          sys.path.insert(0, str(harness.resolve()))
+          from installed_process import contain_children, verify_children_gone
+
+          suites = {"installed-evidence": ("test_installed_evidence.py", 10),
+                    "owned-stop": ("test_installed_stop.py", 2),
+                    "stop-recovery": ("test_installed_stop_recovery.py", 6)}
+          receipt = {
+              "schemaVersion": 1, "kind": "medusa-direct-pid-120", "status": "failed",
+              "sourceSha": os.environ["MEDUSA_PRODUCT_SHA"], "sourceTree": os.environ["MEDUSA_PRODUCT_TREE"],
+              "wrapperSha": os.environ["GITHUB_SHA"], "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "suites": {key: {"command": "unreached", "exitCode": None, "cleanup": "unreached",
+                               "counts": None} for key in suites},
+          }
+
+
+          def save():
+              atomic_write_private(root / "safe/receipt.json", (json.dumps(receipt, sort_keys=True) + "\n").encode())
+
+
+          def run(name, pattern, expected):
+              row = receipt["suites"][name]
+              path = root / "outer" / (name + ".json")
+              try:
+                  with (root / "outer" / (name + ".log")).open("xb") as log:
+                      child = subprocess.Popen(
+                          [sys.executable, "-B", "-m", "tools.qa.unittest_run", "--result", str(path),
+                           "discover", "-s", str(harness), "-p", pattern],
+                          stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+                      try:
+                          code = child.wait(timeout=30)
+                          row["command"] = "exited"
+                          row["exitCode"] = code
+                      except subprocess.TimeoutExpired:
+                          row["command"] = "deadline"
+                          if child.poll() is None:
+                              child.kill()
+                          try:
+                              child.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              row["command"] = "unreaped"
+              except OSError:
+                  row["command"] = "spawn-or-io"
+              finally:
+                  row["cleanup"] = "failed"
+                  save()
+                  try:
+                      verify_children_gone()
+                  except TimeoutError:
+                      pass
+                  else:
+                      row["cleanup"] = "passed"
+                      save()
+              try:
+                  if path.stat().st_size > 16384:
+                      return False
+                  result = read_result(path)
+                  summarize(result)
+                  counts = result["counts"]
+                  if any(value > 64 for value in counts.values()):
+                      return False
+                  row["counts"] = counts
+                  save()
+              except (OSError, ValueError):
+                  return False
+              return (row["command"] == "exited" and row["exitCode"] == 0 and row["cleanup"] == "passed"
+                      and counts["testsRun"] == expected
+                      and all(value == 0 for key, value in counts.items() if key != "testsRun"))
+
+
+          save()
+          contain_children()
+          for suite, (pattern, expected) in suites.items():
+              if not run(suite, pattern, expected):
+                  sys.exit(1)
+          receipt["status"] = "passed"
+          save()
+          MEDUSA_CONTROLLER
+          printf '%s  %s\n' '00769a29fdcea08da112e710b0ea690b5f39ac212e94c4282d0068d024470c76' "$MEDUSA_ROOT/outer/controller.py" | sha256sum --check --status
+          PYTHONPATH="$PWD" python3 -B "$MEDUSA_ROOT/outer/controller.py" >"$MEDUSA_ROOT/outer/controller.log" 2>&1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && steps.root.outputs.admitted == 'true'
+        with:
+          name: medusa-120-direct-pid-counts
+          path: ${{ env.MEDUSA_ROOT }}/safe/receipt.json
+          if-no-files-found: error
+          retention-days: 7
