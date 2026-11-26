@@ -1,3 +1,4 @@
+import { RecordingEventKind } from "@xtrace/protocol";
 import { parentPort, workerData } from "node:worker_threads";
 import { workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
@@ -25,6 +26,13 @@ const assembler = createRecordingAssembler(diagnostic ? async (id, payload, toke
   const result = await send(id, payload, token);
   if (payload.case === "recordingStarted") Atomics.add(diagnostic, workerCounters.startStaged, 1);
   if (payload.case === "recordingFinished") Atomics.add(diagnostic, workerCounters.finishStaged, 1);
+  if (payload.case === "eventBatch") {
+    for (const event of payload.value.events) {
+      if (event.kind === RecordingEventKind.FRAME_ENTER && event.symbol.startsWith("express.handler:")) {
+        Atomics.add(diagnostic, workerCounters.expressHandlerStaged, 1);
+      }
+    }
+  }
   return result;
 } : send);
 

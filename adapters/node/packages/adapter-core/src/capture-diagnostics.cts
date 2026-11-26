@@ -1,5 +1,6 @@
 import { realpathSync, writeSync } from "node:fs";
-import { expressPatchStatus } from "./express-instrument.cjs";
+import { dirname, join } from "node:path";
+import { expressPatchStatus, observeExpressHandlers } from "./express-instrument.cjs";
 import { resolveFromEntry, resolveMedusaExpress } from "./modules.cjs";
 import { workerCounters } from "./runtime/transport.cjs";
 import type { ModuleStatus } from "./runtime/registry.cjs";
@@ -40,6 +41,11 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
   const workerBuffer = new SharedArrayBuffer(Object.keys(workerCounters).length * Uint32Array.BYTES_PER_ELEMENT);
   const worker = new Uint32Array(workerBuffer);
   const scope = expressScope();
+  const expressEvidence = { invoked: 0, withContext: 0, posted: 0 };
+  try {
+    const layer = realpathSync(join(dirname(resolveMedusaExpress()), "lib", "router", "layer.js"));
+    observeExpressHandlers(layer, (stage) => { expressEvidence[stage] += 1; });
+  } catch { /* No exact Medusa Express 4 Layer to observe. */ }
   let express: ExpressState = "not-observed";
   let transportFailed = false;
   let closeRequested = false;
@@ -47,8 +53,9 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
     // Do not schedule work or keep the worker alive. This is a snapshot, not a drain barrier.
     // The nonce only authenticates this finite line from the proof's private stream.
     try {
-      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V1 " + JSON.stringify({
+      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V2 " + JSON.stringify({
         nonce, exitCode, scope, express, patchedLayers: expressPatchStatus().patched, counts,
+        expressEvidence: { ...expressEvidence, anyLayerStaged: Atomics.load(worker, workerCounters.expressHandlerStaged) },
         startStaged: Atomics.load(worker, workerCounters.startStaged),
         finishStaged: Atomics.load(worker, workerCounters.finishStaged),
         workerFailed: Atomics.load(worker, workerCounters.failed) === 1,

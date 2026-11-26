@@ -5,7 +5,7 @@ import re
 
 from installed_evidence import require
 
-PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V1 "
+PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V2 "
 COUNTERS = frozenset({
     "startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
     "finishPosted", "finishRejected", "eventRejected", "routeRejected",
@@ -14,8 +14,9 @@ SCOPES = frozenset({"same-package", "different-package", "transitive-only", "ent
 EXPRESS = frozenset({"not-observed", "installed", "express-not-found", "unsupported-express",
                     "unsupported-node", "install-failed", "disabled-other"})
 SWITCHES = frozenset({"workerFailed", "transportFailed", "closeRequested"})
+HANDLER_COUNTS = frozenset({"invoked", "withContext", "posted", "anyLayerStaged"})
 FIELDS = frozenset({"nonce", "exitCode", "scope", "express", "patchedLayers", "counts",
-                    "startStaged", "finishStaged"}) | SWITCHES
+                    "startStaged", "finishStaged", "expressEvidence"}) | SWITCHES
 
 
 def unique(items):
@@ -50,6 +51,11 @@ def project_capture_diagnostic(log, nonce):
         require(bounded(obj["exitCode"], 255))
         require(all(type(obj[key]) is bool for key in SWITCHES))
         require(all(bounded(obj[key], 1_000_000) for key in ("patchedLayers", "startStaged", "finishStaged")))
+        handlers = obj["expressEvidence"]
+        require(isinstance(handlers, dict) and set(handlers) == HANDLER_COUNTS)
+        require(all(bounded(value, 1_000_000) for value in handlers.values()))
+        require(handlers["posted"] <= handlers["withContext"] <= handlers["invoked"])
+        require(obj["patchedLayers"] > 0 or not any(handlers.values()))
         counts = obj["counts"]
         require(isinstance(counts, dict) and set(counts) == COUNTERS)
         require(all(bounded(value, 1_000_000) for value in counts.values()))

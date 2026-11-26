@@ -13,6 +13,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
                     patchedLayers=0, counts={"startAttempts": 47, "startAccepted": 12,
                         "startCapacityRejected": 35, "startOtherRejected": 0, "finishPosted": 12,
                         "finishRejected": 0, "eventRejected": 2, "routeRejected": 0},
+                    expressEvidence=dict(invoked=0, withContext=0, posted=0, anyLayerStaged=0),
                     startStaged=9, finishStaged=8, workerFailed=False, transportFailed=False,
                     closeRequested=False) | overrides
 
@@ -29,6 +30,17 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
         self.assertNotIn(self.nonce, private)
         self.assertNotIn("private example path", private)
         self.assertIsNone(project_capture_diagnostic(self.line(), None))
+
+    def test_layer_invocation_and_worker_staging_are_separate(self):
+        counts = dict(invoked=40, withContext=12, posted=9, anyLayerStaged=7)
+        data = self.line(express="installed", patchedLayers=1, expressEvidence=counts)
+        self.assertEqual(project_capture_diagnostic(data, self.nonce)["expressEvidence"], counts)
+        for bad in (counts | dict(posted=13), counts | dict(withContext=41),
+                    counts | dict(anyLayerStaged=True), counts | dict(sourcePath="/private/example")):
+            data = self.line(express="installed", patchedLayers=1, expressEvidence=bad)
+            self.assertEqual(project_capture_diagnostic(data, self.nonce), {"status": "invalid"})
+        self.assertEqual(project_capture_diagnostic(self.line(expressEvidence=counts), self.nonce),
+                         {"status": "invalid"})
 
     def test_stale_ambiguous_or_unterminated_observation_is_invalid(self):
         self.assertEqual(project_capture_diagnostic(b"ordinary stderr\n", self.nonce), {"status": "missing"})

@@ -8,7 +8,7 @@ import type { CaptureEvent, HttpCaptureTransport, RecordingSummary } from "../ru
 
 const require = createRequire(import.meta.url);
 const { installHttpCapture } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
-const { expressPatchStatus } = require("../express-instrument.cjs") as typeof import("../express-instrument.cjs");
+const { expressPatchStatus, observeExpressHandlers } = require("../express-instrument.cjs") as typeof import("../express-instrument.cjs");
 const context = require("../runtime/context.cjs") as typeof import("../runtime/context.cjs");
 const modules = require("../modules.cjs") as typeof import("../modules.cjs");
 
@@ -61,7 +61,7 @@ function frames(recording: Seen): Array<[string, string]> {
 }
 
 /** One test per Express major: the Layer patch needs the framework loaded after it is installed. */
-export async function scenario(fixture: string): Promise<{ byPath: Map<string, Seen>; statuses: Map<string, number> }> {
+export async function scenario(fixture: string) {
   const seen = new Map<string, Seen>();
   const transport = recordingTransport(seen);
   context.setCaptureProfile({ limitations: ["route_unavailable", "values_unavailable"], holdStart: true });
@@ -73,6 +73,10 @@ export async function scenario(fixture: string): Promise<{ byPath: Map<string, S
   const module = modules.expressModule((specifier) => fixtureRequire.resolve(specifier), () => transport);
   assert.deepEqual(module.detect({ nodeVersion: process.version, packageVersion: "" }), { supported: true });
   module.install({ nodeVersion: process.version, packageVersion: "" });
+  const handlerEvidence = { invoked: 0, withContext: 0, posted: 0 };
+  if (expectedMajor === 4) {
+    observeExpressHandlers(fixtureRequire.resolve("express/lib/router/layer"), (stage) => { handlerEvidence[stage] += 1; });
+  }
   const before = expressPatchStatus().patched;
   const express = fixtureRequire("express") as () => {
     use(...args: unknown[]): void; get(path: string, ...handlers: unknown[]): void; post(path: string, ...handlers: unknown[]): void; listen(port: number, host: string): http.Server;
@@ -117,7 +121,7 @@ export async function scenario(fixture: string): Promise<{ byPath: Map<string, S
   const ordered = [...seen.values()];
   assert.equal(seen.size, 6, "exactly one recording per request, six requests sent");
   ["/owners/42", "/api/pets/7", "/clinics/9/vets/3", "/boom", "/missing", "/upload"].forEach((path, index) => byPath.set(path, ordered[index]!));
-  return { byPath, statuses };
+  return { byPath, statuses, handlerEvidence };
 }
 
 export function assertJourney(result: Awaited<ReturnType<typeof scenario>>): void {

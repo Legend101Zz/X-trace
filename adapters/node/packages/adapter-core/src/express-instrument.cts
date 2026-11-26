@@ -45,6 +45,17 @@ export interface ExpressPatchStatus {
   patched: number;
 }
 
+type ObservedHandler = "invoked" | "withContext" | "posted";
+
+let observedLayer: string | undefined;
+let observeHandler: ((stage: ObservedHandler) => void) | undefined;
+
+/** Proof-only counter on handlers from one exact, recognized Layer module. */
+export function observeExpressHandlers(layer: string, observe: (stage: ObservedHandler) => void): void {
+  observedLayer = layer;
+  observeHandler = observe;
+}
+
 export interface ExpressPatchHooks {
   transport(): HttpCaptureTransport;
 }
@@ -101,10 +112,11 @@ function patchLayerModule(module: { exports: unknown }, filename: string): void 
   if (typeof originalRequest !== "function" || typeof originalError !== "function") return;
   if ((originalRequest as { [PATCHED]?: true })[PATCHED]) return;
 
+  const observe = filename === observedLayer ? observeHandler : undefined;
   Layer.prototype[requestName] = tag(function xtraceHandleRequest(this: LayerLike, request: unknown, response: unknown, next: unknown): unknown {
     let forward = next;
     try {
-      prepareHandle(this);
+      prepareHandle(this, observe);
       if (this.route) withRequestContext(request, () => matched(this, request));
       else if (isRouterMount(this) && typeof next === "function") {
         const stack = mountStack(request);
@@ -205,20 +217,26 @@ function prefixCovers(prefix: string, baseUrl: string): boolean {
 }
 
 /** Wraps a handler once so its frame brackets the call; Express catches throws, so it is recorded here. */
-function prepareHandle(layer: LayerLike): void {
+function prepareHandle(layer: LayerLike, observe?: (stage: ObservedHandler) => void): void {
   const fn = layer.handle;
   if (typeof fn !== "function" || fn[WRAPPED_HANDLE] || layer.route || Array.isArray(fn.stack)) return;
   if (INTERNAL_LAYERS.has(fn.name)) return;
   const kind = "route" in layer ? "middleware" : "handler";
   const label = symbolName(layer.name, fn.name);
   const wrapped = function xtraceExpressHandle(this: unknown, ...args: unknown[]): unknown {
+    const report = args.length === 3 && kind === "handler" ? observe : undefined;
+    report?.("invoked");
     const context = currentContext();
     const transport = hooks?.transport();
     if (!context || !transport || context.finished) return Reflect.apply(fn, this, args);
+    report?.("withContext");
     const symbol = `express.${args.length === 4 ? "error_handler" : kind}:${label}`;
     const parent = context.frameStack[context.frameStack.length - 1] ?? "";
     const enter = recordEvent(context, transport, { ...events.frameEnter(symbol), parentEventId: parent });
-    if (enter) context.frameStack.push(enter);
+    if (enter) {
+      report?.("posted");
+      context.frameStack.push(enter);
+    }
     try {
       const result = Reflect.apply(fn, this, args);
       if (enter) recordEvent(context, transport, events.frameExit(symbol, enter));

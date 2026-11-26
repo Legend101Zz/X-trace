@@ -26,8 +26,9 @@ class InstalledStopRecovery(unittest.TestCase):
         process.observe_children.side_effect = RuntimeError(private)
         process.child.wait.side_effect = [subprocess.TimeoutExpired([private], 25), 0]
         with (patch("installed.traceback.print_exc"),
+              patch("installed.time.monotonic", side_effect=[0, 0, 25, 26, 26, 27]),
               patch("installed.select.select", side_effect=[([], [], []), ([30], [], []),
-                                                           ([], [], []), ([31], [], [])]) as ready,
+                                                           ([31], [], [])]) as ready,
               patch("installed.signal.pidfd_send_signal") as pidfd_send,
               patch("installed.reap_exited_group_children", return_value=1) as reap,
               patch("installed.os.close") as close,
@@ -42,12 +43,29 @@ class InstalledStopRecovery(unittest.TestCase):
         ])
         process.child.terminate.assert_called_once_with()
         self.assertEqual(process.child.wait.call_args_list, [call(timeout=25), call(timeout=5)])
-        self.assertEqual(ready.call_args_list, [call([30], [], [], 0), call([30], [], [], 5),
-                                               call([31], [], [], 0), call([31], [], [], 5)])
+        self.assertEqual(ready.call_args_list, [call([30, 31], [], [], 0), call([30, 31], [], [], 4),
+                                               call([31], [], [], 3)])
         self.assertEqual(pidfd_send.call_args_list, [call(30, signal.SIGKILL), call(31, signal.SIGKILL)])
         self.assertEqual(killpg.call_args_list, [call(246, signal.SIGKILL), call(246, 0)])
         self.assertEqual(close.call_args_list, [call(30), call(31)])
         reap.assert_called_once_with(246)
+
+    def test_descendants_share_the_original_grace_deadline_after_launcher_exit(self):
+        process = self.process((30, 31))
+        with (patch("installed.time.monotonic", side_effect=[100, 101, 110, 119]),
+              patch("installed.select.select", side_effect=[([31], [], []), ([30], [], [])]) as ready,
+              patch("installed.signal.pidfd_send_signal") as pidfd_send,
+              patch("installed.reap_exited_group_children", return_value=2),
+              patch("installed.os.close"),
+              patch("installed.os.killpg", side_effect=ProcessLookupError)):
+            self.assertEqual(process.stop(), 0)
+        process.child.terminate.assert_called_once_with()
+        process.child.wait.assert_called_once_with(timeout=24)
+        self.assertEqual(ready.call_args_list, [call([30, 31], [], [], 15), call([30], [], [], 6)])
+        pidfd_send.assert_not_called()
+        self.assertEqual(process.stop_recovery_reasons, [])
+        self.assertEqual(process.reaped_group_exits, 2)
+        self.assertTrue(process.cleaned)
 
     def test_no_recovery_is_distinct_from_the_group_absence_verdict(self):
         process = self.process()

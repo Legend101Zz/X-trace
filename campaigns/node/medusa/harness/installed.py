@@ -249,26 +249,40 @@ class Process:
             except Exception:
                 traceback.print_exc()
                 recovery_reasons.append("descendant-inventory-failed")
+            grace_deadline = time.monotonic() + 25
+            recovery_deadline = grace_deadline + 5
             if self.child.poll() is None:
                 self.child.terminate()
             try:
-                code = self.child.wait(timeout=25)
+                code = self.child.wait(timeout=max(0, grace_deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 recovery_reasons.append("launcher-wait-deadline")
                 if self.child.poll() is None:
                     os.killpg(self.child.pid, signal.SIGKILL)
-                code = self.child.wait(timeout=5)
-            for handle in self.owned_children.values():
-                if not select.select([handle], [], [], 0)[0]:
-                    reason = "descendant-exit-not-yet-observed"
-                    if reason not in recovery_reasons:
-                        recovery_reasons.append(reason)
+                code = self.child.wait(timeout=max(0, recovery_deadline - time.monotonic()))
+
+            # The launcher can exit before its children report exit. Observe all
+            # owned pidfds in the time left on the original grace clock.
+            pending = set(self.owned_children.values())
+            while pending:
+                timeout = max(0, grace_deadline - time.monotonic())
+                ready, _, _ = select.select(sorted(pending), [], [], timeout)
+                if not ready:
+                    break
+                pending.difference_update(ready)
+            if pending:
+                recovery_reasons.append("descendant-exit-not-yet-observed")
+                for handle in sorted(pending):
                     try:
                         signal.pidfd_send_signal(handle, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    if not select.select([handle], [], [], 5)[0]:
+                while pending:
+                    timeout = max(0, recovery_deadline - time.monotonic())
+                    ready, _, _ = select.select(sorted(pending), [], [], timeout)
+                    if not ready:
                         raise ProcessStopFailure("descendant-exit-unverified")
+                    pending.difference_update(ready)
             # After the leader exits, its dead children can still occupy the
             # group until this subreaper consumes their wait status.
             self.reaped_group_exits = reap_exited_group_children(self.child.pid)
