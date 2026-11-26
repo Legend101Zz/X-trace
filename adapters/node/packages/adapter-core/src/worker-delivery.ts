@@ -2,6 +2,8 @@ import { MAX_IN_FLIGHT_MESSAGES } from "./runtime/transport.cjs";
 import { adjacentEvents, type InputMessage, type RecordingAssembler } from "./worker-core.js";
 
 interface DeliveryHooks {
+  /** Takes the oldest already queued message from the same port, without waiting. */
+  receivePending?(): InputMessage | undefined;
   staged(): void;
   routeFoldStaged?(events: number): void;
   close(): Promise<void>;
@@ -25,6 +27,19 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
     for (let index = 0; index < count; index += 1) hooks.staged();
   }
 
+  function append(message: InputMessage): void {
+    if (message.type === "close") closing = true;
+    pending.push(message);
+  }
+
+  function peek(index: number): InputMessage | undefined {
+    if (index === pending.length && index < MAX_IN_FLIGHT_MESSAGES && !closing && !stopped) {
+      const message = hooks.receivePending?.();
+      if (message) append(message);
+    }
+    return pending[index];
+  }
+
   async function drain(): Promise<void> {
     draining = true;
     try {
@@ -37,14 +52,16 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
         }
         if (message.type === "event") {
           const events = [message];
-          while (pending[0] && adjacentEvents(events[events.length - 1]!, pending[0])) {
+          while (events.length < MAX_IN_FLIGHT_MESSAGES) {
+            const next = peek(0);
+            if (!next || !adjacentEvents(events[events.length - 1]!, next)) break;
             events.push(pending.shift()!);
           }
           await assembler.handleEvents(events, credit);
         } else if (message.type === "route") {
           let folded = 0;
           await assembler.handle(message, {
-            peek: (offset) => pending[offset],
+            peek,
             take(count) {
               pending.splice(0, count);
               folded += count;
@@ -70,13 +87,12 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
   return {
     enqueue(message: InputMessage): void {
       if (closing || stopped) return;
-      if (message.type === "close") closing = true;
-      else if (pending.length >= MAX_IN_FLIGHT_MESSAGES) {
+      if (message.type !== "close" && pending.length >= MAX_IN_FLIGHT_MESSAGES) {
         stop();
         hooks.fail();
         return;
       }
-      pending.push(message);
+      append(message);
       if (!draining) void drain();
     },
     abort: stop,

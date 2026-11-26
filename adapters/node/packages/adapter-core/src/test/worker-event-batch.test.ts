@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
-import type { Worker } from "node:worker_threads";
+import { MessageChannel, receiveMessageOnPort, type Worker } from "node:worker_threads";
 import { create, toBinary } from "@bufbuild/protobuf";
 import { blake3 } from "hash-wasm";
 import { AgentEnvelopeSchema, RecordingEventKind, type AgentEnvelope } from "@xtrace/protocol";
@@ -35,13 +35,18 @@ function wireEvents(payload: Payload): bigint[] {
   return payload.value.events.map((value) => value.recordingSeq);
 }
 
-function createHarness(send: SendFn, maxBatchEvents = 64, fitsEnvelope: NonNullable<Parameters<typeof createRecordingAssembler>[3]>["fitsEnvelope"] = () => true) {
+function createHarness(
+  send: SendFn, maxBatchEvents = 64,
+  fitsEnvelope: NonNullable<Parameters<typeof createRecordingAssembler>[3]>["fitsEnvelope"] = () => true,
+  receivePending?: () => InputMessage | undefined,
+) {
   const assembler = createRecordingAssembler(send, () => 5n, undefined, { maxBatchEvents, fitsEnvelope });
   const done = deferred();
   const failed = deferred();
   let credits = 0;
   const stagedFolds: number[] = [];
   const delivery = createWorkerDelivery(assembler, {
+    ...(receivePending ? { receivePending } : {}),
     staged: () => { credits += 1; },
     routeFoldStaged: (events) => { stagedFolds.push(events); },
     close: async () => done.resolve(),
@@ -305,4 +310,48 @@ test("a rejected folded route batch refunds neither the route nor its queued eve
   assert.equal(h.stagedFolds.length, 0);
   assert.deepEqual(sent.map((payload) => payload.case === "eventBatch" ? wireEvents(payload) : payload.case),
     ["recordingStarted", [2n, 3n]]);
+});
+
+
+test("the worker batches adjacent port messages without crossing gaps, finish or close", async (t) => {
+  const { port1, port2 } = new MessageChannel();
+  t.after(() => { port1.close(); port2.close(); });
+  const startSent = deferred();
+  const startAck = deferred();
+  const firstBatchSent = deferred();
+  const firstBatchAck = deferred();
+  const payloads: Payload[] = [];
+  const h = createHarness(async (_, payload) => {
+    payloads.push(payload);
+    if (payload.case === "recordingStarted") {
+      startSent.resolve();
+      await startAck.promise;
+    } else if (payloads.length === 2) {
+      firstBatchSent.resolve();
+      await firstBatchAck.promise;
+    }
+  }, 64, undefined, () => receiveMessageOnPort(port1)?.message as InputMessage | undefined);
+
+  h.delivery.enqueue(start(A, true));
+  h.delivery.enqueue(event(2));
+  h.delivery.enqueue({ type: "route", recordingId: A, route: "/items" });
+  await startSent.promise;
+  const gap: InputMessage = { ...event(5), kind: "gap", gap: {
+    reason: "queue-full", count: 1, firstSequence: 5n, lastSequence: 5n,
+  } };
+  for (const message of [event(3), event(4), gap, event(6), event(7), finish(7), close, start(B)]) {
+    port2.postMessage(message);
+  }
+  startAck.resolve();
+  await firstBatchSent.promise;
+  assert.deepEqual(wireEvents(payloads[1]!), [2n, 3n, 4n]);
+  assert.equal(h.credits(), 2, "only the held start and prefix have returned credit");
+  assert.deepEqual(h.stagedFolds, []);
+  port1.on("message", (message: InputMessage) => h.delivery.enqueue(message));
+  firstBatchAck.resolve();
+  await Promise.race([h.done, h.failed.then(() => assert.fail("port delivery failed"))]);
+  assert.deepEqual(payloads.map((p) => p.case === "eventBatch" ? wireEvents(p) : p.case),
+    ["recordingStarted", [2n, 3n, 4n], [5n], [6n, 7n], "recordingFinished"]);
+  assert.equal(h.credits(), 9);
+  assert.deepEqual(h.stagedFolds, [2]);
 });

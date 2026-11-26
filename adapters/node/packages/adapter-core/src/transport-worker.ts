@@ -1,5 +1,5 @@
 import { RecordingEventKind } from "@xtrace/protocol";
-import { parentPort, workerData } from "node:worker_threads";
+import { parentPort, receiveMessageOnPort, workerData } from "node:worker_threads";
 import { returnCaptureCredit, routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
 import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
@@ -76,6 +76,9 @@ async function initialize(): Promise<void> {
   // The opt-in receipt samples a notification-driven view. Wakeups coalesce.
   const notify = diagnostic ? () => parentPort?.postMessage({ type: "staged" }) : undefined;
   delivery = createWorkerDelivery(assembler, {
+    receivePending: () => parentPort
+      ? receiveMessageOnPort(parentPort)?.message as InputMessage | undefined
+      : undefined,
     staged: () => returnCaptureCredit(data.credits, notify),
     ...(routeFolds ? {
       routeFoldStaged(events: number) {
