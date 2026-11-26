@@ -395,7 +395,19 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     }
     if (width >= 1280) {
       const views = page.getByRole('tablist', { name: 'Replay view' });
-      for (const name of ['Steps', 'Map']) await assertLabelUncovered(views.getByRole('tab', { name, exact: true }));
+      for (const name of ['Steps', 'Map']) {
+        const tab = views.getByRole('tab', { name, exact: true });
+        await assertLabelUncovered(tab);
+        if (pointer === 'coarse') {
+          assert.ok(await tab.evaluate((button) => {
+            const box = button.getBoundingClientRect();
+            const y = box.top + box.height / 2;
+            return box.width >= 44 && box.height >= 44 &&
+              [box.left + 1, box.left + box.width / 2, box.right - 1].every((x) =>
+                button.contains(document.elementFromPoint(x, y)));
+          }), 'the coarse mode tab has a 44px target clear of both neighboring dividers');
+        }
+      }
     }
     await saveScreenshot(`viewer-replay-tools-${pointer}-${width}.png`, `loaded-tools-real-Spring-${pointer}`, width, height, page);
     await ensureMore();

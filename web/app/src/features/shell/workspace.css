@@ -182,6 +182,9 @@
 }
 
 @media (min-width: 861px) and (pointer: coarse) {
+  /* Each adjacent 8px divider has a centered 44px drag target. Keep the mode
+     controls outside the 18px of that target extending into the Steps pane. */
+  .steps-content > .mode-switch { margin-inline: 18px; max-width: calc(100% - 36px); }
   .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector::before {
     inset: 50% 0 auto; transform: translateY(-50%);
   }
