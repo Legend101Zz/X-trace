@@ -33,6 +33,10 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
         self.assertEqual(result["counts"]["startBeforeCreditNotification"], 1)
         self.assertEqual(result["routeFoldEvidence"], {"batches": 2, "events": 3})
         self.assertEqual(result["finishProgress"], self.snapshot()["finishProgress"])
+        for active in ("route-start", "route-held-events"):
+            progress = self.snapshot()["finishProgress"] | {"active": active}
+            self.assertEqual(project_capture_diagnostic(self.line(finishProgress=progress), self.nonce)
+                             ["finishProgress"], progress)
         private = json.dumps(result)
         self.assertNotIn(self.nonce, private)
         self.assertNotIn("private example path", private)

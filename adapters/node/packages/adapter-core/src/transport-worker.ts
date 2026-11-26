@@ -3,7 +3,8 @@ import { parentPort, receiveMessageOnPort, workerData } from "node:worker_thread
 import { returnCaptureCredit, routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
 import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
-import { finishProgressDiagnosticOffset, noteFinishProgress, noteFinishWork } from "./runtime/finish-progress.cjs";
+import { finishProgressDiagnosticOffset, noteFinishProgress, noteFinishWork,
+  type FinishWork } from "./runtime/finish-progress.cjs";
 import { createWorkerDelivery } from "./worker-delivery.js";
 
 interface StartupData {
@@ -90,7 +91,7 @@ async function initialize(): Promise<void> {
     staged: () => returnCaptureCredit(data.credits, notify),
     ...(finishProgress ? {
       finishProgress: (boundary: "received" | "dispatched") => noteFinishProgress(finishProgress, boundary),
-      activeWork: (type: InputMessage["type"] | "idle") => noteFinishWork(finishProgress, type),
+      activeWork: (type: FinishWork) => noteFinishWork(finishProgress, type),
     } : {}),
     ...(routeFolds ? {
       routeFoldStaged(events: number) {

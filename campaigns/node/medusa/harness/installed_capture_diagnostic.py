@@ -5,10 +5,10 @@ import re
 
 from installed_evidence import require
 
-PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V6 "
+PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V7 "
 DAEMON_PREFIX = b"XTR-MEDUSA-DAEMON-FINISH-V1 "
 DAEMON_FIELDS = ("sessions", "decoded", "admitted", "ackReady", "ackQueued", "ackFlushed")
-ACTIVE_WORK = frozenset(("idle", "start", "event", "route", "finish", "close"))
+ACTIVE_WORK = frozenset(("idle", "start", "event", "route", "finish", "close", "route-start", "route-held-events"))
 COUNTERS = frozenset({
     "startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
     "finishPosted", "finishRejected", "eventRejected", "routeRejected",

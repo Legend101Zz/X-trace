@@ -27,6 +27,7 @@ import {
 } from "@xtrace/protocol";
 import type { CaptureEventKind, ExceptionFacts, GapFacts, InteractionFacts, SourceBindingName, SourceFacts } from "./runtime/events.cjs";
 import { MAX_IN_FLIGHT_MESSAGES, type RecordingSummary } from "./runtime/transport.cjs";
+import type { RouteWork } from "./runtime/finish-progress.cjs";
 
 export interface InputMessage {
   type: "start" | "event" | "finish" | "close" | "route";
@@ -255,6 +256,7 @@ export function adjacentEvents(previous: InputMessage, next: InputMessage): bool
 type Credit = (count: number) => void;
 
 interface RouteLookahead {
+  activeWork?(phase: RouteWork): void;
   peek(offset: number): InputMessage | undefined;
   take(count: number): void;
 }
@@ -388,9 +390,12 @@ export function createRecordingAssembler(
     return state.releasing ??= (async () => {
       if (!state.started) {
         state.routeLost = summary === undefined;
+        followingRoute?.activeWork?.("route-start");
         await sendStart(recordingId, state, summary);
       }
-      await sendEvents(recordingId, state, state.held.splice(0), undefined, followingRoute);
+      const held = state.held.splice(0);
+      followingRoute?.activeWork?.(held.length > 0 ? "route-held-events" : "route");
+      await sendEvents(recordingId, state, held, undefined, followingRoute);
     })();
   }
 

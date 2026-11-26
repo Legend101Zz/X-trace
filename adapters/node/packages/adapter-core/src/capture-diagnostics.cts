@@ -59,7 +59,7 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
     try {
       const folded = Atomics.load(routeFolds, 0);
       const finishProgress = readFinishProgress(finishBoundaries);
-      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V6 " + JSON.stringify({
+      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V7 " + JSON.stringify({
         nonce, exitCode, scope, express, patchedLayers: expressPatchStatus().patched, counts,
         expressEvidence: { ...expressEvidence, anyLayerStaged: Atomics.load(worker, workerCounters.expressHandlerStaged) },
         routeFoldEvidence: { batches: Number(folded >> 32n), events: Number(folded & 0xffff_ffffn) },

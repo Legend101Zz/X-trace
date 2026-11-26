@@ -325,6 +325,7 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
   const startAck = deferred();
   const firstBatchSent = deferred();
   const firstBatchAck = deferred();
+  const finishReceived = deferred();
   const payloads: Payload[] = [];
   const progress = new BigUint64Array(new SharedArrayBuffer(BigUint64Array.BYTES_PER_ELEMENT));
   const note = (boundary: FinishBoundary) => noteFinishProgress(progress, boundary);
@@ -342,13 +343,17 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
       note("submitted");
       note("written");
     }
-  }, 64, undefined, () => receiveMessageOnPort(port1)?.message as InputMessage | undefined, note,
-  (type) => noteFinishWork(progress, type));
+  }, 64, undefined, () => receiveMessageOnPort(port1)?.message as InputMessage | undefined, (phase) => {
+    note(phase);
+    if (phase === "received") finishReceived.resolve();
+  }, (type) => noteFinishWork(progress, type));
 
   h.delivery.enqueue(start(A, true));
   h.delivery.enqueue(event(2));
   h.delivery.enqueue({ type: "route", recordingId: A, route: "/items" });
   await startSent.promise;
+  assert.equal(readFinishProgress(progress)?.active, "route-start");
+  assert.equal(h.credits(), 2, "the route remains charged before its start ACK");
   const gap: InputMessage = { ...event(5), kind: "gap", gap: {
     reason: "queue-full", count: 1, firstSequence: 5n, lastSequence: 5n,
   } };
@@ -358,10 +363,14 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
   startAck.resolve();
   await firstBatchSent.promise;
   assert.deepEqual(wireEvents(payloads[1]!), [2n, 3n, 4n]);
-  assert.equal(readFinishProgress(progress)?.active, "route");
+  assert.equal(readFinishProgress(progress)?.active, "route-held-events");
   assert.equal(h.credits(), 2, "only the held start and prefix have returned credit");
   assert.deepEqual(h.stagedFolds, []);
   port1.on("message", (message: InputMessage) => h.delivery.enqueue(message));
+  await finishReceived.promise;
+  assert.deepEqual(readFinishProgress(progress),
+    { received: 1, dispatched: 0, submitted: 0, written: 0, staged: 0, active: "route-held-events" });
+  assert.equal(h.credits(), 2, "the queued finish and route batch have returned no credit");
   firstBatchAck.resolve();
   await Promise.race([h.done, h.failed.then(() => assert.fail("port delivery failed"))]);
   assert.deepEqual(payloads.map((p) => p.case === "eventBatch" ? wireEvents(p) : p.case),

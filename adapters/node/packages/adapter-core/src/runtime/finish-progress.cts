@@ -6,8 +6,9 @@ const mask = 0xfffn;
 const overflow = 1n << 63n;
 const workShift = 60n;
 const workMask = 7n << workShift;
-const work = ["idle", "start", "event", "route", "finish", "close"] as const;
+const work = ["idle", "start", "event", "route", "finish", "close", "route-start", "route-held-events"] as const;
 export type FinishWork = typeof work[number];
+export type RouteWork = Extract<FinishWork, `route${string}`>;
 export type FinishBoundary = keyof typeof fields;
 
 /** One worker writes; the app can read a coherent snapshot while that worker is still live. */

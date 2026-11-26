@@ -1,11 +1,12 @@
 import { MAX_IN_FLIGHT_MESSAGES } from "./runtime/transport.cjs";
+import type { FinishWork } from "./runtime/finish-progress.cjs";
 import { adjacentEvents, type InputMessage, type RecordingAssembler } from "./worker-core.js";
 
 interface DeliveryHooks {
   /** Takes the oldest already queued message from the same port, without waiting. */
   receivePending?(): InputMessage | undefined;
   finishProgress?(boundary: "received" | "dispatched"): void;
-  activeWork?(type: InputMessage["type"] | "idle"): void;
+  activeWork?(type: FinishWork): void;
   staged(): void;
   routeFoldStaged?(events: number): void;
   close(): Promise<void>;
@@ -65,6 +66,7 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
         } else if (message.type === "route") {
           let folded = 0;
           await assembler.handle(message, {
+            ...(hooks.activeWork ? { activeWork: hooks.activeWork } : {}),
             peek,
             take(count) {
               pending.splice(0, count);
