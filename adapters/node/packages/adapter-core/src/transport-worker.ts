@@ -3,6 +3,7 @@ import { parentPort, receiveMessageOnPort, workerData } from "node:worker_thread
 import { returnCaptureCredit, routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
 import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
+import { finishProgressDiagnosticOffset, noteFinishProgress } from "./runtime/finish-progress.cjs";
 import { createWorkerDelivery } from "./worker-delivery.js";
 
 interface StartupData {
@@ -19,15 +20,22 @@ const data = workerData as StartupData;
 const startup = new Int32Array(data.startupBarrier);
 const diagnostic = data.diagnosticBuffer && new Uint32Array(data.diagnosticBuffer);
 const routeFolds = data.diagnosticBuffer && new BigUint64Array(data.diagnosticBuffer, routeFoldDiagnosticOffset, 1);
+const finishProgress = data.diagnosticBuffer && new BigUint64Array(data.diagnosticBuffer, finishProgressDiagnosticOffset, 1);
 let session: AuthenticatedXtpSession | undefined;
 let delivery: ReturnType<typeof createWorkerDelivery> | undefined;
 let shuttingDown = false;
 
 const send: SendFn = (id, payload, token) => session!.send(id, payload, token);
 const observedSend: SendFn = diagnostic ? async (id, payload, token) => {
+  if (payload.case === "recordingFinished" && finishProgress) {
+    noteFinishProgress(finishProgress, "submitted");
+    const result = await session!.send(id, payload, token, () => noteFinishProgress(finishProgress, "written"));
+    noteFinishProgress(finishProgress, "staged");
+    Atomics.add(diagnostic, workerCounters.finishStaged, 1);
+    return result;
+  }
   const result = await send(id, payload, token);
   if (payload.case === "recordingStarted") Atomics.add(diagnostic, workerCounters.startStaged, 1);
-  if (payload.case === "recordingFinished") Atomics.add(diagnostic, workerCounters.finishStaged, 1);
   if (payload.case === "eventBatch") {
     for (const event of payload.value.events) {
       if (event.kind === RecordingEventKind.FRAME_ENTER && event.symbol.startsWith("express.handler:")) {
@@ -80,6 +88,8 @@ async function initialize(): Promise<void> {
       ? receiveMessageOnPort(parentPort)?.message as InputMessage | undefined
       : undefined,
     staged: () => returnCaptureCredit(data.credits, notify),
+    ...(finishProgress ? { finishProgress: (boundary: "received" | "dispatched") =>
+      noteFinishProgress(finishProgress, boundary) } : {}),
     ...(routeFolds ? {
       routeFoldStaged(events: number) {
         // One atomic pair so the exit snapshot cannot observe half a fold.

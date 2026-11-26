@@ -17,6 +17,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
                         "routeBeforeCreditNotification": 0},
                     expressEvidence=dict(invoked=0, withContext=0, posted=0, anyLayerStaged=0),
                     routeFoldEvidence=dict(batches=2, events=3),
+                    finishProgress=dict(received=12, dispatched=10, submitted=9, written=9, staged=8),
                     startStaged=9, finishStaged=8, workerFailed=False, transportFailed=False,
                     closeRequested=False) | overrides
 
@@ -31,6 +32,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
         self.assertEqual(result["counts"]["startCapacityRejected"], 35)
         self.assertEqual(result["counts"]["startBeforeCreditNotification"], 1)
         self.assertEqual(result["routeFoldEvidence"], {"batches": 2, "events": 3})
+        self.assertEqual(result["finishProgress"], self.snapshot()["finishProgress"])
         private = json.dumps(result)
         self.assertNotIn(self.nonce, private)
         self.assertNotIn("private example path", private)
@@ -54,7 +56,15 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
             self.assertEqual(project_capture_diagnostic(log, self.nonce), {"status": "invalid"})
 
     def test_records_with_extra_values_or_impossible_counts_are_invalid(self):
-        for overrides in ({"examplePath": "/private/example"}, {"scope": "/private/example"},
+        progress = self.snapshot()["finishProgress"]
+        for overrides in ({"finishProgress": None},
+                          {"finishProgress": progress | {"staged": 9}},
+                          {"finishProgress": progress | {"written": 10}},
+                          {"finishProgress": progress | {"received": 13}},
+                          {"finishProgress": progress | {"received": 4096}},
+                          {"finishProgress": progress | {"received": True}},
+                          {"finishProgress": progress | {"private": "example"}},
+                          {"examplePath": "/private/example"}, {"scope": "/private/example"},
                           {"finishStaged": 13}, {"startStaged": 13}, {"workerFailed": 1},
                           {"routeFoldEvidence": {"batches": 0, "events": 1}},
                           {"routeFoldEvidence": {"batches": 1, "events": 64}},

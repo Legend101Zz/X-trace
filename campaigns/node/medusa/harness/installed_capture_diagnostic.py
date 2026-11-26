@@ -5,7 +5,7 @@ import re
 
 from installed_evidence import require
 
-PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V4 "
+PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V5 "
 COUNTERS = frozenset({
     "startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
     "finishPosted", "finishRejected", "eventRejected", "routeRejected",
@@ -17,7 +17,7 @@ EXPRESS = frozenset({"not-observed", "installed", "express-not-found", "unsuppor
 SWITCHES = frozenset({"workerFailed", "transportFailed", "closeRequested"})
 HANDLER_COUNTS = frozenset({"invoked", "withContext", "posted", "anyLayerStaged"})
 FIELDS = frozenset({"nonce", "exitCode", "scope", "express", "patchedLayers", "counts",
-                    "startStaged", "finishStaged", "expressEvidence", "routeFoldEvidence"}) | SWITCHES
+                    "startStaged", "finishStaged", "expressEvidence", "routeFoldEvidence", "finishProgress"}) | SWITCHES
 
 
 def unique(items):
@@ -68,6 +68,15 @@ def project_capture_diagnostic(log, nonce):
         require(obj["startStaged"] <= counts["startAccepted"])
         require(counts["startBeforeCreditNotification"] <= counts["startAccepted"])
         require(obj["finishStaged"] <= counts["finishPosted"] <= counts["startAccepted"])
+        progress = obj["finishProgress"]
+        if progress is None:
+            require(counts["finishPosted"] >= 4096)
+        else:
+            require(isinstance(progress, dict) and set(progress) ==
+                    {"received", "dispatched", "submitted", "written", "staged"})
+            require(all(bounded(value, 4095) for value in progress.values()))
+            require(obj["finishStaged"] == progress["staged"] <= progress["written"] <= progress["submitted"]
+                    <= progress["dispatched"] <= progress["received"] <= counts["finishPosted"])
     except (TypeError, ValueError, RecursionError):
         return {"status": "invalid"}
     return {"status": "observed", **{key: obj[key] for key in FIELDS - {"nonce"}}}

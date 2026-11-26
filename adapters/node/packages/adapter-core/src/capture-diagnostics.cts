@@ -2,6 +2,7 @@ import { realpathSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { expressPatchStatus, observeExpressHandlers } from "./express-instrument.cjs";
 import { resolveFromEntry, resolveMedusaExpress } from "./modules.cjs";
+import { finishProgressDiagnosticOffset, readFinishProgress } from "./runtime/finish-progress.cjs";
 import { routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import type { ModuleStatus } from "./runtime/registry.cjs";
 
@@ -39,9 +40,10 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
   delete process.env.XTRACE_MEDUSA_CAPTURE_DIAGNOSTIC;
   if (!/^[a-f0-9]{48}$/.test(nonce)) return;
   const counts = Object.fromEntries(counters.map((key) => [key, 0])) as Record<Counter, number>;
-  const workerBuffer = new SharedArrayBuffer(routeFoldDiagnosticOffset + BigUint64Array.BYTES_PER_ELEMENT);
+  const workerBuffer = new SharedArrayBuffer(finishProgressDiagnosticOffset + BigUint64Array.BYTES_PER_ELEMENT);
   const routeFolds = new BigUint64Array(workerBuffer, routeFoldDiagnosticOffset, 1);
   const worker = new Uint32Array(workerBuffer);
+  const finishBoundaries = new BigUint64Array(workerBuffer, finishProgressDiagnosticOffset, 1);
   const scope = expressScope();
   const expressEvidence = { invoked: 0, withContext: 0, posted: 0 };
   try {
@@ -56,12 +58,14 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
     // The nonce only authenticates this finite line from the proof's private stream.
     try {
       const folded = Atomics.load(routeFolds, 0);
-      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V4 " + JSON.stringify({
+      const finishProgress = readFinishProgress(finishBoundaries);
+      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V5 " + JSON.stringify({
         nonce, exitCode, scope, express, patchedLayers: expressPatchStatus().patched, counts,
         expressEvidence: { ...expressEvidence, anyLayerStaged: Atomics.load(worker, workerCounters.expressHandlerStaged) },
         routeFoldEvidence: { batches: Number(folded >> 32n), events: Number(folded & 0xffff_ffffn) },
         startStaged: Atomics.load(worker, workerCounters.startStaged),
-        finishStaged: Atomics.load(worker, workerCounters.finishStaged),
+        finishProgress,
+        finishStaged: finishProgress?.staged ?? Atomics.load(worker, workerCounters.finishStaged),
         workerFailed: Atomics.load(worker, workerCounters.failed) === 1,
         transportFailed, closeRequested,
       }) + "\n");

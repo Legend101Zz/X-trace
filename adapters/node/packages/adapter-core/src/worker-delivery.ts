@@ -4,6 +4,7 @@ import { adjacentEvents, type InputMessage, type RecordingAssembler } from "./wo
 interface DeliveryHooks {
   /** Takes the oldest already queued message from the same port, without waiting. */
   receivePending?(): InputMessage | undefined;
+  finishProgress?(boundary: "received" | "dispatched"): void;
   staged(): void;
   routeFoldStaged?(events: number): void;
   close(): Promise<void>;
@@ -30,6 +31,7 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
   function append(message: InputMessage): void {
     if (message.type === "close") closing = true;
     pending.push(message);
+    if (message.type === "finish") hooks.finishProgress?.("received");
   }
 
   function peek(index: number): InputMessage | undefined {
@@ -72,6 +74,7 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
           if (folded > 0) hooks.routeFoldStaged?.(folded);
           credit(1 + folded);
         } else {
+          if (message.type === "finish") hooks.finishProgress?.("dispatched");
           await assembler.handle(message);
           credit(1);
         }

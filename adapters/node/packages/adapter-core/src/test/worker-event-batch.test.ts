@@ -8,6 +8,7 @@ import { AgentEnvelopeSchema, RecordingEventKind, type AgentEnvelope } from "@xt
 import { createCaptureCredits, createHttpCaptureTransport } from "../runtime/transport.cjs";
 import { createRecordingAssembler, HOLD_START_MS, type InputMessage, type SendFn } from "../worker-core.js";
 import { createWorkerDelivery } from "../worker-delivery.js";
+import { noteFinishProgress, readFinishProgress, type FinishBoundary } from "../runtime/finish-progress.cjs";
 
 const A = "01900000-0000-7000-8000-000000000001";
 const B = "01900000-0000-7000-8000-000000000002";
@@ -39,6 +40,7 @@ function createHarness(
   send: SendFn, maxBatchEvents = 64,
   fitsEnvelope: NonNullable<Parameters<typeof createRecordingAssembler>[3]>["fitsEnvelope"] = () => true,
   receivePending?: () => InputMessage | undefined,
+  finishProgress?: (boundary: "received" | "dispatched") => void,
 ) {
   const assembler = createRecordingAssembler(send, () => 5n, undefined, { maxBatchEvents, fitsEnvelope });
   const done = deferred();
@@ -47,6 +49,7 @@ function createHarness(
   const stagedFolds: number[] = [];
   const delivery = createWorkerDelivery(assembler, {
     ...(receivePending ? { receivePending } : {}),
+    ...(finishProgress ? { finishProgress } : {}),
     staged: () => { credits += 1; },
     routeFoldStaged: (events) => { stagedFolds.push(events); },
     close: async () => done.resolve(),
@@ -321,6 +324,8 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
   const firstBatchSent = deferred();
   const firstBatchAck = deferred();
   const payloads: Payload[] = [];
+  const progress = new BigUint64Array(new SharedArrayBuffer(BigUint64Array.BYTES_PER_ELEMENT));
+  const note = (boundary: FinishBoundary) => noteFinishProgress(progress, boundary);
   const h = createHarness(async (_, payload) => {
     payloads.push(payload);
     if (payload.case === "recordingStarted") {
@@ -329,8 +334,13 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
     } else if (payloads.length === 2) {
       firstBatchSent.resolve();
       await firstBatchAck.promise;
+    } else if (payload.case === "recordingFinished") {
+      assert.deepEqual(readFinishProgress(progress),
+        { received: 1, dispatched: 1, submitted: 0, written: 0, staged: 0 });
+      note("submitted");
+      note("written");
     }
-  }, 64, undefined, () => receiveMessageOnPort(port1)?.message as InputMessage | undefined);
+  }, 64, undefined, () => receiveMessageOnPort(port1)?.message as InputMessage | undefined, note);
 
   h.delivery.enqueue(start(A, true));
   h.delivery.enqueue(event(2));
@@ -354,4 +364,11 @@ test("the worker batches adjacent port messages without crossing gaps, finish or
     ["recordingStarted", [2n, 3n, 4n], [5n], [6n, 7n], "recordingFinished"]);
   assert.equal(h.credits(), 9);
   assert.deepEqual(h.stagedFolds, [2]);
+  assert.deepEqual(readFinishProgress(progress),
+    { received: 1, dispatched: 1, submitted: 1, written: 1, staged: 0 });
+  note("staged");
+  assert.equal(readFinishProgress(progress)?.staged, 1);
+  Atomics.store(progress, 0, 4095n);
+  note("received");
+  assert.equal(readFinishProgress(progress), null, "counter overflow is unavailable rather than wrapped");
 });

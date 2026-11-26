@@ -33,8 +33,10 @@ export interface AuthenticatedXtpSession {
    * @param messageId Stable non-empty ID for the outgoing envelope.
    * @param payload Generated Protobuf payload; callers cannot supply wire bytes.
    * @param correlationToken Optional opaque correlation token.
+   * @param onWritten Optional internal observer of the completed local write before the staged ACK.
    */
-  send(messageId: string, payload: AgentEnvelope["payload"], correlationToken?: string): Promise<AgentEnvelope["payload"] & { case: "ack" }>;
+  send(messageId: string, payload: AgentEnvelope["payload"], correlationToken?: string,
+    onWritten?: () => void): Promise<AgentEnvelope["payload"] & { case: "ack" }>;
   /** Sends TLS close-notify and releases the local socket. */
   close(): Promise<void>;
 }
@@ -176,6 +178,7 @@ export async function openXtpSession(
       messageId: string,
       payload: AgentEnvelope["payload"],
       correlationToken = "",
+      onWritten?: () => void,
     ): Promise<AgentEnvelope["payload"] & { case: "ack" }> {
       if (closing || closed) throw new XtraceClientError("XTR-NODE-TRANSPORT", "XTP session is closing or closed");
       if (messageId.length === 0) throw new XtraceClientError("XTR-NODE-ENVELOPE", "message ID must not be empty");
@@ -184,6 +187,7 @@ export async function openXtpSession(
         const envelope = makeEnvelope(seq, process.hrtime.bigint(), messageId, payload, correlationToken);
         try {
           await writeEnvelope(activeSocket, envelope, maxBytes);
+          onWritten?.();
           const response = await nextAck(frames);
           if (response.runtimeSessionId.length !== runtimeSessionId.length ||
               !equalBytes(response.runtimeSessionId, runtimeSessionId) ||
