@@ -30,6 +30,7 @@ function firstVisible(offsets: readonly number[], top: number) {
 
 export function useStepWindow(events: readonly ReplayEvent[], selected: string | undefined) {
   const list = useRef<HTMLOListElement>(null);
+  const selectedRow = useRef<HTMLButtonElement>(null);
   const heights = useRef(new Map<string, number>());
   const measuredWidth = useRef(0);
   const anchor = useRef<{ sequence: string; offset: number } | null>(null);
@@ -140,6 +141,23 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
     };
   }, [events, offsets, mountedKey]);
 
+  useLayoutEffect(() => {
+    const element = list.current;
+    const button = selectedRow.current;
+    const item = button?.closest<HTMLElement>('[data-step-sequence]');
+    const owner = element && stepScrollOwner(element);
+    if (!element || !owner || !owner.clientHeight || !button || !item || selected === undefined) return;
+    const before = owner.scrollTop;
+    revealWithin(owner, button, 'vertical');
+    if (owner.scrollTop === before) return;
+
+    // A mode switch can mount a distant selected row beside estimated spacers.
+    // Re-anchor immediately, before new measurements can restore the old scroll position.
+    const viewportTop = owner.getBoundingClientRect().top + owner.clientTop;
+    anchor.current = { sequence: selected, offset: item.getBoundingClientRect().top - viewportTop };
+    updateViewport(element, owner, viewportTop);
+  }, [selected]);
+
   function revealIndex(index: number) {
     const target = Math.max(0, Math.min(events.length - 1, index));
     const element = list.current;
@@ -153,5 +171,5 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
     return sequence;
   }
 
-  return { list, mounted, offsets, first, focused, setFocused, revealIndex, groupSize: OVERSCAN + 1 };
+  return { list, selectedRow, mounted, offsets, first, focused, setFocused, revealIndex, groupSize: OVERSCAN + 1 };
 }

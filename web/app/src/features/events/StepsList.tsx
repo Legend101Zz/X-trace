@@ -3,8 +3,7 @@ import type { CSSProperties, ReactNode } from 'react';
 import { displaySymbol } from '../../replay/display-symbol';
 import { stepSentence } from '../../replay/step-sentence';
 import type { ReplayEvent } from '../../types';
-import { revealWithin } from '../common/reveal-within';
-import { stepScrollOwner, useStepWindow } from './useStepWindow';
+import { useStepWindow } from './useStepWindow';
 import './steps.css';
 
 export function StepsList({ events, selected, timing, onPick, onMove, onFocusedRowReleased }: {
@@ -16,10 +15,9 @@ export function StepsList({ events, selected, timing, onPick, onMove, onFocusedR
   onFocusedRowReleased?: (sequence: string) => void;
 }) {
   const rail = useRef<HTMLDivElement>(null);
-  const selectedRow = useRef<HTMLButtonElement>(null);
   const pendingFocus = useRef<string | undefined>(undefined);
   const [disclosures, setDisclosures] = useState<ReadonlySet<string>>(new Set());
-  const { list, mounted, offsets, first, focused, setFocused, revealIndex, groupSize } = useStepWindow(events, selected?.sequence);
+  const { list, selectedRow, mounted, offsets, first, focused, setFocused, revealIndex, groupSize } = useStepWindow(events, selected?.sequence);
 
   useLayoutEffect(() => {
     if (focused === undefined || events.some(({ sequence }) => sequence === focused)) return;
@@ -28,12 +26,7 @@ export function StepsList({ events, selected, timing, onPick, onMove, onFocusedR
   }, [events, focused, onFocusedRowReleased, setFocused]);
 
   useLayoutEffect(() => {
-    const row = selectedRow.current;
-    const element = list.current;
-    if (!row || !element) return;
-    // A mode switch remounts Steps. Reveal the pinned selection in its own scrollport.
-    revealWithin(stepScrollOwner(element), row, 'vertical');
-    if (rail.current?.contains(document.activeElement)) row.focus({ preventScroll: true });
+    if (rail.current?.contains(document.activeElement)) selectedRow.current?.focus({ preventScroll: true });
   }, [selected?.sequence]);
 
   useLayoutEffect(() => {

@@ -411,6 +411,9 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     }
     if (width === 736) {
       await expect(page.locator('#events-panel .recording-why')).toHaveJSProperty('open', true);
+      const tail = events.at(-1).sequence;
+      await goto(tail);
+      await verifyMapReturn(page, tail, activate);
       const readableRow = await page.locator('.steps-list .event').evaluateAll((rows) => rows.some((row) => {
         const box = row.getBoundingClientRect();
         const x = box.left + box.width / 2;
@@ -463,6 +466,28 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
 
 export async function assertReadableTourStep(page) {
   await expect(page.locator('#events-panel .recording-why')).toHaveJSProperty('open', true);
+  await assertReadableSelection(page, 'the recorded step sentence remains readable alongside the open disclosure and tour');
+}
+
+export async function verifyMapReturn(page, sequence, activate) {
+  const views = page.getByRole('tablist', { name: 'Replay view' });
+  const map = views.getByRole('tab', { name: 'Map', exact: true });
+  const steps = views.getByRole('tab', { name: 'Steps', exact: true });
+  const selected = page.locator('#events-panel .event[aria-current="true"]');
+  await expect(selected.locator('.event-seq')).toHaveText(sequence);
+  await activate(map);
+  await expect(map).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.steps-list')).toHaveCount(0);
+  await activate(steps);
+  await expect(steps).toHaveAttribute('aria-selected', 'true');
+  await expect(selected).toBeFocused();
+  // Sample the settled remount, after Chromium delivered the row measurements.
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(selected.locator('.event-seq')).toHaveText(sequence);
+  await assertReadableSelection(page, 'the same recorded step sentence is readable after returning from Map');
+}
+
+async function assertReadableSelection(page, message) {
   const row = page.locator('#events-panel .event[aria-current="true"]');
   await expect(row).toBeInViewport({ ratio: 1 });
   const readable = await row.locator('.event-kind').evaluate((sentence) => {
@@ -474,5 +499,5 @@ export async function assertReadableTourStep(page) {
       return [line.left + 1, line.right - 1].every((x) => sentence.contains(document.elementFromPoint(x, y)));
     });
   });
-  assert.ok(readable, 'the recorded step sentence remains readable alongside the open disclosure and tour');
+  assert.ok(readable, message);
 }

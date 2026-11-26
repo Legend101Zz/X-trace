@@ -65,6 +65,46 @@ it('bounds a retained window, pins exact selection and restores a virtualized Wh
   expect(tail()?.querySelector('.event')).toHaveAttribute('aria-current', 'true');
 });
 
+it('keeps a late remounted selection visible through layout, then respects manual scrolling', () => {
+  const events = Array.from({ length: 160 }, (_, index) => ({
+    sequence: String(index + 1), kind: 'recording_event_kind:frame_enter', frameId: 'shared-frame',
+    monotonicNs: '1', symbol: 'Synthetic.method',
+  })) as unknown as ReplayEvent[];
+  const view = (showSteps: boolean, items = events) => <section id="events-panel">
+    <button>View mode</button>
+    {showSteps && <StepsList events={items} selected={events[159]} onMove={() => undefined} onPick={() => undefined} />}
+  </section>;
+  const height = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (this: Element) {
+    return this.id === 'events-panel' ? 180 : 0;
+  });
+  const geometry = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+    if (this.id === 'events-panel') return new DOMRect(0, 0, 320, 180);
+    const panel = this.closest('#events-panel');
+    const position = Number(this.closest('[aria-posinset]')?.getAttribute('aria-posinset') ?? 1);
+    return new DOMRect(0, (position - 1) * 60 - (panel?.scrollTop ?? 0), 320, 60);
+  });
+  try {
+    const { container, rerender } = render(view(false));
+    const mode = screen.getByRole('button', { name: 'View mode' });
+    mode.focus();
+    rerender(view(true));
+    const pane = container.querySelector<HTMLElement>('#events-panel')!;
+    const row = pane.querySelector<HTMLElement>('.event[aria-current="true"]')!;
+    expect(row.closest('[aria-posinset]')).toHaveAttribute('aria-posinset', '160');
+    expect(row.getBoundingClientRect().bottom).toBe(180);
+    expect(mode).toHaveFocus();
+    pane.scrollTop = 600;
+    fireEvent.scroll(pane);
+    rerender(view(true, events.slice()));
+    expect(pane.scrollTop).toBe(600);
+    expect(row).toHaveAttribute('aria-current', 'true');
+    expect(mode).toHaveFocus();
+  } finally {
+    geometry.mockRestore();
+    height.mockRestore();
+  }
+});
+
 it('notifies the pane when the focused nonselected row is released, without changing selection', () => {
   const events = ['2', '4', '6'].map((sequence) => ({
     sequence, kind: 'recording_event_kind:frame_enter', frameId: 'shared-frame', monotonicNs: '1',
