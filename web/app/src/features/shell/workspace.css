@@ -210,7 +210,21 @@
   .replay-context-event { margin: 0; }
   .phone-replay-toolbar { position: relative; background: var(--panel); }
   .phone-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; }
+  .recording-tabs-list .open-recording {
+    display: grid;
+    align-content: center;
+    min-width: calc(8ch + 12px);
+    padding-inline: 5px;
+    line-height: 1.15;
+  }
+  .open-recording-route { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .open-recording-separator { display: none; }
+  .open-recording-id { font: 11px/1.2 var(--mono); }
   .phone-actions .button { min-width: 0; min-height: 44px; padding-inline: 2px; }
+  /* Keep the action row stationary when hover or focus changes which reason is shown. */
+  .phone-navigation-reasons { display: grid; }
+  .phone-navigation-reasons > p { grid-area: 1 / 1; }
+  .phone-navigation-reasons > [data-visible='false'] { visibility: hidden; }
   .phone-more { position: absolute; z-index: 5; bottom: 100%; right: 0; width: min(100%, 28rem); max-height: 50dvh; overflow: auto; padding: 8px; background: var(--panel-raised); border: 1px solid var(--line-strong); }
   .phone-more .button { min-height: 44px; }
   .phone-more p { color: var(--muted); font-size: 12px; }

@@ -256,6 +256,19 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       }
       if (label === 'Calls and returns' && verifyRecordingSelection) {
         await verifyRecordingSelection({ sequence, activate });
+        if (width === 320) {
+          const tabs = page.getByRole('tablist', { name: 'Open recordings' }).getByRole('tab');
+          await expect(tabs).toHaveCount(2);
+          const identities = [];
+          for (const tab of await tabs.all()) {
+            const suffix = tab.locator('.open-recording-id');
+            const name = await tab.getAttribute('aria-label');
+            await expect(suffix).toHaveText(name.slice(-8));
+            await assertLabelUncovered(suffix);
+            identities.push(name.slice(-8));
+          }
+          assert.equal(new Set(identities).size, 2, 'both open recordings show distinct observed identities');
+        }
         await expect(selected.locator('.event-seq')).toHaveText(sequence);
         await expect(page.locator('.replay-filter-note')).toContainText(`showing ${expected.length} of ${events.length} loaded steps`);
       }
@@ -344,6 +357,29 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
     });
     const timingBySequence = new Map(events.map((event, index) => [event.sequence, expectedTiming[index]]));
     await verifyRows(page, events.map(({ sequence }) => sequence), timingBySequence);
+    if (width === 320) {
+      const navigation = page.getByRole('group', { name: 'Replay navigation' });
+      const more = navigation.getByRole('button', { name: 'More', exact: true });
+      const back = navigation.getByRole('button', { name: 'Back', exact: true });
+      const next = navigation.getByRole('button', { name: 'Next', exact: true });
+      await goto(events.at(-1).sequence);
+      await expect(back).toHaveAttribute('aria-disabled', 'false');
+      await expect(next).toHaveAttribute('aria-disabled', 'true');
+      const before = await more.boundingBox();
+      assert.ok(before);
+      for (const action of [back, next]) {
+        await action.focus();
+        await expect(action).toBeFocused();
+        assert.deepEqual(await more.boundingBox(), before, 'changing the focused reason keeps the phone actions stationary');
+      }
+      if (pointer === 'fine') {
+        await selected.focus();
+        for (const action of [back, next]) {
+          await action.hover();
+          assert.deepEqual(await more.boundingBox(), before, 'changing the hovered reason keeps the phone actions stationary');
+        }
+      }
+    }
     if (width === 1280) {
       await activate(page.getByRole('button', { name: 'Settings', exact: true }));
       const settings = page.getByRole('dialog', { name: 'Settings', exact: true });

@@ -84,7 +84,10 @@ export function ReplayToolbar({ backReason, nextReason, frameControls, onMove, o
         <button type="button" className="button" onClick={phone.inspect}>Inspect</button>
       </div>
       <p className="replay-reason replay-playback-status" id={`${id}-playback`}>{phone.playback.stopReason ?? (playing ? phone.pacing : phone.reason ?? 'Replay is paused at the selected step.')}</p>
-      {controls.map(({ action, label, reason }) => reason ? <p key={action} id={`${id}-${action}`} className={action === visibleReason ? "replay-reason" : "sr-only"}>{label} · {reason}</p> : null)}
+      <div className="phone-navigation-reasons">
+        {controls.map(({ action, label, reason }) => reason ? <p key={action} id={`${id}-${action}`}
+          className="replay-reason" data-visible={action === visibleReason}>{label} · {reason}</p> : null)}
+      </div>
     </div>;
   }
   return <div className="replay-toolbar" role="group" aria-label="Replay navigation">
