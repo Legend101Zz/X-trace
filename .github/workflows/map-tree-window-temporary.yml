@@ -82,7 +82,9 @@ jobs:
           assert report["provenance"]["declaredSourceSha"] == os.environ["GITHUB_SHA"]
           sample, = report["samples"]
           assert sample["status"] == "exercised"
+          assert sample["initial"] is None and report["summary"]["validInitialSamples"] == 0
           assert {
+              "initial_steps_and_details_identity_matched",
               "bounded_later_map_keyboard_end", "bounded_later_map_keyboard_up",
               "bounded_later_map_keyboard_home",
           } <= set(sample["actions"])

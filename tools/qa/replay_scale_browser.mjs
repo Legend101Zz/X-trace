@@ -109,8 +109,8 @@ function installClickClock({ recordingId }) {
   }, { capture: true });
 }
 
-async function waitSelection(page, mode, event, recordingId) {
-  await page.waitForFunction(({ mode, sequence, frameId, eventId, recordingId }) => {
+async function waitSelection(page, mode, event, recordingId, { requireInspectorIdentity = true } = {}) {
+  await page.waitForFunction(({ mode, sequence, frameId, eventId, recordingId, requireInspectorIdentity }) => {
     if (document.querySelector('#events-panel h1')?.textContent !== recordingId) return false;
     if (document.querySelector('.recording[aria-current="true"] .recording-title')?.textContent !== recordingId) return false;
     const row = mode === 'steps'
@@ -119,15 +119,17 @@ async function waitSelection(page, mode, event, recordingId) {
     if (!row || !row.checkVisibility()) return false;
     if (mode === 'steps' && row.querySelector('.event-seq')?.textContent !== sequence) return false;
     if (mode === 'map' && row.getAttribute('data-key') !== frameId) return false;
-    const section = Array.from(document.querySelectorAll('.inspector-section')).find((node) =>
-      node.querySelector('.inspector-label')?.textContent === 'Event identity');
-    if (section?.querySelector('.inspector-value.mono')?.textContent !== eventId) return false;
+    if (requireInspectorIdentity) {
+      const section = Array.from(document.querySelectorAll('.inspector-section')).find((node) =>
+        node.querySelector('.inspector-label')?.textContent === 'Event identity');
+      if (section?.querySelector('.inspector-value.mono')?.textContent !== eventId) return false;
+    }
     const rect = row.getBoundingClientRect();
     const x = (Math.max(rect.left, 0) + Math.min(rect.right, innerWidth)) / 2;
     const y = (Math.max(rect.top, 0) + Math.min(rect.bottom, innerHeight)) / 2;
     return rect.width > 0 && rect.height > 0 && x >= 0 && x < innerWidth && y >= 0 && y < innerHeight
       && row.contains(document.elementFromPoint(x, y));
-  }, { mode, sequence: event.sequence, frameId: event.frameId, eventId: event.eventId, recordingId });
+  }, { mode, sequence: event.sequence, frameId: event.frameId, eventId: event.eventId, recordingId, requireInspectorIdentity });
 }
 
 async function domSample(page, phase, apiState, heap) {
@@ -310,7 +312,8 @@ async function measureSample(index, options, manifest, chromium) {
     externalRequests = 0;
     page.on('pageerror', () => { pageErrors += 1; });
     page.on('request', (request) => { if (new URL(request.url()).origin !== new URL(url).origin) externalRequests += 1; });
-    await page.addInitScript(installClickClock, { recordingId: manifest.recording_id });
+    const functionalMapOnly = options['one-map-tree-sample'];
+    if (!functionalMapOnly) await page.addInitScript(installClickClock, { recordingId: manifest.recording_id });
     setStage('catalog');
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.getByRole('button', { name: 'Not linked to an endpoint', exact: true }).click();
@@ -324,14 +327,26 @@ async function measureSample(index, options, manifest, chromium) {
     let selected = detail.events[0];
     expectedSelection = selected;
     cumulative = detail.events.length;
-    setStage('initial_visible_paint_opportunity');
-    await page.waitForFunction(() => window.__xtraceScale?.completed === true);
-    const clock = await page.evaluate(() => ({ ...window.__xtraceScale }));
-    check(clock.trusted && clock.sequence === selected.sequence && Number.isFinite(clock.elapsedMs));
-    await waitSelection(page, 'steps', selected, manifest.recording_id);
-    result.initial = { elapsedMs: clock.elapsedMs, over1500Ms: clock.elapsedMs > 1500,
-      apiFirstPageEvents: detail.events.length, selectedIdentitySha256: identity(selected),
-      responseAndUiIdentityMatched: true, trustedClickCaptured: true, paintOpportunityObserved: true };
+    if (functionalMapOnly) {
+      setStage('initial_steps_visible', 'default_inspector');
+      await waitSelection(page, 'steps', selected, manifest.recording_id, { requireInspectorIdentity: false });
+      setStage('initial_steps_visible', 'details_identity');
+      const inspector = page.getByRole('tablist', { name: 'Inspector evidence', exact: true });
+      const details = inspector.getByRole('tab', { name: 'Details', exact: true });
+      await details.click();
+      check(await details.getAttribute('aria-selected') === 'true');
+      await waitSelection(page, 'steps', selected, manifest.recording_id);
+      result.actions.push('initial_steps_and_details_identity_matched');
+    } else {
+      setStage('initial_visible_paint_opportunity');
+      await page.waitForFunction(() => window.__xtraceScale?.completed === true);
+      const clock = await page.evaluate(() => ({ ...window.__xtraceScale }));
+      check(clock.trusted && clock.sequence === selected.sequence && Number.isFinite(clock.elapsedMs));
+      await waitSelection(page, 'steps', selected, manifest.recording_id);
+      result.initial = { elapsedMs: clock.elapsedMs, over1500Ms: clock.elapsedMs > 1500,
+        apiFirstPageEvents: detail.events.length, selectedIdentitySha256: identity(selected),
+        responseAndUiIdentityMatched: true, trustedClickCaptured: true, paintOpportunityObserved: true };
+    }
     const mapWindowFrames = new Map(options['verify-map-tree-window'] ? detail.events.map((event) => [event.frameId, event]) : []);
     let lastSequence = BigInt(detail.events.at(-1).sequence);
     setStage('initial_steps', 'dom_snapshot');
@@ -540,8 +555,9 @@ async function main() {
       freshBrowserProcessContextAndViewerPerSample: true, cpuOrNetworkThrottling: 'none',
       osAndFilesystemCaches: 'uncontrolled; may be warm', fixtureFrames: 10_000, laterPages: options['later-pages'],
       verifyMapTreeWindow: options['verify-map-tree-window'],
-      timing: 'trusted recording-click capture to visible selected first row after intervening rAF paint opportunity; no physical-display claim',
-      excludedFromTiming: ['fixture seeding', 'viewer startup', 'catalog loading'],
+      timing: options['one-map-tree-sample'] ? 'not measured in the functional Map journey'
+        : 'trusted recording-click capture to visible selected first row after intervening rAF paint opportunity; no physical-display claim',
+      excludedFromTiming: options['one-map-tree-sample'] ? [] : ['fixture seeding', 'viewer startup', 'catalog loading'],
       domScope: 'mounted current document; visible counts require viewport hit-test; Map SVG and accessible tree counted separately',
       runner: { platform: os.platform(), release: os.release(), arch: os.arch(), cpuModel: os.cpus()[0]?.model ?? 'unavailable', cpuCount: os.cpus().length },
     }, samples: [],
@@ -554,7 +570,7 @@ async function main() {
     report.summary = { functionalFailures: report.samples.filter((sample) => sample.status !== 'exercised').length,
       completeJourneySamples: report.samples.filter((sample) => sample.status === 'exercised').length,
       validInitialSamples: times.length, medianMs: times.length ? (times[middle] + times[Math.floor((times.length - 1) / 2)]) / 2 : null,
-      maxMs: times.length ? times.at(-1) : null, samplesOver1500Ms: times.filter((value) => value > 1500).length,
+      maxMs: times.length ? times.at(-1) : null, samplesOver1500Ms: options['one-map-tree-sample'] ? null : times.filter((value) => value > 1500).length,
       aggregationDecision: 'unsettled; descriptive statistics only', memoryThreshold: 'unsettled' };
     await output.writeFile(`${JSON.stringify(report, null, 2)}\n`);
     console.log(JSON.stringify(report));
