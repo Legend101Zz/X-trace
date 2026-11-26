@@ -95,7 +95,7 @@ public final class AgentRuntime {
       BoundedEventQueue queue = new BoundedEventQueue(8192, 2L * 1024 * 1024);
       sink = new RuntimeBridgeSink(queue);
       sink.useScope(config.scope());
-      writer = new RecordingWriter(session, queue, sink);
+      writer = new RecordingWriter(session, queue, sink, !attach);
       FixtureInstrumentation.CaptureLimitations limitations =
           new FixtureInstrumentation.CaptureLimitations();
       sink.untransformedCount(limitations::count);
@@ -259,6 +259,11 @@ public final class AgentRuntime {
 
     private void close() {
       if (!closed.compareAndSet(false, true)) return;
+      JerseyInstrumentation.reportCoverageAtShutdown();
+      if (dev.xtrace.agent.bootstrap.JerseyBridge.takeObservationUnavailable()) {
+        System.err.println("{\"code\":\"XTR-JAVA-INSTRUMENTATION\","
+            + "\"message\":\"Jersey dispatch identity or route observation unavailable\"}");
+      }
       if (lineSink != null) BootstrapBridge.disableLineSink(lineSink);
       proxySink.close();
       writer.close();

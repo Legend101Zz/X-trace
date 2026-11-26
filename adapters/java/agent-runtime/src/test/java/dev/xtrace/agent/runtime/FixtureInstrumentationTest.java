@@ -166,6 +166,23 @@ class FixtureInstrumentationTest {
   }
 
   @Test
+  void pgJdbcTransformationFailureStopsOnlyTheProfileThatRequestsItsProbe() {
+    for (boolean launch : new boolean[] {false, true}) {
+      AtomicBoolean stopped = new AtomicBoolean();
+      var listener = new FixtureInstrumentation.SafeListener(
+          () -> stopped.set(true), ApplicationScope.defaultScope(),
+          new FixtureInstrumentation.CaptureLimitations(), launch);
+      ClassLoader loader = getClass().getClassLoader();
+      var failure = new IllegalStateException("test-only transformation failure");
+      listener.onError("org.postgresql.jdbc.PgStatement", loader, null, false, failure);
+      assertEquals(launch, stopped.get());
+      stopped.set(false);
+      listener.onError("org.h2.jdbc.JdbcPreparedStatement", loader, null, false, failure);
+      assertTrue(stopped.get(), "existing explicit H2 failure remains fatal in both profiles");
+    }
+  }
+
+  @Test
   void attachRequiresRetransformationAndAnExplicitLoadedFixtureClass() throws Exception {
     Instrumentation supported = instrumentation(true, true, OrderService.class);
     FixtureInstrumentation.validateAttach(supported);
