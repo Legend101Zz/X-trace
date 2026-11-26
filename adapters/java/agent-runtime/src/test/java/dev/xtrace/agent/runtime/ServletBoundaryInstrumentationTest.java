@@ -116,6 +116,31 @@ class ServletBoundaryInstrumentationTest {
   }
 
   @Test
+  void onlyFailedJakartaAsyncProbeInvalidatesJerseyCompletion() {
+    var stop = new AtomicInteger();
+    var missingAsync = new AtomicInteger();
+    var listener = new ServletBoundaryInstrumentation.FailureListener(stop::incrementAndGet, missingAsync::incrementAndGet);
+    var loader = getClass().getClassLoader();
+    var type = TypeDescription.ForLoadedType.of(Object.class);
+    var name = type.getName();
+    var failure = new IllegalStateException("selected probe unavailable");
+    assertTrue(listener.selectedFallback(named(name)).matches(type, loader, null, null, null));
+    listener.onError(name, loader, null, false, failure);
+    assertTrue(listener.selectedAsyncStart("javax.servlet", named(name)).matches(type, loader, null, null, null));
+    listener.onError(name, loader, null, false, failure);
+    assertEquals(0, stop.get());
+    assertEquals(0, missingAsync.get());
+    assertTrue(listener.selectedAsyncStart("jakarta.servlet", named(name)).matches(type, loader, null, null, null));
+    assertTrue(listener.selectedFallback(named(name)).matches(type, loader, null, null, null));
+    listener.onError(name, loader, null, false, failure);
+    assertEquals(0, stop.get());
+    assertEquals(1, missingAsync.get());
+    listener.onComplete(name, loader, null, false);
+    listener.onError(name, loader, null, false, failure);
+    assertEquals(1, missingAsync.get());
+  }
+
+  @Test
   void bothServletNamespacesMatchOnlyTheStandardBoundarySignatures() {
     for (String api : List.of("jakarta.servlet", "javax.servlet")) {
       TypeDescription request = new ByteBuddy().makeInterface()
