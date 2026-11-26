@@ -9,7 +9,7 @@ const require = createRequire(import.meta.url);
 const context = require("../runtime/context.cjs") as typeof import("../runtime/context.cjs");
 const { events } = require("../runtime/events.cjs") as typeof import("../runtime/events.cjs");
 const { ModuleRegistry } = require("../runtime/registry.cjs") as typeof import("../runtime/registry.cjs");
-const { createHttpCaptureTransport } = require("../runtime/transport.cjs") as typeof import("../runtime/transport.cjs");
+const { createCaptureCredits, createHttpCaptureTransport } = require("../runtime/transport.cjs") as typeof import("../runtime/transport.cjs");
 
 class Capture implements HttpCaptureTransport {
   readonly seen: CaptureEvent[] = [];
@@ -101,7 +101,7 @@ test("core registry disables a module whose detect() throws and keeps others", (
 test("transport: finish carries the resolved summary and still reserves its terminal slot", () => {
   class FakeWorker extends EventEmitter { readonly sent: Array<Record<string, unknown>> = []; postMessage(m: Record<string, unknown>): void { this.sent.push(m); } ref(): void {} }
   const worker = new FakeWorker();
-  const transport = createHttpCaptureTransport(worker as unknown as Worker);
+  const transport = createHttpCaptureTransport(worker as unknown as Worker, createCaptureCredits());
   assert.equal(transport.start("r", "GET", 1n), true);
   assert.equal(transport.finish("r", 2n, 5n, 0, { route: "/users/:id", httpStatus: 200, outcome: "responded" }), true);
   assert.deepEqual(worker.sent.at(-1)?.summary, { route: "/users/:id", httpStatus: 200, outcome: "responded" });

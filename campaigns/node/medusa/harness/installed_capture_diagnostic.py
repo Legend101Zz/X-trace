@@ -5,10 +5,11 @@ import re
 
 from installed_evidence import require
 
-PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V2 "
+PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V3 "
 COUNTERS = frozenset({
     "startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
     "finishPosted", "finishRejected", "eventRejected", "routeRejected",
+    "startBeforeCreditNotification", "eventBeforeCreditNotification", "routeBeforeCreditNotification",
 })
 SCOPES = frozenset({"same-package", "different-package", "transitive-only", "entry-only", "neither"})
 EXPRESS = frozenset({"not-observed", "installed", "express-not-found", "unsupported-express",
@@ -61,6 +62,7 @@ def project_capture_diagnostic(log, nonce):
         require(all(bounded(value, 1_000_000) for value in counts.values()))
         require(counts["startAttempts"] == counts["startAccepted"] + counts["startCapacityRejected"] + counts["startOtherRejected"])
         require(obj["startStaged"] <= counts["startAccepted"])
+        require(counts["startBeforeCreditNotification"] <= counts["startAccepted"])
         require(obj["finishStaged"] <= counts["finishPosted"] <= counts["startAccepted"])
     except (TypeError, ValueError, RecursionError):
         return {"status": "invalid"}

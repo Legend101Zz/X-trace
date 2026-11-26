@@ -6,7 +6,8 @@ import { workerCounters } from "./runtime/transport.cjs";
 import type { ModuleStatus } from "./runtime/registry.cjs";
 
 const counters = ["startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
-  "finishPosted", "finishRejected", "eventRejected", "routeRejected"] as const;
+  "finishPosted", "finishRejected", "eventRejected", "routeRejected",
+  "startBeforeCreditNotification", "eventBeforeCreditNotification", "routeBeforeCreditNotification"] as const;
 type Counter = typeof counters[number];
 
 type ExpressScope = "same-package" | "different-package" | "transitive-only" | "entry-only" | "neither";
@@ -53,7 +54,7 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
     // Do not schedule work or keep the worker alive. This is a snapshot, not a drain barrier.
     // The nonce only authenticates this finite line from the proof's private stream.
     try {
-      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V2 " + JSON.stringify({
+      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V3 " + JSON.stringify({
         nonce, exitCode, scope, express, patchedLayers: expressPatchStatus().patched, counts,
         expressEvidence: { ...expressEvidence, anyLayerStaged: Atomics.load(worker, workerCounters.expressHandlerStaged) },
         startStaged: Atomics.load(worker, workerCounters.startStaged),

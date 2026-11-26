@@ -5,7 +5,7 @@ import type { Worker } from "node:worker_threads";
 import { create, toBinary } from "@bufbuild/protobuf";
 import { blake3 } from "hash-wasm";
 import { AgentEnvelopeSchema, RecordingEventKind, type AgentEnvelope } from "@xtrace/protocol";
-import { createHttpCaptureTransport } from "../runtime/transport.cjs";
+import { createCaptureCredits, createHttpCaptureTransport } from "../runtime/transport.cjs";
 import { createRecordingAssembler, HOLD_START_MS, type InputMessage, type SendFn } from "../worker-core.js";
 import { createWorkerDelivery } from "../worker-delivery.js";
 
@@ -180,14 +180,15 @@ test("app thread still charges all 64 logical messages and preserves the reserve
       await eventAck.promise;
     }
   }, () => 5n, undefined, { maxBatchEvents: 64, fitsEnvelope: () => true });
+  const credits = createCaptureCredits();
   const delivery = createWorkerDelivery(assembler, {
-    staged: () => worker.emit("message", { type: "staged" }),
+    staged: () => { Atomics.add(credits, 0, 1); },
     close: async () => done.resolve(),
     fail: () => done.reject(new Error("fixture delivery failed")),
   });
   worker.ref = () => {};
   worker.postMessage = delivery.enqueue;
-  const transport = createHttpCaptureTransport(worker as unknown as Worker);
+  const transport = createHttpCaptureTransport(worker as unknown as Worker, credits);
   assert.equal(transport.start(A, "GET", 1n), true);
   for (let sequence = 2n; sequence <= 63n; sequence += 1n) {
     assert.equal(transport.event(A, {

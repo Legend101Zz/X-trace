@@ -12,7 +12,9 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
         return dict(nonce=self.nonce, exitCode=0, scope="transitive-only", express="express-not-found",
                     patchedLayers=0, counts={"startAttempts": 47, "startAccepted": 12,
                         "startCapacityRejected": 35, "startOtherRejected": 0, "finishPosted": 12,
-                        "finishRejected": 0, "eventRejected": 2, "routeRejected": 0},
+                        "finishRejected": 0, "eventRejected": 2, "routeRejected": 0,
+                        "startBeforeCreditNotification": 1, "eventBeforeCreditNotification": 3,
+                        "routeBeforeCreditNotification": 0},
                     expressEvidence=dict(invoked=0, withContext=0, posted=0, anyLayerStaged=0),
                     startStaged=9, finishStaged=8, workerFailed=False, transportFailed=False,
                     closeRequested=False) | overrides
@@ -26,6 +28,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
         self.assertEqual(result["scope"], "transitive-only")
         self.assertEqual(result["startStaged"], 9)
         self.assertEqual(result["counts"]["startCapacityRejected"], 35)
+        self.assertEqual(result["counts"]["startBeforeCreditNotification"], 1)
         private = json.dumps(result)
         self.assertNotIn(self.nonce, private)
         self.assertNotIn("private example path", private)
@@ -51,5 +54,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
     def test_records_with_extra_values_or_impossible_counts_are_invalid(self):
         for overrides in ({"examplePath": "/private/example"}, {"scope": "/private/example"},
                           {"finishStaged": 13}, {"startStaged": 13}, {"workerFailed": 1},
-                          {"counts": self.snapshot()["counts"] | {"startAttempts": 46}}):
+                          {"counts": self.snapshot()["counts"] | {"startAttempts": 46}},
+                          {"counts": self.snapshot()["counts"] | {"startBeforeCreditNotification": 13}},
+                          {"counts": self.snapshot()["counts"] | {"eventBeforeCreditNotification": "private"}}):
             self.assertEqual(project_capture_diagnostic(self.line(**overrides), self.nonce), {"status": "invalid"})

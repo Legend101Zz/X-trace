@@ -7,6 +7,19 @@ export type { CaptureEvent };
 export const MAX_IN_FLIGHT_MESSAGES = 64;
 const MAX_ACTIVE_RECORDINGS = 64;
 
+const COMPLETED = 0;
+const NOTIFICATION_PENDING = 1;
+
+export function createCaptureCredits(): Uint32Array<SharedArrayBuffer> {
+  return new Uint32Array(new SharedArrayBuffer(2 * Uint32Array.BYTES_PER_ELEMENT));
+}
+
+/** Called once by the worker at the existing handoff-credit boundary. */
+export function returnCaptureCredit(credits: Uint32Array<SharedArrayBuffer>, notify?: () => void): void {
+  Atomics.add(credits, COMPLETED, 1);
+  if (notify && Atomics.exchange(credits, NOTIFICATION_PENDING, 1) === 0) notify();
+}
+
 export const workerCounters = { startStaged: 0, finishStaged: 1, failed: 2, expressHandlerStaged: 3 } as const;
 
 /** What the application thread needs from the worker handoff. */
@@ -42,8 +55,15 @@ interface RecordingMessage {
 }
 
 /** Keeps app-thread handoff bounded and reserves one terminal slot per admitted request. */
-export function createHttpCaptureTransport(worker: Worker, diagnostic?: CaptureDiagnostic): HttpCaptureTransport {
-  let pending = 0;
+export function createHttpCaptureTransport(
+  worker: Worker, credits: Uint32Array<SharedArrayBuffer>, diagnostic?: CaptureDiagnostic,
+): HttpCaptureTransport {
+  // Both counters wrap on uint32. Their modular difference is the number of
+  // charged handoffs, which never exceeds the original producer bound.
+  let posted = Atomics.load(credits, COMPLETED);
+  const pending = () => (posted - Atomics.load(credits, COMPLETED)) >>> 0;
+  let notified = posted;
+  const notificationPending = () => (posted - notified) >>> 0;
   let reservedFinishes = 0;
   let failed = false;
   let failureCallback: (() => void) | undefined;
@@ -52,13 +72,16 @@ export function createHttpCaptureTransport(worker: Worker, diagnostic?: CaptureD
     if (failed) return;
     failed = true;
     diagnostic?.transportFailed();
-    pending = 0;
     reservedFinishes = 0;
     failureCallback?.();
   };
   worker.on("message", (message: WorkerMessage) => {
-    if (message?.type === "staged") pending = Math.max(0, pending - 1);
-    else if (message?.type === "failure") fail();
+    if (diagnostic && message?.type === "staged") {
+      // Clear before sampling so a concurrent return is sampled here or can
+      // publish another wakeup. There is at most one queued notification.
+      Atomics.store(credits, NOTIFICATION_PENDING, 0);
+      notified = Atomics.load(credits, COMPLETED);
+    } else if (message?.type === "failure") fail();
   });
   worker.on("error", fail);
   worker.on("exit", (code) => { if (code !== 0) fail(); });
@@ -67,7 +90,7 @@ export function createHttpCaptureTransport(worker: Worker, diagnostic?: CaptureD
     if (failed) return false;
     try {
       worker.postMessage(message);
-      pending += 1;
+      posted = (posted + 1) >>> 0;
       return true;
     } catch {
       fail();
@@ -78,13 +101,15 @@ export function createHttpCaptureTransport(worker: Worker, diagnostic?: CaptureD
   return {
     start(recordingId, method, startedAtNs, holdStart = false) {
       diagnostic?.increment("startAttempts");
-      if (pending + reservedFinishes + 2 > MAX_IN_FLIGHT_MESSAGES || reservedFinishes >= MAX_ACTIVE_RECORDINGS) {
+      if (pending() + reservedFinishes + 2 > MAX_IN_FLIGHT_MESSAGES || reservedFinishes >= MAX_ACTIVE_RECORDINGS) {
         diagnostic?.increment("startCapacityRejected");
         return false;
       }
+      const notificationWouldRefuse = diagnostic && notificationPending() + reservedFinishes + 2 > MAX_IN_FLIGHT_MESSAGES;
       reservedFinishes += 1;
       if (post({ type: "start", recordingId, method, startedAtNs, holdStart })) {
         diagnostic?.increment("startAccepted");
+        if (notificationWouldRefuse) diagnostic.increment("startBeforeCreditNotification");
         return true;
       }
       reservedFinishes = Math.max(0, reservedFinishes - 1);
@@ -92,13 +117,17 @@ export function createHttpCaptureTransport(worker: Worker, diagnostic?: CaptureD
       return false;
     },
     event(recordingId, event) {
-      const posted = pending + reservedFinishes < MAX_IN_FLIGHT_MESSAGES && post({ type: "event", recordingId, ...event });
+      const notificationWouldRefuse = diagnostic && notificationPending() + reservedFinishes >= MAX_IN_FLIGHT_MESSAGES;
+      const posted = pending() + reservedFinishes < MAX_IN_FLIGHT_MESSAGES && post({ type: "event", recordingId, ...event });
       if (!posted) diagnostic?.increment("eventRejected");
+      else if (notificationWouldRefuse) diagnostic.increment("eventBeforeCreditNotification");
       return posted;
     },
     route(recordingId, route) {
-      const posted = pending + reservedFinishes < MAX_IN_FLIGHT_MESSAGES && post({ type: "route", recordingId, route });
+      const notificationWouldRefuse = diagnostic && notificationPending() + reservedFinishes >= MAX_IN_FLIGHT_MESSAGES;
+      const posted = pending() + reservedFinishes < MAX_IN_FLIGHT_MESSAGES && post({ type: "route", recordingId, route });
       if (!posted) diagnostic?.increment("routeRejected");
+      else if (notificationWouldRefuse) diagnostic.increment("routeBeforeCreditNotification");
       return posted;
     },
     finish(recordingId, finalSequence, durationNs, droppedEvents, summary) {

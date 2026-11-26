@@ -8,6 +8,7 @@ import type { Worker } from "node:worker_threads";
 import type { CaptureEvent, HttpCaptureTransport } from "../http-capture.cjs";
 
 const require = createRequire(import.meta.url);
+const { createCaptureCredits } = require("../runtime/transport.cjs") as typeof import("../runtime/transport.cjs");
 const { installHttpCapture, createHttpCaptureTransport, wrapRequestListener } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
 
 class CapturedTransport implements HttpCaptureTransport {
@@ -126,7 +127,7 @@ test("a real response close is distinct and queue saturation is carried as a dro
     postMessage(message: unknown): void { this.sent.push(message); }
   }
   const worker = new DelayedWorker();
-  const bounded = createHttpCaptureTransport(worker as unknown as Worker);
+  const bounded = createHttpCaptureTransport(worker as unknown as Worker, createCaptureCredits());
   assert.equal(bounded.start("01900000-0000-7000-8000-000000000001", "GET", 1n), true);
   for (let index = 0; index < 62; index += 1) {
     assert.equal(bounded.event("01900000-0000-7000-8000-000000000001", {

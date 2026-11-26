@@ -6,7 +6,7 @@ import { effectiveLimitations } from "./manifest.cjs";
 import { asyncContextModule, expressModule, nodeHttpModule } from "./modules.cjs";
 import { setCaptureProfile } from "./runtime/context.cjs";
 import { ModuleRegistry, type InstallEnvironment, type InstrumentationModule } from "./runtime/registry.cjs";
-import type { HttpCaptureTransport } from "./runtime/transport.cjs";
+import { createCaptureCredits, type HttpCaptureTransport } from "./runtime/transport.cjs";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 
@@ -63,12 +63,14 @@ export function startCaptureFromRequire(): void {
   }
   const plan = planCapture(diagnostic);
   const startupBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const credits = createCaptureCredits();
   let worker: Worker;
   try {
     worker = new Worker(join(__dirname, "transport-worker.js"), {
       execArgv: [],
       workerData: {
         bootstrapPath,
+        credits,
         startupBarrier,
         manifestPath: join(__dirname, "node-capabilities.json"),
         capabilities: plan.planned,
@@ -87,7 +89,7 @@ export function startCaptureFromRequire(): void {
     return;
   }
   try {
-    plan.install(createHttpCaptureTransport(worker, diagnostic));
+    plan.install(createHttpCaptureTransport(worker, credits, diagnostic));
     worker.unref();
   } catch {
     void worker.terminate();

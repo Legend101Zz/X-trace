@@ -1,6 +1,6 @@
 import { RecordingEventKind } from "@xtrace/protocol";
 import { parentPort, workerData } from "node:worker_threads";
-import { workerCounters } from "./runtime/transport.cjs";
+import { returnCaptureCredit, workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
 import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
 import { createWorkerDelivery } from "./worker-delivery.js";
@@ -8,6 +8,7 @@ import { createWorkerDelivery } from "./worker-delivery.js";
 interface StartupData {
   bootstrapPath: string;
   startupBarrier: SharedArrayBuffer;
+  credits: Uint32Array<SharedArrayBuffer>;
   manifestPath: string;
   /** Capabilities of the modules that will install; only these are advertised to the daemon. */
   capabilities?: string[];
@@ -71,8 +72,10 @@ async function initialize(): Promise<void> {
     value: capabilitySetFor(data.capabilities ?? ["http.server.request_root", "async_correlation"]),
   });
   const assembler = createRecordingAssembler(observedSend, undefined, undefined, session, fail);
+  // The opt-in receipt samples a notification-driven view. Wakeups coalesce.
+  const notify = diagnostic ? () => parentPort?.postMessage({ type: "staged" }) : undefined;
   delivery = createWorkerDelivery(assembler, {
-    staged: () => parentPort?.postMessage({ type: "staged" }),
+    staged: () => returnCaptureCredit(data.credits, notify),
     async close() {
       await session!.close();
       parentPort?.close();
