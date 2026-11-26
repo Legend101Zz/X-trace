@@ -87,17 +87,99 @@ def wait_port(process, path, deadline):
     return port
 
 
-def read_until(client, directory, predicate, deadline):
+def terminal_pair(api):
+    return len(api["details"]) == 2 and all(d.get("completion") == "complete" for d in api["details"].values())
+
+
+def last_read_counts(api):
+    """Return only the last returned read's finite labels and counts. A raised call has no read."""
+    if not isinstance(api, dict):
+        return None
+    listed, details, failure = api.get("recordings"), api.get("details"), api.get("readFailure")
+    counts = None
+    if isinstance(details, dict) and len(details) <= 400:
+        counts = dict.fromkeys(("complete", "partial", "invalid", "unavailable", "other"), 0)
+        for detail in details.values():
+            state = detail.get("completion") if isinstance(detail, dict) else None
+            counts[state if isinstance(state, str) and state in counts else "other"] += 1
+    observed_failure = None
+    if isinstance(failure, dict):
+        stage, reason = failure.get("stage"), failure.get("reason")
+        if stage in boundary_diagnostics.READ_STAGES and reason in boundary_diagnostics.READ_REASONS:
+            observed_failure = {"stage": stage, "reason": reason}
+    return {"ok": api.get("ok") if type(api.get("ok")) is bool else None,
+            "listed": len(listed) if isinstance(listed, list) and len(listed) <= 400 else None,
+            "detailCompletion": counts, "readFailure": observed_failure}
+
+
+def read_until(client, directory, predicate, deadline, progress):
     client.deadline = deadline
+    started, returned, last = 0, 0, None
     try:
         while time.monotonic() < deadline:
-            api = xinstr.collect_api(client, directory)
-            require(api["ok"])
-            if predicate(api):
-                return api
+            started += 1
+            progress["stage"] = "collect-api"
+            last = xinstr.collect_api(client, directory)
+            returned = started
+            progress["stage"] = "require-api-read"
+            require(last["ok"])
+            progress["stage"] = "check-terminal-pair"
+            if predicate(last):
+                # A poll can start on time while its final read or validation runs late.
+                if time.monotonic() <= deadline:
+                    return last
+                break
+        progress["stage"] = "terminal-pair-deadline"
         raise TimeoutError("focused API observation deadline")
     finally:
         client.deadline = None
+        # No projection work inside the observation loop or extension of its deadline.
+        progress.update(pollsStarted=started if started <= 1_000_000 else None,
+                        lastReturnedPoll=returned if returned <= 1_000_000 else None,
+                        lastRead=last_read_counts(last))
+
+
+EXPECTED_REFUSAL = {
+    "listedNewRecordings": 2, "newRecordings": 2, "namedMatched": 1, "optionalNamed": 0,
+    "missingNamed": 0, "capacityRejected": 0, "unexpectedRoots": 0, "unclassifiedRecordings": 0,
+    "unreadRecordings": 0, "routeLess": [
+        {"completion": "complete", "method": "GET", "outcome": "responded", "httpStatus": 403,
+         "recordings": 1}],
+    # Only the mapped POST can be assigned. The observed route-less GET remains unassigned.
+    "unassignedRecordings": 1, "assignedPartialRecordings": 0, "overmatchedRequests": 0,
+    "unmatchedSentRequests": 0, "unaccountedRequests": 0, "excessAccountedRequests": 0,
+}
+
+
+def verify_refusal_boundary(client, directory, sent, expected, optional, deadline, summary):
+    progress = {"stage": "collect-api", "pollsStarted": 0, "lastReturnedPoll": 0, "lastRead": None,
+                "snapshotMatches": None, "strictFacts": None}
+    summary["post403"] = progress
+    api = read_until(client, directory, terminal_pair, deadline, progress)
+    progress["stage"] = "strict-accounting"
+    strict = xinstr.burst_accounting(api["details"], sent, expected, {}, optional_roots=optional)
+    progress["stage"] = "snapshot"
+    snapshot = boundary_diagnostics.snapshot(api["details"], api["recordings"], {}, strict)
+    progress["stage"] = "require-inventory"
+    # These diagnostic keys are fixed. No returned routes, identifiers or unexpected fields escape.
+    progress["snapshotMatches"] = {
+        "fieldSet": set(snapshot) == set(EXPECTED_REFUSAL),
+        # Reuse the producer's closed v2 schema before copying any actual buckets.
+        "routeLess": snapshot["routeLess"] if boundary_diagnostics._snapshot(snapshot, 2) else None,
+        "mismatched": [key for key, want in EXPECTED_REFUSAL.items() if snapshot.get(key) != want],
+        "counts": {key: value for key, value in snapshot.items() if key in EXPECTED_REFUSAL and key != "routeLess"
+                   and type(value) is int and 0 <= value <= boundary_diagnostics.MAX_COUNT},
+    }
+    require(snapshot == EXPECTED_REFUSAL)
+    summary["checks"]["route-less-inventory-exact"] = "passed"
+    progress["stage"] = "require-strict-exclusion"
+    progress["strictFacts"] = {"unverified": strict["verified"] is False,
+                               "noOptionalIds": strict["optionalRootIds"] == [],
+                               "oneNamed": type(strict["recordingCount"]) is int and strict["recordingCount"] == 1}
+    require(all(progress["strictFacts"].values()))
+    summary["checks"]["strict-attribution-preserved"] = "passed"
+    progress["stage"] = "complete"
+    return api, strict, snapshot
 
 
 def compare_mapped_pages(root, api, cli_rows, detail_limit):
@@ -198,20 +280,17 @@ def prove(candidate, fixture, summary):
                                      "/__fixture/refusal/committed/probe", timeout=10)
         require(response["status"] == 403)
         summary["checks"]["committed-filter-403"] = "passed"
-        def terminal_pair(api):
-            return len(api["details"]) == 2 and all(d.get("completion") == "complete" for d in api["details"].values())
-        api = read_until(client, root / "campaign/java/jhipster/instrumented-1/api", terminal_pair,
-                         time.monotonic() + 30)
-        strict = xinstr.burst_accounting(api["details"], sent, expected, {}, optional_roots=optional)
-        snapshot = boundary_diagnostics.snapshot(api["details"], api["recordings"], {}, strict)
-        require(snapshot == {"listedNewRecordings": 2, "newRecordings": 2, "namedMatched": 1,
-                "optionalNamed": 0, "missingNamed": 0, "capacityRejected": 0, "unexpectedRoots": 0,
-                "unclassifiedRecordings": 0, "unreadRecordings": 0, "routeLess": [
-                    {"completion": "complete", "method": "GET", "outcome": "responded", "httpStatus": 403,
-                     "recordings": 1}]})
-        summary["checks"]["route-less-inventory-exact"] = "passed"
-        require(not strict["verified"] and strict["optionalRootIds"] == [] and strict["recordingCount"] == 1)
-        summary["checks"]["strict-attribution-preserved"] = "passed"
+        try:
+            api, strict, snapshot = verify_refusal_boundary(
+                client, root / "campaign/java/jhipster/instrumented-1/api", sent, expected, optional,
+                time.monotonic() + 30, summary)
+        except Exception as error:
+            if "post403" in summary:
+                kinds = ((TimeoutError, "deadline"), (OSError, "io"), (KeyError, "missing-field"),
+                         (TypeError, "type"), (ValueError, "validation"))
+                summary["post403"]["failure"] = next(
+                    (label for cls, label in kinds if isinstance(error, cls)), "other")
+            raise
         (root / "boundary-private.json").write_text(json.dumps({"mapped": boundary, "strict": strict,
                                                                "snapshot": snapshot}) + "\n")
         summary["inventory"] = snapshot

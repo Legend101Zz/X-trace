@@ -39,9 +39,83 @@ class FocusedFixture(unittest.TestCase):
         fail = {"ok": False, "details": {}, "reason": "private response and path"}
         with mock.patch.object(fixture.xinstr, "collect_api", return_value=fail) as collect:
             with self.assertRaises(ValueError):
-                fixture.read_until(client, Path("unused"), lambda api: True, fixture.time.monotonic() + 1)
+                fixture.read_until(client, Path("unused"), lambda api: True, fixture.time.monotonic() + 1, {})
         self.assertEqual(collect.call_count, 1)
         self.assertIsNone(client.deadline)
+
+    def test_post403_exact_v2_inventory_requires_unassigned_route_less_receipt(self):
+        rid, other = "private-mapped-id", "private-other-id"
+        def detail(symbol, driver, status):
+            return {"completion": "complete", "outcome": {"kind": "responded", "httpStatus": status},
+                    "events": [{"kind": "recording_event_kind:request_update", "symbol": symbol,
+                                "interaction": {"kind": "interaction_kind:framework", "driver": driver,
+                                                "method": symbol.split()[1]}}]}
+        api = {"ok": True, "recordings": [{"recordingId": rid}, {"recordingId": other}],
+               "details": {rid: detail("http.request POST /orders", "spring-mvc", 201),
+                           other: detail("http.request GET", "servlet", 403)}}
+        summary = {"checks": {}}
+        def run():
+            with mock.patch.object(fixture.xinstr, "collect_api", return_value=api):
+                return fixture.verify_refusal_boundary(mock.Mock(), Path("unused"), [("mapped", "POST", "/orders")],
+                    {"mapped": [{"method": "POST", "route": "/orders"}]}, (("GET", "/private-path", 403),),
+                    fixture.time.monotonic() + 5, summary)
+        _, strict, snapshot = run()
+        self.assertEqual(snapshot, fixture.EXPECTED_REFUSAL)
+        self.assertFalse(strict["verified"])
+        self.assertEqual(summary["post403"]["snapshotMatches"]["mismatched"], [])
+        self.assertEqual(summary["post403"]["stage"], "complete")
+        api["details"][other]["outcome"]["httpStatus"] = 401
+        summary = {"checks": {}}
+        with self.assertRaises(ValueError):
+            run()
+        self.assertEqual(summary["checks"], {})
+        self.assertEqual(summary["post403"]["stage"], "require-inventory")
+        self.assertEqual(summary["post403"]["snapshotMatches"]["mismatched"], ["routeLess"])
+        self.assertEqual(summary["post403"]["snapshotMatches"]["routeLess"], [
+            {"completion": "complete", "method": "GET", "outcome": "responded",
+             "httpStatus": 401, "recordings": 1}])
+        self.assertNotIn("private-", json.dumps(summary))
+
+    def test_post403_earlier_returned_read_survives_later_failed_poll(self):
+        client, progress = mock.Mock(), {}
+        read = {"ok": True, "recordings": [{"recordingId": "private-id"}],
+                "details": {"private-id": {"completion": "partial"}}, "reason": "private-value"}
+        with mock.patch.object(fixture.xinstr, "collect_api", side_effect=[read, OSError("private-error")]):
+            with self.assertRaises(OSError):
+                fixture.read_until(client, Path("unused"), fixture.terminal_pair,
+                                   fixture.time.monotonic() + 5, progress)
+        self.assertIsNone(client.deadline)
+        self.assertEqual((progress["stage"], progress["pollsStarted"], progress["lastReturnedPoll"]),
+                         ("collect-api", 2, 1))
+        self.assertEqual(progress["lastRead"]["detailCompletion"]["partial"], 1)
+        self.assertNotIn("private-", json.dumps(progress))
+        failed = {"ok": False, "readFailure": {"stage": "detail", "reason": "deadline"}}
+        with mock.patch.object(fixture.xinstr, "collect_api", return_value=failed), self.assertRaises(ValueError):
+            fixture.read_until(client, Path("unused"), fixture.terminal_pair,
+                               fixture.time.monotonic() + 5, progress)
+        self.assertEqual(progress["stage"], "require-api-read")
+        self.assertEqual(progress["lastRead"]["readFailure"], failed["readFailure"])
+
+    def test_post403_terminal_pair_must_be_verified_by_the_deadline(self):
+        api = {"ok": True, "recordings": [{"recordingId": rid} for rid in ("one", "two")],
+               "details": {rid: {"completion": "complete"} for rid in ("one", "two")}}
+        for finished in (29, 30, 31):
+            with self.subTest(finished=finished):
+                client, progress = mock.Mock(), {}
+                with mock.patch.object(fixture, "time") as clock, \
+                        mock.patch.object(fixture.xinstr, "collect_api", return_value=api) as collect:
+                    clock.monotonic.side_effect = [0, finished]
+                    if finished <= 30:
+                        self.assertIs(fixture.read_until(client, Path("unused"), fixture.terminal_pair,
+                                                        30, progress), api)
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            fixture.read_until(client, Path("unused"), fixture.terminal_pair, 30, progress)
+                        self.assertEqual(progress["stage"], "terminal-pair-deadline")
+                collect.assert_called_once_with(client, Path("unused"))
+                self.assertIsNone(client.deadline)
+                self.assertEqual((progress["pollsStarted"], progress["lastReturnedPoll"]), (1, 1))
+                self.assertEqual(progress["lastRead"]["detailCompletion"]["complete"], 2)
 
     def test_native_page_comparison_rejects_cli_identity_cursor_and_event_disagreement(self):
         with tempfile.TemporaryDirectory() as temp:
