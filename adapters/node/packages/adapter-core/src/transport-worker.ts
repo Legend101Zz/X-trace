@@ -1,6 +1,6 @@
 import { RecordingEventKind } from "@xtrace/protocol";
 import { parentPort, workerData } from "node:worker_threads";
-import { returnCaptureCredit, workerCounters } from "./runtime/transport.cjs";
+import { returnCaptureCredit, routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
 import { capabilitySetFor, createRecordingAssembler, type InputMessage, type SendFn } from "./worker-core.js";
 import { createWorkerDelivery } from "./worker-delivery.js";
@@ -18,6 +18,7 @@ interface StartupData {
 const data = workerData as StartupData;
 const startup = new Int32Array(data.startupBarrier);
 const diagnostic = data.diagnosticBuffer && new Uint32Array(data.diagnosticBuffer);
+const routeFolds = data.diagnosticBuffer && new BigUint64Array(data.diagnosticBuffer, routeFoldDiagnosticOffset, 1);
 let session: AuthenticatedXtpSession | undefined;
 let delivery: ReturnType<typeof createWorkerDelivery> | undefined;
 let shuttingDown = false;
@@ -76,6 +77,12 @@ async function initialize(): Promise<void> {
   const notify = diagnostic ? () => parentPort?.postMessage({ type: "staged" }) : undefined;
   delivery = createWorkerDelivery(assembler, {
     staged: () => returnCaptureCredit(data.credits, notify),
+    ...(routeFolds ? {
+      routeFoldStaged(events: number) {
+        // One atomic pair so the exit snapshot cannot observe half a fold.
+        Atomics.add(routeFolds, 0, (1n << 32n) + BigInt(events));
+      },
+    } : {}),
     async close() {
       await session!.close();
       parentPort?.postMessage({ type: "drained" });

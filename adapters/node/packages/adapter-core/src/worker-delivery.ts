@@ -3,6 +3,7 @@ import { adjacentEvents, type InputMessage, type RecordingAssembler } from "./wo
 
 interface DeliveryHooks {
   staged(): void;
+  routeFoldStaged?(events: number): void;
   close(): Promise<void>;
   fail(): void;
 }
@@ -51,6 +52,7 @@ export function createWorkerDelivery(assembler: RecordingAssembler, hooks: Deliv
           });
           // The route and any folded events are still charged until the
           // combined wire batch is acknowledged.
+          if (folded > 0) hooks.routeFoldStaged?.(folded);
           credit(1 + folded);
         } else {
           await assembler.handle(message);

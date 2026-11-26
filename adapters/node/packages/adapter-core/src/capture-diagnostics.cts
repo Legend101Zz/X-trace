@@ -2,7 +2,7 @@ import { realpathSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { expressPatchStatus, observeExpressHandlers } from "./express-instrument.cjs";
 import { resolveFromEntry, resolveMedusaExpress } from "./modules.cjs";
-import { workerCounters } from "./runtime/transport.cjs";
+import { routeFoldDiagnosticOffset, workerCounters } from "./runtime/transport.cjs";
 import type { ModuleStatus } from "./runtime/registry.cjs";
 
 const counters = ["startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
@@ -39,7 +39,8 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
   delete process.env.XTRACE_MEDUSA_CAPTURE_DIAGNOSTIC;
   if (!/^[a-f0-9]{48}$/.test(nonce)) return;
   const counts = Object.fromEntries(counters.map((key) => [key, 0])) as Record<Counter, number>;
-  const workerBuffer = new SharedArrayBuffer(Object.keys(workerCounters).length * Uint32Array.BYTES_PER_ELEMENT);
+  const workerBuffer = new SharedArrayBuffer(routeFoldDiagnosticOffset + BigUint64Array.BYTES_PER_ELEMENT);
+  const routeFolds = new BigUint64Array(workerBuffer, routeFoldDiagnosticOffset, 1);
   const worker = new Uint32Array(workerBuffer);
   const scope = expressScope();
   const expressEvidence = { invoked: 0, withContext: 0, posted: 0 };
@@ -54,9 +55,11 @@ export function captureDiagnostic(): CaptureDiagnostic | undefined {
     // Do not schedule work or keep the worker alive. This is a snapshot, not a drain barrier.
     // The nonce only authenticates this finite line from the proof's private stream.
     try {
-      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V3 " + JSON.stringify({
+      const folded = Atomics.load(routeFolds, 0);
+      writeSync(2, "XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V4 " + JSON.stringify({
         nonce, exitCode, scope, express, patchedLayers: expressPatchStatus().patched, counts,
         expressEvidence: { ...expressEvidence, anyLayerStaged: Atomics.load(worker, workerCounters.expressHandlerStaged) },
+        routeFoldEvidence: { batches: Number(folded >> 32n), events: Number(folded & 0xffff_ffffn) },
         startStaged: Atomics.load(worker, workerCounters.startStaged),
         finishStaged: Atomics.load(worker, workerCounters.finishStaged),
         workerFailed: Atomics.load(worker, workerCounters.failed) === 1,

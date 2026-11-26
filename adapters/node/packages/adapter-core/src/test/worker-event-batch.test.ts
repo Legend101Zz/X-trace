@@ -40,12 +40,14 @@ function createHarness(send: SendFn, maxBatchEvents = 64, fitsEnvelope: NonNulla
   const done = deferred();
   const failed = deferred();
   let credits = 0;
+  const stagedFolds: number[] = [];
   const delivery = createWorkerDelivery(assembler, {
     staged: () => { credits += 1; },
+    routeFoldStaged: (events) => { stagedFolds.push(events); },
     close: async () => done.resolve(),
     fail: failed.resolve,
   });
-  return { assembler, delivery, done: done.promise, failed: failed.promise, credits: () => credits };
+  return { assembler, delivery, done: done.promise, failed: failed.promise, credits: () => credits, stagedFolds };
 }
 
 test("queued adjacent events batch in wire order across interleaved recordings and route, gap and finish boundaries", async () => {
@@ -255,8 +257,10 @@ test("route release combines the staged held prefix with consecutive queued hand
   assert.equal(routed.value.matchedRouteTemplate, "/items");
   assert.deepEqual(wireEvents(batch!), [2n, 3n, 4n, 5n]);
   assert.equal(h.credits(), 3, "neither the route nor the folded events credit before the batch ACK");
+  assert.equal(h.stagedFolds.length, 0);
   eventAck.resolve();
   await Promise.race([h.done, h.failed.then(() => assert.fail("delivery failed"))]);
+  assert.deepEqual(h.stagedFolds, [2], "only the two staged queued events are counted as folded");
   assert.equal(h.credits(), 7, "exactly the original seven logical messages are credited");
   assert.deepEqual(sent.map(({ case: kind }) => kind), ["recordingStarted", "eventBatch", "recordingFinished"]);
   const sealed = sent[2]!;
@@ -280,6 +284,7 @@ test("route release preserves a control boundary and falls back at the negotiate
     startAck.resolve();
     await Promise.race([h.done, h.failed.then(() => assert.fail("delivery failed"))]);
     assert.deepEqual(batches, [[2n], [3n]]);
+    assert.equal(h.stagedFolds.length, 0);
     assert.equal(h.credits(), messages.length - 1);
   }
 });
@@ -297,6 +302,7 @@ test("a rejected folded route batch refunds neither the route nor its queued eve
   startAck.resolve();
   await h.failed;
   assert.equal(h.credits(), 2);
+  assert.equal(h.stagedFolds.length, 0);
   assert.deepEqual(sent.map((payload) => payload.case === "eventBatch" ? wireEvents(payload) : payload.case),
     ["recordingStarted", [2n, 3n]]);
 });

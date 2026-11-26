@@ -16,6 +16,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
                         "startBeforeCreditNotification": 1, "eventBeforeCreditNotification": 3,
                         "routeBeforeCreditNotification": 0},
                     expressEvidence=dict(invoked=0, withContext=0, posted=0, anyLayerStaged=0),
+                    routeFoldEvidence=dict(batches=2, events=3),
                     startStaged=9, finishStaged=8, workerFailed=False, transportFailed=False,
                     closeRequested=False) | overrides
 
@@ -29,6 +30,7 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
         self.assertEqual(result["startStaged"], 9)
         self.assertEqual(result["counts"]["startCapacityRejected"], 35)
         self.assertEqual(result["counts"]["startBeforeCreditNotification"], 1)
+        self.assertEqual(result["routeFoldEvidence"], {"batches": 2, "events": 3})
         private = json.dumps(result)
         self.assertNotIn(self.nonce, private)
         self.assertNotIn("private example path", private)
@@ -54,6 +56,9 @@ class InstalledCaptureDiagnostic(unittest.TestCase):
     def test_records_with_extra_values_or_impossible_counts_are_invalid(self):
         for overrides in ({"examplePath": "/private/example"}, {"scope": "/private/example"},
                           {"finishStaged": 13}, {"startStaged": 13}, {"workerFailed": 1},
+                          {"routeFoldEvidence": {"batches": 0, "events": 1}},
+                          {"routeFoldEvidence": {"batches": 1, "events": 64}},
+                          {"routeFoldEvidence": {"batches": 1, "events": 2, "private": "example"}},
                           {"counts": self.snapshot()["counts"] | {"startAttempts": 46}},
                           {"counts": self.snapshot()["counts"] | {"startBeforeCreditNotification": 13}},
                           {"counts": self.snapshot()["counts"] | {"eventBeforeCreditNotification": "private"}}):

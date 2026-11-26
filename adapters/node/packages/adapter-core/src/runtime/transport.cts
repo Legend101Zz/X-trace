@@ -21,6 +21,7 @@ export function returnCaptureCredit(credits: Uint32Array<SharedArrayBuffer>, not
 }
 
 export const workerCounters = { startStaged: 0, finishStaged: 1, failed: 2, expressHandlerStaged: 3 } as const;
+export const routeFoldDiagnosticOffset = Object.keys(workerCounters).length * Uint32Array.BYTES_PER_ELEMENT;
 
 /** What the application thread needs from the worker handoff. */
 export interface HttpCaptureTransport {

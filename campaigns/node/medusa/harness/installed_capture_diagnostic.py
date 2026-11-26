@@ -5,7 +5,7 @@ import re
 
 from installed_evidence import require
 
-PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V3 "
+PREFIX = b"XTR-MEDUSA-CAPTURE-DIAGNOSTIC-V4 "
 COUNTERS = frozenset({
     "startAttempts", "startAccepted", "startCapacityRejected", "startOtherRejected",
     "finishPosted", "finishRejected", "eventRejected", "routeRejected",
@@ -17,7 +17,7 @@ EXPRESS = frozenset({"not-observed", "installed", "express-not-found", "unsuppor
 SWITCHES = frozenset({"workerFailed", "transportFailed", "closeRequested"})
 HANDLER_COUNTS = frozenset({"invoked", "withContext", "posted", "anyLayerStaged"})
 FIELDS = frozenset({"nonce", "exitCode", "scope", "express", "patchedLayers", "counts",
-                    "startStaged", "finishStaged", "expressEvidence"}) | SWITCHES
+                    "startStaged", "finishStaged", "expressEvidence", "routeFoldEvidence"}) | SWITCHES
 
 
 def unique(items):
@@ -57,6 +57,10 @@ def project_capture_diagnostic(log, nonce):
         require(all(bounded(value, 1_000_000) for value in handlers.values()))
         require(handlers["posted"] <= handlers["withContext"] <= handlers["invoked"])
         require(obj["patchedLayers"] > 0 or not any(handlers.values()))
+        fold = obj["routeFoldEvidence"]
+        require(isinstance(fold, dict) and set(fold) == {"batches", "events"})
+        require(all(bounded(value, 1_000_000) for value in fold.values()))
+        require(fold["batches"] <= fold["events"] <= 63 * fold["batches"])
         counts = obj["counts"]
         require(isinstance(counts, dict) and set(counts) == COUNTERS)
         require(all(bounded(value, 1_000_000) for value in counts.values()))
