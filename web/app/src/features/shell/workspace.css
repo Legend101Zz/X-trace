@@ -35,6 +35,10 @@
   .workspace.viewer-workspace { grid-template-columns: minmax(0, var(--requests-size)) 8px minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); grid-template-rows: minmax(0, 1fr) auto; }
   .steps-and-code { display: grid; grid-template-columns: minmax(152px, 1fr) 8px minmax(0, min(var(--code-size), calc(100% - 160px))); }
   .viewer-workspace :is(.mode-switch, .catalog-actions, .page-controls) { flex-wrap: wrap; }
+  /* A narrow split can wrap the navigation onto several lines. Its controls
+     remain scrollable without consuming the reader's entire height. */
+  .steps-and-code .replay-toolbar { max-block-size: 50%; overflow: auto; }
+  .steps-content > .center-head { min-height: 44px; padding-block: 4px; }
   .workspace-code { display: block; background: var(--bg); overflow: auto; }
   .reset-panels { display: block; grid-row: 2; grid-column: 1 / -1; justify-self: end; margin: 8px; }
   .workspace-requests[data-collapsed='true'] > .pane,
@@ -196,9 +200,11 @@
 }
 
 @media (min-width: 861px) and (pointer: coarse) {
-  /* Each adjacent 8px divider has a centered 44px drag target. Keep the mode
-     controls outside the 18px of that target extending into the Steps pane. */
-  .steps-content > .mode-switch { margin-inline: 18px; max-width: calc(100% - 36px); }
+  /* The 44px hit areas extend 18px beyond each 8px divider. Keep both
+     the fixed controls and the scrolled-to row clear of those edges. */
+  .steps-and-code .replay-toolbar { padding-inline: 18px; }
+  .steps-and-code .event-rail { padding-inline: 18px; }
+  .viewer-workspace[data-dock='bottom'] .steps-and-code > .pane > .steps-content { margin-block-end: 18px; }
   .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector::before {
     inset: 50% 0 auto; transform: translateY(-50%);
   }

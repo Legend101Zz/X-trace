@@ -17,7 +17,7 @@ export function StepsList({ events, selected, timing, onPick, onMove, onFocusedR
   const rail = useRef<HTMLDivElement>(null);
   const pendingFocus = useRef<string | undefined>(undefined);
   const [disclosures, setDisclosures] = useState<ReadonlySet<string>>(new Set());
-  const { list, selectedRow, mounted, offsets, first, focused, setFocused, revealIndex, groupSize } = useStepWindow(events, selected?.sequence);
+  const { list, selectedRow, mounted, offsets, first, focused, setFocused, revealIndex, groupSize } = useStepWindow(events, selected?.sequence, timing !== undefined);
 
   useLayoutEffect(() => {
     if (focused === undefined || events.some(({ sequence }) => sequence === focused)) return;

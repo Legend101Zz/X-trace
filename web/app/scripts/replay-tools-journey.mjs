@@ -422,6 +422,8 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       if (width < 1280) await activate(tools.getByRole('button', { name: 'Tools', exact: true }));
       return (width < 1280 ? panel('Tools') : tools).getByRole('button', { name: 'Show timing', exact: true });
     };
+    const checkDenseReader = pointer === 'coarse' && (width === 1024 || width === 1280);
+    if (checkDenseReader) await goto(events.at(-1).sequence);
     const timing = await openTiming();
     await expect(timing).toHaveAttribute('aria-pressed', 'false');
     await touchTargets(width < 1280 ? panel('Tools') : tools);
@@ -435,6 +437,27 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
       return text;
     });
     const timingBySequence = new Map(events.map((event, index) => [event.sequence, expectedTiming[index]]));
+    const verifySelectedReading = async (sequence) => {
+      await expect(selected.locator('.event-seq')).toHaveText(sequence);
+      await expect(selected.locator('.event-time')).toHaveText(timingBySequence.get(sequence));
+      await expect(page.locator('.workspace-inspector')).toHaveAttribute('data-collapsed', 'false');
+      await expect(page.locator('.evidence-pane .inspector-tabs')).toBeInViewport();
+      const summary = page.locator('.replay-context-event');
+      await expect(summary.locator('.mono')).toHaveText(`Event sequence ${sequence}`);
+      await expect(summary.locator('span').last()).toHaveText(await selected.locator('.event-kind').textContent());
+      await expect(selected).toBeInViewport({ ratio: 1 });
+      for (const part of ['.event-seq', '.event-kind', '.event-time']) {
+        await assertLabelUncovered(selected.locator(part));
+      }
+      assert.ok(await selected.evaluate((button) => {
+        const b = button.getBoundingClientRect();
+        const pane = button.closest('.steps-content').getBoundingClientRect();
+        return b.width >= 44 && b.height >= 44 && b.top >= pane.top - 1 && b.bottom <= pane.bottom + 1
+          && [b.left + 3, b.right - 3].every(x => [b.top + 3, b.bottom - 3].every(y =>
+            button.contains(document.elementFromPoint(x, y))));
+      }), 'the selected 44px row is fully reachable inside the Steps reader with Inspector open');
+    };
+    if (checkDenseReader) await verifySelectedReading(events.at(-1).sequence);
     await verifyRows(page, events.map(({ sequence }) => sequence), timingBySequence);
     if (width === 320) {
       const navigation = page.getByRole('group', { name: 'Replay navigation' });
@@ -487,6 +510,15 @@ export async function verifyLoadedReplayTools(page, { events, pointer, saveScree
           }), 'the coarse mode tab has a 44px target clear of both neighboring dividers');
         }
       }
+    }
+    if (checkDenseReader) {
+      // The inventory sweep browsed away. Return through real navigation and
+      // check the row before any action on it could scroll it into view.
+      const back = page.getByRole('group', { name: 'Replay navigation' }).getByRole('button', { name: 'Back', exact: true });
+      await activate(back);
+      await verifySelectedReading(events.at(-2).sequence);
+      await page.keyboard.press('Alt+ArrowDown');
+      await verifySelectedReading(events.at(-1).sequence);
     }
     if (width === 736) {
       await expect(page.locator('#events-panel .recording-why')).toHaveJSProperty('open', true);

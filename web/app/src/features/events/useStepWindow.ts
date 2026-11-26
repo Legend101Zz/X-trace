@@ -13,7 +13,9 @@ export function stepScrollOwner(list: HTMLElement) {
 }
 
 export function focusStepControl(control: HTMLElement) {
-  revealWithin(stepScrollOwner(control), control, 'vertical');
+  const toolbar = control.closest<HTMLElement>('.replay-toolbar');
+  const owner = toolbar && getComputedStyle(toolbar).overflowY === 'auto' ? toolbar : stepScrollOwner(control);
+  revealWithin(owner, control, 'vertical');
   control.focus({ preventScroll: true });
 }
 
@@ -28,7 +30,7 @@ function firstVisible(offsets: readonly number[], top: number) {
   return Math.min(low, offsets.length - 2);
 }
 
-export function useStepWindow(events: readonly ReplayEvent[], selected: string | undefined) {
+export function useStepWindow(events: readonly ReplayEvent[], selected: string | undefined, showTiming: boolean) {
   const list = useRef<HTMLOListElement>(null);
   const selectedRow = useRef<HTMLButtonElement>(null);
   const heights = useRef(new Map<string, number>());
@@ -151,12 +153,12 @@ export function useStepWindow(events: readonly ReplayEvent[], selected: string |
     revealWithin(owner, button, 'vertical');
     if (owner.scrollTop === before) return;
 
-    // A mode switch can mount a distant selected row beside estimated spacers.
-    // Re-anchor immediately, before new measurements can restore the old scroll position.
+    // Entering Steps or changing timing can place the selection beyond the reader.
+    // Anchor the revealed row before measuring its new wrapping or the virtual spacers.
     const viewportTop = owner.getBoundingClientRect().top + owner.clientTop;
     anchor.current = { sequence: selected, offset: item.getBoundingClientRect().top - viewportTop };
     updateViewport(element, owner, viewportTop);
-  }, [selected]);
+  }, [selected, showTiming]);
 
   function revealIndex(index: number) {
     const target = Math.max(0, Math.min(events.length - 1, index));
