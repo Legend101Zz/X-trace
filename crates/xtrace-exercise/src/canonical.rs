@@ -1,7 +1,7 @@
 //! Canonical plan encoding and the plan hash.
 
 use serde_json::{Value, json};
-use xtrace_export::canonical::json_compact;
+use xtrace_domain::canonical_json::json_compact;
 
 use crate::plan::{Plan, PlanItem};
 

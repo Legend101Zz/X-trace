@@ -146,3 +146,44 @@ exit 9 with a message; they never exit 0 and never print a success document.
   is a plain `boundary`).
 
 **Amendment (2026-11-09).** `xtrace export` supports OpenAPI, Postman, cURL and developer bundles. Missing revisions or operation IDs exit 3; usage errors exit 2. Non-empty destinations are refused, and files are staged in a private sibling directory and published by one rename. Per-claim end lines and confidence are unavailable; multi-claim locations are also unavailable. The bundle omits the unavailable policy digest and reports the omission.
+
+## Addendum: bounded previous event windows (2026-11-25, issue #95)
+
+`prevCursor` on the existing recording-detail route addresses the exclusive first
+sequence of the returned page. It is present when a nonempty page starts above
+sequence 2 (sequence 1 opens the recording). It is absent for an empty page or a
+page starting at the first persisted event. Frame-less events participate in the
+same sequence; a frame index is not an event index. `aroundFrame` pages use their
+actual first returned event as this boundary, including pages near either edge
+and pages shortened to keep the anchor within the response budget.
+
+A request following `prevCursor` returns the nearest preceding contiguous events
+in ascending sequence order. The request's current `limit` applies; the cursor
+neither freezes an old limit nor promises to reproduce an earlier page's exact
+shape. Event-count, response-byte and verified-input budgets trim the earlier
+edge of a backward page, retaining the immediate predecessor. Its `nextCursor`
+addresses the last returned sequence, so forward paging resumes contiguously.
+A cursor is an address to verify, not a claim that unread bytes were inspected:
+corrupt or missing predecessor evidence produces an explicit read error and is
+never skipped in favour of an older readable page. An out-of-range backward
+boundary is rejected instead of silently jumping to the recording tail.
+
+Forward tokens retain the existing `v1.` plus unpadded base64url encoding of the
+16 project UUID bytes, 16 recording UUID bytes and 8-byte big-endian exclusive
+sequence. Backward tokens use `v2.` and append a single direction byte `1`
+(`before`) to that payload. Unknown versions, lengths, directions, noncanonical
+base64url, invalid backward-token recording UUID versions/variants and foreign
+project/recording scopes are rejected. Historical v1 identity acceptance and
+project-ID bytes remain readable; recording UUIDv4 compatibility follows ADR 0002.
+No cursor stores captured values or filesystem paths. `cursor` and `aroundFrame`
+remain mutually exclusive; the existing HTTP schema is unchanged.
+
+Each returned page pins publication and one SQLite WAL snapshot. Segment
+metadata is checked once in ascending order and retained only up to the existing
+segment ceiling, with fixed-width hashes and sequence fields validated before
+retention. Selected segments are decoded in the requested direction, with the
+same object checks, XTF/frame verification and per-request input budget. The
+published journal is charged to that budget and projected before sealed segments
+for backward reads. Final navigation-enriched response sizing also uses selection
+order, then reverses a backward page for the wire. There is no migration, index
+backfill, whole-recording object scan, budget increase or repeated page search.

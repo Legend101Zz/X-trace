@@ -39,6 +39,7 @@ pub mod application;
 pub mod catalog_discovery;
 pub mod commands;
 pub mod error;
+pub mod exercise;
 pub mod observed_endpoint_queries;
 pub mod ports;
 pub mod queries;

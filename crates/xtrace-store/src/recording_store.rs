@@ -40,6 +40,7 @@ use xtrace_domain::{
     ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
 };
 use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
+use xtrace_protocol::xtf::XtfEventEnvelope;
 
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
@@ -844,6 +845,14 @@ impl SqliteRecordingStore<'_> {
         #[cfg(test)]
         let mut phase = work_profile::Phase::enter("read_window_admission");
         let correlation_id = CorrelationId::new();
+        if request.after_sequence.is_some() && request.before_sequence.is_some()
+            || request.before_sequence.is_some_and(|sequence| sequence <= 2)
+            || request.limit == 0
+            || request.limit > xtrace_application::recording_queries::MAX_RECORDING_EVENT_LIMIT
+        {
+            return Err(recording_query_validation_error(correlation_id));
+        }
+        let backward = request.before_sequence.is_some();
         self.binding.revalidate(correlation_id)?;
         let published = recording_journal::PublishedRead::new(self, correlation_id)?;
         let connection =
@@ -946,6 +955,10 @@ impl SqliteRecordingStore<'_> {
             .map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
+        // Validate all metadata in ascending order on this same snapshot before selecting
+        // either direction. The existing segment ceiling bounds this vector and scan; only
+        // the selected suffix/prefix is decoded, under the unchanged verified-input budget.
+        let mut segments = Vec::new();
         let mut expected_ordinal = 0_u32;
         let mut expected_sequence = Some(2_u64);
         let mut segment_count = 0_u64;
@@ -1049,28 +1062,6 @@ impl SqliteRecordingStore<'_> {
                 .checked_add(1)
                 .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
 
-            let after_sequence = request.after_sequence.unwrap_or(0);
-            if last_sequence < after_sequence {
-                continue;
-            }
-            let is_page_lookbehind = last_sequence == after_sequence;
-            if events.len() >= event_limit
-                && first_sequence
-                    != events
-                        .last()
-                        .and_then(|event| event.sequence.parse::<u64>().ok())
-                        .and_then(|sequence| sequence.checked_add(1))
-                        .unwrap_or(u64::MAX)
-            {
-                has_more = true;
-                continue;
-            }
-            if projection_byte_limit_reached {
-                continue;
-            }
-            if verified_work_limit_reached {
-                continue;
-            }
             let segment = SegmentRow {
                 object_hash,
                 first_recording_seq: first,
@@ -1082,6 +1073,97 @@ impl SqliteRecordingStore<'_> {
                 checksum,
             };
             segment.validate(correlation_id)?;
+            segments.push((
+                ordinal,
+                first_sequence,
+                last_sequence,
+                count,
+                uncompressed_size,
+                segment,
+            ));
+        }
+        #[cfg(test)]
+        phase.switch("read_tail_projection");
+        let journal = if let Some((ordinal, tail)) = journal {
+            // Publication and sealed rows belong to the same pinned snapshot. A published
+            // journal prefix may already have been sealed; never project it twice.
+            let tail: Vec<_> =
+                tail.into_iter().filter(|event| event.recording_seq > sealed_last).collect();
+            if !tail.is_empty() && ordinal != expected_ordinal {
+                return Err(object_corrupt_error(correlation_id));
+            }
+            if let (Some(first), Some(last)) = (tail.first(), tail.last()) {
+                if sealed_last.checked_add(1) != Some(first.recording_seq) {
+                    return Err(object_corrupt_error(correlation_id));
+                }
+                incomplete_evidence.insert(
+                    pending_evidence_index,
+                    format!("durable_tail_pending:{}..{}", first.recording_seq, last.recording_seq),
+                );
+            }
+            tail
+        } else {
+            Vec::new()
+        };
+        let has_journal_tail = !journal.is_empty();
+        let frontier = journal.last().map_or(sealed_last, |event| event.recording_seq);
+        if request.before_sequence.is_some_and(|before| before > frontier) {
+            // Public backward tokens are anchored at an event from a prior page. An
+            // out-of-range anchor must not silently jump to an unrelated earlier suffix.
+            return Err(recording_query_validation_error(correlation_id));
+        }
+        if backward {
+            for envelope in journal.iter().rev() {
+                let event =
+                    envelope.event.as_ref().ok_or_else(|| object_corrupt_error(correlation_id))?;
+                if request.before_sequence.is_some_and(|before| event.recording_seq >= before) {
+                    continue;
+                }
+                if !append_projected_window_event(
+                    event,
+                    source_root,
+                    &mut source_cache,
+                    &mut events,
+                    &mut projection_bytes,
+                    event_limit,
+                    correlation_id,
+                )? {
+                    projection_byte_limit_reached = true;
+                    break;
+                }
+                if event.kind == WIRE_KIND_GAP {
+                    incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
+                }
+            }
+            segments.reverse();
+        }
+        for (ordinal, first_sequence, last_sequence, count, uncompressed_size, segment) in segments
+        {
+            let after_sequence = request.after_sequence.unwrap_or(0);
+            if request.before_sequence.is_some_and(|before| first_sequence >= before)
+                || last_sequence < after_sequence
+            {
+                continue;
+            }
+            let is_page_lookbehind = !backward && last_sequence == after_sequence;
+            if events.len() >= event_limit
+                && (backward
+                    || first_sequence
+                        != events
+                            .last()
+                            .and_then(|event| event.sequence.parse::<u64>().ok())
+                            .and_then(|sequence| sequence.checked_add(1))
+                            .unwrap_or(u64::MAX))
+            {
+                has_more = true;
+                continue;
+            }
+            if projection_byte_limit_reached {
+                continue;
+            }
+            if verified_work_limit_reached {
+                continue;
+            }
             let compressed_size = usize::try_from(segment.compressed_bytes)
                 .map_err(|_| recording_query_corrupt_error(correlation_id))?;
             let segment_work = compressed_size
@@ -1162,7 +1244,7 @@ impl SqliteRecordingStore<'_> {
                 || verified.segment_ordinal() != ordinal
                 || verified.event_count() != count
                 || verified.logical_bytes()
-                    != u64::try_from(uncompressed_bytes)
+                    != u64::try_from(segment.uncompressed_bytes)
                         .map_err(|_| recording_query_corrupt_error(correlation_id))?
                 || verified.first_recording_seq() != first_sequence
                 || verified.last_recording_seq() != last_sequence
@@ -1184,86 +1266,59 @@ impl SqliteRecordingStore<'_> {
             )?;
             #[cfg(test)]
             phase.switch("read_projection");
-            for envelope in decoded.events() {
-                let Some(event) = envelope.event.as_ref() else {
-                    return Err(object_corrupt_error(correlation_id));
-                };
-                if event.recording_seq <= after_sequence {
+            let ordered: Box<dyn Iterator<Item = &XtfEventEnvelope>> = if backward {
+                Box::new(decoded.events().iter().rev())
+            } else {
+                Box::new(decoded.events().iter())
+            };
+            for envelope in ordered {
+                let event =
+                    envelope.event.as_ref().ok_or_else(|| object_corrupt_error(correlation_id))?;
+                if event.recording_seq <= after_sequence
+                    || request.before_sequence.is_some_and(|before| event.recording_seq >= before)
+                {
                     continue;
                 }
-                if events.len() == event_limit {
-                    has_more = true;
-                    break;
-                }
-                if event.kind == 14 {
-                    incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
-                }
-                let projected = project_persisted_event(event, source_root, &mut source_cache);
-                let projected_size = projected
-                    .serialized_size_with_separator()
-                    .map_err(|_| recording_query_resource_error(correlation_id))?;
-                if projected_size > MAX_RECORDING_EVENT_PROJECTION_BYTES {
-                    return Err(recording_query_resource_error(correlation_id));
-                }
-                if projection_bytes
-                    .checked_add(projected_size)
-                    .is_none_or(|total| total > MAX_RECORDING_EVENT_PROJECTION_BYTES)
-                {
+                if !append_projected_window_event(
+                    event,
+                    source_root,
+                    &mut source_cache,
+                    &mut events,
+                    &mut projection_bytes,
+                    event_limit,
+                    correlation_id,
+                )? {
                     has_more = true;
                     projection_byte_limit_reached = true;
                     break;
                 }
-                projection_bytes += projected_size;
-                events.push(projected);
+                if event.kind == WIRE_KIND_GAP {
+                    incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
+                }
             }
         }
         #[cfg(test)]
         phase.switch("read_tail_projection");
-        let mut has_journal_tail = false;
-        if let Some((ordinal, tail)) = journal {
-            // Use the boundary from the same row snapshot that was decoded,
-            // including rows beyond this page, to avoid repeating a published tail.
-            let tail: Vec<_> =
-                tail.into_iter().filter(|event| event.recording_seq > sealed_last).collect();
-            has_journal_tail = !tail.is_empty();
-            if !tail.is_empty() && ordinal != expected_ordinal {
-                return Err(object_corrupt_error(correlation_id));
-            }
-            if let (Some(first), Some(last)) = (tail.first(), tail.last()) {
-                if sealed_last.checked_add(1) != Some(first.recording_seq) {
-                    return Err(object_corrupt_error(correlation_id));
-                }
-                incomplete_evidence.insert(
-                    pending_evidence_index,
-                    format!("durable_tail_pending:{}..{}", first.recording_seq, last.recording_seq),
-                );
-            }
-            // Journal envelopes have already passed checkpoint, digest, canonical
-            // encoding and sequence checks. Project them exactly like XTF events;
-            // they supply neither terminal proof nor an invented frame identity.
-            for envelope in &tail {
+        if !backward {
+            // Journal envelopes passed checkpoint, digest, canonical encoding and sequence
+            // checks. They supply neither terminal proof nor invented frame identities.
+            for envelope in &journal {
                 let event =
                     envelope.event.as_ref().ok_or_else(|| object_corrupt_error(correlation_id))?;
                 if event.recording_seq <= request.after_sequence.unwrap_or(0) {
                     continue;
                 }
-                if events.len() == event_limit
-                    || projection_byte_limit_reached
+                if projection_byte_limit_reached
                     || verified_work_limit_reached
-                {
-                    has_more = true;
-                    break;
-                }
-                let projected = project_persisted_event(event, source_root, &mut source_cache);
-                let projected_size = projected
-                    .serialized_size_with_separator()
-                    .map_err(|_| recording_query_resource_error(correlation_id))?;
-                if projected_size > MAX_RECORDING_EVENT_PROJECTION_BYTES {
-                    return Err(recording_query_resource_error(correlation_id));
-                }
-                if projection_bytes
-                    .checked_add(projected_size)
-                    .is_none_or(|total| total > MAX_RECORDING_EVENT_PROJECTION_BYTES)
+                    || !append_projected_window_event(
+                        event,
+                        source_root,
+                        &mut source_cache,
+                        &mut events,
+                        &mut projection_bytes,
+                        event_limit,
+                        correlation_id,
+                    )?
                 {
                     has_more = true;
                     break;
@@ -1271,8 +1326,6 @@ impl SqliteRecordingStore<'_> {
                 if event.kind == WIRE_KIND_GAP {
                     incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
                 }
-                projection_bytes += projected_size;
-                events.push(projected);
             }
         }
         #[cfg(test)]
@@ -1391,6 +1444,18 @@ impl SqliteRecordingStore<'_> {
         if final_projection_truncated {
             events.truncate(final_event_count);
             has_more = true;
+        }
+        if let Some(before) = request.before_sequence {
+            // Trimming happened in descending selection order, retaining the nearest
+            // predecessor even when byte/work budgets shortened the page. The wire order
+            // stays ascending. Never return a page that silently skips unreadable events.
+            if events.first().and_then(|event| event.sequence.parse::<u64>().ok())
+                != before.checked_sub(1)
+            {
+                return Err(recording_query_resource_error(correlation_id));
+            }
+            events.reverse();
+            has_more = true; // `before` itself is a persisted event in this snapshot.
         }
         #[cfg(test)]
         phase.switch("read_finalize");
@@ -3442,6 +3507,38 @@ fn terminal_final_sequence(
     Ok(Some(finish.final_recording_seq))
 }
 
+// Returns false at either event-count or projection-byte bound. Callers traverse in
+// selection order, so the same function retains a forward prefix or backward suffix.
+fn append_projected_window_event(
+    event: &xtrace_protocol::generated::agent::RecordingEvent,
+    source_root: Option<&Path>,
+    source_cache: &mut SourceProjectionCache,
+    events: &mut Vec<PersistedEvent>,
+    projection_bytes: &mut usize,
+    event_limit: usize,
+    correlation_id: CorrelationId,
+) -> Result<bool, RecordingStoreError> {
+    if events.len() >= event_limit {
+        return Ok(false);
+    }
+    let projected = project_persisted_event(event, source_root, source_cache);
+    let projected_size = projected
+        .serialized_size_with_separator()
+        .map_err(|_| recording_query_resource_error(correlation_id))?;
+    if projected_size > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+        return Err(recording_query_resource_error(correlation_id));
+    }
+    if projection_bytes
+        .checked_add(projected_size)
+        .is_none_or(|total| total > MAX_RECORDING_EVENT_PROJECTION_BYTES)
+    {
+        return Ok(false);
+    }
+    *projection_bytes += projected_size;
+    events.push(projected);
+    Ok(true)
+}
+
 fn project_persisted_event(
     event: &xtrace_protocol::generated::agent::RecordingEvent,
     source_root: Option<&Path>,
@@ -3793,8 +3890,9 @@ fn project_matching_source(
             truncated = end_line.is_some_and(|end| end > upper);
             break;
         }
+        // A retained blank line has no bytes but still needs a separator before the next line.
+        let separator_bytes = usize::from(found);
         found = true;
-        let separator_bytes = usize::from(!excerpt.is_empty());
         if excerpt.len().saturating_add(separator_bytes) > MAX_SOURCE_EXCERPT_BYTES {
             truncated = true;
             break;
@@ -3957,6 +4055,57 @@ mod source_projection_tests {
             .expect("source projection");
         assert_eq!(projected.status, SourceStatus::Matched);
         assert_eq!(projected.excerpt.as_deref(), Some("two\nthree"));
+    }
+
+    #[test]
+    fn matching_source_preserves_leading_and_consecutive_blank_lines() {
+        let root = tempdir();
+        for (bytes, end_line, expected) in [
+            (&b"header\n\nbody\nfooter\n"[..], 3, "\nbody"),
+            (&b"header\n\n\nbody\n\nfooter\n"[..], 5, "\n\nbody\n"),
+        ] {
+            write_source(root.path(), bytes);
+            let mut source = range(PATH, ContentHash::of_bytes(bytes));
+            source.end_line = Some(end_line);
+            let projected = project(&source, Some(root.path())).expect("matched source projection");
+            assert_eq!(projected.status, SourceStatus::Matched);
+            assert_eq!(projected.start_line, 2);
+            assert_eq!(projected.end_line, Some(end_line));
+            assert_eq!(projected.excerpt.as_deref(), Some(expected));
+            assert!(!projected.truncated);
+        }
+    }
+
+    #[test]
+    fn leading_blank_line_consumes_separator_at_excerpt_byte_limit() {
+        let root = tempdir();
+        let tail = "a".repeat(MAX_SOURCE_EXCERPT_BYTES - 2);
+        let contents = format!("header\n\n{tail}é\n");
+        let bytes = contents.as_bytes();
+        write_source(root.path(), bytes);
+        let projected = project(&range(PATH, ContentHash::of_bytes(bytes)), Some(root.path()))
+            .expect("matched source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.start_line, 2);
+        assert_eq!(projected.end_line, Some(3));
+        let expected = format!("\n{tail}");
+        assert_eq!(projected.excerpt.as_deref(), Some(expected.as_str()));
+        assert_eq!(expected.len(), MAX_SOURCE_EXCERPT_BYTES - 1);
+        assert!(projected.truncated);
+
+        let contents = format!("header\n\n{tail}\nnext\n");
+        let bytes = contents.as_bytes();
+        write_source(root.path(), bytes);
+        let mut source = range(PATH, ContentHash::of_bytes(bytes));
+        source.end_line = Some(4);
+        let projected = project(&source, Some(root.path())).expect("matched source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.start_line, 2);
+        assert_eq!(projected.end_line, Some(4));
+        let expected = format!("\n{tail}\n");
+        assert_eq!(projected.excerpt.as_deref(), Some(expected.as_str()));
+        assert_eq!(expected.len(), MAX_SOURCE_EXCERPT_BYTES);
+        assert!(projected.truncated);
     }
 
     #[test]
@@ -8204,6 +8353,7 @@ mod tests {
                     recording_id: anchor.recording_id,
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 },
                 None,
             )
@@ -8335,6 +8485,7 @@ mod tests {
                     recording_id: anchor.recording_id,
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 },
                 None,
             )
@@ -8427,6 +8578,7 @@ mod tests {
                     recording_id: anchor.recording_id,
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 },
                 None,
             )
@@ -8523,6 +8675,7 @@ mod tests {
                         recording_id: anchor.recording_id,
                         limit: 10,
                         after_sequence: None,
+                        before_sequence: None,
                     },
                     None,
                 )
@@ -8570,6 +8723,7 @@ mod tests {
                         recording_id: anchor.recording_id,
                         limit: 10,
                         after_sequence: None,
+                        before_sequence: None,
                     },
                     None,
                 )
@@ -8639,6 +8793,7 @@ mod tests {
                         recording_id: anchor.recording_id,
                         limit: 10,
                         after_sequence: None,
+                        before_sequence: None,
                     },
                     None,
                 )
@@ -8707,6 +8862,7 @@ mod tests {
                         recording_id: anchor.recording_id,
                         limit: 10,
                         after_sequence: None,
+                        before_sequence: None,
                     },
                     None,
                 )
@@ -8792,6 +8948,7 @@ mod tests {
                         recording_id: anchor.recording_id,
                         limit: 10,
                         after_sequence: None,
+                        before_sequence: None,
                     },
                     None
                 )
@@ -8869,6 +9026,7 @@ mod tests {
                                             recording_id,
                                             limit: 10,
                                             after_sequence: None,
+                                            before_sequence: None,
                                         },
                                         None,
                                     )
@@ -9010,6 +9168,7 @@ mod tests {
                     recording_id: anchor.recording_id,
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 },
                 None,
             )
@@ -9485,6 +9644,7 @@ mod tests {
                     recording_id: anchor.recording_id,
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 },
                 None,
             )

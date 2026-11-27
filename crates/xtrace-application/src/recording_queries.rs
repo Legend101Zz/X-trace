@@ -186,6 +186,9 @@ pub struct ShowWindowRequest {
     pub limit: u32,
     /// Exclusive internal sequence offset decoded from a scoped cursor.
     pub after_sequence: Option<u64>,
+    /// Exclusive upper bound for backward paging; mutually exclusive with `after_sequence`.
+    /// The adapter selects the nearest earlier events, then returns ascending order.
+    pub before_sequence: Option<u64>,
 }
 
 /// Bounded interaction metadata from persisted XTF, excluding raw paths.
@@ -847,7 +850,9 @@ pub struct RecordingDetail {
     pub first_sequence: Option<String>,
     /// Last sequence in the returned window, decimal string.
     pub last_sequence: Option<String>,
-    /// Backward-paging cursor, when an earlier window exists.
+    /// Opaque cursor before the first returned event, when that sequence is above 2.
+    /// Following it verifies and returns the immediately preceding bounded window;
+    /// unreadable predecessor evidence remains an explicit read failure.
     pub prev_cursor: Option<String>,
     /// Projection the events carry.
     pub projection: Projection,
@@ -1130,13 +1135,16 @@ pub fn show_recording<P: RecordingReadPort>(
         Some((_, sequence)) => {
             Some(sequence.saturating_sub(u64::from(request.limit / 2)).max(2).saturating_sub(1))
         }
-        None => after_sequence.map(|cursor| cursor.sequence),
+        None => after_sequence.filter(|cursor| !cursor.backward).map(|cursor| cursor.sequence),
     };
     let position = ShowWindowRequest {
         project_id: request.project_id,
         recording_id: request.recording_id,
         limit: request.limit,
         after_sequence: after_sequence_start,
+        before_sequence: after_sequence
+            .filter(|cursor| cursor.backward)
+            .map(|cursor| cursor.sequence),
     };
     let mut window = port
         .show_recording(&position)
@@ -1210,6 +1218,7 @@ pub fn show_recording<P: RecordingReadPort>(
             project_id: request.project_id,
             recording_id: request.recording_id,
             sequence,
+            backward: false,
         }))
     } else {
         None
@@ -1232,6 +1241,19 @@ pub fn show_recording<P: RecordingReadPort>(
     }
     let first_sequence = events.first().map(|event| event.sequence.clone());
     let last_sequence = events.last().map(|event| event.sequence.clone());
+    // Sequence 1 opens the recording; persisted events start at 2. The store validates
+    // contiguous segment/journal ranges. A cursor names a boundary, never invents an event;
+    // following it still has to verify the preceding bytes and may report a read failure.
+    let prev_cursor = first_sequence.as_deref().and_then(|first| {
+        first.parse::<u64>().ok().filter(|sequence| *sequence > 2).map(|sequence| {
+            encode_cursor(CursorPayload {
+                project_id: request.project_id,
+                recording_id: request.recording_id,
+                sequence,
+                backward: true,
+            })
+        })
+    });
     Ok(RecordingDetail {
         schema_version: RECORDING_READ_SCHEMA_VERSION,
         project_id: request.project_id,
@@ -1263,7 +1285,7 @@ pub fn show_recording<P: RecordingReadPort>(
         anchor_frame_id: anchor.map(|(frame_id, _)| frame_id),
         first_sequence,
         last_sequence,
-        prev_cursor: None,
+        prev_cursor,
         projection: Projection::Full,
     })
 }
@@ -1273,6 +1295,7 @@ struct CursorPayload {
     project_id: ProjectId,
     recording_id: RecordingId,
     sequence: u64,
+    backward: bool,
 }
 
 fn encode_cursor(cursor: CursorPayload) -> String {
@@ -1280,25 +1303,49 @@ fn encode_cursor(cursor: CursorPayload) -> String {
     payload.extend_from_slice(cursor.project_id.as_uuid().as_bytes());
     payload.extend_from_slice(cursor.recording_id.as_uuid().as_bytes());
     payload.extend_from_slice(&cursor.sequence.to_be_bytes());
-    format!("v1.{}", URL_SAFE_NO_PAD.encode(payload))
+    if cursor.backward {
+        payload.push(1); // v2 direction: before the exclusive sequence boundary.
+        format!("v2.{}", URL_SAFE_NO_PAD.encode(payload))
+    } else {
+        format!("v1.{}", URL_SAFE_NO_PAD.encode(payload))
+    }
 }
 
 fn decode_cursor(token: &str) -> Result<CursorPayload, ()> {
-    let encoded = token.strip_prefix("v1.").ok_or(())?;
-    if encoded.len() > 128 {
+    let (encoded, backward) = if let Some(encoded) = token.strip_prefix("v1.") {
+        (encoded, false)
+    } else {
+        (token.strip_prefix("v2.").ok_or(())?, true)
+    };
+    if token.len() > 128 {
         return Err(());
     }
     let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| ())?;
-    if bytes.len() != 40 {
+    let expected_length = if backward { 41 } else { 40 };
+    if bytes.len() != expected_length
+        || (backward && bytes[40] != 1)
+        || URL_SAFE_NO_PAD.encode(&bytes) != encoded
+    {
         return Err(());
     }
     let project_bytes: [u8; 16] = bytes[..16].try_into().map_err(|_| ())?;
     let recording_bytes: [u8; 16] = bytes[16..32].try_into().map_err(|_| ())?;
-    let sequence_bytes: [u8; 8] = bytes[32..].try_into().map_err(|_| ())?;
+    let sequence_bytes: [u8; 8] = bytes[32..40].try_into().map_err(|_| ())?;
+    let recording = uuid::Uuid::from_bytes(recording_bytes);
+    // v1 preserves its historical identity acceptance. ProjectId reads also admit
+    // historical raw UUID bytes; exact project scope is checked by the use case.
+    if backward
+        && (recording.get_variant() != uuid::Variant::RFC4122
+            || !matches!(recording.get_version_num(), 4 | 7)
+            || u64::from_be_bytes(sequence_bytes) <= 2)
+    {
+        return Err(());
+    }
     Ok(CursorPayload {
         project_id: ProjectId::from_uuid(uuid::Uuid::from_bytes(project_bytes)),
         recording_id: RecordingId::from_uuid(uuid::Uuid::from_bytes(recording_bytes)),
         sequence: u64::from_be_bytes(sequence_bytes),
+        backward,
     })
 }
 
@@ -1498,6 +1545,7 @@ mod tests {
                     project_id,
                     recording_id,
                     sequence: 4,
+                    backward: false,
                 })),
                 around_frame: None,
             },
@@ -1550,8 +1598,18 @@ mod tests {
         let other_recording = RecordingId::new();
         let tokens = [
             "bad-token".to_owned(),
-            encode_cursor(CursorPayload { project_id: other_project, recording_id, sequence: 2 }),
-            encode_cursor(CursorPayload { project_id, recording_id: other_recording, sequence: 2 }),
+            encode_cursor(CursorPayload {
+                project_id: other_project,
+                recording_id,
+                sequence: 2,
+                backward: false,
+            }),
+            encode_cursor(CursorPayload {
+                project_id,
+                recording_id: other_recording,
+                sequence: 2,
+                backward: false,
+            }),
         ];
         for cursor in tokens {
             let error = show_recording(
@@ -1566,6 +1624,91 @@ mod tests {
                 CorrelationId::new(),
             )
             .expect_err("malformed or cross-bound cursor rejected");
+            assert_eq!(error.code.as_str(), "XTR-VALIDATION-RECORDING-CURSOR");
+        }
+    }
+
+    #[test]
+    fn previous_cursor_uses_actual_page_boundary_and_is_absent_for_head_or_empty_pages() {
+        let (project_id, recording_id, mut fixture) = fixture();
+        let request =
+            ShowRecording { project_id, recording_id, limit: 5, cursor: None, around_frame: None };
+        fixture.window.events[0].sequence = "17".to_owned();
+        let page =
+            show_recording(&fixture, request.clone(), CorrelationId::new()).expect("short page");
+        let before =
+            decode_cursor(page.prev_cursor.as_deref().expect("previous cursor")).expect("decode");
+        assert_eq!(
+            before.sequence, 17,
+            "boundary comes from observed page, not the requested limit"
+        );
+        assert!(before.backward);
+        fixture.window.events[0].sequence = "2".to_owned();
+        let page =
+            show_recording(&fixture, request.clone(), CorrelationId::new()).expect("first event");
+        assert!(page.prev_cursor.is_none());
+        fixture.window.events.clear();
+        fixture.window.has_more = false;
+        let page = show_recording(&fixture, request, CorrelationId::new()).expect("empty page");
+        assert!(page.prev_cursor.is_none());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn backward_cursor_rejects_malformed_and_foreign_tokens_and_preserves_v1() {
+        let (project_id, recording_id, fixture) = fixture();
+        let backward = CursorPayload { project_id, recording_id, sequence: 4, backward: true };
+        let token = encode_cursor(backward);
+        assert_eq!(decode_cursor(&token), Ok(backward));
+        let forward = CursorPayload { backward: false, ..backward };
+        assert_eq!(decode_cursor(&encode_cursor(forward)), Ok(forward));
+        let historical_project = CursorPayload {
+            project_id: ProjectId::from_uuid(
+                uuid::Uuid::parse_str("018f0000-0000-4000-8000-000000000002")
+                    .expect("historical project fixture"),
+            ),
+            ..forward
+        };
+        assert_eq!(decode_cursor(&encode_cursor(historical_project)), Ok(historical_project));
+        let legacy_v4 = CursorPayload {
+            recording_id: RecordingId::from_uuid(
+                uuid::Uuid::parse_str("018f0000-0000-4000-8000-000000000001").expect("v4 fixture"),
+            ),
+            ..backward
+        };
+        assert_eq!(decode_cursor(&encode_cursor(legacy_v4)), Ok(legacy_v4));
+        let bytes =
+            URL_SAFE_NO_PAD.decode(token.strip_prefix("v2.").expect("v2")).expect("payload");
+        let mut bad_direction = bytes.clone();
+        bad_direction[40] = 2;
+        let mut bad_project = bytes.clone();
+        bad_project[6] = 0x40; // A different project, regardless of its UUID version.
+        let mut bad_variant = bytes.clone();
+        bad_variant[24] = 0;
+        let malformed = [
+            "v2.bad".to_owned(),
+            format!("{token}="),
+            format!("v2.{}", URL_SAFE_NO_PAD.encode(&bytes[..40])),
+            format!("v2.{}", URL_SAFE_NO_PAD.encode(bad_direction)),
+            format!("v2.{}", URL_SAFE_NO_PAD.encode(bad_project)),
+            format!("v2.{}", URL_SAFE_NO_PAD.encode(bad_variant)),
+            encode_cursor(CursorPayload { sequence: 2, ..backward }),
+            encode_cursor(CursorPayload { project_id: ProjectId::new(), ..backward }),
+            encode_cursor(CursorPayload { recording_id: RecordingId::new(), ..backward }),
+        ];
+        for cursor in malformed {
+            let error = show_recording(
+                &fixture,
+                ShowRecording {
+                    project_id,
+                    recording_id,
+                    limit: 3,
+                    cursor: Some(cursor),
+                    around_frame: None,
+                },
+                CorrelationId::new(),
+            )
+            .expect_err("reject invalid backward token");
             assert_eq!(error.code.as_str(), "XTR-VALIDATION-RECORDING-CURSOR");
         }
     }

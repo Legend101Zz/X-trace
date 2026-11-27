@@ -119,7 +119,9 @@ pub use runtime::{AdapterHelloAck, IncomingEnvelope, OutgoingCommand, PostHelloA
 pub use secret::SessionSecret;
 pub use session::{HandshakeInputs, HandshakeRole, Session, StagedReleaseError};
 pub use tls::{TlsServerMaterials, build_pinned_client_config};
-pub use viewer::{BoundViewer, ViewerError, ViewerReadiness};
+pub use viewer::{
+    BoundViewer, ViewerError, ViewerExerciseAction, ViewerExerciseHandler, ViewerReadiness,
+};
 
 /// Re-export of the XTP-Agent protocol handshake helpers so callers
 /// (the fake adapter in particular) can compute and verify the

@@ -1,0 +1,80 @@
+/* Each Map surface owns its scroll; neither can stretch the full event window into the page. */
+div.canvas-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  height: min(640px, 65dvh);
+  min-width: 0;
+  min-height: 12rem;
+  overflow: hidden;
+}
+
+.canvas-view > .canvas-scroll,
+.canvas-view > .canvas-tree {
+  min-width: 0;
+  min-height: 3rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.canvas-view > .canvas-scroll { flex: 1 1 0; }
+.canvas-view > .canvas-tree { flex: 2 1 0; align-content: start; }
+
+/* Evidence remains reachable without consuming either surface's minimum viewport. */
+.canvas-view > .canvas-notes {
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 0;
+  max-height: 25%;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.canvas-view > .canvas-tree {
+  gap: 0;
+  overflow-anchor: none;
+}
+
+.canvas-tree > [role="treeitem"] { margin-bottom: 2px; }
+
+.canvas-tree > .canvas-tree-spacer {
+  display: block;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  pointer-events: none;
+}
+
+/* Use the Events scrollport's remaining space after its header and paging
+   controls. A viewport-height Map can extend behind the bottom Inspector. */
+#events-panel > .steps-content:has(> #replay-view-map-panel > .canvas-view) {
+  display: flex;
+  flex-direction: column;
+}
+
+#events-panel #replay-view-map-panel:has(> .canvas-view) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 0 0;
+  min-block-size: 9rem;
+}
+
+#replay-view-map-panel > .canvas-view {
+  height: auto;
+  min-height: 0;
+  max-height: min(640px, 65dvh);
+  flex: 1 1 0;
+  gap: 6px;
+}
+
+#replay-view-map-panel > .canvas-view > :is(.canvas-scroll, .canvas-tree) {
+  min-block-size: var(--tap);
+}
+
+/* Keep the open outcome reachable without assigning the whole Map budget
+   to a long outcome or to its recorded limitations. */
+#events-panel > .steps-content:has(> #replay-view-map-panel > .canvas-view) > .recording-why {
+  max-block-size: min(20%, 5rem);
+  overflow: auto;
+  overscroll-behavior: contain;
+}

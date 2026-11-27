@@ -3,7 +3,7 @@ info:
   title: X-trace Experimental Local Viewer API
   version: 1.0.0
   description: >-
-    Same-origin, loopback-only read API for persisted recording metadata and
+    Same-origin, loopback-only API for persisted recording metadata and
     bounded verified event windows with typed source and frame-navigation
     availability. Recording details include producer-declared duration and
     persisted terminal capture-completion evidence, including unavailable
@@ -14,7 +14,7 @@ info:
     not claim framework discovery or catalog completeness. Every
     request must carry the exact Host authority printed by viewer readiness,
     Sec-Fetch-Site: same-origin, and X-XTrace-Client: viewer-v1. There is no
-    CORS support. Authentication POST requests require an exact same-origin
+    CORS support. Authenticated exercise planning writes only owner-private plan state and sends zero application requests. All POST requests require an exact same-origin
     Origin; API GET requests accept an absent Origin only with the required
     same-origin Fetch Metadata and client header, and reject any supplied
     Origin that does not exactly match the viewer origin.
@@ -66,6 +66,83 @@ paths:
         '403': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
         '500': { $ref: '#/components/responses/Problem' }
+  /api/v1/exports/preview:
+    post:
+      operationId: previewCatalogExport
+      summary: Preview the files and omissions for a local catalog export.
+      description: >-
+        Resolves the scope and revision in one admitted project snapshot. JSON requests are
+        limited to 1 KiB and complete preview metadata to 2 MiB. A missing catalog, revision
+        or operation returns 404. Resource limits return 413. Unsafe or incomplete evidence
+        returns 422. The query lane returns 503 when busy and the request deadline returns 504.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/ExchangeOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportSelection' }
+      responses:
+        '200':
+          description: Safe metadata for one complete projection. No file contents or host paths.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportPreview' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /api/v1/exports/save:
+    post:
+      operationId: saveCatalogExport
+      summary: Download the exact approved projection after a fresh catalog read.
+      description: >-
+        Repeat the preview selection and its approval after explicit user confirmation.
+        The server rereads linked evidence even for an unchanged revision. A changed
+        approval returns 409. Logical file bytes are limited to 16 MiB and the encoded
+        attachment to 20 MiB. Errors use the preview route's fixed problem codes.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/ExchangeOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportSaveRequest' }
+      responses:
+        '200':
+          description: A direct single file or a deterministic ZIP of the approved logical files.
+          headers:
+            Content-Disposition:
+              required: true
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { type: string, format: binary }
+            application/yaml:
+              schema: { type: string, format: binary }
+            application/zip:
+              schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+        '504': { $ref: '#/components/responses/Problem' }
   /api/v1/recordings:
     get:
       operationId: listRecordings
@@ -388,8 +465,102 @@ paths:
         '404': { $ref: '#/components/responses/Problem' }
         '501': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
+  /api/v1/exercise/plans:
+    post:
+      operationId: createExercisePlan
+      summary: Create an independent private draft for an observed recording.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ViewerHost' }
+        - { $ref: '#/components/parameters/ViewerFetchSite' }
+        - { $ref: '#/components/parameters/ViewerClient' }
+        - { $ref: '#/components/parameters/ExchangeOrigin' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExerciseDraft' }
+      responses:
+        '200': { $ref: '#/components/responses/PrivateExercisePlan' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/v1/exercise/plans/{hash}:
+    get:
+      operationId: showExercisePlan
+      summary: Inspect the saved state, including expiry and any replacement.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ViewerHost' }
+        - { $ref: '#/components/parameters/ViewerFetchSite' }
+        - { $ref: '#/components/parameters/ViewerClient' }
+        - { $ref: '#/components/parameters/OptionalApiOrigin' }
+        - { $ref: '#/components/parameters/ExercisePlanHash' }
+      responses:
+        '200': { $ref: '#/components/responses/PrivateExercisePlan' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/v1/exercise/plans/{hash}/edit:
+    post:
+      operationId: editExercisePlan
+      summary: Atomically revoke the original and create a new, independently reviewable draft.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ViewerHost' }
+        - { $ref: '#/components/parameters/ViewerFetchSite' }
+        - { $ref: '#/components/parameters/ViewerClient' }
+        - { $ref: '#/components/parameters/ExchangeOrigin' }
+        - { $ref: '#/components/parameters/ExercisePlanHash' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExerciseDraft' }
+      responses:
+        '200': { $ref: '#/components/responses/PrivateExercisePlan' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/v1/exercise/plans/{hash}/review:
+    post:
+      operationId: reviewExercisePlan
+      summary: Record explicit review of the exact plan.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ViewerHost' }
+        - { $ref: '#/components/parameters/ViewerFetchSite' }
+        - { $ref: '#/components/parameters/ViewerClient' }
+        - { $ref: '#/components/parameters/ExchangeOrigin' }
+        - { $ref: '#/components/parameters/ExercisePlanHash' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExerciseReviewRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/PrivateExercisePlan' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/v1/exercise/plans/{hash}/approve:
+    post:
+      operationId: approveExercisePlan
+      summary: Record explicit item consent for the exact reviewed plan and owner-confirmed target.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ViewerHost' }
+        - { $ref: '#/components/parameters/ViewerFetchSite' }
+        - { $ref: '#/components/parameters/ViewerClient' }
+        - { $ref: '#/components/parameters/ExchangeOrigin' }
+        - { $ref: '#/components/parameters/ExercisePlanHash' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExerciseApproval' }
+      responses:
+        '200': { $ref: '#/components/responses/PrivateExercisePlan' }
+        default: { $ref: '#/components/responses/Problem' }
 components:
   parameters:
+    ExercisePlanHash:
+      in: path
+      name: hash
+      required: true
+      schema: { type: string, pattern: '^[0-9a-f]{64}$' }
     ViewerHost:
       in: header
       name: Host
@@ -429,6 +600,11 @@ components:
       in: cookie
       name: xtrace_viewer_session
   responses:
+    PrivateExercisePlan:
+      description: Owner-private review of this immutable plan. The viewer response disables caching.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ExerciseReview' }
     Problem:
       description: Safe RFC 9457-like problem document.
       headers:
@@ -439,6 +615,287 @@ components:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
   schemas:
+    ExportFormat:
+      type: string
+      enum: [openapi, postman, curl, bundle]
+    ExportDigest:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: Lowercase hexadecimal BLAKE3 digest.
+    ExportSelection:
+      type: object
+      additionalProperties: false
+      required: [format, yaml, revision, scope]
+      properties:
+        format: { $ref: '#/components/schemas/ExportFormat' }
+        yaml: { type: boolean, description: Allowed only for OpenAPI when true. }
+        revision:
+          description: The last catalog publication for this project or one explicit revision UUID.
+          oneOf:
+            - { type: string, const: latest }
+            - { type: string, format: uuid }
+        scope:
+          description: >-
+            Every eligible operation of the revision, a catalog operation UUID or an observed
+            endpoint UUID prefixed with observed:. The observed selector is resolved within this
+            project and revision using its recorded component, binding, HTTP method and declared
+            route. The supported finite observed alias shares its catalog UUID, but the selector
+            kind remains distinct for approval. Divergent stored aliases are corrupt. A missing or
+            ambiguous match is unavailable.
+          oneOf:
+            - { type: string, const: all }
+            - { type: string, format: uuid }
+            - { type: string, pattern: '^observed:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
+    ExportApproval:
+      type: object
+      additionalProperties: false
+      required: [revisionId, digest]
+      properties:
+        revisionId: { type: string, format: uuid }
+        digest: { $ref: '#/components/schemas/ExportDigest' }
+    ExportSaveRequest:
+      type: object
+      additionalProperties: false
+      required: [format, yaml, revision, scope, approval]
+      properties:
+        format: { $ref: '#/components/schemas/ExportFormat' }
+        yaml: { type: boolean, description: Allowed only for OpenAPI when true. }
+        revision:
+          description: The last catalog publication for this project or one explicit revision UUID.
+          oneOf:
+            - { type: string, const: latest }
+            - { type: string, format: uuid }
+        scope:
+          description: >-
+            Every eligible operation of the revision, a catalog operation UUID or an observed
+            endpoint UUID prefixed with observed:. The observed selector is resolved within this
+            project and revision using its recorded component, binding, HTTP method and declared
+            route. The supported finite observed alias shares its catalog UUID, but the selector
+            kind remains distinct for approval. Divergent stored aliases are corrupt. A missing or
+            ambiguous match is unavailable.
+          oneOf:
+            - { type: string, const: all }
+            - { type: string, format: uuid }
+            - { type: string, pattern: '^observed:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
+        approval: { $ref: '#/components/schemas/ExportApproval' }
+    ExportPreviewFile:
+      type: object
+      required: [name, recipeOrdinal, mode, bytes, blake3]
+      properties:
+        name:
+          type: [string, 'null']
+          description: Safe relative filename. Null when the logical recipe name embeds catalog route text.
+        recipeOrdinal:
+          type: [integer, 'null']
+          minimum: 1
+          description: Identifies a recipe whose name is withheld.
+        mode: { type: integer, const: 420, description: Non-executable logical file mode (octal 0644). }
+        bytes: { type: integer, minimum: 0, maximum: 16777216 }
+        blake3: { $ref: '#/components/schemas/ExportDigest' }
+    ExportOmissionGroup:
+      type: object
+      required: [format, kind, reason, count]
+      properties:
+        format: { type: [string, 'null'], enum: [openapi, postman, curl, bundle, null] }
+        kind: { type: string, description: Fixed subject label with no catalog names. }
+        reason: { type: string, description: Fixed omission reason with no offender paths or values. }
+        count: { type: integer, minimum: 1, maximum: 32768 }
+    ExportDownload:
+      type: object
+      required: [filename, mediaType]
+      properties:
+        filename: { type: string, enum: [openapi.json, openapi.yaml, collection.postman.json, xtrace-curl.zip, xtrace-bundle.zip] }
+        mediaType: { type: string, enum: [application/json, application/yaml, application/zip] }
+    ExportPreview:
+      type: object
+      required: [schemaVersion, requestId, projectId, request, revisionId, revisionOrdinal, catalogOperationId, selectedOperations, emittedOperations, files, omissions, totalBytes, contentHash, approval, download]
+      properties:
+        schemaVersion: { type: integer, const: 1 }
+        requestId: { type: string, format: uuid }
+        projectId: { type: string, format: uuid }
+        request: { $ref: '#/components/schemas/ExportSelection' }
+        revisionId: { type: string, format: uuid }
+        revisionOrdinal: { type: integer, minimum: 0 }
+        catalogOperationId:
+          type: [string, 'null']
+          format: uuid
+          description: Resolved catalog operation for this revision. Null for all operations.
+        selectedOperations: { type: integer, minimum: 0, maximum: 4096 }
+        emittedOperations: { type: integer, minimum: 0, maximum: 4096 }
+        files:
+          type: array
+          maxItems: 4101
+          items: { $ref: '#/components/schemas/ExportPreviewFile' }
+        omissions:
+          type: array
+          maxItems: 32768
+          items: { $ref: '#/components/schemas/ExportOmissionGroup' }
+        totalBytes: { type: integer, minimum: 0, maximum: 16777216 }
+        contentHash:
+          $ref: '#/components/schemas/ExportDigest'
+          description: Digest over the sorted logical paths, modes and exact file bytes.
+        approval: { $ref: '#/components/schemas/ExportApproval' }
+        download: { $ref: '#/components/schemas/ExportDownload' }
+    ExerciseTarget:
+      type: object
+      additionalProperties: false
+      required: [base_url, operator_owned_development]
+      properties:
+        base_url: { type: string, maxLength: 128, description: Plain HTTP IPv4 or IPv6 loopback origin with explicit port. }
+        operator_owned_development: { type: boolean, const: true }
+    ExerciseInput:
+      type: object
+      additionalProperties: false
+      required: [name, location, required, value]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128 }
+        location: { type: string, enum: [path, query, header, cookie] }
+        required: { type: boolean }
+        value:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [source]
+              properties: { source: { const: unresolved } }
+            - type: object
+              additionalProperties: false
+              required: [source, value]
+              properties: { source: { const: operator }, value: { type: string, maxLength: 4096 } }
+            - type: object
+              additionalProperties: false
+              required: [source, reference]
+              properties: { source: { const: credential_reference }, reference: { type: string, maxLength: 64 } }
+    ExerciseBody:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [source]
+          properties: { source: { enum: [not_recorded, empty_by_operator] } }
+        - type: object
+          additionalProperties: false
+          required: [source, content_type, content]
+          properties:
+            source: { const: operator }
+            content_type: { type: string, enum: [application/json, text/plain] }
+            content: { type: string, description: At most 65536 UTF-8 bytes. }
+    ExerciseDraft:
+      type: object
+      additionalProperties: false
+      required: [revision_id, operation_id, selected_operation_version_id, recording_id, target, inputs, body, lifetime_seconds]
+      properties:
+        revision_id: { type: string, format: uuid }
+        operation_id: { type: string, format: uuid }
+        selected_operation_version_id: { type: string, minLength: 1, maxLength: 128 }
+        recording_id: { type: string, format: uuid }
+        target: { $ref: '#/components/schemas/ExerciseTarget' }
+        inputs: { type: array, maxItems: 64, items: { $ref: '#/components/schemas/ExerciseInput' } }
+        body: { $ref: '#/components/schemas/ExerciseBody' }
+        lifetime_seconds: { type: integer, minimum: 1, maximum: 900 }
+    ExerciseReviewRequest:
+      type: object
+      additionalProperties: false
+      maxProperties: 0
+    ExerciseApproval:
+      type: object
+      additionalProperties: false
+      required: [plan_id, item_ids, confirm_owned_development]
+      properties:
+        plan_id: { type: string, format: uuid }
+        item_ids: { type: array, minItems: 1, maxItems: 1, uniqueItems: true, items: { type: string, format: uuid } }
+        confirm_owned_development: { type: boolean, const: true }
+    ExerciseReview:
+      type: object
+      required: [kind, plan_id, plan_hash, project_id, observed_recording, selected_catalog_operation, target, inputs, body, phase, created_at, expires_at, expired, preview, ready_for_approval, execution_available, requests_sent, bounds, result, note]
+      properties:
+        kind: { const: exercise_plan_review }
+        plan_id: { type: string, format: uuid }
+        plan_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        project_id: { type: string, format: uuid }
+        observed_recording:
+          type: object
+          required: [recording_id, operation_id, catalog_revision_id, operation_version_id, version_evidence]
+          properties:
+            recording_id: { type: string, format: uuid }
+            operation_id: { type: string, format: uuid }
+            catalog_revision_id: { type: 'null' }
+            operation_version_id: { type: 'null' }
+            version_evidence: { const: not_observed }
+        selected_catalog_operation:
+          type: object
+          required: [operation_id, selection_basis, catalog]
+          properties:
+            operation_id: { type: string, format: uuid }
+            selection_basis: { const: operator_selected_catalog_version }
+            catalog:
+              type: object
+              required: [revision_id, catalog_hash, operation_version_id, application_component, binding_key, method, route_template, conflicted]
+              properties:
+                revision_id: { type: string, format: uuid }
+                catalog_hash: { type: string }
+                operation_version_id: { type: string }
+                application_component: { type: string }
+                binding_key: { type: string }
+                method: { type: string }
+                route_template: { type: string }
+                conflicted: { type: boolean }
+        target: { $ref: '#/components/schemas/ExerciseTarget' }
+        inputs: { type: array, items: { $ref: '#/components/schemas/ExerciseInput' } }
+        body: { $ref: '#/components/schemas/ExerciseBody' }
+        created_at: { type: integer }
+        expires_at: { type: integer }
+        expired: { type: boolean }
+        phase: { $ref: '#/components/schemas/ExercisePhase' }
+        preview:
+          type: object
+          required: [plan_hash, synthesis_plan_hash, target, selected_items, items_needing_approval, items, requests_sent]
+          properties:
+            plan_hash: { type: string }
+            synthesis_plan_hash: { type: string }
+            revision_id: { type: string }
+            target: { type: string }
+            target_host_class: { type: string }
+            selected_items: { type: integer }
+            items_needing_approval: { type: integer }
+            requests_sent: { const: 0 }
+            items:
+              type: array
+              items:
+                type: object
+                required: [item_id, operation_id, request, effect, selected, ready, needs_approval]
+                properties:
+                  item_id: { type: string, format: uuid }
+                  synthesis_item_id: { type: string, format: uuid }
+                  operation_id: { type: string, format: uuid }
+                  request: { type: string }
+                  selection_reason: { type: string }
+                  effect: { enum: [read_only, mutating, unknown] }
+                  selected: { type: boolean }
+                  ready: { type: boolean }
+                  needs_approval: { type: boolean }
+                  unresolved_required: { type: array, items: { type: string } }
+                  credentials_needed_at_run_time: { type: array, items: { type: string } }
+        ready_for_approval: { type: boolean }
+        execution_available: { const: false }
+        requests_sent: { const: 0 }
+        bounds: { type: object, additionalProperties: { type: integer } }
+        result:
+          type: object
+          required: [status, reason]
+          properties: { status: { const: unavailable }, reason: { const: executor_not_implemented } }
+        supersedes: { type: string, pattern: '^[0-9a-f]{64}$' }
+        note: { type: string }
+    ExercisePhase:
+      type: object
+      required: [phase]
+      properties:
+        phase: { enum: [draft, reviewed, approved, superseded, consumed] }
+        reviewed_at: { type: integer }
+        approved_at: { type: integer }
+        item_ids: { type: array, items: { type: string, format: uuid } }
+        replacement_hash: { type: string }
+        replacement_created_at: { type: integer }
+        previous: { $ref: '#/components/schemas/ExercisePhase' }
+        consumed_at: { type: integer }
     AuthResponse:
       type: object
       required: [authenticated, requestId]

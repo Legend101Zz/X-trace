@@ -32,6 +32,8 @@ approved contracts; if code and a contract disagree, raise it instead of silentl
   integration and acceptance mechanics (amended by 0012) · 0007 process provenance · 0008 private-storage admission ·
   0009 wave batching (amended by 0012) · 0010 replay navigation extras, catalog CLI, exit codes · 0011 recording
   limitations · 0012 agent workforce, GitHub verification, risk-scaled merges.
+- `docs/decisions/0017-private-owner-reviewed-exercise-plans.md`: proposed private plan/review/approval lifecycle,
+  exact CLI input codec, one-use reservation semantics and remaining viewer/executor work (Refs #121).
 
 ## Release
 

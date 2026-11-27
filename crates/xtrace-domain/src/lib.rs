@@ -37,6 +37,7 @@
     )
 )]
 
+pub mod canonical_json;
 pub mod capture_budget;
 pub mod catalog;
 pub mod catalog_admission;
@@ -55,6 +56,7 @@ pub mod provenance;
 pub mod recording;
 pub mod run;
 pub mod runtime;
+pub mod secret_shapes;
 pub mod static_claims;
 pub mod time;
 pub mod value;
