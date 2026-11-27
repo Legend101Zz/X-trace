@@ -145,7 +145,12 @@ def node_pack(src: Path, env: dict, stage_pack: Path):
         return (parts[0] == "test" or rel.name.endswith((".d.ts", ".d.cts", ".d.mts", ".map", ".tsbuildinfo"))
                 or rel.as_posix() == "manifest.sha256")
 
-    copy_tree(dist, stage_pack / "dist", skip)
+    packaged_dist = stage_pack / "dist"
+    copy_tree(dist, packaged_dist, skip)
+    # The launcher validates the exact installed dist inventory. The source build's
+    # manifest also covers files omitted from the package.
+    (packaged_dist / "manifest.sha256").write_text(
+        "\n".join(sha_rows(packaged_dist, {"manifest.sha256"})) + "\n", encoding="utf-8")
     # ADR 0004 unbundled layout: licenses/THIRD_PARTY.txt lists every bundled dependency.
     lic = ["Third-party packages bundled in the Node adapter pack", ""]
     for pj in sorted((stage_pack / "dist" / "node_modules").rglob("package.json")):
