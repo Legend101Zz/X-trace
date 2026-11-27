@@ -46,6 +46,11 @@ export const BUILTIN_MODULES: readonly ModuleDescriptor[] = [
     capability: "async_correlation",
     limitationsWhenAbsent: ["async_correlation_unavailable"],
   },
+  {
+    name: "process-linkage",
+    capability: "process_linkage",
+    limitationsWhenAbsent: [],
+  },
 ];
 
 /** Limitations that hold regardless of which modules install in this version. */

@@ -4,6 +4,7 @@ import { installExpressLayerPatch } from "./express-instrument.cjs";
 import { installFastifyPatch, resolveFastifyRoute } from "./fastify-instrument.cjs";
 import { installNestPatch } from "./nest-instrument.cjs";
 import { installHttpClientCapture, installMysqlCapture, installPgCapture } from "./interactions/index.cjs";
+import { installProcessLinkageCapture } from "./process-linkage.cjs";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
@@ -247,6 +248,16 @@ export function outboundHttpModule(transport?: () => HttpCaptureTransport): Inst
     detect: supportedNode,
     install() {
       if (transport) installHttpClientCapture({ transport });
+    },
+  };
+}
+
+export function processLinkageModule(transport?: () => HttpCaptureTransport): InstrumentationModule {
+  return {
+    descriptor: descriptor("process-linkage"),
+    detect: supportedNode,
+    install() {
+      if (transport) installProcessLinkageCapture({ transport });
     },
   };
 }

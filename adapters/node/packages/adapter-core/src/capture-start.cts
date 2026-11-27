@@ -11,8 +11,9 @@ import {
   nodeHttpModule,
   outboundHttpModule,
   pgModule,
+  processLinkageModule,
 } from "./modules.cjs";
-import { setCaptureProfile } from "./runtime/context.cjs";
+import { setCaptureProfile, withoutCapture } from "./runtime/context.cjs";
 import { ModuleRegistry, type InstallEnvironment, type InstrumentationModule } from "./runtime/registry.cjs";
 import type { HttpCaptureTransport } from "./runtime/transport.cjs";
 
@@ -48,6 +49,7 @@ export function planCapture(): CapturePlan {
     pgModule(undefined, () => transport!),
     mysqlModule(undefined, () => transport!),
     outboundHttpModule(() => transport!),
+    processLinkageModule(() => transport!),
   ];
   const planned = modules.filter((module) => module.detect(environment).supported).map((module) => module.descriptor.capability);
   return {
@@ -79,7 +81,7 @@ export function startCaptureFromRequire(): void {
   const startupBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   let worker: Worker;
   try {
-    worker = new Worker(join(__dirname, "transport-worker.js"), {
+    worker = withoutCapture(() => new Worker(join(__dirname, "transport-worker.js"), {
       execArgv: [],
       workerData: {
         bootstrapPath,
@@ -87,7 +89,7 @@ export function startCaptureFromRequire(): void {
         manifestPath: join(__dirname, "node-capabilities.json"),
         capabilities: plan.planned,
       },
-    });
+    }));
   } catch {
     warnUnavailable("XTR-NODE-STARTUP");
     return;

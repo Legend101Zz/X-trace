@@ -747,9 +747,15 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           || event.symbol().equals(FINISH_FRAME_GAP_SYMBOL);
       boolean lines = event.symbol().equals(BootstrapBridge.LINE_BUDGET_SYMBOL);
       boolean untransformed = event.symbol().equals(UNTRANSFORMED_GAP_SYMBOL);
+      boolean childNotInstrumented =
+          event.symbol().equals(BootstrapBridge.CHILD_PROCESS_NOT_INSTRUMENTED_SYMBOL);
+      boolean bootstrapConsumed =
+          event.symbol().equals(BootstrapBridge.BOOTSTRAP_CONSUMED_SYMBOL);
       builder.setGap(
           GapPayload.newBuilder()
               .setReason(correlationLost ? GapReason.GAP_REASON_CORRELATION_LOST
+                  : childNotInstrumented ? GapReason.GAP_REASON_CHILD_PROCESS_NOT_INSTRUMENTED
+                  : bootstrapConsumed ? GapReason.GAP_REASON_BOOTSTRAP_CONSUMED
                   : lines ? GapReason.GAP_REASON_LINE_BUDGET
                   : untransformed ? GapReason.GAP_REASON_CLASS_NOT_TRANSFORMED
                   : cap || admission || memory || frame
@@ -802,6 +808,13 @@ final class RecordingWriter implements AutoCloseable, Runnable {
                 .setDriver(operation.driver())
                 .setMethod(operation.method()));
       }
+    } else if (kind == RecordingEventKind.RECORDING_EVENT_KIND_ASYNC_LINK
+        && BootstrapBridge.PROCESS_LINK_SYMBOL.equals(event.symbol())) {
+      builder.setInteraction(
+          Interaction.newBuilder()
+              .setKind(InteractionKind.INTERACTION_KIND_PROCESS)
+              .setDriver("jvm")
+              .setMethod("fork"));
     }
     return builder.build();
   }
@@ -866,6 +879,13 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             .putConfig("mechanism", "reactor_context")
             .putConfig("framework", "spring-webflux")
             .build();
+    Capability processLinkage =
+        Capability.newBuilder()
+            .setName("process_linkage")
+            .putConfig("boundary", "java.lang.ProcessBuilder.start")
+            .putConfig("spawn_kind", "jvm_fork")
+            .putConfig("env_policy", "no_raw_argv_or_env_explicit_gap_or_opt_in_link")
+            .build();
     session.send(
         "java-premain-capabilities",
         "",
@@ -873,6 +893,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             .addCapabilities(frames)
             .addCapabilities(database)
             .addCapabilities(asyncCorrelation)
+            .addCapabilities(processLinkage)
             .build());
   }
 
