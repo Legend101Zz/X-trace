@@ -17,7 +17,35 @@ pub fn update(mut model: Model, message: Message) -> (Model, Vec<Effect>) {
                 model.selected_recording =
                     model.selected_recording.min(rows.len().saturating_sub(1));
                 model.recordings = rows;
+                model.list_after = None;
+                model.list_next_after = None;
+                model.list_has_more = false;
+                model.list_history.clear();
                 model.status = Status::Ready;
+            }
+            Err(text) => model.status = Status::Failed(text),
+        },
+        Message::RecordingsPageLoaded { after, result } => match result {
+            Ok(page) => {
+                if after == model.list_after {
+                    model.selected_recording =
+                        model.selected_recording.min(page.recordings.len().saturating_sub(1));
+                } else {
+                    if after.is_some() && model.list_next_after == after {
+                        model.list_history.push(model.list_after.clone());
+                    } else if model.list_history.last() == Some(&after) {
+                        model.list_history.pop();
+                    } else if after.is_none() {
+                        model.list_history.clear();
+                    }
+                    model.selected_recording = 0;
+                }
+                model.list_after = after;
+                model.list_next_after = page.next_after;
+                model.list_has_more = page.has_more;
+                model.recordings = page.recordings;
+                model.status = Status::Ready;
+                clear_transient_loading_notice(&mut model.notice);
             }
             Err(text) => model.status = Status::Failed(text),
         },
@@ -37,6 +65,8 @@ pub fn update(mut model: Model, message: Message) -> (Model, Vec<Effect>) {
                     anchored.or_else(|| keep.as_deref().and_then(find)).unwrap_or(0);
                 if anchored.is_some() {
                     model.notice.clear();
+                } else {
+                    clear_transient_loading_notice(&mut model.notice);
                 }
                 model.window = Some(window);
                 model.status = Status::Ready;
@@ -58,12 +88,48 @@ pub fn update(mut model: Model, message: Message) -> (Model, Vec<Effect>) {
                 apply_navigation(&mut model, &recording_id, action, result, &mut effects);
             }
         }
+        Message::Reconnected(result) => match result {
+            Ok(()) => {
+                model.notice = "reconnected; refreshing...".to_owned();
+                model.status = Status::Loading;
+                emit_refresh(&model, &mut effects);
+            }
+            Err(text) => {
+                model.status = Status::Failed(text);
+                model.notice = "reconnect failed; press R to retry.".to_owned();
+            }
+        },
     }
     (model, effects)
 }
 
+fn clear_transient_loading_notice(notice: &mut String) {
+    if notice == "reconnected; refreshing..." {
+        "reconnected.".clone_into(notice);
+    } else if notice.starts_with("loading ") {
+        notice.clear();
+    }
+}
+
 fn selected_frame_id(window: &crate::model::Window, index: usize) -> Option<String> {
     window.frames.get(index).and_then(|f| f.frame_id.clone())
+}
+
+fn emit_refresh(model: &Model, effects: &mut Vec<Effect>) {
+    match (&model.screen, &model.open_recording) {
+        (Screen::Replay, Some(id)) => {
+            let around =
+                model.window.as_ref().and_then(|w| selected_frame_id(w, model.selected_frame));
+            effects.push(Effect::LoadWindow { recording_id: id.clone(), around_frame: around });
+        }
+        _ => {
+            if let Some(after) = model.list_after.clone() {
+                effects.push(Effect::LoadRecordingsPage { after: Some(after) });
+            } else {
+                effects.push(Effect::LoadRecordings);
+            }
+        }
+    }
 }
 
 fn key_pressed(model: &mut Model, key: Key, effects: &mut Vec<Effect>) {
@@ -108,23 +174,74 @@ fn key_pressed(model: &mut Model, key: Key, effects: &mut Vec<Effect>) {
                 model.notice.clear();
             }
         }
+        Key::PrevPage => page_previous(model, effects),
+        Key::NextPage => page_next(model, effects),
         Key::Refresh => {
             model.status = Status::Loading;
-            match (&model.screen, &model.open_recording) {
-                (Screen::Replay, Some(id)) => {
-                    let around = model
-                        .window
-                        .as_ref()
-                        .and_then(|w| selected_frame_id(w, model.selected_frame));
-                    effects.push(Effect::LoadWindow {
-                        recording_id: id.clone(),
-                        around_frame: around,
-                    });
-                }
-                _ => effects.push(Effect::LoadRecordings),
-            }
+            emit_refresh(model, effects);
+        }
+        Key::Reconnect => {
+            model.status = Status::Loading;
+            model.notice = "reconnecting to persisted store...".to_owned();
+            effects.push(Effect::Reconnect);
         }
         Key::Nav(action) => request_navigation(model, action, effects),
+    }
+}
+
+fn page_previous(model: &mut Model, effects: &mut Vec<Effect>) {
+    match model.screen {
+        Screen::Recordings => {
+            if let Some(prev) = model.list_history.last().cloned() {
+                model.status = Status::Loading;
+                model.notice = "loading previous recordings page...".to_owned();
+                effects.push(Effect::LoadRecordingsPage { after: prev });
+            } else {
+                model.notice = "already on the first recordings page.".to_owned();
+            }
+        }
+        Screen::Replay => {
+            let (Some(recording_id), Some(window)) =
+                (model.open_recording.clone(), model.window.as_ref())
+            else {
+                return;
+            };
+            if let Some(cursor) = window.prev_cursor.clone() {
+                model.status = Status::Loading;
+                model.notice = "loading previous event window...".to_owned();
+                effects.push(Effect::LoadWindowPage { recording_id, cursor: Some(cursor) });
+            } else {
+                model.notice = "already at the first event window.".to_owned();
+            }
+        }
+    }
+}
+
+fn page_next(model: &mut Model, effects: &mut Vec<Effect>) {
+    match model.screen {
+        Screen::Recordings => {
+            if let Some(next) = model.list_next_after.clone() {
+                model.status = Status::Loading;
+                model.notice = "loading next recordings page...".to_owned();
+                effects.push(Effect::LoadRecordingsPage { after: Some(next) });
+            } else {
+                model.notice = "already on the last recordings page.".to_owned();
+            }
+        }
+        Screen::Replay => {
+            let (Some(recording_id), Some(window)) =
+                (model.open_recording.clone(), model.window.as_ref())
+            else {
+                return;
+            };
+            if let Some(cursor) = window.next_cursor.clone() {
+                model.status = Status::Loading;
+                model.notice = "loading next event window...".to_owned();
+                effects.push(Effect::LoadWindowPage { recording_id, cursor: Some(cursor) });
+            } else {
+                model.notice = "already at the last event window.".to_owned();
+            }
+        }
     }
 }
 

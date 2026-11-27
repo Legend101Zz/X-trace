@@ -62,46 +62,75 @@ try {
       await dumpDom(page, `list-${w}`);
       await page.screenshot({ path: path.join(out, `list-${w}.png`), fullPage: true });
       row.steps.list = { status: "pass", screenshot: `list-${w}.png` };
-      // The recordings list lives under the "Unmatched recordings" tab (or under an observed endpoint when one is linked).
-      const tab = page.getByRole("button", { name: /unmatched recordings/i }).or(page.getByRole("tab", { name: /unmatched recordings/i })).first();
-      if (await tab.count()) { await tab.click({ timeout: 10000 }); await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {}); }
+      // Ensure the Requests pane is visible (narrow viewports start on Requests, but guard defensively).
+      const requestsTab = page.locator("#recordings-tab");
+      if ((await page.locator("#recordings-panel").getAttribute("data-active").catch(() => null)) !== "true" && (await requestsTab.isVisible().catch(() => false))) {
+        await requestsTab.click({ timeout: 10000 });
+      }
+      // Prefer a linked recording under an observed endpoint when present; otherwise open "Not linked to an endpoint" (or legacy "Unmatched recordings").
+      let rowLoc = page.locator("#recordings-panel .recording-list button.recording").first();
+      if (!(await rowLoc.count())) {
+        const endpointCard = page.locator("#recordings-panel button.endpoint-card").first();
+        if (await endpointCard.count()) {
+          await endpointCard.click({ timeout: 10000 });
+          await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+          await rowLoc.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
+        }
+      }
+      if (!(await rowLoc.count())) {
+        const unmatchedBtn = page
+          .locator("#recordings-panel")
+          .getByRole("button", { name: /not linked to an endpoint|unmatched recordings/i })
+          .or(page.locator("#recordings-panel").getByRole("tab", { name: /not linked to an endpoint|unmatched recordings/i }))
+          .first();
+        if (await unmatchedBtn.count()) {
+          await unmatchedBtn.click({ timeout: 10000 });
+          await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+          await rowLoc.waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
+        }
+      }
       await dumpDom(page, `recordings-${w}`);
       await page.screenshot({ path: path.join(out, `recordings-${w}.png`), fullPage: true });
-      const skip = /^(refresh|observed endpoints|unmatched recordings|load more|previous|next)$/i;
-      const buttons = await page.getByRole("button").all();
-      let rowLoc = null;
-      for (const b of buttons) {
-        const name = ((await b.innerText().catch(() => "")) || "").trim();
-        if (name && !skip.test(name.split("\n")[0].trim())) { rowLoc = b; break; }
-      }
-      if (rowLoc) {
+      if (await rowLoc.count()) {
         await rowLoc.click({ timeout: 10000 });
         await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-        await page.waitForTimeout(500);
+        const eventsTab = page.locator("#events-tab");
+        if ((await page.locator("#events-panel").getAttribute("data-active").catch(() => null)) !== "true" && (await eventsTab.isVisible().catch(() => false))) {
+          await eventsTab.click({ timeout: 10000 });
+        }
+        await page.locator("#events-panel .event-rail .event").first().waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
+        await page.waitForTimeout(300);
         await dumpDom(page, `linear-${w}`);
         await page.screenshot({ path: path.join(out, `linear-${w}.png`), fullPage: true });
         row.linearOverflow = await overflow(page);
-        // Linear: an event row of the ordered event window (.event-rail), not text elsewhere on the page
-        const linearShown = await page.locator(".event-rail .event .event-symbol").filter({ hasText: /http\.request|frame_enter|frame enter|[A-Za-z]\.[a-z]/i }).first().count();
+        // Linear (Steps): an ordered event row inside #events-panel .event-rail carrying a real event kind.
+        const linearShown = await page.locator("#events-panel .event-rail .event[data-event-kind]").evaluateAll((els) =>
+          els.some((el) => /request|frame|line|interaction/i.test(el.getAttribute("data-event-kind") || "") && (el.textContent || "").trim().length > 0),
+        );
         row.steps.linear = linearShown
           ? { status: "pass", screenshot: `linear-${w}.png` }
-          : { status: "fail", reason: "a recording was opened but the Linear event window shows no request or frame event", screenshot: `linear-${w}.png` };
+          : { status: "fail", reason: "a recording was opened but the Linear (Steps) event window shows no request or frame event", screenshot: `linear-${w}.png` };
       } else {
         row.steps.linear = { status: "fail", reason: "no recording row found in the recordings list" };
       }
-      const canvas = page.getByRole("tab", { name: /canvas/i }).or(page.getByRole("button", { name: /canvas/i })).first();
+      const canvas = page
+        .locator("#replay-view-map-tab")
+        .or(page.getByRole("tab", { name: /^(map|canvas)$/i }))
+        .or(page.getByRole("button", { name: /^(map|canvas)$/i }))
+        .first();
       if (await canvas.count()) {
         await canvas.click({ timeout: 10000 });
         await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-        await page.waitForTimeout(500);
+        await page.locator(".canvas-view .canvas-node, .canvas-view [role=tree] [role=treeitem]").first().waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
+        await page.waitForTimeout(300);
         await dumpDom(page, `canvas-${w}`);
         await page.screenshot({ path: path.join(out, `canvas-${w}.png`), fullPage: true });
         row.canvasOverflow = await overflow(page);
         const drawn = await page.locator(".canvas-view .canvas-node, .canvas-view [role=tree] [role=treeitem], svg .canvas-node").count();
         row.steps.canvas = drawn ? { status: "pass", screenshot: `canvas-${w}.png` }
-          : { status: "fail", reason: "Canvas opened but shows no request or frame node", screenshot: `canvas-${w}.png` };
+          : { status: "fail", reason: "Canvas (Map) opened but shows no request or frame node", screenshot: `canvas-${w}.png` };
       } else {
-        row.steps.canvas = { status: "not-implemented", reason: "the viewer offers no Canvas control" };
+        row.steps.canvas = { status: "not-implemented", reason: "the viewer offers no Canvas/Map control" };
       }
       row.horizontalOverflow = Boolean(row.linearOverflow || row.canvasOverflow || await overflow(page));
       row.pageErrors = consoleErrors.length;

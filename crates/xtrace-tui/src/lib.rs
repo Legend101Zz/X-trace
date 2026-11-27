@@ -18,10 +18,10 @@ pub mod model;
 pub mod update;
 pub mod view;
 
-pub use client::{ClientError, ReplayClient};
+pub use client::{ClientError, ReplayBackend, ReplayClient};
 pub use model::{
-    Effect, FrameRow, Key, Message, Model, NavAction, NavResult, RecordingRow, Screen, Status,
-    Window,
+    Effect, FrameRow, Key, Message, Model, NavAction, NavResult, RecordingRow, RecordingsPage,
+    Screen, Status, Window,
 };
 pub use update::update;
 pub use view::{Grid, render};

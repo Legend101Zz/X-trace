@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use xtrace_tui::{
     ClientError, Effect, FrameRow, Key, Message, Model, NavAction, NavResult, RecordingRow,
-    ReplayClient, Screen, Status, Window, render, update,
+    RecordingsPage, ReplayBackend, ReplayClient, Screen, Status, Window, render, update,
 };
 
 fn nav(
@@ -40,6 +40,12 @@ fn frame(n: u64) -> FrameRow {
             Some(NavResult::Unavailable("the recording is partial and evidence ends here.".into())),
             Some(NavResult::Boundary(None)),
         ),
+        gap_reason: None,
+        gap_count: None,
+        source_location: None,
+        bindings_summary: Vec::new(),
+        truncated: false,
+        field_truncations: Vec::new(),
     }
 }
 
@@ -49,6 +55,11 @@ fn window(id: &str, count: u64) -> Window {
         frames: (1..=count).map(frame).collect(),
         completion: "partial".into(),
         anchor_frame_id: None,
+        route: None,
+        outcome: None,
+        limitations: Vec::new(),
+        prev_cursor: None,
+        next_cursor: None,
     }
 }
 
@@ -58,11 +69,15 @@ fn recordings() -> Vec<RecordingRow> {
             id: "018f0000-0000-7000-8000-000000000011".into(),
             completion: "complete".into(),
             event_count: 120,
+            route: None,
+            outcome: None,
         },
         RecordingRow {
             id: "018f0000-0000-7000-8000-000000000012".into(),
             completion: "partial".into(),
             event_count: 7,
+            route: None,
+            outcome: None,
         },
     ]
 }
@@ -285,9 +300,17 @@ fn client_trait_drives_the_loop_without_a_terminal() {
             Effect::LoadRecordings => {
                 Message::RecordingsLoaded(client.list_recordings().map_err(|e| e.0))
             }
+            Effect::LoadRecordingsPage { after } => Message::RecordingsPageLoaded {
+                after: after.clone(),
+                result: client.list_recordings_page(after.as_deref()).map_err(|e| e.0),
+            },
             Effect::LoadWindow { recording_id, around_frame } => Message::WindowLoaded(
                 client.window(&recording_id, around_frame.as_deref()).map_err(|e| e.0),
             ),
+            Effect::LoadWindowPage { recording_id, cursor } => Message::WindowLoaded(
+                client.window_page(&recording_id, None, cursor.as_deref()).map_err(|e| e.0),
+            ),
+            Effect::Reconnect => Message::Reconnected(client.reconnect().map_err(|e| e.0)),
             Effect::Navigate { .. } | Effect::Quit => continue,
         };
         let (next, effects) = update(model, message);
@@ -465,4 +488,177 @@ fn driver_step_settles_effects_against_a_client_and_reports_quit() {
     assert!(!text.contains('\u{1b}'));
     let err = render_plain(&Fake, (80, 24), Some("no-such-recording")).expect_err("unknown id");
     assert!(err.contains("not in this project"), "{err}");
+}
+
+#[test]
+fn route_outcome_limitations_gap_bindings_source_and_truncations_render_honestly() {
+    let mut rows = recordings();
+    rows[0].route = Some("GET /owners".into());
+    rows[0].outcome = Some("responded".into());
+    let (model, _) = update(
+        Model::new(100, 30, true),
+        Message::RecordingsPageLoaded {
+            after: None,
+            result: Ok(RecordingsPage {
+                recordings: rows,
+                next_after: Some("018f0000-0000-7000-8000-000000000012".into()),
+                has_more: true,
+            }),
+        },
+    );
+    assert_fits(&model);
+    let list_text = render(&model).to_plain();
+    assert!(
+        list_text.contains(
+            "> 018f0000-0000-7000-8000-000000000011  complete  120 events  GET /owners  responded"
+        ),
+        "{list_text}"
+    );
+    assert!(list_text.contains("truncated: more recordings exist"), "{list_text}");
+
+    let (model, _) = update(model, Message::Key(Key::Enter));
+    let mut win = window("018f0000-0000-7000-8000-000000000011", 3);
+    win.route = Some("GET /owners".into());
+    win.outcome = Some("responded 200".into());
+    win.limitations = vec!["capture_policy_not_armed".into()];
+    win.prev_cursor = Some("prev-tok".into());
+    win.next_cursor = Some("next-tok".into());
+    win.frames[0].source_location = Some("src/Owners.java:42".into());
+    win.frames[0].bindings_summary = vec![
+        "ownerId (integer): 7".into(),
+        "token: [redacted by auth-header; string]".into(),
+        "payload: [truncated 32/512B] body".into(),
+        "arg: [unavailable: focused_capture_not_armed]".into(),
+        "extra: [dropped: value_budget]".into(),
+    ];
+    win.frames[0].truncated = true;
+    win.frames[0].field_truncations = vec!["symbol (truncated, 300B)".into()];
+    win.frames[1].kind = "recording_event_kind:gap".into();
+    win.frames[1].symbol = None;
+    win.frames[1].gap_reason = Some("line_budget".into());
+    win.frames[1].gap_count = Some(9);
+
+    let (model, _) = update(model, Message::WindowLoaded(Ok(win)));
+    assert_fits(&model);
+    let detail_text = render(&model).to_plain();
+    assert!(detail_text.contains("route: GET /owners"), "{detail_text}");
+    assert!(detail_text.contains("outcome: responded 200"), "{detail_text}");
+    assert!(detail_text.contains("limitations: capture_policy_not_armed"), "{detail_text}");
+    assert!(detail_text.contains("GAP: line_budget (9 suppressed)"), "{detail_text}");
+    assert!(detail_text.contains("src/Owners.java:42"), "{detail_text}");
+    assert!(detail_text.contains("[redacted by auth-header; string]"), "{detail_text}");
+    assert!(detail_text.contains("[truncated 32/512B]"), "{detail_text}");
+    assert!(detail_text.contains("[unavailable: focused_capture_not_armed]"), "{detail_text}");
+    assert!(detail_text.contains("[dropped: value_budget]"), "{detail_text}");
+    assert!(detail_text.contains("truncated fields: symbol (truncated, 300B)"), "{detail_text}");
+    assert!(detail_text.contains("page: p prev / n next"), "{detail_text}");
+
+    // Ensure MIN_WIDTH x MIN_HEIGHT also fits without panic or overflow.
+    let (small, _) = update(model, Message::Resize(40, 8));
+    assert_fits(&small);
+}
+
+#[test]
+fn paging_and_reconnect_effects_round_trip() {
+    use std::cell::Cell;
+    use xtrace_tui::driver::{decode_keys, step};
+
+    struct PagedBackend {
+        reconnects: Cell<usize>,
+    }
+    impl ReplayBackend for PagedBackend {
+        fn list_recordings(&self) -> Result<Vec<RecordingRow>, ClientError> {
+            Ok(vec![recordings()[0].clone()])
+        }
+        fn list_recordings_page(&self, after: Option<&str>) -> Result<RecordingsPage, ClientError> {
+            if after.is_none() {
+                let mut r = recordings()[0].clone();
+                if self.reconnects.get() > 0 {
+                    r.route = Some("GET /vets".into());
+                }
+                Ok(RecordingsPage {
+                    recordings: vec![r],
+                    next_after: Some("cursor-2".into()),
+                    has_more: true,
+                })
+            } else {
+                Ok(RecordingsPage {
+                    recordings: vec![recordings()[1].clone()],
+                    next_after: None,
+                    has_more: false,
+                })
+            }
+        }
+        fn window(&self, id: &str, around: Option<&str>) -> Result<Window, ClientError> {
+            self.window_page(id, around, None)
+        }
+        fn window_page(
+            &self,
+            id: &str,
+            _around: Option<&str>,
+            cursor: Option<&str>,
+        ) -> Result<Window, ClientError> {
+            let mut w = window(id, 2);
+            if cursor == Some("w-next") {
+                w.prev_cursor = Some("w-prev".into());
+                w.frames[0].sequence = 502;
+            } else {
+                w.next_cursor = Some("w-next".into());
+            }
+            Ok(w)
+        }
+        fn navigate(&self, _: &str, _: &str, _: NavAction) -> Result<NavResult, ClientError> {
+            Err(ClientError("embedded".into()))
+        }
+        fn reconnect(&self) -> Result<(), ClientError> {
+            self.reconnects.set(self.reconnects.get() + 1);
+            Ok(())
+        }
+    }
+
+    let mut pending = Vec::new();
+    assert_eq!(
+        decode_keys(&mut pending, b"npR\x1b[5~\x1b[6~"),
+        vec![Key::NextPage, Key::PrevPage, Key::Reconnect, Key::PrevPage, Key::NextPage]
+    );
+
+    let backend = PagedBackend { reconnects: Cell::new(0) };
+    let (model, _) = step(&backend, Model::new(100, 30, true), Message::Key(Key::Refresh));
+    assert!(model.list_has_more);
+    let (model, _) = step(&backend, model, Message::Key(Key::NextPage));
+    assert_eq!(model.recordings[0].id, "018f0000-0000-7000-8000-000000000012");
+    assert!(!model.list_has_more);
+    assert_eq!(model.list_history.len(), 1);
+    let (model, _) = step(&backend, model, Message::Key(Key::PrevPage));
+    assert_eq!(model.recordings[0].id, "018f0000-0000-7000-8000-000000000011");
+    assert!(model.list_has_more);
+    let (model, _) = step(&backend, model, Message::Key(Key::Reconnect));
+    assert_eq!(backend.reconnects.get(), 1);
+    assert_eq!(model.recordings[0].route.as_deref(), Some("GET /vets"));
+
+    let (model, _) = step(&backend, model, Message::Key(Key::Enter));
+    assert_eq!(model.window.as_ref().and_then(|w| w.next_cursor.as_deref()), Some("w-next"));
+    let (model, _) = step(&backend, model, Message::Key(Key::NextPage));
+    assert_eq!(model.window.as_ref().map(|w| w.frames[0].sequence), Some(502));
+    assert_eq!(model.window.as_ref().and_then(|w| w.prev_cursor.as_deref()), Some("w-prev"));
+    let (model, _) = step(&backend, model, Message::Key(Key::PrevPage));
+    assert_eq!(model.window.as_ref().map(|w| w.frames[0].sequence), Some(1));
+}
+
+#[test]
+fn new_fields_also_neutralize_control_characters() {
+    let hostile = "x\u{1b}[31mred\u{7}\n\u{202e}y";
+    let mut model = open_replay(80, 24, true);
+    let w = model.window.as_mut().expect("window");
+    w.route = Some(hostile.into());
+    w.outcome = Some(hostile.into());
+    w.limitations = vec![hostile.into()];
+    w.frames[0].source_location = Some(hostile.into());
+    w.frames[0].bindings_summary = vec![hostile.into()];
+    w.frames[0].field_truncations = vec![hostile.into()];
+    w.frames[8].gap_reason = Some(hostile.into());
+    assert_fits(&model);
+    for row in render(&model).rows() {
+        assert!(!row.chars().any(char::is_control), "control char leaked in {row:?}");
+    }
 }

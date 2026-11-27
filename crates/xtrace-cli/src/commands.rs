@@ -668,7 +668,7 @@ where
     UserDataPaths::home_with(env_reader)
 }
 
-fn init<F>(
+pub(crate) fn init<F>(
     project_dir: PathBuf,
     display_name: String,
     idempotency_key: String,

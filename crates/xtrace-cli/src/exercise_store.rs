@@ -408,27 +408,61 @@ mod tests {
         }
     }
 
-    fn private_store() -> (tempfile::TempDir, Arc<PrivateExerciseStore>) {
+    const EXERCISE_SCRATCH_SLOTS: usize = 16;
+
+    static EXERCISE_SLOTS: std::sync::OnceLock<Vec<AdmittedPrivateRoot>> =
+        std::sync::OnceLock::new();
+    static NEXT_EXERCISE_SLOT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Pre-allocate exclusive private slots before any test starts so sibling tests never
+    /// mutate shared `TMPDIR`/`XTRACE_TEST_PRIVATE_SCRATCH` metadata (`nlink`/`mtime`) during
+    /// another test's `AdmittedPrivateRoot` ancestor walk.
+    fn init_exercise_slots() -> Vec<AdmittedPrivateRoot> {
         use std::os::unix::fs::PermissionsExt as _;
-        let root = tempfile::Builder::new()
-            .prefix("xt-ex-plan-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(std::env::temp_dir())
-            .unwrap();
-        let admitted = AdmittedPrivateRoot::open(root.path()).unwrap();
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let family_name = format!("xt-ex-plan-{}-{nanos}", std::process::id());
+        let family = if let Some(scratch) = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH") {
+            let root = AdmittedPrivateRoot::open(std::path::Path::new(&scratch))
+                .expect("admitted private test scratch");
+            root.create_private_child(&family_name).expect("private exercise test family")
+        } else {
+            let path = std::env::temp_dir().join(&family_name);
+            std::fs::create_dir(&path).expect("create exercise test family");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod exercise test family");
+            AdmittedPrivateRoot::open(&path).expect("admitted exercise test family")
+        };
+        (0..EXERCISE_SCRATCH_SLOTS)
+            .map(|slot| {
+                family
+                    .create_private_child(&format!("s{slot:02}"))
+                    .expect("pre-allocated private exercise test slot")
+            })
+            .collect()
+    }
+
+    fn private_store() -> Arc<PrivateExerciseStore> {
+        let slots = EXERCISE_SLOTS.get_or_init(init_exercise_slots);
+        let index = NEXT_EXERCISE_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            index < slots.len(),
+            "exercise_store::tests::EXERCISE_SCRATCH_SLOTS ({EXERCISE_SCRATCH_SLOTS}) exhausted"
+        );
+        let admitted = &slots[index];
         let catalog = SqliteStore::open(
-            &root.path().join("metadata.sqlite3"),
+            &admitted.path().join("metadata.sqlite3"),
             xtrace_store::OpenOptions::default(),
         )
         .unwrap();
         let project = ProjectId::new();
-        let store = Arc::new(PrivateExerciseStore {
+        Arc::new(PrivateExerciseStore {
             project,
             plans: admitted.create_private_child("exercise-plans").unwrap(),
             catalog,
-            project_data_root: root.path().into(),
-        });
-        (root, store)
+            project_data_root: admitted.path().into(),
+        })
     }
 
     struct EditClockFixture<'a> {
@@ -484,7 +518,7 @@ mod tests {
     #[test]
     fn edit_expiry_on_each_side_of_the_commit_never_acknowledges_or_rearms_consent() {
         for expire_before_commit in [true, false] {
-            let (_root, store) = private_store();
+            let store = private_store();
             let sample = stored(store.project).content;
             let now = sample.created_at;
             let expiry = sample.expires_at;
@@ -531,7 +565,7 @@ mod tests {
     #[test]
     fn expiry_during_staging_cleans_only_owned_staging_and_never_rolls_back_published_state() {
         use std::cell::Cell;
-        let (_root, store) = private_store();
+        let store = private_store();
         let original = stored(store.project);
         let mut next = original.clone();
         next.revision = 3;
@@ -560,7 +594,7 @@ mod tests {
 
     #[test]
     fn occupied_staging_blocks_writes_until_owner_preserves_it() {
-        let (_root, store) = private_store();
+        let store = private_store();
         let unique = "unrelated-private.json";
         let mut other = store.plans.create_private_file(unique).unwrap();
         other.write_all(b"untouched").unwrap();
@@ -593,7 +627,7 @@ mod tests {
     #[test]
     fn actual_private_port_refuses_contending_and_stale_revision_writers() {
         use std::os::unix::fs::PermissionsExt as _;
-        let (_root, store) = private_store();
+        let store = private_store();
         let project = store.project;
         let original = stored(project);
         store.insert(&original).unwrap();
