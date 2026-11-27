@@ -1008,17 +1008,43 @@ mod tests {
         assert!(w1.frames[1].bindings_summary.iter().any(|b| b.contains("dropped: value_budget")));
         assert!(!format!("{w1:?}").contains(canary));
 
-        // Window cursor paging on rec2.
+        // Window cursor paging on rec2 (capped by WINDOW_LIMIT and MAX_RECORDING_EVENT_PROJECTION_BYTES).
         let bw1 = facade.window_page(&rec2.to_string(), None, None).expect("bw1");
+        let page1_len = bw1.frames.len();
+        assert!(
+            page1_len > 0 && page1_len <= usize::try_from(WINDOW_LIMIT).unwrap() && page1_len < 505,
+            "expected bounded first page, got {page1_len}"
+        );
+        assert_eq!(bw1.frames[0].sequence, 2);
         assert!(bw1.prev_cursor.is_none());
         let next_c = bw1.next_cursor.as_deref().expect("next cursor");
         let bw2 = facade.window_page(&rec2.to_string(), None, Some(next_c)).expect("bw2");
-        assert_eq!(bw2.frames.len(), 5);
-        assert_eq!(bw2.frames[0].sequence, 502);
+        assert!(!bw2.frames.is_empty());
+        assert_eq!(bw2.frames[0].sequence, bw1.frames.last().expect("bw1 last").sequence + 1);
         assert_eq!(bw2.route.as_deref(), Some("POST /orders"));
+
+        let mut total_frames = page1_len + bw2.frames.len();
+        let mut last_seq = bw2.frames.last().expect("bw2 last").sequence;
+        let mut cur = bw2.next_cursor.clone();
+        while let Some(token) = cur {
+            let next_page = facade.window_page(&rec2.to_string(), None, Some(&token)).expect("bw+");
+            assert!(!next_page.frames.is_empty());
+            assert_eq!(next_page.frames[0].sequence, last_seq + 1);
+            total_frames += next_page.frames.len();
+            last_seq = next_page.frames.last().expect("last").sequence;
+            cur = next_page.next_cursor;
+        }
+        assert_eq!(total_frames, 505);
+        assert_eq!(last_seq, 506);
+
         let prev_c = bw2.prev_cursor.as_deref().expect("prev cursor");
         let bw_back = facade.window_page(&rec2.to_string(), None, Some(prev_c)).expect("bw_back");
-        assert_eq!(bw_back.frames.len(), 500);
+        assert_eq!(bw_back.frames.len(), page1_len);
+        assert_eq!(bw_back.frames[0].sequence, 2);
+        assert_eq!(
+            bw_back.frames.last().expect("bw_back last").sequence + 1,
+            bw2.frames[0].sequence
+        );
 
         // Reconnect picks up newly persisted rec3.
         persistence

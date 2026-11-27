@@ -705,8 +705,15 @@ fn tui_discloses_paging_truncation_pages_list_and_window_and_reconnects_live() {
     let win_plain = fx.tui(&["--recording", &big_arg, "--plain"]);
     assert!(win_plain.status.success());
     let win_text = String::from_utf8_lossy(&win_plain.stdout);
-    assert!(win_text.contains("more events exist beyond the 500 shown"), "{win_text}");
+    let shown: u64 = win_text
+        .split("more events exist beyond the ")
+        .nth(1)
+        .and_then(|rest| rest.split(" shown").next())
+        .and_then(|num| num.parse().ok())
+        .unwrap_or_else(|| panic!("expected bounded window truncation disclosure: {win_text}"));
+    assert!(shown > 0 && shown < 505, "expected bounded page < 505, got {shown}: {win_text}");
     assert!(win_text.contains("page: n next"), "{win_text}");
+    let page2_first_symbol = format!("Scale.f{}", shown + 2);
 
     // Interactive PTY checks list paging, window cursor paging, and live reconnect after store write.
     let mut pty =
@@ -720,7 +727,7 @@ fn tui_discloses_paging_truncation_pages_list_and_window_and_reconnects_live() {
     pty.wait("route: POST /orders");
     pty.wait("page: n next");
     pty.send("n");
-    pty.wait("Scale.f506");
+    pty.wait(&page2_first_symbol);
     pty.wait("page: p prev");
     pty.send("p");
     pty.wait("Scale.f2");
