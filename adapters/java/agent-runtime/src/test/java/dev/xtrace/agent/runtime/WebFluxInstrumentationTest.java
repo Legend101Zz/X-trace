@@ -90,16 +90,22 @@ class WebFluxInstrumentationTest {
   @Test
   void transformsWebFluxContractsAcrossVersionsAndRejectsUnsupportedSpringJar(
       @TempDir Path tempDir) throws Exception {
+    Map<String, byte[]> reactorDefs =
+        ReactorContextInstrumentationTest.buildReactorStubDefinitions(true);
+    Map<String, byte[]> webFluxDefs = buildWebFluxStubDefinitions(true);
     Map<String, byte[]> defs = new LinkedHashMap<>();
-    defs.putAll(ReactorContextInstrumentationTest.buildReactorStubDefinitions(true));
-    defs.putAll(buildWebFluxStubDefinitions(true));
+    defs.putAll(reactorDefs);
+    defs.putAll(webFluxDefs);
 
+    Path reactorJar =
+        ReactorContextInstrumentationTest.writeJar(
+            tempDir.resolve("reactor-core-3.6.8.jar"), "3.6.8", reactorDefs);
     Path spring6Jar =
         ReactorContextInstrumentationTest.writeJar(
-            tempDir.resolve("spring-webflux-6.1.14.jar"), "6.1.14", defs);
+            tempDir.resolve("spring-webflux-6.1.14.jar"), "6.1.14", webFluxDefs);
     Path spring52Jar =
         ReactorContextInstrumentationTest.writeJar(
-            tempDir.resolve("spring-webflux-5.2.9.jar"), "5.2.9.RELEASE", defs);
+            tempDir.resolve("spring-webflux-5.2.9.jar"), "5.2.9.RELEASE", webFluxDefs);
 
     var listener = WebFluxInstrumentation.failureListener(() -> {});
     var locator =
@@ -119,7 +125,7 @@ class WebFluxInstrumentationTest {
 
     try (URLClassLoader loader =
         new ReactorContextInstrumentationTest.TransformingJarClassLoader(
-            new URL[] {spring6Jar.toUri().toURL()},
+            new URL[] {reactorJar.toUri().toURL(), spring6Jar.toUri().toURL()},
             getClass().getClassLoader(),
             defs,
             transformer)) {
@@ -147,7 +153,9 @@ class WebFluxInstrumentationTest {
 
     // Unsupported Spring 5.2 JAR must fail closed and stay untransformed.
     try (URLClassLoader oldLoader =
-        new URLClassLoader(new URL[] {spring52Jar.toUri().toURL()}, getClass().getClassLoader())) {
+        new URLClassLoader(
+            new URL[] {reactorJar.toUri().toURL(), spring52Jar.toUri().toURL()},
+            getClass().getClassLoader())) {
       byte[] originalDispatcher = defs.get(WebFluxInstrumentation.DISPATCHER_HANDLER);
       byte[] transformed =
           transformer.transform(
@@ -260,13 +268,19 @@ class WebFluxInstrumentationTest {
   @Test
   void executesTransformedWebFluxPipelineWithAsyncReactorHopThroughRecordingWriter(
       @TempDir Path tempDir) throws Exception {
+    Map<String, byte[]> reactorDefs =
+        ReactorContextInstrumentationTest.buildReactorStubDefinitions(true);
+    Map<String, byte[]> webFluxDefs = buildWebFluxStubDefinitions(true);
     Map<String, byte[]> defs = new LinkedHashMap<>();
-    defs.putAll(ReactorContextInstrumentationTest.buildReactorStubDefinitions(true));
-    defs.putAll(buildWebFluxStubDefinitions(true));
+    defs.putAll(reactorDefs);
+    defs.putAll(webFluxDefs);
 
-    Path combinedJar =
+    Path reactorJar =
         ReactorContextInstrumentationTest.writeJar(
-            tempDir.resolve("spring-webflux-6.2.1.jar"), "6.2.1", defs);
+            tempDir.resolve("reactor-core-3.6.8.jar"), "3.6.8", reactorDefs);
+    Path webFluxJar =
+        ReactorContextInstrumentationTest.writeJar(
+            tempDir.resolve("spring-webflux-6.2.1.jar"), "6.2.1", webFluxDefs);
 
     var wfListener = WebFluxInstrumentation.failureListener(() -> {});
     var rxListener = new ReactorContextInstrumentation.FailureListener(() -> {});
@@ -313,7 +327,7 @@ class WebFluxInstrumentationTest {
             new RecordingWriter(transport, queue, sink, Duration.ofSeconds(2));
         URLClassLoader loader =
             new ReactorContextInstrumentationTest.TransformingJarClassLoader(
-                new URL[] {combinedJar.toUri().toURL()},
+                new URL[] {reactorJar.toUri().toURL(), webFluxJar.toUri().toURL()},
                 getClass().getClassLoader(),
                 defs,
                 combined)) {
