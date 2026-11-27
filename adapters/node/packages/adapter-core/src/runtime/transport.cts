@@ -83,6 +83,7 @@ export function createHttpCaptureTransport(
 
   let pending = 0;
   let postedCount = 0;
+  let hasPostedCapture = false;
   let reservedFinishes = 0;
   let rejectedStartCount = 0;
   let closePosted = false;
@@ -149,6 +150,7 @@ export function createHttpCaptureTransport(
     try {
       worker.postMessage(message);
       postedCount = (postedCount + 1) >>> 0;
+      hasPostedCapture = true;
       if (!sharedControl) pending += 1;
       return true;
     } catch {
@@ -159,7 +161,7 @@ export function createHttpCaptureTransport(
 
   const close = (): void => {
     if (closePosted || failed || workerExited) return;
-    hadPendingWorkAtClose = inFlight() > 0 || reservedFinishes > 0 || rejectedStartCount > 0;
+    hadPendingWorkAtClose = hasPostedCapture || inFlight() > 0 || reservedFinishes > 0 || rejectedStartCount > 0;
     closePosted = true;
     try {
       worker.ref?.();

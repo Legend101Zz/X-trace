@@ -261,6 +261,22 @@ test("process.exit hook runs synchronous drain once, respects re-entrant exit, a
   const startedAt = Date.now();
   assert.equal(t2.drainSync?.(25), false);
   assert.ok(Date.now() - startedAt < 500, "stalled drainSync returned within bounded deadline");
+
+  // Case 3: once capture messages have been posted and staged (inFlight === 0, reservedFinishes === 0),
+  // drainSync still honors the full drain budget while the worker flushes TLS/daemon ACKs.
+  const buf3 = new SharedArrayBuffer(SHARED_CONTROL_WORDS * Int32Array.BYTES_PER_ELEMENT);
+  const ctrl3 = new Int32Array(buf3);
+  const w3 = new SyncDrainWorker(ctrl3, false);
+  const t3 = createHttpCaptureTransport(w3 as unknown as Worker, { sharedControl: ctrl3, drainTimeoutMs: 360 });
+  assert.equal(t3.start("01900000-0000-7000-8000-000000000012", "GET", 1n), true);
+  assert.equal(t3.finish("01900000-0000-7000-8000-000000000012", 2n, 5n, 0), true);
+  Atomics.add(ctrl3, CONTROL_STAGED_INDEX, 2);
+  const stagedDrainStart = Date.now();
+  assert.equal(t3.drainSync?.(360), false);
+  assert.ok(
+    Date.now() - stagedDrainStart >= 320,
+    "drainSync must not truncate to 250ms after capture messages were already staged",
+  );
 });
 
 test("SIGTERM and SIGINT hooks drain cleanly without app handlers and flush non-destructively with app handlers", async () => {

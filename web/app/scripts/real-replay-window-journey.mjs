@@ -21,6 +21,7 @@ try {
   page.on('console', (message) => { if (message.type() === 'error') browserErrors += 1; });
   await page.goto(url);
   await page.locator('.endpoint-card').first().click();
+  await expect(page.locator('.recording-list .recording')).toHaveCount(2);
   const read = async (recordingId, cursor) => {
     const result = await page.evaluate(async ({ recordingId, cursor, canaries }) => {
       const query = new URLSearchParams({ limit: '200' });
@@ -51,7 +52,8 @@ try {
   };
 
   stage = 'find three real server pages';
-  const initials = await Promise.all(recordingIds.map((id) => read(id)));
+  const initials = [];
+  for (const id of recordingIds) initials.push(await read(id));
   const pagedIndex = initials.findIndex(({ next }) => next != null);
   assert.ok(pagedIndex >= 0, 'bounded Spring workload has a real successor');
   const recordingId = recordingIds[pagedIndex];
