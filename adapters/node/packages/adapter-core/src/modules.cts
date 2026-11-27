@@ -1,6 +1,9 @@
 import { BUILTIN_MODULES } from "./manifest.cjs";
 import { installHttpCapture } from "./http-capture.cjs";
 import { installExpressLayerPatch } from "./express-instrument.cjs";
+import { installFastifyPatch, resolveFastifyRoute } from "./fastify-instrument.cjs";
+import { installNestPatch } from "./nest-instrument.cjs";
+import { installHttpClientCapture, installMysqlCapture, installPgCapture } from "./interactions/index.cjs";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
@@ -111,4 +114,139 @@ export function resolveFromEntry(specifier: string): string {
   const entry = process.argv[1];
   const paths = [process.cwd(), ...(typeof entry === "string" && entry !== "" ? [dirname(resolvePath(entry))] : []), ...(require.main?.paths ?? [])];
   return require.resolve(specifier, { paths });
+}
+
+function readPackageMajor(packageJsonPath: string, expectedName: string): { readable: boolean; nameMatch: boolean; major: number } {
+  try {
+    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { name?: unknown; version?: unknown };
+    const nameMatch = parsed.name === expectedName;
+    const major = typeof parsed.version === "string" ? Number.parseInt(parsed.version, 10) || 0 : 0;
+    return { readable: true, nameMatch, major };
+  } catch {
+    return { readable: false, nameMatch: false, major: 0 };
+  }
+}
+
+export function fastifyModule(
+  resolve: (specifier: string) => string = resolveFromEntry,
+  transport?: () => HttpCaptureTransport,
+): InstrumentationModule {
+  return {
+    descriptor: descriptor("fastify"),
+    detect(environment) {
+      const node = supportedNode(environment);
+      if (!node.supported) return node;
+      let located: string;
+      try {
+        located = resolve("fastify/package.json");
+      } catch {
+        return { supported: false, reason: "fastify_not_found" };
+      }
+      const pkg = readPackageMajor(located, "fastify");
+      if (pkg.readable && (!pkg.nameMatch || (pkg.major !== 4 && pkg.major !== 5))) {
+        return { supported: false, reason: "fastify_version_unsupported" };
+      }
+      return { supported: true };
+    },
+    install() {
+      registerRouteResolver(resolveFastifyRoute);
+      if (transport) installFastifyPatch({ transport });
+    },
+  };
+}
+
+export function nestModule(
+  resolve: (specifier: string) => string = resolveFromEntry,
+  transport?: () => HttpCaptureTransport,
+): InstrumentationModule {
+  return {
+    descriptor: descriptor("nest"),
+    detect(environment) {
+      const node = supportedNode(environment);
+      if (!node.supported) return node;
+      let located: string;
+      try {
+        located = resolve("@nestjs/core/package.json");
+      } catch {
+        return { supported: false, reason: "nest_not_found" };
+      }
+      const pkg = readPackageMajor(located, "@nestjs/core");
+      if (pkg.readable && (!pkg.nameMatch || pkg.major < 8 || pkg.major > 11)) {
+        return { supported: false, reason: "nest_version_unsupported" };
+      }
+      return { supported: true };
+    },
+    install() {
+      if (transport) installNestPatch({ transport });
+    },
+  };
+}
+
+export function pgModule(
+  resolve: (specifier: string) => string = resolveFromEntry,
+  transport?: () => HttpCaptureTransport,
+): InstrumentationModule {
+  return {
+    descriptor: descriptor("pg"),
+    detect(environment) {
+      const node = supportedNode(environment);
+      if (!node.supported) return node;
+      let located: string;
+      try {
+        located = resolve("pg/package.json");
+      } catch {
+        return { supported: false, reason: "pg_not_found" };
+      }
+      const pkg = readPackageMajor(located, "pg");
+      if (pkg.readable && (!pkg.nameMatch || pkg.major !== 8)) {
+        return { supported: false, reason: "pg_version_unsupported" };
+      }
+      return { supported: true };
+    },
+    install() {
+      if (transport) installPgCapture({ transport });
+    },
+  };
+}
+
+export function mysqlModule(
+  resolve: (specifier: string) => string = resolveFromEntry,
+  transport?: () => HttpCaptureTransport,
+): InstrumentationModule {
+  return {
+    descriptor: descriptor("mysql"),
+    detect(environment) {
+      const node = supportedNode(environment);
+      if (!node.supported) return node;
+      const candidates: Array<{ spec: string; name: string; supportedMajors: number[] }> = [
+        { spec: "mysql2/package.json", name: "mysql2", supportedMajors: [2, 3] },
+        { spec: "mysql/package.json", name: "mysql", supportedMajors: [2] },
+      ];
+      let sawUnsupported = false;
+      for (const candidate of candidates) {
+        try {
+          const located = resolve(candidate.spec);
+          const pkg = readPackageMajor(located, candidate.name);
+          if (!pkg.readable || (pkg.nameMatch && candidate.supportedMajors.includes(pkg.major))) {
+            return { supported: true };
+          }
+          sawUnsupported = true;
+        } catch { /* try next */ }
+      }
+      return { supported: false, reason: sawUnsupported ? "mysql_version_unsupported" : "mysql_not_found" };
+    },
+    install() {
+      if (transport) installMysqlCapture({ transport });
+    },
+  };
+}
+
+export function outboundHttpModule(transport?: () => HttpCaptureTransport): InstrumentationModule {
+  return {
+    descriptor: descriptor("outbound-http"),
+    detect: supportedNode,
+    install() {
+      if (transport) installHttpClientCapture({ transport });
+    },
+  };
 }

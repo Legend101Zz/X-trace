@@ -17,6 +17,31 @@ export const BUILTIN_MODULES: readonly ModuleDescriptor[] = [
     limitationsWhenAbsent: [],
   },
   {
+    name: "fastify",
+    capability: "http.server.fastify",
+    limitationsWhenAbsent: [],
+  },
+  {
+    name: "nest",
+    capability: "framework.nest",
+    limitationsWhenAbsent: [],
+  },
+  {
+    name: "pg",
+    capability: "interactions.pg",
+    limitationsWhenAbsent: [],
+  },
+  {
+    name: "mysql",
+    capability: "interactions.mysql",
+    limitationsWhenAbsent: [],
+  },
+  {
+    name: "outbound-http",
+    capability: "interactions.outbound_http",
+    limitationsWhenAbsent: [],
+  },
+  {
     name: "async-context",
     capability: "async_correlation",
     limitationsWhenAbsent: ["async_correlation_unavailable"],
@@ -70,6 +95,18 @@ export function effectiveLimitations(
   baseline: readonly string[] = BASELINE_LIMITATIONS,
 ): string[] {
   const codes = new Set(baseline);
+  if (baseline === BASELINE_LIMITATIONS) {
+    if (installed.has("express") || installed.has("fastify") || installed.has("nest")) {
+      codes.delete("frameworks_uninstrumented");
+    }
+    const hasDb = installed.has("pg") || installed.has("mysql");
+    const hasOutboundHttp = installed.has("outbound-http");
+    if (hasDb || hasOutboundHttp) {
+      codes.delete("database_and_outbound_calls_unavailable");
+      if (!hasDb) codes.add("database_calls_unavailable");
+      if (!hasOutboundHttp) codes.add("outbound_http_unavailable");
+    }
+  }
   for (const module of modules) {
     if (installed.has(module.name)) continue;
     for (const limitation of module.limitationsWhenAbsent) codes.add(limitation);

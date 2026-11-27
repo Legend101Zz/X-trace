@@ -2,7 +2,16 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { createHttpCaptureTransport } from "./http-capture.cjs";
 import { effectiveLimitations } from "./manifest.cjs";
-import { asyncContextModule, expressModule, nodeHttpModule } from "./modules.cjs";
+import {
+  asyncContextModule,
+  expressModule,
+  fastifyModule,
+  mysqlModule,
+  nestModule,
+  nodeHttpModule,
+  outboundHttpModule,
+  pgModule,
+} from "./modules.cjs";
 import { setCaptureProfile } from "./runtime/context.cjs";
 import { ModuleRegistry, type InstallEnvironment, type InstrumentationModule } from "./runtime/registry.cjs";
 import type { HttpCaptureTransport } from "./runtime/transport.cjs";
@@ -30,7 +39,16 @@ export interface CapturePlan {
 export function planCapture(): CapturePlan {
   const environment: InstallEnvironment = { nodeVersion: process.version, packageVersion: "" };
   let transport: HttpCaptureTransport | undefined;
-  const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule(), expressModule(undefined, () => transport!)];
+  const modules: InstrumentationModule[] = [
+    nodeHttpModule(() => transport!),
+    asyncContextModule(),
+    expressModule(undefined, () => transport!),
+    fastifyModule(undefined, () => transport!),
+    nestModule(undefined, () => transport!),
+    pgModule(undefined, () => transport!),
+    mysqlModule(undefined, () => transport!),
+    outboundHttpModule(() => transport!),
+  ];
   const planned = modules.filter((module) => module.detect(environment).supported).map((module) => module.descriptor.capability);
   return {
     planned,
@@ -38,11 +56,12 @@ export function planCapture(): CapturePlan {
       transport = created;
       const registry = new ModuleRegistry();
       for (const module of modules) registry.tryInstall(module, environment);
+      const capabilities = registry.capabilities();
       // Recordings carry the limitations that really hold: the baseline plus every module that did not install.
       setCaptureProfile({
         limitations: effectiveLimitations(new Set(registry.statuses().filter((status) => status.state === "installed").map((status) => status.name))),
         // The start is held briefly (bounded in the worker) so a route resolved at finish can ride on it.
-        holdStart: registry.capabilities().includes("http.server.route_template"),
+        holdStart: capabilities.includes("http.server.route_template") || capabilities.includes("http.server.fastify"),
       });
     },
   };
