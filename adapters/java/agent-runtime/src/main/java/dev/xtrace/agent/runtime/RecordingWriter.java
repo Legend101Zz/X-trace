@@ -362,6 +362,9 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       }
       terminal.setOutcome(outcome);
     }
+    if (!finish.unsupportedCapabilities().isEmpty()) {
+      terminal.addAllUnsupportedCapabilityCodes(finish.unsupportedCapabilities());
+    }
     String messageId = pending.start.recordingId() + ":finished";
     if (!session.fitsEnvelope(messageId, pending.start.recordingId(), terminal.build())) {
       // Keep the observed exception type and outcome kind. Omitted optional detail is named by
@@ -375,6 +378,9 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       }
       terminal.setFinalRecordingSeq(Math.addExact(pending.sequence, 1))
           .putDropCountsByPriority(1, saturatingAdd(droppedEvents, 1));
+      if (!session.fitsEnvelope(messageId, pending.start.recordingId(), terminal.build())) {
+        terminal.clearUnsupportedCapabilityCodes();
+      }
       if (!session.fitsEnvelope(messageId, pending.start.recordingId(), terminal.build())) {
         terminal.setOutcome(terminal.getOutcome().toBuilder().clearThrownFromEventId());
       }
@@ -551,6 +557,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           builder.setThrownFromEventId(outcome.thrownFromEventId());
         }
       }
+      case BridgeSink.Outcome.CLIENT_ABORTED ->
+          builder.setKind(OutcomeKind.OUTCOME_KIND_CLIENT_ABORTED);
       default -> builder.setKind(OutcomeKind.OUTCOME_KIND_UNOBSERVED);
     }
     return builder.build();
@@ -725,8 +733,10 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_GAP) {
       // A gap always states why and how much. Events shed by the bounded queue are QUEUE_FULL
-      // with the shed count; an unresolvable handler is a lost correlation, count one.
+      // with the shed count; an unresolvable handler or detached reactive flow is CORRELATION_LOST.
       boolean handler = event.symbol().equals(BootstrapBridge.HANDLER_UNRESOLVED_SYMBOL);
+      boolean correlationLost = handler
+          || event.symbol().equals(BootstrapBridge.CORRELATION_LOST_SYMBOL);
       // The per-recording event cap has no dedicated reason: THROTTLE is the nearest accurate
       // one (events withheld by a configured limit); a dedicated reason is requested from C.
       boolean cap = event.symbol().equals(CAP_GAP_SYMBOL);
@@ -739,7 +749,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       boolean untransformed = event.symbol().equals(UNTRANSFORMED_GAP_SYMBOL);
       builder.setGap(
           GapPayload.newBuilder()
-              .setReason(handler ? GapReason.GAP_REASON_CORRELATION_LOST
+              .setReason(correlationLost ? GapReason.GAP_REASON_CORRELATION_LOST
                   : lines ? GapReason.GAP_REASON_LINE_BUDGET
                   : untransformed ? GapReason.GAP_REASON_CLASS_NOT_TRANSFORMED
                   : cap || admission || memory || frame
@@ -762,14 +772,19 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_REQUEST_UPDATE) {
       // Only a matched handler contributes the third part, a validated route template.
       String[] parts = event.symbol().split(" ", 3);
-      boolean filterOnly = frameworkDriver.equals("servlet");
-      boolean shaped = parts.length == (filterOnly ? 2 : 3) && parts[0].equals("http.request");
+      boolean servletOnly = frameworkDriver.equals("servlet");
+      boolean webFlux = frameworkDriver.equals("spring-webflux");
+      boolean shaped = servletOnly
+          ? (parts.length == 2 && parts[0].equals("http.request"))
+          : webFlux
+              ? ((parts.length == 2 || parts.length == 3) && parts[0].equals("http.request"))
+              : (parts.length == 3 && parts[0].equals("http.request"));
       builder.setInteraction(
           Interaction.newBuilder()
               .setKind(InteractionKind.INTERACTION_KIND_FRAMEWORK)
               .setDriver(frameworkDriver)
               .setMethod(shaped ? parts[1] : "")
-              .setPath(shaped && !filterOnly ? parts[2] : ""));
+              .setPath(shaped && parts.length == 3 && !servletOnly ? parts[2] : ""));
     } else if (kind == RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE) {
       builder.setInteraction(
           Interaction.newBuilder()
@@ -845,10 +860,20 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     Capability.Builder database =
         Capability.newBuilder().setName("database").putConfig("driver", "h2");
     if (pgJdbcEnabled) database.putConfig("drivers", "h2,pgjdbc");
+    Capability asyncCorrelation =
+        Capability.newBuilder()
+            .setName("async_correlation")
+            .putConfig("mechanism", "reactor_context")
+            .putConfig("framework", "spring-webflux")
+            .build();
     session.send(
         "java-premain-capabilities",
         "",
-        CapabilitySet.newBuilder().addCapabilities(frames).addCapabilities(database).build());
+        CapabilitySet.newBuilder()
+            .addCapabilities(frames)
+            .addCapabilities(database)
+            .addCapabilities(asyncCorrelation)
+            .build());
   }
 
   static long duration(long start, long finish) {
