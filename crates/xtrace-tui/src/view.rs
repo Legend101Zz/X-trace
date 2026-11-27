@@ -128,9 +128,18 @@ pub fn render(model: &Model) -> Grid {
     rows.push(fit(&title(model), width));
     let footer_rows = if model.screen == Screen::Replay { 3 } else { 2 };
     let body_height = height - 1 - footer_rows;
-    let body = if model.help { help_body() } else { body_lines(model, body_height) };
+    let detail_headers = if model.help || matches!(model.status, Status::Failed(_)) {
+        Vec::new()
+    } else {
+        replay_headers(model, body_height.saturating_sub(1))
+    };
+    let content_height = body_height.saturating_sub(detail_headers.len());
+    let body = if model.help { help_body() } else { body_lines(model, content_height) };
+    for header in detail_headers {
+        rows.push(fit(&header, width));
+    }
     let first_visible = body.offset;
-    for (index, line) in body.lines.iter().enumerate().take(body_height) {
+    for (index, line) in body.lines.iter().enumerate().take(content_height) {
         if body.selected == Some(first_visible + index) {
             selected_row = Some(rows.len());
         }
@@ -157,9 +166,34 @@ struct Body {
 
 fn title(model: &Model) -> String {
     match (&model.screen, &model.open_recording) {
-        (Screen::Replay, Some(id)) => format!("X-trace · replay {id}"),
+        (Screen::Replay, Some(id)) => {
+            if let Some(route) = model.window.as_ref().and_then(|w| w.route.as_deref()) {
+                format!("X-trace · replay {id} · {route}")
+            } else {
+                format!("X-trace · replay {id}")
+            }
+        }
         _ => "X-trace · recordings".to_owned(),
     }
+}
+
+fn replay_headers(model: &Model, max_lines: usize) -> Vec<String> {
+    if model.screen != Screen::Replay || max_lines == 0 {
+        return Vec::new();
+    }
+    let Some(window) = &model.window else {
+        return Vec::new();
+    };
+    let mut headers = Vec::new();
+    if window.route.is_some() || window.outcome.is_some() {
+        let route = window.route.as_deref().unwrap_or("unobserved");
+        let outcome = window.outcome.as_deref().unwrap_or("none");
+        headers.push(format!("route: {route} · outcome: {outcome}"));
+    }
+    if !window.limitations.is_empty() && headers.len() < max_lines {
+        headers.push(format!("limitations: {}", window.limitations.join(", ")));
+    }
+    headers
 }
 
 fn help_body() -> Body {
@@ -170,7 +204,8 @@ fn help_body() -> Body {
         "  b          back to list",
         "  [ ]        previous / next frame",
         "  i o u      step into / over / out",
-        "  r          refresh",
+        "  n / p      next / previous page",
+        "  r / R      refresh / reconnect store",
         "  ?          close this help",
         "  q          quit",
     ];
@@ -198,7 +233,7 @@ fn body_lines(model: &Model, height: usize) -> Body {
                 lines: vec![
                     "Could not load persisted evidence".to_owned(),
                     text.clone(),
-                    "Press r to retry.".to_owned(),
+                    "Press r to retry or R to reconnect.".to_owned(),
                 ],
                 offset: 0,
                 selected: None,
@@ -225,7 +260,19 @@ fn body_lines(model: &Model, height: usize) -> Body {
                 .take(height)
                 .map(|(index, row)| {
                     let marker = if index == model.selected_recording { '>' } else { ' ' };
-                    format!("{marker} {}  {}  {} events", row.id, row.completion, row.event_count)
+                    let mut line = format!(
+                        "{marker} {}  {}  {} events",
+                        row.id, row.completion, row.event_count
+                    );
+                    if let Some(route) = &row.route {
+                        line.push_str("  ");
+                        line.push_str(route);
+                    }
+                    if let Some(outcome) = &row.outcome {
+                        line.push_str("  ");
+                        line.push_str(outcome);
+                    }
+                    line
                 })
                 .collect();
             Body { lines, offset: start, selected: Some(model.selected_recording) }
@@ -247,28 +294,96 @@ fn body_lines(model: &Model, height: usize) -> Body {
                     selected: None,
                 };
             }
-            let start = window_start(model.selected_frame, window.frames.len(), height);
-            let lines = window
-                .frames
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(height)
-                .map(|(index, frame)| frame_line(frame, index == model.selected_frame))
-                .collect();
-            Body { lines, offset: start, selected: Some(model.selected_frame) }
+            let mut all_lines = Vec::new();
+            let mut selected_line_index = 0;
+            for (index, frame) in window.frames.iter().enumerate() {
+                if index == model.selected_frame {
+                    selected_line_index = all_lines.len();
+                }
+                let indent =
+                    " ".repeat(frame.depth.map_or(0, |d| usize::try_from(d.min(12)).unwrap_or(0)));
+                let inline_source = frame
+                    .source_location
+                    .as_deref()
+                    .filter(|loc| !is_gap(&frame.kind) && can_inline_source(frame, &indent, loc));
+                all_lines.push(frame_line(
+                    frame,
+                    index == model.selected_frame,
+                    &indent,
+                    inline_source,
+                ));
+                if let Some(loc) = frame.source_location.as_deref() {
+                    if inline_source.is_none() && !is_gap(&frame.kind) {
+                        all_lines.push(format!("      {indent}source: {loc}"));
+                    }
+                }
+                for binding in &frame.bindings_summary {
+                    all_lines.push(format!("      {indent}binding: {binding}"));
+                }
+                if !frame.field_truncations.is_empty() {
+                    all_lines.push(format!(
+                        "      {indent}truncated fields: {}",
+                        frame.field_truncations.join(", ")
+                    ));
+                }
+            }
+            let start = window_start(selected_line_index, all_lines.len(), height);
+            let lines = all_lines.into_iter().skip(start).take(height).collect();
+            Body { lines, offset: start, selected: Some(selected_line_index) }
         }
     }
 }
 
-fn frame_line(frame: &FrameRow, selected: bool) -> String {
+fn can_inline_source(frame: &FrameRow, indent: &str, loc: &str) -> bool {
+    let symbol_len = frame.symbol.as_deref().unwrap_or("no symbol persisted").chars().count();
+    let trunc_len = if frame.truncated { 12 } else { 0 };
+    // `> {:>5} {indent}{kind} {symbol} @ {loc}`
+    8 + indent.len()
+        + frame.kind.chars().count()
+        + 1
+        + symbol_len
+        + 3
+        + loc.chars().count()
+        + trunc_len
+        <= 78
+}
+
+fn frame_line(
+    frame: &FrameRow,
+    selected: bool,
+    indent: &str,
+    inline_source: Option<&str>,
+) -> String {
     let marker = if selected { '>' } else { ' ' };
-    let indent = " ".repeat(frame.depth.map_or(0, |d| usize::try_from(d.min(12)).unwrap_or(0)));
     let symbol = frame.symbol.as_deref().unwrap_or("no symbol persisted");
     if is_gap(&frame.kind) {
-        format!("{marker} {:>5} {indent}GAP: events were not emitted here", frame.sequence)
+        match (&frame.gap_reason, frame.gap_count) {
+            (Some(reason), Some(count)) => {
+                format!("{marker} {:>5} {indent}GAP: {reason} ({count} suppressed)", frame.sequence)
+            }
+            (Some(reason), None) => {
+                format!("{marker} {:>5} {indent}GAP: {reason}", frame.sequence)
+            }
+            (None, Some(count)) => {
+                format!(
+                    "{marker} {:>5} {indent}GAP: events were not emitted here ({count} suppressed)",
+                    frame.sequence
+                )
+            }
+            (None, None) => {
+                format!("{marker} {:>5} {indent}GAP: events were not emitted here", frame.sequence)
+            }
+        }
     } else {
-        format!("{marker} {:>5} {indent}{} {symbol}", frame.sequence, frame.kind)
+        let mut line = format!("{marker} {:>5} {indent}{} {symbol}", frame.sequence, frame.kind);
+        if let Some(loc) = inline_source {
+            line.push_str(" @ ");
+            line.push_str(loc);
+        }
+        if frame.truncated {
+            line.push_str(" [truncated]");
+        }
+        line
     }
 }
 
@@ -293,11 +408,38 @@ fn nav_line(model: &Model) -> String {
 
 fn notice_line(model: &Model) -> String {
     if !model.notice.is_empty() {
+        if model.screen == Screen::Recordings && model.list_has_more {
+            return format!("{} · truncated: more recordings exist (n next)", model.notice);
+        }
         return model.notice.clone();
     }
     match (&model.screen, &model.window) {
+        (Screen::Recordings, _) => {
+            let page_num = model.list_history.len() + 1;
+            match (model.list_has_more, !model.list_history.is_empty()) {
+                (true, true) => format!(
+                    "{} recordings shown · page {page_num} · truncated: more recordings exist (p prev / n next)",
+                    model.recordings.len()
+                ),
+                (true, false) => format!(
+                    "{} recordings shown · truncated: more recordings exist (press n for next page)",
+                    model.recordings.len()
+                ),
+                (false, true) => format!(
+                    "{} recordings shown · page {page_num} (press p for previous page)",
+                    model.recordings.len()
+                ),
+                (false, false) => String::new(),
+            }
+        }
         (Screen::Replay, Some(window)) => {
-            format!("{} frames · recording {}", window.frames.len(), window.completion)
+            let base = format!("{} frames · recording {}", window.frames.len(), window.completion);
+            match (window.prev_cursor.is_some(), window.next_cursor.is_some()) {
+                (true, true) => format!("{base} · page: p prev / n next"),
+                (true, false) => format!("{base} · page: p prev"),
+                (false, true) => format!("{base} · page: n next"),
+                (false, false) => base,
+            }
         }
         _ => String::new(),
     }

@@ -35,6 +35,8 @@ pub fn decode_keys(pending: &mut Vec<u8>, incoming: &[u8]) -> Vec<Key> {
                     match rest[end] {
                         b'A' => keys.push(Key::Up),
                         b'B' => keys.push(Key::Down),
+                        b'~' if rest[..end] == *b"5" => keys.push(Key::PrevPage),
+                        b'~' if rest[..end] == *b"6" => keys.push(Key::NextPage),
                         _ => {}
                     }
                     index += 2 + end + 1;
@@ -57,7 +59,10 @@ pub fn decode_keys(pending: &mut Vec<u8>, incoming: &[u8]) -> Vec<Key> {
             b'i' => keys.push(Key::Nav(NavAction::Into)),
             b'o' => keys.push(Key::Nav(NavAction::Over)),
             b'u' => keys.push(Key::Nav(NavAction::Out)),
+            b'p' | b'<' => keys.push(Key::PrevPage),
+            b'n' | b'>' => keys.push(Key::NextPage),
             b'r' => keys.push(Key::Refresh),
+            b'R' => keys.push(Key::Reconnect),
             b'?' => keys.push(Key::Help),
             b'q' | 0x03 | 0x04 => keys.push(Key::Quit),
             _ => {}
@@ -72,16 +77,25 @@ pub fn decode_keys(pending: &mut Vec<u8>, incoming: &[u8]) -> Vec<Key> {
 /// `Quit`.
 pub fn perform<C: ReplayClient>(client: &C, effect: Effect) -> Option<Message> {
     match effect {
-        Effect::LoadRecordings => {
-            Some(Message::RecordingsLoaded(client.list_recordings().map_err(|e| e.0)))
-        }
+        Effect::LoadRecordings => Some(Message::RecordingsPageLoaded {
+            after: None,
+            result: client.list_recordings_page(None).map_err(|e| e.0),
+        }),
+        Effect::LoadRecordingsPage { after } => Some(Message::RecordingsPageLoaded {
+            after: after.clone(),
+            result: client.list_recordings_page(after.as_deref()).map_err(|e| e.0),
+        }),
         Effect::LoadWindow { recording_id, around_frame } => Some(Message::WindowLoaded(
             client.window(&recording_id, around_frame.as_deref()).map_err(|e| e.0),
+        )),
+        Effect::LoadWindowPage { recording_id, cursor } => Some(Message::WindowLoaded(
+            client.window_page(&recording_id, None, cursor.as_deref()).map_err(|e| e.0),
         )),
         Effect::Navigate { recording_id, frame_id, action } => {
             let result = client.navigate(&recording_id, &frame_id, action).map_err(|e| e.0);
             Some(Message::Navigated { recording_id, from_frame: frame_id, action, result })
         }
+        Effect::Reconnect => Some(Message::Reconnected(client.reconnect().map_err(|e| e.0))),
         Effect::Quit => None,
     }
 }

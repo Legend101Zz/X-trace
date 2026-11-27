@@ -19,6 +19,8 @@ impl ReplayClient for Fixture {
             id: REC.to_owned(),
             completion: "complete".to_owned(),
             event_count: 6,
+            route: None,
+            outcome: None,
         }])
     }
 
@@ -52,6 +54,12 @@ impl ReplayClient for Fixture {
                         Some(nav(n + 1)),
                         Some(NavResult::Boundary(None)),
                     ],
+                    gap_reason: None,
+                    gap_count: None,
+                    source_location: None,
+                    bindings_summary: Vec::new(),
+                    truncated: false,
+                    field_truncations: Vec::new(),
                 }
             })
             .collect();
@@ -60,6 +68,11 @@ impl ReplayClient for Fixture {
             frames,
             completion: "complete".to_owned(),
             anchor_frame_id: around.map(str::to_owned),
+            route: None,
+            outcome: None,
+            limitations: Vec::new(),
+            prev_cursor: None,
+            next_cursor: None,
         })
     }
 
