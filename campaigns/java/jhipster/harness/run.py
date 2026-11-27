@@ -35,7 +35,10 @@ def build() -> int:
 def make_stack(run_id: str) -> xcamp.Stack:
     return xcamp.Stack(
         project="jhipster", jdk_image=IMAGE, jar=JAR, run_id=run_id, app_port=8080,
-        app_args=["--spring.profiles.active=prod", "--server.port={APPPORT}"],
+        # Prod suppresses Spring INFO. Boot 4 reports the actual port only after bind;
+        # retain this specific signal for port-zero discovery in host runs.
+        app_args=["--spring.profiles.active=prod", "--server.port={APPPORT}", "--server.address={BINDADDR}",
+                  "--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO"],
         env={"SPRING_DATASOURCE_URL": "jdbc:postgresql://{DBHOST}:{DBPORT}/jhipsterSampleApplication",
              "SPRING_DATASOURCE_USERNAME": "jhipsterSampleApplication", "SPRING_DATASOURCE_PASSWORD": "campaign-synthetic",
              "JHIPSTER_SECURITY_AUTHENTICATION_JWT_BASE64_SECRET": JWT_SECRET},

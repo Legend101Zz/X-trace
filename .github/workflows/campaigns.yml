@@ -124,6 +124,7 @@ jobs:
       CAMP_KIND: ${{ matrix.kind }}
       CAMP_SHA: ${{ matrix.sha }}
       CAMP_URL: ${{ matrix.url }}
+      CAMP_TAG: ${{ matrix.tag }}
       CAMP_BUILD: ${{ matrix.buildCommand }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -150,7 +151,7 @@ jobs:
       - name: Clone the upstream project at its pinned SHA
         run: |
           python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
-            --step checkout-upstream -- sh tools/qa/camp_clone.sh "$CAMP_URL" "$CAMP_SHA" "$CAMP_ROOT/$CAMP_KIND/$CAMP_PROJECT/src"
+            --step checkout-upstream -- sh tools/qa/camp_clone.sh "$CAMP_URL" "$CAMP_SHA" "$CAMP_ROOT/$CAMP_KIND/$CAMP_PROJECT/src" "$CAMP_TAG"
       - name: Build the upstream project (host, no source changes)
         if: matrix.kind == 'java'
         run: |
