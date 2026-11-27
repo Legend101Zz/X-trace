@@ -97,6 +97,7 @@ let linkedCount = 0;
 let gapCount = 0;
 const records: NodeProcessLinkRecord[] = [];
 const linkedTargets = new WeakSet<object>();
+const patchedWorkers = new WeakSet<object>();
 const inSpawnHook = new AsyncLocalStorage<true>();
 const optInClaimStore = new AsyncLocalStorage<OptInClaimState>();
 
@@ -235,8 +236,8 @@ export function resetProcessLinkageForTest(): void {
 }
 
 function patchWorkerConstructor(): void {
-  const current = workerThreads.Worker as typeof workerThreads.Worker & { [PATCHED]?: true };
-  if (typeof current !== "function" || current[PATCHED]) return;
+  const current = workerThreads.Worker;
+  if (typeof current !== "function" || patchedWorkers.has(current)) return;
   originalWorker = current;
   const wrapped = new Proxy(current, {
     construct(target, args, newTarget) {
@@ -250,8 +251,8 @@ function patchWorkerConstructor(): void {
       recordObservedSpawn("node_worker", options.evalMode || options.detached, claim, worker);
       return worker;
     },
-  }) as typeof workerThreads.Worker & { [PATCHED]?: true };
-  Object.defineProperty(wrapped, PATCHED, { value: true });
+  });
+  patchedWorkers.add(wrapped);
   (workerThreads as { Worker: typeof workerThreads.Worker }).Worker = wrapped;
   workerPatched = true;
 }

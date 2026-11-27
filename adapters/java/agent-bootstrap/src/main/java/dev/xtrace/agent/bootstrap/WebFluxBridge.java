@@ -264,6 +264,10 @@ public final class WebFluxBridge {
       return returnValue;
     }
     if (session == null) return returnValue;
+    if (session.excludedByScope.get()) {
+      cleanupExchangeAttribute(session.exchange);
+      return returnValue;
+    }
     if (thrown != null) {
       if (session.recorded.get()) {
         ReactorContextBridge.signalError(session.rootToken, thrown);
@@ -415,7 +419,7 @@ public final class WebFluxBridge {
     if (session == null) {
       Object exchange = serverRequestExchange(serverRequest);
       session = new WebFluxSession(
-          System.nanoTime(), httpMethodFromServerRequest(serverRequest), exchange, exchange != null);
+          System.nanoTime(), httpMethodFromServerRequest(serverRequest), exchange, false);
       ownsLifecycle = true;
     }
     if (session.excludedByScope.get() || session.finished.get()) return null;
@@ -559,10 +563,10 @@ public final class WebFluxBridge {
     try {
       BootstrapBridge.RecordingState state = session.rootToken.slot.state();
       if (state == null) return;
-      int status = session.exchange != null
+      boolean provisional = session.exchange == null || !session.hasOuterBoundary;
+      int status = (!provisional && session.exchange != null)
           ? statusFromExchange(session.exchange)
           : session.provisionalStatus;
-      boolean provisional = session.exchange == null || !session.hasOuterBoundary;
       Throwable actualError = error != null ? error : null;
       String[] unsupported = ReactorContextBridge.isPropagationUnavailable()
           ? new String[] {"async_correlation"} : null;
