@@ -39,6 +39,7 @@ pub mod catalog_discovery_store;
 pub mod catalog_history_store;
 pub mod connection;
 pub mod error;
+pub mod exercise_provenance_store;
 pub mod idempotency_repository;
 pub mod migrations;
 pub mod project_repository;
@@ -53,6 +54,7 @@ pub use connection::{
     StoreBootstrap,
 };
 pub use error::{StoreError, StoreErrorKind};
+pub use exercise_provenance_store::SqliteExerciseProvenanceStore;
 pub use idempotency_repository::SqliteIdempotencyStore;
 pub use migrations::{MigrationRecord, Migrations};
 pub use project_repository::SqliteProjectRepository;

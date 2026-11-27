@@ -12,7 +12,8 @@
 //! `v0005_catalog_discovery` and `v0006_catalog_retry_namespace_expiry`; the
 //! replay contract appends `v0007_recording_event_cap_sanity_bound` and
 //! `v0008_frame_index_depth_async`; ADR 0011 appends `v0009_recording_limitations`;
-//! session health appends `v0010_session_health`. Migrations remain append-only: later
+//! session health appends `v0010_session_health`; ADR 0018 appends
+//! `v0011_exercise_provenance`. Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
@@ -50,6 +51,94 @@ CREATE TABLE session_health (
     rejected_requests INTEGER NOT NULL CHECK(rejected_requests >= 0),
     PRIMARY KEY (project_id, runtime_session_id)
 ) STRICT;
+";
+
+/// Ephemeral approved-exercise execution provenance and recording linkage (ADR 0018).
+/// Never stores raw credential values, handles, headers, or request/response bodies.
+const EXERCISE_PROVENANCE_SCHEMA: &str = "
+CREATE TABLE exercise_runs (
+    exercise_run_id   BLOB PRIMARY KEY CHECK(length(exercise_run_id) = 16
+                          AND substr(hex(exercise_run_id), 13, 1) = '7'
+                          AND substr(hex(exercise_run_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    project_id        BLOB NOT NULL CHECK(length(project_id) = 16)
+                          REFERENCES projects(project_id) ON DELETE CASCADE,
+    plan_id           BLOB NOT NULL CHECK(length(plan_id) = 16
+                          AND substr(hex(plan_id), 13, 1) = '7'
+                          AND substr(hex(plan_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    plan_hash         TEXT NOT NULL CHECK(length(CAST(plan_hash AS BLOB)) = 64
+                          AND plan_hash GLOB '[0-9a-f]*'
+                          AND plan_hash NOT GLOB '*[^0-9a-f]*'),
+    target_origin     TEXT NOT NULL CHECK(length(CAST(target_origin AS BLOB)) BETWEEN 1 AND 128
+                          AND (substr(target_origin, 1, 17) = 'http://127.0.0.1:'
+                               OR substr(target_origin, 1, 13) = 'http://[::1]:')
+                          AND instr(substr(target_origin, 8), '/') = 0
+                          AND instr(target_origin, '?') = 0
+                          AND instr(target_origin, '#') = 0
+                          AND instr(target_origin, '@') = 0),
+    status            TEXT NOT NULL CHECK(status IN
+                          ('reserved', 'running', 'succeeded', 'failed', 'delivery_unknown')),
+    failure_class     TEXT CHECK(failure_class IS NULL OR (
+                          length(CAST(failure_class AS BLOB)) BETWEEN 1 AND 64
+                          AND failure_class GLOB '[a-z]*'
+                          AND failure_class NOT GLOB '*[^a-z0-9_]*')),
+    started_at        TEXT NOT NULL CHECK(length(CAST(started_at AS BLOB)) BETWEEN 1 AND 64),
+    finished_at       TEXT CHECK(finished_at IS NULL OR length(CAST(finished_at AS BLOB)) BETWEEN 1 AND 64),
+    UNIQUE (project_id, exercise_run_id),
+    CHECK ((status IN ('failed', 'delivery_unknown')) = (failure_class IS NOT NULL)),
+    CHECK ((status IN ('succeeded', 'failed', 'delivery_unknown')) = (finished_at IS NOT NULL))
+) STRICT;
+
+CREATE INDEX exercise_runs_project_plan
+    ON exercise_runs(project_id, plan_hash, exercise_run_id DESC);
+
+CREATE TABLE exercise_items (
+    exercise_run_id   BLOB NOT NULL CHECK(length(exercise_run_id) = 16),
+    project_id        BLOB NOT NULL CHECK(length(project_id) = 16),
+    exercise_item_id  BLOB NOT NULL CHECK(length(exercise_item_id) = 16
+                          AND substr(hex(exercise_item_id), 13, 1) IN ('7', '8')
+                          AND substr(hex(exercise_item_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    operation_id      BLOB NOT NULL CHECK(length(operation_id) = 16),
+    method            TEXT NOT NULL CHECK(length(CAST(method AS BLOB)) BETWEEN 1 AND 16
+                          AND method GLOB '[A-Z]*'
+                          AND method NOT GLOB '*[^A-Z]*'),
+    route_template    TEXT NOT NULL CHECK(length(CAST(route_template AS BLOB)) BETWEEN 1 AND 2048),
+    effect            TEXT NOT NULL CHECK(effect IN ('read_only', 'mutating', 'unknown')),
+    status            TEXT NOT NULL CHECK(status IN
+                          ('reserved', 'sending', 'succeeded', 'failed', 'delivery_unknown')),
+    failure_class     TEXT CHECK(failure_class IS NULL OR (
+                          length(CAST(failure_class AS BLOB)) BETWEEN 1 AND 64
+                          AND failure_class GLOB '[a-z]*'
+                          AND failure_class NOT GLOB '*[^a-z0-9_]*')),
+    http_status       INTEGER CHECK(http_status IS NULL OR (http_status BETWEEN 100 AND 599)),
+    request_bytes     INTEGER CHECK(request_bytes IS NULL OR (request_bytes BETWEEN 0 AND 131072)),
+    response_bytes    INTEGER CHECK(response_bytes IS NULL OR (response_bytes BETWEEN 0 AND 1048576)),
+    duration_ms       INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+    PRIMARY KEY (exercise_run_id, exercise_item_id),
+    UNIQUE (project_id, exercise_run_id, exercise_item_id),
+    FOREIGN KEY (project_id, exercise_run_id)
+        REFERENCES exercise_runs(project_id, exercise_run_id) ON DELETE CASCADE,
+    CHECK ((status IN ('failed', 'delivery_unknown')) = (failure_class IS NOT NULL))
+) STRICT;
+
+CREATE INDEX exercise_items_project_item
+    ON exercise_items(project_id, exercise_item_id, exercise_run_id DESC);
+
+CREATE TABLE exercise_recording_links (
+    project_id        BLOB NOT NULL CHECK(length(project_id) = 16),
+    exercise_run_id   BLOB NOT NULL CHECK(length(exercise_run_id) = 16),
+    exercise_item_id  BLOB NOT NULL CHECK(length(exercise_item_id) = 16),
+    recording_id      BLOB NOT NULL CHECK(length(recording_id) = 16),
+    linked_at         TEXT NOT NULL CHECK(length(CAST(linked_at AS BLOB)) BETWEEN 1 AND 64),
+    PRIMARY KEY (exercise_run_id, exercise_item_id, recording_id),
+    UNIQUE (project_id, recording_id),
+    FOREIGN KEY (project_id, exercise_run_id, exercise_item_id)
+        REFERENCES exercise_items(project_id, exercise_run_id, exercise_item_id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id, recording_id)
+        REFERENCES recordings(project_id, recording_id)
+) STRICT;
+
+CREATE INDEX exercise_recording_links_project_item
+    ON exercise_recording_links(project_id, exercise_item_id);
 ";
 
 /// One declared migration. The body is the SQL to apply.
@@ -117,6 +206,11 @@ impl Migrations {
                 version: 10,
                 label: "v0010_session_health",
                 statements: &[SESSION_HEALTH_SCHEMA],
+            },
+            MigrationRecord {
+                version: 11,
+                label: "v0011_exercise_provenance",
+                statements: &[EXERCISE_PROVENANCE_SCHEMA],
             },
         ]
     }
@@ -1343,7 +1437,7 @@ mod tests {
             apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v9"),
             Migrations::latest_version()
         );
-        assert_eq!(Migrations::latest_version(), 10);
+        assert_eq!(Migrations::latest_version(), 11);
         assert_ne!(applied_checksum(&conn), v8_checksum, "checksum changes with v9");
         let legacy: i64 = conn
             .query_row(
@@ -1409,7 +1503,10 @@ mod tests {
         insert_project(&conn, &project).expect("project");
         insert_recording(&conn, &id(0x41), &project, &id(0x51), "partial")
             .expect("legacy recording");
-        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("v10"), 10);
+        assert_eq!(
+            apply_pending(&conn, "test", CorrelationId::new()).expect("v10"),
+            Migrations::latest_version()
+        );
         assert_ne!(applied_checksum(&conn), checksum);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM session_health", [], |row| row.get::<_, i64>(0))
@@ -1434,7 +1531,92 @@ mod tests {
         ] {
             assert!(conn.execute(sql, params![owner, session, count]).is_err());
         }
-        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("reopen"), 10);
+        assert_eq!(
+            apply_pending(&conn, "test", CorrelationId::new()).expect("reopen"),
+            Migrations::latest_version()
+        );
+    }
+
+    #[test]
+    fn migration_v11_adds_exercise_provenance_tables_and_enforces_constraints() {
+        let conn = new_memory();
+        apply_catalog(&conn, "test", CorrelationId::new(), &Migrations::catalog()[..10])
+            .expect("v10 store");
+        let v10_checksum = applied_checksum(&conn);
+        let project = id(0x31);
+        let recording = id(0x41);
+        insert_project(&conn, &project).expect("project");
+        insert_recording(&conn, &recording, &project, &id(0x51), "complete")
+            .expect("legacy recording");
+        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("v11"), 11);
+        assert_ne!(applied_checksum(&conn), v10_checksum);
+        for table in ["exercise_runs", "exercise_items", "exercise_recording_links"] {
+            assert!(table_exists(&conn, table), "{table} must exist");
+            assert_eq!(table_count(&conn, table), 0, "{table} must not backfill legacy rows");
+        }
+        assert_eq!(table_count(&conn, "recordings"), 1, "legacy recordings preserved");
+
+        let mut run_id = id(0x61);
+        run_id[6] = 0x70;
+        run_id[8] = 0x80;
+        let mut plan_id = id(0x62);
+        plan_id[6] = 0x70;
+        plan_id[8] = 0x80;
+        let mut item_id = id(0x63);
+        item_id[6] = 0x80;
+        item_id[8] = 0x80;
+        let plan_hash = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO exercise_runs (exercise_run_id, project_id, plan_id, plan_hash, \
+             target_origin, status, failure_class, started_at, finished_at) \
+             VALUES (?1, ?2, ?3, ?4, 'http://127.0.0.1:8080', 'succeeded', NULL, 't1', 't2')",
+            params![run_id.as_slice(), project.as_slice(), plan_id.as_slice(), &plan_hash],
+        )
+        .expect("valid run");
+        conn.execute(
+            "INSERT INTO exercise_items (exercise_run_id, project_id, exercise_item_id, \
+             operation_id, method, route_template, effect, status, failure_class, http_status, \
+             request_bytes, response_bytes, duration_ms) \
+             VALUES (?1, ?2, ?3, ?4, 'POST', '/orders', 'mutating', 'succeeded', NULL, 200, 128, 64, 5)",
+            params![run_id.as_slice(), project.as_slice(), item_id.as_slice(), id(0x64).as_slice()],
+        )
+        .expect("valid item");
+        conn.execute(
+            "INSERT INTO exercise_recording_links (project_id, exercise_run_id, exercise_item_id, \
+             recording_id, linked_at) VALUES (?1, ?2, ?3, ?4, 't3')",
+            params![
+                project.as_slice(),
+                run_id.as_slice(),
+                item_id.as_slice(),
+                recording.as_slice()
+            ],
+        )
+        .expect("valid recording link");
+
+        // Non-loopback or query-carrying target_origin must be rejected in SQL.
+        let mut bad_run = run_id;
+        bad_run[15] = 0x99;
+        assert!(
+            conn.execute(
+                "INSERT INTO exercise_runs (exercise_run_id, project_id, plan_id, plan_hash, \
+                 target_origin, status, failure_class, started_at, finished_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'http://10.0.0.1:8080', 'succeeded', NULL, 't1', 't2')",
+                params![bad_run.as_slice(), project.as_slice(), plan_id.as_slice(), &plan_hash],
+            )
+            .is_err()
+        );
+        // Oversized response_bytes (> 1_048_576) or failed without failure_class must be rejected in SQL.
+        assert!(
+            conn.execute(
+                "INSERT INTO exercise_items (exercise_run_id, project_id, exercise_item_id, \
+                 operation_id, method, route_template, effect, status, failure_class, http_status, \
+                 request_bytes, response_bytes, duration_ms) \
+                 VALUES (?1, ?2, ?3, ?4, 'GET', '/x', 'read_only', 'failed', NULL, 200, 10, 1048577, 1)",
+                params![run_id.as_slice(), project.as_slice(), item_id.as_slice(), id(0x65).as_slice()],
+            )
+            .is_err()
+        );
+        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("reopen v11"), 11);
     }
 
     #[test]

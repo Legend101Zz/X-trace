@@ -5,8 +5,10 @@
 //! persisted UI state, or the presence of a credential reference.
 
 mod body_json;
+mod exec;
 mod model;
 mod service;
 
+pub use exec::*;
 pub use model::*;
 pub use service::{ExercisePlanService, review_document};
