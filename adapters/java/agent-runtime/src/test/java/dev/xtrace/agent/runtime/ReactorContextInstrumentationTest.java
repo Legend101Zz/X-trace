@@ -160,28 +160,21 @@ class ReactorContextInstrumentationTest {
         subCls.getField("ctx").set(subB, ctxB);
 
         // First exercise Scheduler.schedule(Runnable) via Advice arg wrapping from active token A.
+        Runnable wrappedScheduled;
         try (var scopeA = ReactorContextBridge.enterScope(tokA)) {
           Method schedule = schedCls.getMethod("schedule", Runnable.class);
-          Future<?> scheduledFuture =
-              poolExec.submit(
-                  () -> {
-                    try {
-                      Runnable wrapped =
-                          (Runnable)
-                              schedule.invoke(
-                                  scheduler,
-                                  (Runnable)
-                                      () -> {
-                                        BootstrapBridge.frameEnter("ScheduledA.task");
-                                        BootstrapBridge.frameExit("ScheduledA.task", null);
-                                      });
-                      wrapped.run();
-                    } catch (Exception e) {
-                      throw new RuntimeException(e);
-                    }
-                  });
-          scheduledFuture.get(5, TimeUnit.SECONDS);
+          wrappedScheduled =
+              (Runnable)
+                  schedule.invoke(
+                      scheduler,
+                      (Runnable)
+                          () -> {
+                            BootstrapBridge.frameEnter("ScheduledA.task");
+                            BootstrapBridge.frameExit("ScheduledA.task", null);
+                          });
         }
+        Future<?> scheduledFuture = poolExec.submit(wrappedScheduled);
+        scheduledFuture.get(5, TimeUnit.SECONDS);
 
         // Now run concurrent subscribers across worker threads with interleaved frames.
         Method subscribe = pubCls.getMethod("subscribe", loader.loadClass("reactor.core.CoreSubscriber"));

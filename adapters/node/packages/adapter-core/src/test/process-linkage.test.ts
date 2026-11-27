@@ -32,7 +32,9 @@ class RecordingTransport implements HttpCaptureTransport {
 
 function closeProcess(proc: childProcessTypes.ChildProcess): Promise<void> {
   return new Promise((resolve) => {
-    if (proc.exitCode !== null || proc.killed) {
+    const exited = proc.exitCode !== null || proc.signalCode !== null || proc.killed;
+    const stdoutDone = !proc.stdout || proc.stdout.readableEnded;
+    if (exited && stdoutDone) {
       resolve();
       return;
     }
@@ -41,12 +43,10 @@ function closeProcess(proc: childProcessTypes.ChildProcess): Promise<void> {
   });
 }
 
-function terminateWorker(worker: workerThreadsTypes.Worker): Promise<void> {
-  return new Promise((resolve) => {
-    worker.once("exit", () => resolve());
-    worker.once("error", () => resolve());
-    void worker.terminate().catch(() => resolve());
-  });
+async function terminateWorker(worker: workerThreadsTypes.Worker): Promise<void> {
+  try {
+    await worker.terminate();
+  } catch { /* best effort */ }
 }
 
 test("uninstrumented Worker and child_process calls emit bounded gaps with zero raw argv or env leakage", async (t) => {

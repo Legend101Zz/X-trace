@@ -876,15 +876,12 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     Capability asyncCorrelation =
         Capability.newBuilder()
             .setName("async_correlation")
-            .putConfig("mechanism", "reactor_context")
-            .putConfig("framework", "spring-webflux")
+            .putConfig("kind", "reactor")
             .build();
     Capability processLinkage =
         Capability.newBuilder()
             .setName("process_linkage")
-            .putConfig("boundary", "java.lang.ProcessBuilder.start")
-            .putConfig("spawn_kind", "jvm_fork")
-            .putConfig("env_policy", "no_raw_argv_or_env_explicit_gap_or_opt_in_link")
+            .putConfig("kind", "jvm_fork")
             .build();
     session.send(
         "java-premain-capabilities",

@@ -458,9 +458,12 @@ class WebFluxInstrumentationTest {
             .make();
     map.put(serverRequest.getTypeDescription().getName(), serverRequest.getBytes());
 
-    var monoDesc =
-        new net.bytebuddy.description.type.TypeDescription.Latent(
-            WebFluxInstrumentation.MONO, java.lang.reflect.Modifier.PUBLIC, null);
+    DynamicType.Unloaded<?> monoStub =
+        new ByteBuddy()
+            .subclass(Object.class)
+            .name(WebFluxInstrumentation.MONO)
+            .make();
+    TypeDescription monoDesc = monoStub.getTypeDescription();
 
     DynamicType.Unloaded<?> webHandler =
         new ByteBuddy()
@@ -533,28 +536,25 @@ class WebFluxInstrumentationTest {
     map.put(handlerFn.getTypeDescription().getName(), handlerFn.getBytes());
 
     // Concrete test execution classes for live ByteBuddy advice verification:
-    var reactorMonoDesc =
-        new TypeDescription.Latent(
-            WebFluxInstrumentation.MONO, java.lang.reflect.Modifier.PUBLIC, null);
     DynamicType.Unloaded<?> execMono =
         new ByteBuddy()
-            .subclass(reactorMonoDesc)
+            .subclass(monoDesc)
             .name("reactor.core.publisher.TestExecMono")
             .defineField("action", Runnable.class, Visibility.PUBLIC)
             .defineField("ctxModifier", Function.class, Visibility.PUBLIC)
             .defineField("onSuccess", Consumer.class, Visibility.PUBLIC)
             .defineField("onError", Consumer.class, Visibility.PUBLIC)
             .defineField("onCancel", Runnable.class, Visibility.PUBLIC)
-            .defineMethod("contextWrite", reactorMonoDesc, Visibility.PUBLIC)
+            .defineMethod("contextWrite", monoDesc, Visibility.PUBLIC)
             .withParameters(Function.class)
             .intercept(MethodDelegation.to(ExecBehavior.class))
-            .defineMethod("doOnSuccess", reactorMonoDesc, Visibility.PUBLIC)
+            .defineMethod("doOnSuccess", monoDesc, Visibility.PUBLIC)
             .withParameters(Consumer.class)
             .intercept(MethodDelegation.to(ExecBehavior.class))
-            .defineMethod("doOnError", reactorMonoDesc, Visibility.PUBLIC)
+            .defineMethod("doOnError", monoDesc, Visibility.PUBLIC)
             .withParameters(Consumer.class)
             .intercept(MethodDelegation.to(ExecBehavior.class))
-            .defineMethod("doOnCancel", reactorMonoDesc, Visibility.PUBLIC)
+            .defineMethod("doOnCancel", monoDesc, Visibility.PUBLIC)
             .withParameters(Runnable.class)
             .intercept(MethodDelegation.to(ExecBehavior.class))
             .defineMethod("run", Object.class, Visibility.PUBLIC)
