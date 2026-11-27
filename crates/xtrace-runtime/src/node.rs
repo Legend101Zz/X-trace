@@ -864,6 +864,7 @@ const REQUIRED_DIST_FILES: &[&str] = &[
     "modules.cjs",
     "nest-instrument.cjs",
     "node-capabilities.json",
+    "process-linkage.cjs",
     "register.cjs",
     "register.mjs",
     "runtime/context.cjs",

@@ -51,6 +51,7 @@ pub mod hash;
 pub mod honesty;
 pub mod ids;
 pub mod observation_classifier;
+pub mod process_linkage;
 pub mod project;
 pub mod provenance;
 pub mod recording;
@@ -75,8 +76,12 @@ pub use hash::{ContentHash, HashParseError};
 pub use honesty::{HonestyMarker, honesty_flags};
 pub use ids::{
     CatalogRevisionId, ClaimId, CorrelationId, FrameId, InteractionId, OperationId,
-    OperationVersionId, PolicyId, ProjectId, RecordingId, RunId, RuntimeSessionId,
+    OperationVersionId, PolicyId, ProjectId, RecordingId, RunId, RuntimeSessionId, SessionLinkId,
     SourceArtifactId, SourceRevisionId,
+};
+pub use process_linkage::{
+    MAX_CORRELATION_TOKEN_BYTES, ProcessLinkValidationError, RuntimeSessionLink, SessionLinkStatus,
+    SpawnKind, hash_correlation_token,
 };
 pub use project::{FingerprintParseError, Project, RepositoryFingerprint};
 pub use provenance::{

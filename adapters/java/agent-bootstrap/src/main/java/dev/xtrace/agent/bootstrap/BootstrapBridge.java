@@ -36,6 +36,16 @@ public final class BootstrapBridge {
   /** Symbol of the GAP event that records lost reactive or async correlation. */
   public static final String CORRELATION_LOST_SYMBOL = "xtrace.capture.gap.correlation-lost";
 
+  /** Symbol of the GAP event that records an uninstrumented child process spawn. */
+  public static final String CHILD_PROCESS_NOT_INSTRUMENTED_SYMBOL =
+      "xtrace.capture.gap.child-process-not-instrumented";
+
+  /** Symbol of the GAP event that records an already-consumed child bootstrap claim. */
+  public static final String BOOTSTRAP_CONSUMED_SYMBOL = "xtrace.capture.gap.bootstrap-consumed";
+
+  /** Symbol of the ASYNC_LINK event that records an explicitly linked JVM child process. */
+  public static final String PROCESS_LINK_SYMBOL = "xtrace.process.jvm_fork";
+
   private BootstrapBridge() {}
 
   /** Installs the one process-wide runtime sink. Reinstallation is rejected. */
@@ -349,6 +359,42 @@ public final class BootstrapBridge {
           sink, state, state.nextEventId(), parent, BridgeEventKind.GAP,
           CORRELATION_LOST_SYMBOL, Math.max(1, count));
       if (!accepted) state.dropped.incrementAndGet();
+      return accepted;
+    }
+  }
+
+  static String activeRecordingId() {
+    RequestContext context = CONTEXT.get();
+    if (!captureActive(context) || SINK.get() == null) return "";
+    return context.state.recordingId;
+  }
+
+  static boolean emitProcessGap(String symbol, int count) {
+    RequestContext context = CONTEXT.get();
+    BridgeSink sink = SINK.get();
+    if (!captureActive(context) || sink == null || !validSymbol(symbol)) return false;
+    synchronized (context.state.emitLock) {
+      if (context.state.closed) return false;
+      flushLine(context);
+      boolean accepted = safeEvent(
+          sink, context.state, context.state.nextEventId(), context.currentParent(),
+          BridgeEventKind.GAP, symbol, Math.max(1, count));
+      if (!accepted) context.state.dropped.incrementAndGet();
+      return accepted;
+    }
+  }
+
+  static boolean emitProcessLink(String symbol) {
+    RequestContext context = CONTEXT.get();
+    BridgeSink sink = SINK.get();
+    if (!captureActive(context) || sink == null || !validSymbol(symbol)) return false;
+    synchronized (context.state.emitLock) {
+      if (context.state.closed) return false;
+      flushLine(context);
+      boolean accepted = safeEvent(
+          sink, context.state, context.state.nextEventId(), context.currentParent(),
+          BridgeEventKind.ASYNC_LINK, symbol, 0);
+      if (!accepted) context.state.dropped.incrementAndGet();
       return accepted;
     }
   }
@@ -970,6 +1016,7 @@ public final class BootstrapBridge {
     SINK.set(null);
     ReactorContextBridge.resetForTest();
     WebFluxBridge.resetForTest();
+    ProcessLinkageBridge.resetForTest();
   }
 
   private static boolean safeStart(

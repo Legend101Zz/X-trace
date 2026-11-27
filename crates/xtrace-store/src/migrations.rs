@@ -13,8 +13,9 @@
 //! replay contract appends `v0007_recording_event_cap_sanity_bound` and
 //! `v0008_frame_index_depth_async`; ADR 0011 appends `v0009_recording_limitations`;
 //! session health appends `v0010_session_health`; ADR 0018 appends
-//! `v0011_exercise_provenance`. Migrations remain append-only: later
-//! slices must add a new record instead of editing an applied one.
+//! `v0011_exercise_provenance`; ADR 0019 appends `v0012_process_linkage`.
+//! Migrations remain append-only: later slices must add a new record instead
+//! of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
 //! retried after a crash. The runner wraps every migration in a
@@ -141,6 +142,52 @@ CREATE INDEX exercise_recording_links_project_item
     ON exercise_recording_links(project_id, exercise_item_id);
 ";
 
+/// Parent-child runtime session linkage and explicit correlation gaps (ADR 0019).
+/// Never stores raw argv, environment values, executable paths, or raw tokens.
+const PROCESS_LINKAGE_SCHEMA: &str = "
+CREATE TABLE runtime_session_links (
+    link_id                 BLOB PRIMARY KEY CHECK(length(link_id) = 16),
+    parent_recording_id     BLOB CHECK(parent_recording_id IS NULL OR length(parent_recording_id) = 16)
+                                REFERENCES recordings(recording_id),
+    parent_session_id       BLOB NOT NULL CHECK(length(parent_session_id) = 16),
+    child_recording_id      BLOB CHECK(child_recording_id IS NULL OR length(child_recording_id) = 16)
+                                REFERENCES recordings(recording_id),
+    child_session_id        BLOB CHECK(child_session_id IS NULL OR length(child_session_id) = 16),
+    spawn_kind              TEXT NOT NULL CHECK(spawn_kind IN
+                                ('node_worker', 'node_child_process', 'jvm_fork')),
+    status                  TEXT NOT NULL CHECK(status IN
+                                ('linked', 'uninstrumented_gap', 'correlation_lost')),
+    gap_reason              TEXT CHECK(gap_reason IS NULL OR gap_reason IN
+                                ('child_process_not_instrumented', 'correlation_lost', 'bootstrap_consumed')),
+    correlation_token_hash  BLOB CHECK(correlation_token_hash IS NULL OR length(correlation_token_hash) = 32),
+    created_at_ms           INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    CHECK(parent_recording_id IS NULL OR child_recording_id IS NULL OR parent_recording_id != child_recording_id),
+    CHECK(child_session_id IS NULL OR child_session_id != parent_session_id),
+    CHECK(
+        (status = 'linked' AND child_session_id IS NOT NULL AND gap_reason IS NULL)
+        OR (status = 'uninstrumented_gap' AND child_session_id IS NULL AND child_recording_id IS NULL
+            AND gap_reason IN ('child_process_not_instrumented', 'bootstrap_consumed'))
+        OR (status = 'correlation_lost' AND child_recording_id IS NULL
+            AND gap_reason = 'correlation_lost')
+    )
+) STRICT;
+
+CREATE INDEX runtime_session_links_parent_session
+    ON runtime_session_links(parent_session_id, created_at_ms, link_id);
+
+CREATE INDEX runtime_session_links_parent_recording
+    ON runtime_session_links(parent_recording_id, created_at_ms, link_id)
+    WHERE parent_recording_id IS NOT NULL;
+
+CREATE INDEX runtime_session_links_child_session
+    ON runtime_session_links(child_session_id, link_id)
+    WHERE child_session_id IS NOT NULL;
+
+CREATE INDEX runtime_session_links_child_recording
+    ON runtime_session_links(child_recording_id, link_id)
+    WHERE child_recording_id IS NOT NULL;
+";
+
 /// One declared migration. The body is the SQL to apply.
 #[derive(Clone, Debug)]
 pub struct MigrationRecord {
@@ -211,6 +258,11 @@ impl Migrations {
                 version: 11,
                 label: "v0011_exercise_provenance",
                 statements: &[EXERCISE_PROVENANCE_SCHEMA],
+            },
+            MigrationRecord {
+                version: 12,
+                label: "v0012_process_linkage",
+                statements: &[PROCESS_LINKAGE_SCHEMA],
             },
         ]
     }
@@ -1437,7 +1489,7 @@ mod tests {
             apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v9"),
             Migrations::latest_version()
         );
-        assert_eq!(Migrations::latest_version(), 11);
+        assert_eq!(Migrations::latest_version(), 12);
         assert_ne!(applied_checksum(&conn), v8_checksum, "checksum changes with v9");
         let legacy: i64 = conn
             .query_row(
@@ -1548,7 +1600,10 @@ mod tests {
         insert_project(&conn, &project).expect("project");
         insert_recording(&conn, &recording, &project, &id(0x51), "complete")
             .expect("legacy recording");
-        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("v11"), 11);
+        assert_eq!(
+            apply_pending(&conn, "test", CorrelationId::new()).expect("v11"),
+            Migrations::latest_version()
+        );
         assert_ne!(applied_checksum(&conn), v10_checksum);
         for table in ["exercise_runs", "exercise_items", "exercise_recording_links"] {
             assert!(table_exists(&conn, table), "{table} must exist");
@@ -1616,7 +1671,107 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("reopen v11"), 11);
+        assert_eq!(
+            apply_pending(&conn, "test", CorrelationId::new()).expect("reopen v11"),
+            Migrations::latest_version()
+        );
+    }
+
+    #[test]
+    fn migration_v12_adds_runtime_session_links_and_enforces_constraints() {
+        let conn = new_memory();
+        apply_catalog(&conn, "test", CorrelationId::new(), &Migrations::catalog()[..11])
+            .expect("v11 store");
+        let v11_checksum = applied_checksum(&conn);
+        let project = id(0x31);
+        let parent_rec = id(0x41);
+        let child_rec = id(0x42);
+        let parent_session = id(0x51);
+        let child_session = id(0x52);
+        insert_project(&conn, &project).expect("project");
+        insert_recording(&conn, &parent_rec, &project, &parent_session, "complete")
+            .expect("parent recording");
+        insert_recording(&conn, &child_rec, &project, &child_session, "complete")
+            .expect("child recording");
+
+        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("v12"), 12);
+        assert_ne!(applied_checksum(&conn), v11_checksum);
+        assert!(table_exists(&conn, "runtime_session_links"));
+        assert_eq!(table_count(&conn, "runtime_session_links"), 0);
+        assert_eq!(table_count(&conn, "recordings"), 2);
+
+        let token_hash = [0xab_u8; 32];
+        conn.execute(
+            "INSERT INTO runtime_session_links \
+             (link_id, parent_recording_id, parent_session_id, child_recording_id, child_session_id, \
+              spawn_kind, status, gap_reason, correlation_token_hash, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'node_worker', 'linked', NULL, ?6, 1700000000000)",
+            params![
+                id(0x71).as_slice(),
+                parent_rec.as_slice(),
+                parent_session.as_slice(),
+                child_rec.as_slice(),
+                child_session.as_slice(),
+                token_hash.as_slice(),
+            ],
+        )
+        .expect("valid linked row");
+
+        conn.execute(
+            "INSERT INTO runtime_session_links \
+             (link_id, parent_recording_id, parent_session_id, child_recording_id, child_session_id, \
+              spawn_kind, status, gap_reason, correlation_token_hash, created_at_ms) \
+             VALUES (?1, ?2, ?3, NULL, NULL, 'jvm_fork', 'uninstrumented_gap', 'child_process_not_instrumented', NULL, 1700000000001)",
+            params![id(0x72).as_slice(), parent_rec.as_slice(), parent_session.as_slice()],
+        )
+        .expect("valid uninstrumented gap row");
+
+        // Linked status without child_session_id or with gap_reason must fail.
+        assert!(
+            conn.execute(
+                "INSERT INTO runtime_session_links \
+                 (link_id, parent_recording_id, parent_session_id, child_recording_id, child_session_id, \
+                  spawn_kind, status, gap_reason, correlation_token_hash, created_at_ms) \
+                 VALUES (?1, NULL, ?2, NULL, NULL, 'node_worker', 'linked', NULL, NULL, 1)",
+                params![id(0x73).as_slice(), parent_session.as_slice()],
+            )
+            .is_err()
+        );
+        // Self-link must fail.
+        assert!(
+            conn.execute(
+                "INSERT INTO runtime_session_links \
+                 (link_id, parent_recording_id, parent_session_id, child_recording_id, child_session_id, \
+                  spawn_kind, status, gap_reason, correlation_token_hash, created_at_ms) \
+                 VALUES (?1, NULL, ?2, NULL, ?2, 'node_worker', 'linked', NULL, NULL, 1)",
+                params![id(0x74).as_slice(), parent_session.as_slice()],
+            )
+            .is_err()
+        );
+        // Uninstrumented gap cannot use correlation_lost or supply child_session_id.
+        assert!(
+            conn.execute(
+                "INSERT INTO runtime_session_links \
+                 (link_id, parent_recording_id, parent_session_id, child_recording_id, child_session_id, \
+                  spawn_kind, status, gap_reason, correlation_token_hash, created_at_ms) \
+                 VALUES (?1, NULL, ?2, NULL, NULL, 'node_child_process', 'uninstrumented_gap', 'correlation_lost', NULL, 1)",
+                params![id(0x75).as_slice(), parent_session.as_slice()],
+            )
+            .is_err()
+        );
+        // Unknown recording FK must fail.
+        assert!(
+            conn.execute(
+                "INSERT INTO runtime_session_links \
+                 (link_id, parent_recording_id, parent_session_id, child_recording_id, child_session_id, \
+                  spawn_kind, status, gap_reason, correlation_token_hash, created_at_ms) \
+                 VALUES (?1, ?2, ?3, NULL, NULL, 'jvm_fork', 'correlation_lost', 'correlation_lost', NULL, 1)",
+                params![id(0x76).as_slice(), id(0x99).as_slice(), parent_session.as_slice()],
+            )
+            .is_err()
+        );
+        // Reopen is idempotent at v12.
+        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("reopen v12"), 12);
     }
 
     #[test]

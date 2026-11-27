@@ -117,6 +117,7 @@ public final class AgentRuntime {
       ProxyInstrumentation.install(instrumentation, writer::stopIncomplete, attach);
       ReactorContextInstrumentation.install(instrumentation, limitations::report, attach);
       WebFluxInstrumentation.install(instrumentation, limitations::report, attach);
+      ProcessLinkageInstrumentation.install(instrumentation, limitations::report, attach);
       FixtureInstrumentation.install(
           instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes, limitations);
       if (lineSink != null && !BootstrapBridge.installLineSink(lineSink)) {
@@ -264,6 +265,7 @@ public final class AgentRuntime {
       JerseyInstrumentation.reportCoverageAtShutdown();
       WebFluxInstrumentation.reportCoverageAtShutdown();
       ReactorContextInstrumentation.reportCoverageAtShutdown();
+      ProcessLinkageInstrumentation.reportCoverageAtShutdown();
       if (dev.xtrace.agent.bootstrap.JerseyBridge.takeObservationUnavailable()) {
         System.err.println("{\"code\":\"XTR-JAVA-INSTRUMENTATION\","
             + "\"message\":\"Jersey dispatch identity or route observation unavailable\"}");

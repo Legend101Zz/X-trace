@@ -100,6 +100,7 @@ const CAPABILITY_CONFIG: Record<string, Record<string, string>> = {
   "interactions.pg": { driver: "pg", sanitization: "literals-and-params-redacted" },
   "interactions.mysql": { driver: "mysql,mysql2", sanitization: "literals-and-params-redacted" },
   "interactions.outbound_http": { clients: "node:http,node:https,fetch,undici", sanitization: "host-method-sanitized-path-only" },
+  process_linkage: { boundaries: "worker_threads.Worker,child_process.spawn,child_process.fork,child_process.execFile", env_policy: "no_env_leak_explicit_gap_or_opt_in_link" },
 };
 
 const START_KINDS: Record<CaptureEventKind, RecordingEventKind> = {

@@ -42,6 +42,7 @@ pub mod error;
 pub mod exercise_provenance_store;
 pub mod idempotency_repository;
 pub mod migrations;
+pub mod process_linkage_store;
 pub mod project_repository;
 pub mod recording_port;
 pub mod recording_store;
@@ -57,6 +58,7 @@ pub use error::{StoreError, StoreErrorKind};
 pub use exercise_provenance_store::SqliteExerciseProvenanceStore;
 pub use idempotency_repository::SqliteIdempotencyStore;
 pub use migrations::{MigrationRecord, Migrations};
+pub use process_linkage_store::SqliteProcessLinkageStore;
 pub use project_repository::SqliteProjectRepository;
 pub use recording_port::{SqliteRecordingPersistence, SqliteRecordingReader};
 pub use recording_store::{
