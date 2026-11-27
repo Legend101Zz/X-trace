@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""JHipster sample app campaign harness (PREPARATION, uninstrumented baseline). See petclinic/harness/run.py for usage."""
+"""JHipster sample app campaign harness (baseline + instrumented/overhead/flows). See petclinic/harness/run.py for usage."""
 import concurrent.futures
+import json
+import os
 import pathlib
 import re
+import shlex
 import sys
-import json
+import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
 import xcamp  # noqa: E402
+import xinstr  # noqa: E402
 
 CAMP, PROJ, SRC = xcamp.load_campaign(__file__)
 HERE = pathlib.Path(__file__).resolve()
@@ -31,11 +35,14 @@ def build() -> int:
 def make_stack(run_id: str) -> xcamp.Stack:
     return xcamp.Stack(
         project="jhipster", jdk_image=IMAGE, jar=JAR, run_id=run_id, app_port=8080,
-        app_args=["--spring.profiles.active=prod", "--server.port={APPPORT}"],
+        # Prod suppresses Spring INFO. Boot 4 reports the actual port only after bind;
+        # retain this specific signal for port-zero discovery in host runs.
+        app_args=["--spring.profiles.active=prod", "--server.port={APPPORT}", "--server.address={BINDADDR}",
+                  "--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO"],
         env={"SPRING_DATASOURCE_URL": "jdbc:postgresql://{DBHOST}:{DBPORT}/jhipsterSampleApplication",
              "SPRING_DATASOURCE_USERNAME": "jhipsterSampleApplication", "SPRING_DATASOURCE_PASSWORD": "campaign-synthetic",
              "JHIPSTER_SECURITY_AUTHENTICATION_JWT_BASE64_SECRET": JWT_SECRET},
-        java_opts=["-Xmx1g"], db_name="jhipsterSampleApplication", db_user="jhipsterSampleApplication",
+        java_opts=["-Xmx1g", "-Dxtrace.agent.recordingDiagnostics=true"], db_name="jhipsterSampleApplication", db_user="jhipsterSampleApplication",
         db_password="campaign-synthetic", ready_path="/management/health", ready_timeout=360,
         ready_ok=lambda st, body: st == 200 and '"UP"' in body)
 
@@ -209,6 +216,7 @@ SCENARIOS = [
 
 
 def baseline(out):
+    os.environ.pop("XCAMP_LAUNCH_PREFIX", None)
     return xcamp.run_baseline(project="jhipster", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR),
                               "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
                               "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
@@ -216,5 +224,178 @@ def baseline(out):
                               adaptations=CAMP["configAdaptations"], harness_files=[HERE])
 
 
+CRUD = "org.springframework.data.repository.CrudRepository"
+LIST_CRUD = "org.springframework.data.repository.ListCrudRepository"
+PAGING_REPO = "org.springframework.data.repository.PagingAndSortingRepository"
+JPA_REPO = "org.springframework.data.jpa.repository.JpaRepository"
+REPO_BASES = [CRUD, LIST_CRUD, PAGING_REPO, JPA_REPO]
+AUTH_HINTS = {"controller": "AuthenticateController"}
+USER_HINTS = {"service": "UserService", "repository": ["UserRepository", *REPO_BASES]}
+BANK_HINTS = {"controller": "BankAccountResource", "repository": ["BankAccountRepository", *REPO_BASES]}
+LABEL_HINTS = {"controller": "LabelResource", "repository": ["LabelRepository", *REPO_BASES]}
+OP_HINTS = {"controller": "OperationResource", "repository": ["OperationRepository", *REPO_BASES]}
+
+EXPECT = {
+    "anonymous-and-invalid-login-denied": [
+        # Pre-dispatch Spring Security 401s occur in the servlet filter chain before any controller frame.
+        {"method": "GET", "route": "/api/bank-accounts", "status": 401, "layers": [], "sourceOptional": True,
+         "preDispatch": True},
+        {"method": "GET", "route": "/api/admin/users", "status": 401, "layers": [], "sourceOptional": True,
+         "preDispatch": True},
+        {"method": "POST", "route": "/api/authenticate", "status": 401, "layers": ["controller"],
+         "layerHints": AUTH_HINTS},
+    ],
+    "admin-and-user-authentication": [
+        {"method": "POST", "route": "/api/authenticate", "statuses": [200, 200], "layers": ["controller"],
+         "layerHints": AUTH_HINTS},
+        {"method": "GET", "route": "/api/account", "status": 200, "layers": ["controller", "service", "repository"],
+         "layerHints": {"controller": "AccountResource", **USER_HINTS}},
+        {"method": "GET", "route": "/api/admin/users", "status": 200,
+         "layers": ["controller", "service", "repository"],
+         "layerHints": {"controller": "UserResource", **USER_HINTS}},
+        # Pre-dispatch Spring Security 403 for ROLE_USER occurs in the filter chain before UserResource.
+        {"method": "GET", "route": "/api/admin/users", "status": 403, "layers": [], "sourceOptional": True,
+         "preDispatch": True},
+    ],
+    "account-create-read-roundtrip": [
+        {"method": "POST", "route": "/api/authenticate", "status": 200, "layers": ["controller"],
+         "layerHints": AUTH_HINTS},
+        {"method": "POST", "route": "/api/bank-accounts", "status": 201, "layers": ["controller", "repository"],
+         "layerHints": BANK_HINTS},
+        {"method": "GET", "route": "/api/bank-accounts/{id}", "status": 200, "layers": ["controller", "repository"],
+         "layerHints": BANK_HINTS},
+    ],
+    "account-validation-errors": [
+        {"method": "POST", "route": "/api/authenticate", "status": 200, "layers": ["controller"],
+         "layerHints": AUTH_HINTS},
+        {"method": "POST", "route": "/api/bank-accounts", "statuses": [400, 400, 415], "layers": ["controller"],
+         "layerHints": {"controller": "BankAccountResource"}},
+    ],
+    "account-update-and-missing": [
+        {"method": "POST", "route": "/api/authenticate", "status": 200, "layers": ["controller"],
+         "layerHints": AUTH_HINTS},
+        {"method": "PUT", "route": "/api/bank-accounts/{id}", "statuses": [200, 400], "layers": ["controller", "repository"],
+         "layerHints": BANK_HINTS},
+        {"method": "GET", "route": "/api/bank-accounts/{id}", "status": 200, "layers": ["controller", "repository"],
+         "layerHints": BANK_HINTS},
+    ],
+    "operation-with-relations": [
+        {"method": "POST", "route": "/api/authenticate", "status": 200, "layers": ["controller"],
+         "layerHints": AUTH_HINTS},
+        {"method": "POST", "route": "/api/labels", "status": 201, "layers": ["controller", "repository"],
+         "layerHints": LABEL_HINTS},
+        {"method": "POST", "route": "/api/operations", "status": 201, "layers": ["controller", "repository"],
+         "layerHints": OP_HINTS},
+        {"method": "GET", "route": "/api/operations/{id}", "status": 200, "layers": ["controller", "repository"],
+         "layerHints": OP_HINTS},
+    ],
+    "concurrent-isolation": [
+        {"method": "POST", "route": "/api/authenticate", "status": 200, "layers": ["controller"],
+         "layerHints": AUTH_HINTS, "minCount": 13},
+        {"method": "POST", "route": "/api/bank-accounts", "status": 201, "layers": ["controller"],
+         "layerHints": {"controller": "BankAccountResource"}, "minCount": 12},
+        {"method": "GET", "route": "/api/bank-accounts/{id}", "status": 200, "layers": ["controller"],
+         "layerHints": {"controller": "BankAccountResource"}, "minCount": 12},
+        {"method": "GET", "route": "/api/account", "status": 200, "layers": ["controller"],
+         "layerHints": {"controller": "AccountResource"}, "minCount": 12},
+    ],
+    "delete-and-not-found": [
+        {"method": "POST", "route": "/api/authenticate", "status": 200, "layers": ["controller"],
+         "layerHints": AUTH_HINTS},
+        {"method": "DELETE", "route": "/api/operations/{id}", "status": 204, "layers": ["controller", "repository"],
+         "layerHints": OP_HINTS},
+        {"method": "GET", "route": "/api/operations/{id}", "status": 404, "layers": ["controller", "repository"],
+         "layerHints": OP_HINTS},
+        {"method": "DELETE", "route": "/api/labels/{id}", "status": 204, "layers": ["controller", "repository"],
+         "layerHints": LABEL_HINTS},
+        {"method": "GET", "route": "/api/bank-accounts/{id}", "status": 404, "layers": ["controller", "repository"],
+         "layerHints": BANK_HINTS},
+    ],
+}
+
+APP_PACKAGE = "io.github.jhipster.sample"
+SOURCE_ROOT = "src/main/java"
+
+
+def instrumented(out: pathlib.Path | None = None, baseline_receipt: pathlib.Path | None = None) -> int:
+    """One reset-to-finish run with the app launched by the PACKAGED `xtrace run`, then judged through the read API."""
+    need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
+    missing = [k for k, v in need.items() if not v]
+    if missing or os.environ.get("XCAMP_APP_MODE") != "host":
+        print("instrumented needs XCAMP_APP_MODE=host and " + ", ".join(missing or ["(all set)"]))
+        return 2
+    xtrace, agent = need["XCAMP_XTRACE"], need["XCAMP_AGENT"]
+    os.environ["XCAMP_LAUNCH_PREFIX"] = " ".join(shlex.quote(x) for x in
+        [xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent,
+         "--app-package", APP_PACKAGE, "--source-root", SOURCE_ROOT, "--"])
+    canaries = None
+    if os.environ.get("XCAMP_CANARY_FILE"):
+        canaries = json.loads(pathlib.Path(os.environ["XCAMP_CANARY_FILE"]).read_text())
+    n = 1
+    while (PROJ / f"instrumented-{n}").exists():
+        n += 1
+    out = out or PROJ / f"instrumented-{n}"
+    baseline_receipt = baseline_receipt or (pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]) if os.environ.get("XCAMP_BASELINE_RECEIPT") else None)
+    r = xinstr.run_instrumented(
+        project="jhipster", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR), "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
+                                  "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
+        make_stack=make_stack, scenarios=SCENARIOS, out_dir=out, norm_extra=[], expectations=EXPECT, xtrace=xtrace,
+        project_dir=SRC, data_home=pathlib.Path(need["XCAMP_DATA_HOME"]), adaptations=CAMP["configAdaptations"],
+        canaries=canaries, baseline_receipt=baseline_receipt, harness_files=[HERE, pathlib.Path(xinstr.__file__)],
+        extra_canary_paths=[("POST", "/api/authenticate")], skip_canary_auth_paths=("/api/authenticate",))
+    print(json.dumps({"result": r["result"], "api": r["api"], "problemClasses": r["problemClasses"]}))
+    return 0 if r["result"] == "recorded" else 1
+
+
+def overhead() -> int:
+    """Five fresh baseline/instrumented pairs, in that order; no retry of a failed repeat."""
+    root = pathlib.Path(os.environ["XCAMP_OVERHEAD_DIR"])
+    root.mkdir(parents=True, exist_ok=False)
+    runs = []
+    manifest = root / "runs.json"
+    for repeat in range(5):
+        baseline_receipt = root / f"baseline-{repeat}" / "receipt.json"
+        for mode in ("baseline", "instrumented"):
+            dest = root / f"{mode}-{repeat}"
+            started = time.time_ns()
+            if mode == "baseline":
+                result = baseline(dest)
+                rc = 0 if result["result"] == "passed_baseline_only" else 1
+            else:
+                rc = instrumented(dest, baseline_receipt)
+            runs.append({"mode": mode, "repeat": repeat, "startedNs": started, "finishedNs": time.time_ns(),
+                         "receiptPath": str((dest / "receipt.json").resolve()), "exitCode": rc})
+            manifest.write_text(json.dumps({"runs": runs}, indent=1, sort_keys=True) + "\n")
+            if rc != 0:
+                return rc
+    return 0
+
+
+def flows() -> int:
+    """Lifecycle and focused-capture flows (record/stop, restart, interrupted recording, lines, values); writes flows-<n>/flows.json."""
+    need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
+    missing = [k for k, v in need.items() if not v]
+    if missing or os.environ.get("XCAMP_APP_MODE") != "host":
+        print("flows needs XCAMP_APP_MODE=host and " + ", ".join(missing or ["(all set)"]))
+        return 2
+    import xflows
+    n = 1
+    while (PROJ / f"flows-{n}").exists():
+        n += 1
+    out = PROJ / f"flows-{n}"
+    out.mkdir(parents=True)
+    results = xflows.Flows(xtrace=need["XCAMP_XTRACE"], agent=need["XCAMP_AGENT"], project_dir=SRC,
+                           data_home=pathlib.Path(need["XCAMP_DATA_HOME"]), out_dir=out, make_stack=make_stack,
+                           app_package=APP_PACKAGE, source_root=SOURCE_ROOT, project="jhipster").run_all()
+    (out / "flows.json").write_text(json.dumps({"schemaVersion": 1, "kind": "campaign_flows", "steps": results}, indent=1, sort_keys=True))
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "overhead":
+        sys.exit(overhead())
+    if len(sys.argv) > 1 and sys.argv[1] == "instrumented":
+        sys.exit(instrumented())
+    if len(sys.argv) > 1 and sys.argv[1] == "flows":
+        sys.exit(flows())
     sys.exit(xcamp.main_cli("jhipster", build, baseline, PROJ))

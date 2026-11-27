@@ -409,6 +409,27 @@ class Artifacts(unittest.TestCase):
             report = json.loads((root / "out/recordings-per-scenario.json").read_text())
             self.assertEqual(report["recordings"][0]["recordingId"], RID)
 
+    def test_project_routes_and_packages_cover_jhipster_and_fineract_without_echoing_unknowns(self):
+        cases = (
+            ("jhipster", "/api/bank-accounts/{id}", "/api/bank-accounts/99",
+             "io.github.jhipster.sample.web.rest.BankAccountResource.getBankAccount", "controller",
+             "io.github.jhipster.sample.repository.BankAccountRepository.findById", "repository"),
+            ("fineract", "/fineract-provider/api/v1/clients/{clientId}", "/fineract-provider/api/v1/clients/42",
+             "org.apache.fineract.portfolio.client.api.ClientsApiResource.retrieveOne", "controller",
+             "org.apache.fineract.portfolio.client.service.ClientWritePlatformServiceJpaRepositoryImpl.createClient", "service"),
+        )
+        for project, good_route, raw_route, sym_a, layer_a, sym_b, layer_b in cases:
+            with self.subTest(project=project):
+                self.assertEqual(cd.safe_symbol("http.request GET " + good_route, project=project),
+                                 "http.request GET " + good_route)
+                self.assertIsNone(cd.safe_symbol("http.request GET " + raw_route, project=project))
+                self.assertIsNone(cd.safe_symbol("http.request GET /owners/{ownerId}", project=project))
+                self.assertEqual(cd.safe_symbol(sym_a, project=project),
+                                 f"withheld:{layer_a}:sha256:" + hashlib.sha256(sym_a.encode()).hexdigest())
+                self.assertEqual(cd.safe_symbol(sym_b, project=project),
+                                 f"withheld:{layer_b}:sha256:" + hashlib.sha256(sym_b.encode()).hexdigest())
+        self.assertEqual(cd.ROUTES, cd.project_config("petclinic")[0])
+
 
 class Workflow(unittest.TestCase):
     def test_diagnostics_run_before_scanning_and_are_in_the_exact_upload_tree(self):

@@ -24,9 +24,11 @@ export interface AuthenticatedXtpSession {
   readonly runtimeSessionId: Uint8Array;
   /** Negotiated maximum length of one encoded protobuf envelope. */
   readonly maxEnvelopeBytes: number;
+  /** Negotiated maximum events per EventBatch envelope. */
+  readonly maxBatchEvents: number;
   /**
    * Sends one envelope in invocation order and waits for its contiguous Staged acknowledgement.
-   * Up to 64 send calls may be pending at once.
+   * Up to 256 send calls may be pending at once.
    * @param messageId Stable non-empty ID for the outgoing envelope.
    * @param payload Generated Protobuf payload; callers cannot supply wire bytes.
    * @param correlationToken Optional opaque correlation token.
@@ -150,7 +152,9 @@ export async function openXtpSession(
     let closing = false;
     let closed = false;
     let closePromise: Promise<void> | undefined;
-    const sendQueue = new BoundedSendQueue(64);
+    // Headroom above DEFAULT_MAX_ACTIVE_RECORDINGS (256) so 256 concurrent hold-start releases
+    // plus in-flight finish/health frames cannot saturate the bounded send queue.
+    const sendQueue = new BoundedSendQueue(512);
     async function send(
       messageId: string,
       payload: AgentEnvelope["payload"],
@@ -196,6 +200,7 @@ export async function openXtpSession(
       protocolMinor: daemonHello.protocolMinor,
       runtimeSessionId,
       maxEnvelopeBytes: maxBytes,
+      maxBatchEvents: daemonHello.maxBatchEvents,
       send,
       async close() {
         if (closePromise) return closePromise;

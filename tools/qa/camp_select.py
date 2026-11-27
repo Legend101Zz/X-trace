@@ -41,7 +41,8 @@ def matrix(repo: pathlib.Path, names: list[str]) -> dict:
         kind = "java" if name in JAVA else "node"
         camp = json.loads((repo / "campaigns" / kind / name / "campaign.json").read_text())
         up = camp["upstream"]
-        entry = {"project": name, "kind": kind, "sha": up["sha"], "url": up["canonicalUrl"]}
+        entry = {"project": name, "kind": kind, "sha": up["sha"], "url": up["canonicalUrl"],
+                 "tag": up.get("stableTag") or ""}
         if kind == "java":
             entry["jdk"] = int(camp["runtime"]["jdk"])
             entry["buildCommand"] = camp["build"]["command"]

@@ -3,9 +3,13 @@ import https = require("node:https");
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { bindRequest, captureSuppressed, createContext, finishContext, recordEvent, resolveRoute, runInContext, type RecordingContext } from "./runtime/context.cjs";
 import { events, type CaptureEvent, type CaptureEventKind } from "./runtime/events.cjs";
-import { createHttpCaptureTransport, type HttpCaptureTransport } from "./runtime/transport.cjs";
+import {
+  createHttpCaptureTransport,
+  installProcessShutdownHooks,
+  type HttpCaptureTransport,
+} from "./runtime/transport.cjs";
 
-export { createHttpCaptureTransport, type HttpCaptureTransport };
+export { createHttpCaptureTransport, installProcessShutdownHooks, type HttpCaptureTransport };
 export type { CaptureEvent };
 export type HttpCaptureEventKind = CaptureEventKind;
 

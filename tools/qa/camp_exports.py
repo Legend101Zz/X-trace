@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan the Spring MVC catalog, then export and judge all developer formats, including the bundle.
+"""Scan the catalog (Spring MVC or JAX-RS), then export and judge all developer formats, including the bundle.
 
   camp_exports.py --xtrace BIN --project-dir DIR --analyzer BIN --out DIR --file SUMMARY --project P
 
@@ -39,14 +39,21 @@ def judge(results: dict[str, tuple[int, int]]) -> tuple[str, str]:
     return "pass", "all formats exported and wrote output: " + ",".join(results)
 
 
-def judge_scan(code: int, doc: dict) -> tuple[str, str]:
+def _framework_label(framework: str) -> str:
+    return {"spring-mvc": "Spring MVC", "jaxrs": "JAX-RS"}.get(framework, framework)
+
+
+def judge_scan(code: int, doc: dict, framework: str = "spring-mvc") -> tuple[str, str]:
     data = doc.get("data", doc)
+    label = _framework_label(framework)
+    if code == 9:
+        return "not-implemented", f"{label} scan exited 9 (not implemented in this build); exports not attempted"
     if code != 0:
-        return "fail", f"Spring MVC scan exited {code}; exports not attempted"
+        return "fail", f"{label} scan exited {code}; exports not attempted"
     if not isinstance(data, dict) or data.get("persisted") is not True or not data.get("catalogRevisionId") or not \
             isinstance(data.get("result"), dict) or not data["result"].get("operations"):
         return "fail", "scan produced no persisted catalog with operations; exports not attempted"
-    return "pass", "Spring MVC analyzer persisted a catalog with operations"
+    return "pass", f"{label} analyzer persisted a catalog with operations"
 
 
 def judge_bundle(dest: pathlib.Path, catalog: dict, counts: dict[str, int]) -> tuple[str, str]:
@@ -115,24 +122,28 @@ def judge_bundle(dest: pathlib.Path, catalog: dict, counts: dict[str, int]) -> t
         return "fail", "bundle contents, inventory, catalog revision or operation counts could not be verified"
 
 
-def run_exports(xtrace: str, project_dir: str, analyzer: str, out: pathlib.Path) -> list[tuple[str, str, str]]:
+def run_exports(xtrace: str, project_dir: str, analyzer: str, out: pathlib.Path,
+                source_root: str = "src/main/java", framework: str = "spring-mvc") -> list[tuple[str, str, str]]:
     """Scan before exporting. Never count pre-existing output as evidence from this invocation."""
     out.mkdir(parents=True, exist_ok=True)
+    label = _framework_label(framework)
     try:
         scan = subprocess.run([xtrace, "scan", "--project-dir", project_dir,
-                               "--source", str(pathlib.Path(project_dir) / "src/main/java"),
-                               "--framework", "spring-mvc", "--analyzer", analyzer, "--json"],
+                               "--source", str(pathlib.Path(project_dir) / source_root),
+                               "--framework", framework, "--analyzer", analyzer, "--json"],
                               capture_output=True, text=True, timeout=320)
+        raw_doc = scan.stdout if (scan.stdout or "").strip() else (scan.stderr or "")
         try:
-            doc = json.loads(scan.stdout)
+            doc = json.loads(raw_doc)
         except ValueError:
             doc = {}
-        status, note = judge_scan(scan.returncode, doc if isinstance(doc, dict) else {})
+        status, note = judge_scan(scan.returncode, doc if isinstance(doc, dict) else {}, framework=framework)
     except (OSError, subprocess.SubprocessError):
-        status, note = "fail", "Spring MVC scan could not complete; exports not attempted"
+        status, note = "fail", f"{label} scan could not complete; exports not attempted"
     steps = [("export-catalog-scan", status, note)]
     if status != "pass":
-        return steps + [(f"export-{fmt}", "fail", note) for fmt in ALL_FORMATS] + [("export-formats", "fail", note)]
+        downstream = "not-implemented" if status == "not-implemented" else "fail"
+        return steps + [(f"export-{fmt}", downstream, note) for fmt in ALL_FORMATS] + [("export-formats", downstream, note)]
     results = {}
     counts = {}
     bundle_ok = False
@@ -176,8 +187,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     for n in ("xtrace", "project-dir", "analyzer", "out", "file", "project"):
         ap.add_argument(f"--{n}", required=True)
+    ap.add_argument("--source-root", default="src/main/java")
+    ap.add_argument("--framework", default="spring-mvc")
     a = ap.parse_args()
-    for name, status, note in run_exports(a.xtrace, a.project_dir, a.analyzer, pathlib.Path(a.out)):
+    for name, status, note in run_exports(a.xtrace, a.project_dir, a.analyzer, pathlib.Path(a.out),
+                                          source_root=a.source_root, framework=a.framework):
         cs.record(pathlib.Path(a.file), a.project, name, status, note)
         print(f"campaign step {name}: {status} ({note})")
     return 0

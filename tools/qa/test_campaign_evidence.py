@@ -41,10 +41,10 @@ class WorkflowEvidence(unittest.TestCase):
         self.assertIn("--require standard-artifacts:1", text)
         self.assertIn('--loc "standard-artifacts=${FLOWS_DIR:-/nonexistent}/api-standard"', text)
         self.assertIn("--require overhead-artifacts:1", text)
-        self.assertIn('--loc "overhead-artifacts=$CAMP_ROOT/java/petclinic/overhead"', text)
+        self.assertIn('--loc "overhead-artifacts=$CAMP_ROOT/java/$CAMP_PROJECT/overhead"', text)
         flows = text[text.index("      - name: Product flows,"):text.index("      - name: Privacy canary scan")]
         self.assertIn('export XCAMP_CANARY_FILE="$RUNNER_TEMP/priv/canaries.json"', flows)
-        self.assertIn('camp_overhead.py --manifest "$CAMP_ROOT/java/petclinic/overhead/runs.json"', text)
+        self.assertIn('camp_overhead.py --manifest "$CAMP_ROOT/java/$CAMP_PROJECT/overhead/runs.json"', text)
 
 
 if __name__ == "__main__":

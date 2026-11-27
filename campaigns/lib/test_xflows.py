@@ -734,6 +734,73 @@ class Drivers(unittest.TestCase):
         self.assertIn("stop was not invoked", flow.results["partial-recording-reopen"]["note"])
         flow._record.assert_called_once_with()
 
+    def test_non_petclinic_flow_configs_parameterize_auth_table_locks_and_probes(self):
+        import urllib.parse
+        import xcamp
+        from tools.qa import canary
+        canaries = canary.make_canaries()
+        for project, table, expected_auth_substr in (
+                ("jhipster", "bank_account", "Bearer tok-123"),
+                ("fineract", "m_client", "Basic "),
+        ):
+            with self.subTest(project=project):
+                cfg = xflows.flow_config_for(project)
+                flow = self.flow()
+                flow.project = project
+                flow.flow_config = cfg
+                flow._stack.return_value.hold_table_writes = Mock(side_effect=nullcontext)
+                flow._record = Mock(side_effect=[(0, self.armed(), "/bootstrap.json"), (0, {}, "")])
+                proc = flow._stack.return_value._proc
+                proc.pid = 71
+                proc.poll.return_value = None
+                stalled_method, stalled_route = cfg["partial"]["stalled"]
+
+                def show(args, **kwargs):
+                    if args[2] == "list":
+                        return self.result({"recordings": [{"recording_id": "held", "status": "recording"}], "next_after": None})
+                    detail = rec(stalled_method, stalled_route)
+                    detail["status"] = "recording"
+                    return self.result(detail)
+
+                ctl_m, ctl_r = cfg["partial"]["control_routes"][0]
+                details = {"ctl": rec(ctl_m, ctl_r), "held": rec(stalled_method, stalled_route, "partial", evidence=["interrupted"])}
+                with patch.object(xcamp, "http_request", return_value={"status": 200, "body": b'{"id_token":"tok-123"}'}) as http, \
+                        patch.object(xflows.time, "sleep"), \
+                        patch.object(xflows.socket, "create_connection") as connect, \
+                        patch.object(xflows.subprocess, "run", side_effect=show), \
+                        patch.object(xflows.time, "monotonic", side_effect=[0, 0]), \
+                        patch.object(xflows.os, "kill"), \
+                        patch.object(xflows, "read_api", side_effect=[self.api({}), self.api(details)]):
+                    flow.partial()
+                self.assertEqual(flow.results["partial-recording-reopen"]["status"], "pass")
+                flow._stack.return_value.hold_table_writes.assert_called_once_with(table)
+                flow._stack.return_value.hold_owner_writes.assert_not_called()
+                payload = connect.return_value.sendall.call_args.args[0].decode()
+                self.assertIn(expected_auth_substr, payload)
+                self.assertTrue(any(c.args[2].startswith(cfg["partial"]["controls"][0].split("?")[0]) for c in http.call_args_list))
+
+                # Focused and standard probes exercise the project's routes and preserve auth headers.
+                observe = Mock()
+                marker = "XTplain.0123456789abcdef"
+                with patch.object(xcamp, "http_request", return_value={"status": 200, "body": b'{"id_token":"tok-123"}'}) as http:
+                    served = xflows._project_focused_requests(cfg, "http://127.0.0.1:8000", canaries, observe, marker)
+                self.assertEqual(set(served), set(cfg["focused"]))
+                self.assertEqual(list(served.values()), [200] * len(cfg["focused"]))
+                if project == "jhipster":
+                    auth_call = http.call_args_list[0]
+                    self.assertNotIn("Authorization", auth_call.kwargs["headers"])
+                    secret_call = http.call_args_list[4]
+                    self.assertEqual(secret_call.kwargs["headers"]["Authorization"], "Bearer tok-123")
+                    self.assertIn(canaries["json-body-password"], secret_call.kwargs["body"].decode())
+                else:
+                    secret_call = http.call_args_list[4]
+                    self.assertEqual(secret_call.kwargs["headers"]["Fineract-Platform-TenantId"], "default")
+                    self.assertTrue(secret_call.kwargs["headers"]["Authorization"].startswith("Basic "))
+                    self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(secret_call.args[2]).query)["lastName"],
+                                     [canaries["focused-business-secret"]])
+                self.assertTrue(cfg["extra_canary_paths"], f"{project} must declare extra_canary_paths for auth/password canaries")
+        self.assertEqual(xflows.flow_config_for("petclinic")["extra_canary_paths"], ())
+
 
 if __name__ == "__main__":
     unittest.main()

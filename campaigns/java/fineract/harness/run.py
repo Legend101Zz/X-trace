@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Apache Fineract campaign harness (PREPARATION, uninstrumented baseline). See petclinic/harness/run.py for usage."""
+"""Apache Fineract campaign harness (baseline + instrumented/overhead/flows). See petclinic/harness/run.py for usage."""
 import base64
 import concurrent.futures
 import json
+import os
 import pathlib
+import shlex
 import sys
+import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
 import xcamp  # noqa: E402
+import xinstr  # noqa: E402
 
 CAMP, PROJ, SRC = xcamp.load_campaign(__file__)
 HERE = pathlib.Path(__file__).resolve()
@@ -47,7 +51,7 @@ def make_stack(run_id: str) -> xcamp.Stack:
              "FINERACT_DEFAULT_TENANTDB_HOSTNAME": "{DBHOST}", "FINERACT_DEFAULT_TENANTDB_PORT": "{DBPORT}",
              "FINERACT_DEFAULT_TENANTDB_NAME": "fineract_default",
              "FINERACT_DEFAULT_TENANTDB_UID": "root", "FINERACT_DEFAULT_TENANTDB_PWD": "postgres"},
-        java_opts=["-Xmx2g"], db_name="fineract_tenants", effect_db="fineract_default", db_user="root", db_password="postgres",
+        java_opts=["-Xmx2g", "-Dxtrace.agent.recordingDiagnostics=true"], db_name="fineract_tenants", effect_db="fineract_default", db_user="root", db_password="postgres",
         extra_db_init=["CREATE DATABASE fineract_default"], ready_timeout=900,
         ready_path="/fineract-provider/actuator/health", ready_ok=lambda st, body: st == 200 and '"UP"' in body)
 
@@ -204,6 +208,7 @@ SCENARIOS = [
 
 
 def baseline(out):
+    os.environ.pop("XCAMP_LAUNCH_PREFIX", None)
     return xcamp.run_baseline(project="fineract", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR),
                               "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
                               "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
@@ -211,5 +216,166 @@ def baseline(out):
                               adaptations=CAMP["configAdaptations"], harness_files=[HERE])
 
 
+CRUD = "org.springframework.data.repository.CrudRepository"
+JPA_REPO = "org.springframework.data.jpa.repository.JpaRepository"
+OFFICE_READ = {
+    "controller": "OfficesApiResource",
+    "service": ["OfficeReadPlatformServiceImpl", "OfficeReadPlatformService"],
+}
+CLIENT_READ = {
+    "controller": "ClientsApiResource",
+    "service": ["ClientReadPlatformServiceImpl", "ClientReadPlatformService"],
+}
+CLIENT_WRITE_SERVICES = [
+    "PortfolioCommandSourceWritePlatformServiceImpl",
+    "SynchronousCommandProcessingService",
+    "ClientWritePlatformServiceJpaRepositoryImpl",
+]
+CLIENT_WRITE = {
+    "controller": "ClientsApiResource",
+    "service": CLIENT_WRITE_SERVICES,
+    "repository": ["ClientRepository", "ClientRepositoryWrapper", "PortfolioCommandSourceRepository", CRUD, JPA_REPO],
+}
+
+EXPECT = {
+    "denied-without-valid-credentials": [
+        # Pre-dispatch Spring Security BasicAuthenticationFilter 401s occur before Jersey dispatch (sendError(401)).
+        {"method": "GET", "route": f"{BASE}/clients", "statuses": [401, 401], "layers": [], "sourceOptional": True,
+         "preDispatch": True, "allowUnobserved": True},
+        {"method": "POST", "route": f"{BASE}/clients", "status": 401, "layers": [], "sourceOptional": True,
+         "preDispatch": True, "allowUnobserved": True},
+    ],
+    "authenticated-seed-read": [
+        {"method": "GET", "route": f"{BASE}/offices", "status": 200, "layers": ["controller", "service"],
+         "layerHints": OFFICE_READ},
+        {"method": "GET", "route": f"{BASE}/offices/{{officeId}}", "status": 200, "layers": ["controller", "service"],
+         "layerHints": OFFICE_READ},
+        {"method": "GET", "route": f"{BASE}/clients", "status": 200, "layers": ["controller", "service"],
+         "layerHints": CLIENT_READ},
+    ],
+    "client-create-read-roundtrip": [
+        {"method": "POST", "route": f"{BASE}/clients", "status": 200, "layers": ["controller", "service", "repository"],
+         "layerHints": CLIENT_WRITE},
+        {"method": "GET", "route": f"{BASE}/clients/{{clientId}}", "status": 200, "layers": ["controller", "service"],
+         "layerHints": CLIENT_READ},
+    ],
+    "client-validation-errors": [
+        {"method": "POST", "route": f"{BASE}/clients", "statuses": [400, 404, 415], "layers": ["controller", "service"],
+         "layerHints": {"controller": "ClientsApiResource", "service": CLIENT_WRITE_SERVICES}},
+    ],
+    "client-update": [
+        {"method": "PUT", "route": f"{BASE}/clients/{{clientId}}", "status": 200,
+         "layers": ["controller", "service", "repository"], "layerHints": CLIENT_WRITE},
+        {"method": "GET", "route": f"{BASE}/clients/{{clientId}}", "status": 200, "layers": ["controller", "service"],
+         "layerHints": CLIENT_READ},
+    ],
+    "client-activate-command": [
+        {"method": "POST", "route": f"{BASE}/clients/{{clientId}}", "statuses": [200, 403],
+         "layers": ["controller", "service", "repository"], "layerHints": CLIENT_WRITE},
+        {"method": "GET", "route": f"{BASE}/clients/{{clientId}}", "status": 200, "layers": ["controller", "service"],
+         "layerHints": CLIENT_READ},
+    ],
+    "concurrent-isolation": [
+        {"method": "POST", "route": f"{BASE}/clients", "status": 200, "layers": ["controller"],
+         "layerHints": {"controller": "ClientsApiResource"}, "minCount": 12},
+        {"method": "GET", "route": f"{BASE}/clients/{{clientId}}", "status": 200, "layers": ["controller"],
+         "layerHints": {"controller": "ClientsApiResource"}, "minCount": 12},
+        {"method": "GET", "route": f"{BASE}/offices/{{officeId}}", "status": 200, "layers": ["controller"],
+         "layerHints": {"controller": "OfficesApiResource"}, "minCount": 16},
+    ],
+    "delete-and-not-found": [
+        {"method": "POST", "route": f"{BASE}/clients", "status": 200,
+         "layers": ["controller", "service", "repository"], "layerHints": CLIENT_WRITE},
+        {"method": "DELETE", "route": f"{BASE}/clients/{{clientId}}", "statuses": [200, 403],
+         "layers": ["controller", "service", "repository"], "layerHints": CLIENT_WRITE},
+        {"method": "GET", "route": f"{BASE}/clients/{{clientId}}", "statuses": [404, 404],
+         "layers": ["controller", "service"], "layerHints": CLIENT_READ},
+    ],
+}
+
+APP_PACKAGE = "org.apache.fineract"
+SOURCE_ROOT = "fineract-provider/src/main/java"
+
+
+def instrumented(out: pathlib.Path | None = None, baseline_receipt: pathlib.Path | None = None) -> int:
+    """One reset-to-finish run with the app launched by the PACKAGED `xtrace run`, then judged through the read API."""
+    need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
+    missing = [k for k, v in need.items() if not v]
+    if missing or os.environ.get("XCAMP_APP_MODE") != "host":
+        print("instrumented needs XCAMP_APP_MODE=host and " + ", ".join(missing or ["(all set)"]))
+        return 2
+    xtrace, agent = need["XCAMP_XTRACE"], need["XCAMP_AGENT"]
+    os.environ["XCAMP_LAUNCH_PREFIX"] = " ".join(shlex.quote(x) for x in
+        [xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent,
+         "--app-package", APP_PACKAGE, "--source-root", SOURCE_ROOT, "--"])
+    canaries = None
+    if os.environ.get("XCAMP_CANARY_FILE"):
+        canaries = json.loads(pathlib.Path(os.environ["XCAMP_CANARY_FILE"]).read_text())
+    n = 1
+    while (PROJ / f"instrumented-{n}").exists():
+        n += 1
+    out = out or PROJ / f"instrumented-{n}"
+    baseline_receipt = baseline_receipt or (pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]) if os.environ.get("XCAMP_BASELINE_RECEIPT") else None)
+    r = xinstr.run_instrumented(
+        project="fineract", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR), "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
+                                  "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
+        make_stack=make_stack, scenarios=SCENARIOS, out_dir=out, norm_extra=NORM, expectations=EXPECT, xtrace=xtrace,
+        project_dir=SRC, data_home=pathlib.Path(need["XCAMP_DATA_HOME"]), adaptations=CAMP["configAdaptations"],
+        canaries=canaries, baseline_receipt=baseline_receipt, harness_files=[HERE, pathlib.Path(xinstr.__file__)],
+        extra_canary_paths=[("POST", f"{BASE}/clients")])
+    print(json.dumps({"result": r["result"], "api": r["api"], "problemClasses": r["problemClasses"]}))
+    return 0 if r["result"] == "recorded" else 1
+
+
+def overhead() -> int:
+    """Five fresh baseline/instrumented pairs, in that order; no retry of a failed repeat."""
+    root = pathlib.Path(os.environ["XCAMP_OVERHEAD_DIR"])
+    root.mkdir(parents=True, exist_ok=False)
+    runs = []
+    manifest = root / "runs.json"
+    for repeat in range(5):
+        baseline_receipt = root / f"baseline-{repeat}" / "receipt.json"
+        for mode in ("baseline", "instrumented"):
+            dest = root / f"{mode}-{repeat}"
+            started = time.time_ns()
+            if mode == "baseline":
+                result = baseline(dest)
+                rc = 0 if result["result"] == "passed_baseline_only" else 1
+            else:
+                rc = instrumented(dest, baseline_receipt)
+            runs.append({"mode": mode, "repeat": repeat, "startedNs": started, "finishedNs": time.time_ns(),
+                         "receiptPath": str((dest / "receipt.json").resolve()), "exitCode": rc})
+            manifest.write_text(json.dumps({"runs": runs}, indent=1, sort_keys=True) + "\n")
+            if rc != 0:
+                return rc
+    return 0
+
+
+def flows() -> int:
+    """Lifecycle and focused-capture flows (record/stop, restart, interrupted recording, lines, values); writes flows-<n>/flows.json."""
+    need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
+    missing = [k for k, v in need.items() if not v]
+    if missing or os.environ.get("XCAMP_APP_MODE") != "host":
+        print("flows needs XCAMP_APP_MODE=host and " + ", ".join(missing or ["(all set)"]))
+        return 2
+    import xflows
+    n = 1
+    while (PROJ / f"flows-{n}").exists():
+        n += 1
+    out = PROJ / f"flows-{n}"
+    out.mkdir(parents=True)
+    results = xflows.Flows(xtrace=need["XCAMP_XTRACE"], agent=need["XCAMP_AGENT"], project_dir=SRC,
+                           data_home=pathlib.Path(need["XCAMP_DATA_HOME"]), out_dir=out, make_stack=make_stack,
+                           app_package=APP_PACKAGE, source_root=SOURCE_ROOT, project="fineract").run_all()
+    (out / "flows.json").write_text(json.dumps({"schemaVersion": 1, "kind": "campaign_flows", "steps": results}, indent=1, sort_keys=True))
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "overhead":
+        sys.exit(overhead())
+    if len(sys.argv) > 1 and sys.argv[1] == "instrumented":
+        sys.exit(instrumented())
+    if len(sys.argv) > 1 and sys.argv[1] == "flows":
+        sys.exit(flows())
     sys.exit(xcamp.main_cli("fineract", build, baseline, PROJ))

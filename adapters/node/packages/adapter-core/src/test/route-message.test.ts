@@ -71,7 +71,7 @@ test("an empty route message is ignored", async () => {
 test("transport.route posts a route message and refuses at the in-flight limit", () => {
   const posted: Array<Record<string, unknown>> = [];
   const worker = Object.assign(new EventEmitter(), { postMessage(message: Record<string, unknown>) { posted.push(message); } });
-  const transport = createHttpCaptureTransport(worker as never);
+  const transport = createHttpCaptureTransport(worker as never, { maxInFlightMessages: 64, maxActiveRecordings: 64 });
   assert.equal(transport.route?.(ID, "/owners/:id"), true);
   assert.deepEqual(posted.at(-1), { type: "route", recordingId: ID, route: "/owners/:id" });
   // Each accepted message stays pending until the worker stages it; fill the 64-message window.

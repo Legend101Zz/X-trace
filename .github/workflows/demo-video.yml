@@ -1,0 +1,189 @@
+name: demo-video
+
+# Builds the candidate 0.0.1 Linux package, captures synthetic Spring Petclinic recordings via `xtrace run`,
+# records an automated Chromium walkthrough of the v2 Simple viewer (`tools/qa/record_demo.mjs`), transcodes
+# crisp MP4 + lightweight (<5 MB) README-ready GIF via ffmpeg, captures `xtrace tui --plain`, and uploads
+# `xtrace-demo-media` as an artifact. No secrets are used.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Candidate ref (branch, tag or SHA); empty means the dispatched ref
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-video-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  record-demo:
+    name: record demo media (linux-x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Rust toolchain (stable, from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - name: Build 0.0.1 Linux package from dispatched ref
+        run: |
+          python3 packaging/build.py --out dist --platform linux-x86_64
+          sh packaging/install.sh verify-dist dist/linux-x86_64
+          mkdir -p "$RUNNER_TEMP/xpkg"
+          tar -xzf dist/linux-x86_64/xtrace-0.0.1-linux-x86_64.tar.gz -C "$RUNNER_TEMP/xpkg"
+          top=$(ls -d "$RUNNER_TEMP"/xpkg/xtrace-* | head -n1)
+          echo "XTRACE_BIN=$top/bin/xtrace" >> "$GITHUB_ENV"
+          echo "XTRACE_AGENT=$top/share/xtrace/packs/java/agent/xtrace-java-agent.jar" >> "$GITHUB_ENV"
+          echo "XTRACE_ANALYZER=$top/share/xtrace/analyzers/java/bin/xtrace-java-static" >> "$GITHUB_ENV"
+          "$top/bin/xtrace" --version
+
+      - name: Clone and build synthetic Spring Petclinic
+        run: |
+          set -eu
+          PETCLINIC_DIR="$RUNNER_TEMP/petclinic"
+          URL=$(python3 -c 'import json; print(json.load(open("campaigns/java/petclinic/campaign.json"))["upstream"]["canonicalUrl"])')
+          SHA=$(python3 -c 'import json; print(json.load(open("campaigns/java/petclinic/campaign.json"))["upstream"]["sha"])')
+          ART=$(python3 -c 'import json; print(json.load(open("campaigns/java/petclinic/campaign.json"))["build"]["artifact"])')
+          sh tools/qa/camp_clone.sh "$URL" "$SHA" "$PETCLINIC_DIR"
+          (cd "$PETCLINIC_DIR" && ./mvnw -B -ntp -DskipTests -Dcheckstyle.skip=true -Dspring-javaformat.skip=true package)
+          echo "PETCLINIC_DIR=$PETCLINIC_DIR" >> "$GITHUB_ENV"
+          echo "PETCLINIC_JAR=$PETCLINIC_DIR/$ART" >> "$GITHUB_ENV"
+
+      - name: Initialize, scan, and record 4 synthetic Petclinic requests
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/xt/data" "$RUNNER_TEMP/xt/tmp"
+          chmod 700 "$RUNNER_TEMP/xt" "$RUNNER_TEMP/xt/data" "$RUNNER_TEMP/xt/tmp"
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data"
+          export TMPDIR="$RUNNER_TEMP/xt/tmp"
+
+          "$XTRACE_BIN" init --project-dir "$PETCLINIC_DIR" --display-name "Spring Petclinic"
+          if [ -x "$XTRACE_ANALYZER" ]; then
+            "$XTRACE_BIN" scan --project-dir "$PETCLINIC_DIR" --source "$PETCLINIC_DIR/src/main/java" \
+              --framework spring-mvc --analyzer "$XTRACE_ANALYZER" --json > "$RUNNER_TEMP/scan.json"
+          else
+            "$XTRACE_BIN" scan --project-dir "$PETCLINIC_DIR" --source "$PETCLINIC_DIR/src/main/java" \
+              --framework spring-mvc --json > "$RUNNER_TEMP/scan.json"
+          fi
+
+          "$XTRACE_BIN" run --project-dir "$PETCLINIC_DIR" --java-agent "$XTRACE_AGENT" \
+            --app-package org.springframework.samples.petclinic --source-root src/main/java -- \
+            "$JAVA_HOME/bin/java" -Xmx768m -jar "$PETCLINIC_JAR" \
+            --server.port=18080 --server.address=127.0.0.1 > "$RUNNER_TEMP/petclinic.log" 2>&1 &
+          APP_PID=$!
+
+          ready=0
+          for _ in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:18080/actuator/health 2>/dev/null | grep -q '"UP"'; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              cat "$RUNNER_TEMP/petclinic.log" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            kill -TERM "$APP_PID" 2>/dev/null || true
+            cat "$RUNNER_TEMP/petclinic.log" || true
+            exit 1
+          fi
+
+          # 4 clean synthetic Petclinic requests with generous pacing so every recording persists cleanly
+          curl -fsS -o /dev/null "http://127.0.0.1:18080/owners?lastName=Davis"
+          sleep 0.6
+          curl -fsS -o /dev/null -X POST "http://127.0.0.1:18080/owners/new" \
+            -d "firstName=Ada&lastName=Lovelace&address=1+Synthetic+Way&city=Testville&telephone=6085550100"
+          sleep 0.6
+          curl -fsS -o /dev/null "http://127.0.0.1:18080/owners/1"
+          sleep 0.6
+          curl -fsS -o /dev/null -H "Accept: application/json" "http://127.0.0.1:18080/vets"
+          sleep 1.0
+
+          kill -TERM "$APP_PID" || true
+          wait "$APP_PID" || true
+          "$XTRACE_BIN" stop --project-dir "$PETCLINIC_DIR" || true
+
+      - name: Install Playwright Chromium and record viewer demo
+        run: |
+          set -eu
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data"
+          export TMPDIR="$RUNNER_TEMP/xt/tmp"
+          npm ci --prefix web/app --ignore-scripts --no-audit --no-fund
+          (cd web/app && npx playwright install --with-deps chromium)
+          mkdir -p "$RUNNER_TEMP/demo-raw"
+          node tools/qa/record_demo.mjs --xtrace "$XTRACE_BIN" --project-dir "$PETCLINIC_DIR" \
+            --out "$RUNNER_TEMP/demo-raw"
+
+      - name: Transcode MP4 + lightweight GIF and capture plain TUI view
+        run: |
+          set -eu
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data"
+          export TMPDIR="$RUNNER_TEMP/xt/tmp"
+          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+
+          MEDIA_OUT="$RUNNER_TEMP/xtrace-demo-media"
+          mkdir -p "$MEDIA_OUT"
+          WEBM=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["videoPath"])' "$RUNNER_TEMP/demo-raw/demo-report.json")
+          test -f "$WEBM"
+
+          ffmpeg -y -i "$WEBM" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -crf 20 \
+            -vf "scale=1280:800:flags=lanczos" "$MEDIA_OUT/xtrace-demo.mp4"
+
+          ffmpeg -y -i "$WEBM" -vf "fps=10,scale=960:-1:flags=lanczos,palettegen=stats_mode=diff" \
+            "$RUNNER_TEMP/demo-raw/palette.png"
+          ffmpeg -y -i "$WEBM" -i "$RUNNER_TEMP/demo-raw/palette.png" \
+            -lavfi "fps=10,scale=960:-1:flags=lanczos [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+            "$MEDIA_OUT/xtrace-demo.gif"
+
+          GIF_BYTES=$(wc -c < "$MEDIA_OUT/xtrace-demo.gif")
+          echo "xtrace-demo.gif size: ${GIF_BYTES} bytes"
+          if [ "$GIF_BYTES" -ge 5242880 ]; then
+            ffmpeg -y -i "$WEBM" -vf "fps=8,scale=800:-1:flags=lanczos,palettegen=max_colors=128:stats_mode=diff" \
+              "$RUNNER_TEMP/demo-raw/palette-compact.png"
+            ffmpeg -y -i "$WEBM" -i "$RUNNER_TEMP/demo-raw/palette-compact.png" \
+              -lavfi "fps=8,scale=800:-1:flags=lanczos [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+              "$MEDIA_OUT/xtrace-demo.gif"
+            GIF_BYTES=$(wc -c < "$MEDIA_OUT/xtrace-demo.gif")
+            echo "re-encoded xtrace-demo.gif size: ${GIF_BYTES} bytes"
+          fi
+          test "$GIF_BYTES" -lt 5242880
+
+          "$XTRACE_BIN" tui --project-dir "$PETCLINIC_DIR" --plain > "$MEDIA_OUT/xtrace-tui-list.txt"
+          FIRST_REC=$(python3 -c 'import json,subprocess,sys; doc=json.loads(subprocess.check_output([sys.argv[1],"recording","list","--project-dir",sys.argv[2],"--limit","1"])); d=doc.get("data",doc); print(d["recordings"][0]["recording_id"])' "$XTRACE_BIN" "$PETCLINIC_DIR")
+          "$XTRACE_BIN" tui --project-dir "$PETCLINIC_DIR" --plain --recording "$FIRST_REC" > "$MEDIA_OUT/xtrace-tui-detail.txt"
+
+          cp "$RUNNER_TEMP/demo-raw/demo-steps.png" \
+             "$RUNNER_TEMP/demo-raw/demo-map.png" \
+             "$RUNNER_TEMP/demo-raw/demo-export.png" \
+             "$RUNNER_TEMP/demo-raw/demo-report.json" \
+             "$MEDIA_OUT/"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: xtrace-demo-media
+          path: ${{ runner.temp }}/xtrace-demo-media
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true

@@ -2,9 +2,10 @@ import { join } from "node:path";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
-import { createHttpCaptureTransport } from "./http-capture.cjs";
+import { createHttpCaptureTransport, installProcessShutdownHooks } from "./http-capture.cjs";
 import { claimCaptureStart, planCapture } from "./capture-start.cjs";
 import { withoutCapture } from "./runtime/context.cjs";
+import { SHARED_CONTROL_WORDS } from "./runtime/transport.cjs";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 const DIST_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -19,11 +20,12 @@ export async function startCapture(): Promise<void> {
     return;
   }
   const plan = planCapture();
+  const startupBarrier = new SharedArrayBuffer(SHARED_CONTROL_WORDS * Int32Array.BYTES_PER_ELEMENT);
   let worker: Worker;
   try {
     worker = withoutCapture(() => new Worker(join(DIST_DIRECTORY, "transport-worker.js"), {
       execArgv: [],
-      workerData: { bootstrapPath, startupBarrier: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT), manifestPath: join(DIST_DIRECTORY, "node-capabilities.json"), capabilities: plan.planned },
+      workerData: { bootstrapPath, startupBarrier, manifestPath: join(DIST_DIRECTORY, "node-capabilities.json"), capabilities: plan.planned },
     }));
   } catch {
     warnUnavailable("XTR-NODE-STARTUP");
@@ -44,7 +46,9 @@ export async function startCapture(): Promise<void> {
     return;
   }
   try {
-    plan.install(createHttpCaptureTransport(worker));
+    const transport = createHttpCaptureTransport(worker, { sharedControl: new Int32Array(startupBarrier) });
+    plan.install(transport);
+    installProcessShutdownHooks(transport);
     worker.unref();
   } catch {
     void worker.terminate();

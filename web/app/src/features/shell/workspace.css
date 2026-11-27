@@ -8,7 +8,10 @@
 .workspace-requests, .workspace-inspector, .workspace-code, .steps-and-code,
 .viewer-workspace .pane, .workspace-code-body { min-width: 0; min-height: 0; }
 .workspace-requests, .workspace-inspector { display: flex; flex-direction: column; }
-.workspace-requests > .pane, .workspace-inspector > .pane { flex: 1; }
+.workspace-requests > .pane, .workspace-inspector > .pane { flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; }
+.workspace-requests > .pane > *, .catalog-start-actions > *,
+.workspace-inspector > .pane > :not(.evidence-content) { flex-shrink: 0; }
+.workspace-requests > .pane :is(.request-tree, .recording-list) { overflow: visible; }
 .workspace-code, .panel-splitter, .collapsed-panel, .reset-panels { display: none; }
 .workspace-code-body { padding: 12px; overflow-wrap: anywhere; }
 .workspace-code-body > p { margin-top: 8px; }
@@ -142,9 +145,6 @@
   .replay-context-why summary { min-height: 44px; }
   .replay-context-request { gap: 6px; }
   .replay-context-event { min-height: 23px; }
-  .workspace-requests > .pane { flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; }
-  .workspace-requests > .pane > *, .catalog-start-actions > * { flex-shrink: 0; }
-  .workspace-requests > .pane > :is(.request-tree, .recording-list) { overflow: visible; }
   .shell .evidence-pane > .pane-head { display: none; }
   .shell .phone-back-to-step { margin: 6px 8px; font-size: 13px; }
   .shell .viewer-preferences { padding-block: 3px; font-size: 12px; }

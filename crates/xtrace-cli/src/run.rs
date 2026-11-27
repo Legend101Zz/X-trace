@@ -7,6 +7,12 @@ use crate::error::CliError;
 
 #[cfg(unix)]
 const DAEMON_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(unix)]
+const NODE_PIPELINE_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_000);
+#[cfg(unix)]
+const NODE_PIPELINE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(15);
+#[cfg(unix)]
+const NODE_SESSION_SCAN_MAX_PAGES: usize = 64;
 
 /// Launches a validated direct Java executable under the project daemon.
 pub(crate) async fn run(
@@ -79,8 +85,11 @@ async fn run_node_unix(
     // explicit adapter distribution have passed preflight.
     let launch = NodeLaunch::validate(&adapter_dist, mode, &command).map_err(CliError::NodeRun)?;
     let mut signals = NodeSignals::install().map_err(CliError::NodeRun)?;
-    let prepared = crate::daemon::prepare(project_dir, &crate::paths::read_env_path).await?;
+    let prepared =
+        crate::daemon::prepare(project_dir.clone(), &crate::paths::read_env_path).await?;
     let crate::daemon::PreparedDaemon { bound, bootstrap_path, mut runtime_dir, lock } = prepared;
+    let project_id = bound.project_id();
+    let runtime_session_id = bound.runtime_session_id();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let mut daemon_task = tokio::spawn(async move {
         bound
@@ -115,38 +124,77 @@ async fn run_node_unix(
         daemon_outcome = observed_daemon;
     }
 
-    let mut capture_incomplete = child_started && launch_error.is_some();
-    if child_status.is_some_and(|status| {
+    let handshake_completed = !bootstrap_path.exists();
+    let mut early_daemon_exit = daemon_outcome.is_some();
+    let child_signal = child_status.and_then(|status| {
         use std::os::unix::process::ExitStatusExt as _;
-        status.signal().is_some()
-    }) {
-        capture_incomplete = true;
+        status.signal()
+    });
+    if child_started
+        && launch_error.is_none()
+        && handshake_completed
+        && daemon_outcome.is_none()
+        && child_signal.is_none_or(is_graceful_node_signal)
+    {
+        if let Some(outcome) = settle_node_daemon_before_shutdown(
+            &project_dir,
+            project_id,
+            runtime_session_id,
+            &mut daemon_task,
+            NODE_PIPELINE_SETTLE_BUDGET,
+        )
+        .await
+        {
+            early_daemon_exit = true;
+            daemon_outcome = Some(outcome);
+        }
     }
-    if shutdown_tx.send(()).is_err() {
-        capture_incomplete = true;
-    }
+
+    let shutdown_send_failed = shutdown_tx.send(()).is_err();
+    let mut daemon_error = false;
+    let mut cleanup_failed = false;
+    let mut drain_deferred = false;
     if let Some(outcome) = daemon_outcome {
         if !matches!(outcome, Ok(Ok(()))) {
-            capture_incomplete = true;
+            daemon_error = true;
         }
         let bootstrap_remains = bootstrap_path.exists();
-        let cleanup_failed = runtime_dir.cleanup().is_err();
-        if bootstrap_remains || cleanup_failed {
-            capture_incomplete = true;
+        if bootstrap_remains || runtime_dir.cleanup().is_err() {
+            cleanup_failed = true;
         }
         drop(runtime_dir);
         drop(lock);
     } else {
         let finalization =
             finalize_daemon(daemon_task, runtime_dir, lock, DAEMON_DRAIN_BUDGET).await;
-        if finalization.cleanup_failed || finalization.deferred {
-            capture_incomplete = true;
-        }
+        cleanup_failed = finalization.cleanup_failed;
+        drain_deferred = finalization.deferred;
         if finalization.outcome.is_some_and(|outcome| !matches!(outcome, Ok(Ok(())))) {
-            capture_incomplete = true;
+            daemon_error = true;
         }
     }
     drop(child);
+
+    let session_verdict = if child_started && handshake_completed {
+        Some(
+            inspect_node_session_capture(&project_dir, project_id, runtime_session_id)
+                .map_or(SessionCaptureVerdict::Unverified, |summary| summary.verdict),
+        )
+    } else {
+        None
+    };
+    let capture_incomplete = classify_node_capture_incomplete(&NodeCaptureOutcome {
+        child_started,
+        launch_error: launch_error.is_some(),
+        child_signal,
+        handshake_completed,
+        early_daemon_exit,
+        shutdown_send_failed,
+        daemon_error,
+        cleanup_failed,
+        drain_deferred,
+        session_verdict,
+    });
     if capture_incomplete && child_started && !capture_notice_written {
         write_capture_incomplete();
     }
@@ -363,6 +411,163 @@ async fn finalize_daemon<T: Send + 'static>(
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionCaptureVerdict {
+    Clean,
+    Incomplete,
+    Unverified,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SessionCaptureSummary {
+    has_active_recordings: bool,
+    verdict: SessionCaptureVerdict,
+}
+
+#[cfg(unix)]
+struct NodeCaptureOutcome {
+    child_started: bool,
+    launch_error: bool,
+    child_signal: Option<i32>,
+    handshake_completed: bool,
+    early_daemon_exit: bool,
+    shutdown_send_failed: bool,
+    daemon_error: bool,
+    cleanup_failed: bool,
+    drain_deferred: bool,
+    session_verdict: Option<SessionCaptureVerdict>,
+}
+
+#[cfg(unix)]
+fn is_graceful_node_signal(signal: i32) -> bool {
+    use rustix::process::Signal;
+    signal == Signal::TERM.as_raw() || signal == Signal::INT.as_raw()
+}
+
+#[cfg(unix)]
+fn classify_node_capture_incomplete(outcome: &NodeCaptureOutcome) -> bool {
+    if !outcome.child_started {
+        return false;
+    }
+    if outcome.launch_error
+        || outcome.early_daemon_exit
+        || outcome.shutdown_send_failed
+        || outcome.daemon_error
+        || outcome.cleanup_failed
+        || outcome.drain_deferred
+        || !outcome.handshake_completed
+    {
+        return true;
+    }
+    if let Some(signal) = outcome.child_signal {
+        if !is_graceful_node_signal(signal) {
+            return true;
+        }
+    }
+    outcome.session_verdict != Some(SessionCaptureVerdict::Clean)
+}
+
+#[cfg(unix)]
+async fn settle_node_daemon_before_shutdown<T: Send + 'static>(
+    project_dir: &std::path::Path,
+    project_id: xtrace_domain::ProjectId,
+    runtime_session_id: xtrace_domain::RuntimeSessionId,
+    daemon_task: &mut tokio::task::JoinHandle<T>,
+    budget: std::time::Duration,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match inspect_node_session_capture(project_dir, project_id, runtime_session_id) {
+            Ok(summary) if !summary.has_active_recordings => return None,
+            Err(()) => return None,
+            Ok(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::select! {
+            outcome = &mut *daemon_task => return Some(outcome),
+            () = tokio::time::sleep(NODE_PIPELINE_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+fn inspect_node_session_capture(
+    project_dir: &std::path::Path,
+    project_id: xtrace_domain::ProjectId,
+    runtime_session_id: xtrace_domain::RuntimeSessionId,
+) -> Result<SessionCaptureSummary, ()> {
+    let (_resolved_project_id, reader, _correlation_id) =
+        crate::commands::open_recording_reader(project_dir, &crate::paths::read_env_path)
+            .map_err(|_| ())?;
+    summarize_session_recordings(&reader, project_id, runtime_session_id)
+}
+
+#[cfg(unix)]
+fn summarize_session_recordings<R: xtrace_application::RecordingReadPort>(
+    reader: &R,
+    project_id: xtrace_domain::ProjectId,
+    runtime_session_id: xtrace_domain::RuntimeSessionId,
+) -> Result<SessionCaptureSummary, ()> {
+    use xtrace_application::{RecordingCompletionEvidence, RecordingStatus};
+
+    let mut after = None;
+    let mut saw_session = false;
+    let mut has_active_recordings = false;
+    let mut has_incomplete = false;
+    for _ in 0..NODE_SESSION_SCAN_MAX_PAGES {
+        let (page, more) = reader.list_recordings(project_id, after, 200).map_err(|_| ())?;
+        let mut page_matched = false;
+        for item in &page {
+            if item.session_context.runtime_session_id != runtime_session_id {
+                continue;
+            }
+            saw_session = true;
+            page_matched = true;
+            if matches!(item.status, RecordingStatus::Recording | RecordingStatus::Finalizing) {
+                has_active_recordings = true;
+            }
+            if matches!(
+                item.status,
+                RecordingStatus::Recording
+                    | RecordingStatus::Finalizing
+                    | RecordingStatus::Partial
+                    | RecordingStatus::Invalid
+            ) || item.completion != RecordingCompletionEvidence::Complete
+                || !item.incomplete_evidence.is_empty()
+                || item.session_context.rejected_requests.as_deref().is_some_and(|c| c != "0")
+            {
+                has_incomplete = true;
+            }
+        }
+        if !more || (saw_session && !page_matched) {
+            return Ok(SessionCaptureSummary {
+                has_active_recordings,
+                verdict: if has_incomplete {
+                    SessionCaptureVerdict::Incomplete
+                } else {
+                    SessionCaptureVerdict::Clean
+                },
+            });
+        }
+        let Some(last) = page.last() else {
+            break;
+        };
+        after = Some(last.recording_id);
+    }
+    Ok(SessionCaptureSummary {
+        has_active_recordings,
+        verdict: if has_incomplete {
+            SessionCaptureVerdict::Incomplete
+        } else {
+            SessionCaptureVerdict::Unverified
+        },
+    })
+}
+
+#[cfg(unix)]
 fn child_exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt as _;
     status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
@@ -483,5 +688,215 @@ mod tests {
             crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
+    }
+
+    #[test]
+    fn node_capture_incomplete_distinguishes_clean_sigterm_from_incomplete_and_abrupt_exits() {
+        use rustix::process::Signal;
+
+        let base = NodeCaptureOutcome {
+            child_started: true,
+            launch_error: false,
+            child_signal: Some(Signal::TERM.as_raw()),
+            handshake_completed: true,
+            early_daemon_exit: false,
+            shutdown_send_failed: false,
+            daemon_error: false,
+            cleanup_failed: false,
+            drain_deferred: false,
+            session_verdict: Some(SessionCaptureVerdict::Clean),
+        };
+        assert!(
+            !classify_node_capture_incomplete(&base),
+            "clean drained SIGTERM exit should not report incomplete capture"
+        );
+        assert!(
+            !classify_node_capture_incomplete(&NodeCaptureOutcome {
+                child_signal: Some(Signal::INT.as_raw()),
+                ..base
+            }),
+            "clean drained SIGINT exit should not report incomplete capture"
+        );
+        assert!(classify_node_capture_incomplete(&NodeCaptureOutcome {
+            session_verdict: Some(SessionCaptureVerdict::Incomplete),
+            ..base
+        }));
+        assert!(classify_node_capture_incomplete(&NodeCaptureOutcome {
+            session_verdict: Some(SessionCaptureVerdict::Unverified),
+            ..base
+        }));
+        assert!(classify_node_capture_incomplete(&NodeCaptureOutcome {
+            handshake_completed: false,
+            ..base
+        }));
+        assert!(classify_node_capture_incomplete(&NodeCaptureOutcome {
+            drain_deferred: true,
+            ..base
+        }));
+        assert!(classify_node_capture_incomplete(&NodeCaptureOutcome {
+            child_signal: Some(Signal::KILL.as_raw()),
+            ..base
+        }));
+        assert!(!classify_node_capture_incomplete(&NodeCaptureOutcome {
+            child_signal: None,
+            ..base
+        }));
+        assert!(classify_node_capture_incomplete(&NodeCaptureOutcome {
+            child_signal: None,
+            session_verdict: Some(SessionCaptureVerdict::Incomplete),
+            ..base
+        }));
+        assert!(classify_node_capture_incomplete(&NodeCaptureOutcome {
+            child_signal: None,
+            session_verdict: Some(SessionCaptureVerdict::Unverified),
+            ..base
+        }));
+        assert!(!classify_node_capture_incomplete(&NodeCaptureOutcome {
+            child_started: false,
+            handshake_completed: false,
+            child_signal: Some(Signal::KILL.as_raw()),
+            ..base
+        }));
+    }
+
+    #[test]
+    fn session_summary_isolates_runtime_session_and_detects_active_partial_or_rejected_capture() {
+        use prost::Message as _;
+        use std::os::unix::fs::DirBuilderExt as _;
+        use xtrace_application::ProjectRepository as _;
+        use xtrace_application::recording::{
+            AcceptedRecordingEvent, BeginRecording, EndpointObservationInput, FinishRecording,
+            RecordEvents, RecordingCapture as _, RecordingCaptureService, SegmentPolicy,
+        };
+        use xtrace_domain::{
+            Project, ProjectId, RecordingId, RepositoryFingerprint, RuntimeSessionId, WallTime,
+        };
+        use xtrace_protocol::generated::agent::RecordingEvent;
+        use xtrace_protocol::xtf::XtfEventEnvelope;
+        use xtrace_store::{
+            OpenOptions, SqliteProjectRepository, SqliteRecordingPersistence,
+            SqliteRecordingReader, SqliteStore,
+        };
+
+        let root = private_tempdir();
+        let project_id = ProjectId::new();
+        let project_root = root.path().join("project");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&project_root)
+            .expect("create project root");
+        let db_path = project_root.join("metadata.sqlite3");
+        let store = SqliteStore::open(&db_path, OpenOptions::default()).expect("open store");
+        let project = Project {
+            id: project_id,
+            canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/tmp/node-run-test"),
+            display_name: "node-run-test".to_string(),
+            created_at: WallTime::now(),
+            last_opened_at: WallTime::now(),
+            config_schema_version: 1,
+            effective_config_hash: "test".to_string(),
+            active_capture_policy_id: None,
+            active_redaction_policy_id: None,
+        };
+        SqliteProjectRepository::new(&store).insert_project(&project).expect("insert project");
+        let persistence = std::sync::Arc::new(SqliteRecordingPersistence::new(
+            store.clone(),
+            project_root.clone(),
+        ));
+        let capture = RecordingCaptureService::new(
+            persistence,
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(64).expect("non-zero"),
+        );
+        let reader = SqliteRecordingReader::new(store, project_root);
+
+        let record_complete = |session_id: RuntimeSessionId| {
+            let rec_id = RecordingId::new();
+            capture
+                .begin_recording(BeginRecording {
+                    project_id,
+                    recording_id: rec_id,
+                    runtime_session_id: session_id,
+                    opened_at: WallTime::now(),
+                    endpoint_observation: EndpointObservationInput::default(),
+                    limitations: Vec::new(),
+                })
+                .expect("begin complete");
+            let event_id = format!("{rec_id}:event:2");
+            let payload = XtfEventEnvelope {
+                recording_seq: 2,
+                event: Some(RecordingEvent {
+                    event_id: event_id.clone(),
+                    recording_seq: 2,
+                    monotonic_ns: 10,
+                    ..RecordingEvent::default()
+                }),
+            };
+            capture
+                .record_events(RecordEvents {
+                    recording_id: rec_id,
+                    events: vec![AcceptedRecordingEvent {
+                        recording_seq: 2,
+                        monotonic_ns: 10,
+                        priority: 1,
+                        canonical_bytes: payload.encode_to_vec(),
+                        payload,
+                    }],
+                })
+                .expect("record event");
+            let mut finish = FinishRecording::without_digest(rec_id, 2);
+            finish.duration_ns = Some(5);
+            finish.event_digest = blake3::hash(event_id.as_bytes()).as_bytes().to_vec();
+            capture.finish_recording(finish).expect("finish complete");
+        };
+
+        // Prior session left an unfinished recording; it must not affect a new clean session.
+        let prior_session = RuntimeSessionId::new();
+        capture
+            .begin_recording(BeginRecording {
+                project_id,
+                recording_id: RecordingId::new(),
+                runtime_session_id: prior_session,
+                opened_at: WallTime::now(),
+                endpoint_observation: EndpointObservationInput::default(),
+                limitations: Vec::new(),
+            })
+            .expect("begin prior unfinished");
+
+        let clean_session = RuntimeSessionId::new();
+        record_complete(clean_session);
+        let clean_summary = summarize_session_recordings(&reader, project_id, clean_session)
+            .expect("clean summary");
+        assert!(!clean_summary.has_active_recordings);
+        assert_eq!(clean_summary.verdict, SessionCaptureVerdict::Clean);
+
+        // Unfinished recording in current session flags active & incomplete.
+        let active_session = RuntimeSessionId::new();
+        capture
+            .begin_recording(BeginRecording {
+                project_id,
+                recording_id: RecordingId::new(),
+                runtime_session_id: active_session,
+                opened_at: WallTime::now(),
+                endpoint_observation: EndpointObservationInput::default(),
+                limitations: Vec::new(),
+            })
+            .expect("begin active");
+        let active_summary = summarize_session_recordings(&reader, project_id, active_session)
+            .expect("active summary");
+        assert!(active_summary.has_active_recordings);
+        assert_eq!(active_summary.verdict, SessionCaptureVerdict::Incomplete);
+
+        // Rejected starts in a session also flag incomplete capture.
+        let rejected_session = RuntimeSessionId::new();
+        record_complete(rejected_session);
+        capture
+            .record_session_rejections(project_id, rejected_session, 3)
+            .expect("record rejections");
+        let rejected_summary = summarize_session_recordings(&reader, project_id, rejected_session)
+            .expect("rejected summary");
+        assert!(!rejected_summary.has_active_recordings);
+        assert_eq!(rejected_summary.verdict, SessionCaptureVerdict::Incomplete);
     }
 }
