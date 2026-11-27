@@ -151,6 +151,16 @@ final class LineProbeBridgeSink implements LineSink {
     }
   }
 
+  @Override
+  public void discardPending() {
+    Pending p = pending.get();
+    p.active = false;
+    p.collecting = false;
+    p.valuesBlocked = true;
+    p.values.clear();
+    p.previewBytes = 0;
+  }
+
   private SiteRegistry.Name nameOf(int nameId) {
     Pending p = pending.get();
     return p.collecting ? registry.name(nameId) : null;

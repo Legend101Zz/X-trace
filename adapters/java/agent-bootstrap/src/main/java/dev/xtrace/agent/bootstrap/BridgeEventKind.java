@@ -17,6 +17,8 @@ public final class BridgeEventKind {
   public static final int DATABASE_START = 7;
   /** Coarse H2 execute end. */
   public static final int DATABASE_END = 8;
+  /** Async / reactive context handoff link. */
+  public static final int ASYNC_LINK = 11;
   /** Sanitized response-status observation. */
   public static final int RESPONSE = 13;
   /** Honest capture gap marker. */

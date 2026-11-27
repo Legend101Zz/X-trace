@@ -36,6 +36,9 @@ public interface LineSink {
   /** Completes the calling thread's pending line event, if any. */
   void flush();
 
+  /** Discards any pending line event on the calling thread without emitting (e.g. after recording close). */
+  default void discardPending() {}
+
   /**
    * The bridge ignored the line probe that just ran (budget spent, no request, deferred). The
    * value calls that follow belong to no accepted event and must not attach to the previous one.
