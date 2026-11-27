@@ -599,11 +599,11 @@ fn paging_and_reconnect_effects_round_trip() {
             cursor: Option<&str>,
         ) -> Result<Window, ClientError> {
             let mut w = window(id, 2);
-            if cursor.is_none() {
-                w.next_cursor = Some("w-next".into());
-            } else {
+            if cursor == Some("w-next") {
                 w.prev_cursor = Some("w-prev".into());
                 w.frames[0].sequence = 502;
+            } else {
+                w.next_cursor = Some("w-next".into());
             }
             Ok(w)
         }
