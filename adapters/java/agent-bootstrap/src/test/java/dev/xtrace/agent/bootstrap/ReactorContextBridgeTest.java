@@ -249,7 +249,7 @@ public class ReactorContextBridgeTest {
     assertNull(ReactorContextBridge.currentToken());
   }
 
-  interface MonoApi<T> {
+  public interface MonoApi<T> {
     MonoApi<T> contextWrite(Function<Object, Object> fn);
 
     MonoApi<T> doOnSuccess(Consumer<Object> fn);
@@ -259,8 +259,8 @@ public class ReactorContextBridgeTest {
     MonoApi<T> doOnCancel(Runnable fn);
   }
 
-  /** Package-private context verifying SpringMvcBridge.publicMethod access. */
-  static final class FakeContext {
+  /** Public context verifying SpringMvcBridge.publicMethod access. */
+  public static final class FakeContext {
     private final Map<Object, Object> values;
 
     FakeContext() {
@@ -448,7 +448,31 @@ public class ReactorContextBridgeTest {
         int responseStatus,
         long droppedEvents) {
       return offerFinishWithOutcome(
-          recordingId, startedMonotonicNs, finishedMonotonicNs, responseStatus, droppedEvents, null);
+          recordingId,
+          startedMonotonicNs,
+          finishedMonotonicNs,
+          responseStatus,
+          droppedEvents,
+          null,
+          null);
+    }
+
+    @Override
+    public boolean offerFinishWithOutcome(
+        String recordingId,
+        long startedMonotonicNs,
+        long finishedMonotonicNs,
+        int responseStatus,
+        long droppedEvents,
+        Outcome outcome) {
+      return offerFinishWithOutcome(
+          recordingId,
+          startedMonotonicNs,
+          finishedMonotonicNs,
+          responseStatus,
+          droppedEvents,
+          outcome,
+          null);
     }
 
     @Override

@@ -59,7 +59,7 @@ test("interaction redaction strips credentials, query params, literals, quotes, 
   assert.equal(JSON.stringify(insertDecoy).includes("secret_val"), false);
   assert.equal(JSON.stringify(insertDecoy).includes("secret_dollar"), false);
 
-  const longSql = interactions.sanitizeSql(`SELECT * FROM users WHERE col IN (${Array.from({ length: 200 }, (_, i) => String(i)).join(",")})`);
+  const longSql = interactions.sanitizeSql(`SELECT * FROM users WHERE col IN (${Array.from({ length: 400 }, (_, i) => String(i)).join(",")})`);
   assert.ok(Buffer.byteLength(longSql.summary, "utf8") <= 512);
   assert.ok(longSql.summary.endsWith("..."));
 

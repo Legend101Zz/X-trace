@@ -6,7 +6,7 @@ import test from "node:test";
 import type { CaptureEvent, HttpCaptureTransport, RecordingSummary } from "../runtime/transport.cjs";
 
 const require = createRequire(import.meta.url);
-const { wrapRequestListener } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
+const { installHttpCapture, wrapRequestListener } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
 const { instrumentFastifyInstance } = require("../fastify-instrument.cjs") as typeof import("../fastify-instrument.cjs");
 const {
   instrumentNestController,
@@ -75,6 +75,7 @@ test("nestModule detects @nestjs/core and declares framework.nest capability", (
 
 test("NestJS controller & service identity on Express attaches to the single HTTP root with no duplicates", async () => {
   const transport = new RecordingTransport();
+  installHttpCapture(transport);
   context.setCaptureProfile({ limitations: ["route_unavailable"], holdStart: true });
   try {
     const service = new UsersService();
@@ -120,9 +121,9 @@ test("NestJS controller & service identity on Express attaches to the single HTT
         "frame-enter:node:http.Server.request",
         "frame-enter:nest.controller:UsersController.getUser",
         "frame-enter:nest.service:UsersService.findById",
+        "frame-exit:node:http.Server.request",
         "frame-exit:nest.service:UsersService.findById",
         "frame-exit:nest.controller:UsersController.getUser",
-        "frame-exit:node:http.Server.request",
       ],
     );
     const ctrlEnter = frames.find((e) => e.kind === "frame-enter" && e.symbol === "nest.controller:UsersController.getUser")!;
@@ -135,6 +136,7 @@ test("NestJS controller & service identity on Express attaches to the single HTT
 
 test("NestJS controller & service identity on Fastify enriches the Fastify request without duplicate roots", async () => {
   const transport = new RecordingTransport();
+  installHttpCapture(transport);
   context.setCaptureProfile({ limitations: ["route_unavailable"], holdStart: true });
   try {
     const service = new UsersService();

@@ -6,7 +6,7 @@ import test from "node:test";
 import type { CaptureEvent, HttpCaptureTransport, RecordingSummary } from "../runtime/transport.cjs";
 
 const require = createRequire(import.meta.url);
-const { wrapRequestListener } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
+const { installHttpCapture, wrapRequestListener } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
 const { fastifyPatchStatus, instrumentFastifyInstance, resolveFastifyRoute } = require("../fastify-instrument.cjs") as typeof import("../fastify-instrument.cjs");
 const context = require("../runtime/context.cjs") as typeof import("../runtime/context.cjs");
 const manifest = require("../manifest.cjs") as typeof import("../manifest.cjs");
@@ -179,6 +179,7 @@ test("fastifyModule detection and manifest capability registration", () => {
 
 test("Fastify encapsulation scopes, lifecycle hooks (onRequest, preHandler, onResponse), and route announcement", async () => {
   const transport = new RecordingTransport();
+  installHttpCapture(transport);
   context.setCaptureProfile({ limitations: ["route_unavailable", "values_unavailable"], holdStart: true });
   try {
     const app = new StubFastify();
@@ -262,6 +263,7 @@ test("Fastify encapsulation scopes, lifecycle hooks (onRequest, preHandler, onRe
 
 test("Fastify onError hook records safe exception without leaking error message, and reports unsupported shapes/hooks", async () => {
   const transport = new RecordingTransport();
+  installHttpCapture(transport);
   context.setCaptureProfile({ limitations: ["route_unavailable"], holdStart: true });
   try {
     const app = new StubFastify();

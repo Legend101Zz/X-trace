@@ -635,7 +635,31 @@ class ReactorContextInstrumentationTest {
         int responseStatus,
         long droppedEvents) {
       return offerFinishWithOutcome(
-          recordingId, startedMonotonicNs, finishedMonotonicNs, responseStatus, droppedEvents, null);
+          recordingId,
+          startedMonotonicNs,
+          finishedMonotonicNs,
+          responseStatus,
+          droppedEvents,
+          null,
+          null);
+    }
+
+    @Override
+    public boolean offerFinishWithOutcome(
+        String recordingId,
+        long startedMonotonicNs,
+        long finishedMonotonicNs,
+        int responseStatus,
+        long droppedEvents,
+        Outcome outcome) {
+      return offerFinishWithOutcome(
+          recordingId,
+          startedMonotonicNs,
+          finishedMonotonicNs,
+          responseStatus,
+          droppedEvents,
+          outcome,
+          null);
     }
 
     @Override
