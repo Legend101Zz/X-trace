@@ -565,6 +565,7 @@ fn validate(content: &ExercisePlanContent) -> Result<(), ExerciseError> {
                         | "te"
                         | "expect"
                         | "content-type"
+                        | "x-xtrace-exercise-item"
                         | "x-xtrace-exercise-item-id"
                         | "x-xtrace-exercise-plan-hash"
                 ))

@@ -35,6 +35,10 @@ impl ExerciseProject {
         Self { id, root, catalog }
     }
 
+    pub(crate) fn provenance_store(&self) -> xtrace_store::SqliteExerciseProvenanceStore {
+        xtrace_store::SqliteExerciseProvenanceStore::new(self.catalog.clone())
+    }
+
     pub(crate) fn open(
         &self,
         create_directory: bool,
