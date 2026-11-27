@@ -1447,7 +1447,7 @@ mod tests {
         let dns = LoopbackLiteralResolver;
         let gate = ExecutionGate::new();
 
-        for code in [301, 302, 303, 307, 308] {
+        for (idx, code) in [301, 302, 303, 307, 308].into_iter().enumerate() {
             let transport = MockTransport {
                 result: Ok(RawHttpResponse { status_code: code, body: vec![] }),
                 calls: Cell::new(0),
@@ -1456,7 +1456,7 @@ mod tests {
                 &spec,
                 ExecutorBounds::default(),
                 &gate,
-                1000,
+                1000 + (idx as u64) * 1000,
                 &dns,
                 &creds,
                 &transport,
