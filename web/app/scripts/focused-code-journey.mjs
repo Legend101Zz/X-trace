@@ -61,6 +61,7 @@ try {
       await expect(requests).toBeFocused();
       await expect(search).not.toBeVisible();
       await requests.press('Enter');
+      await expect(search).toBeFocused();
       const drawerRecording = page.locator('.recording-list .recording').filter({ hasText: recordingId });
       await drawerRecording.press('Enter');
       const activeRecordingTab = page.getByRole('tablist', { name: 'Open recordings' })

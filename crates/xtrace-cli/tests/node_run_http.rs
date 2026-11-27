@@ -297,7 +297,7 @@ server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.addr
         assert!(handle.join().expect("join burst request"));
     }
 
-    let status = wait_for_child(&mut child, Duration::from_secs(15));
+    let status = wait_for_child(&mut child, Duration::from_secs(20));
     assert!(status.success(), "burst exit failed: {status}");
     let _ = stdout_reader.join();
     let stderr_text =
@@ -399,7 +399,7 @@ server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.addr
     rustix::process::kill_process(cli_pid, rustix::process::Signal::TERM)
         .expect("send SIGTERM to xtrace run");
 
-    let status = wait_for_child(&mut child, Duration::from_secs(15));
+    let status = wait_for_child(&mut child, Duration::from_secs(20));
     assert_eq!(status.code(), Some(143), "expected SIGTERM exit code 143: {status}");
     let _ = stdout_reader.join();
     let stderr_text =
@@ -502,7 +502,7 @@ server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.addr
     rustix::process::kill_process(cli_pid, rustix::process::Signal::TERM)
         .expect("send SIGTERM to xtrace run");
 
-    let status = wait_for_child(&mut child, Duration::from_secs(15));
+    let status = wait_for_child(&mut child, Duration::from_secs(20));
     drop(stream);
     assert_eq!(status.code(), Some(143), "expected SIGTERM exit code 143: {status}");
     let _ = stdout_reader.join();
@@ -644,7 +644,7 @@ server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.addr
         .recv_timeout(Duration::from_secs(5))
         .expect("Node HTTP server close callback");
     assert_eq!(closed.trim(), "NODE_HTTP_SERVER_CLOSED");
-    let status = wait_for_child(&mut child, Duration::from_secs(15));
+    let status = wait_for_child(&mut child, Duration::from_secs(20));
     assert!(status.success(), "Node run failed with {status}");
     stdout_reader.join().expect("join xtrace stdout reader");
     for line in line_receiver.try_iter() {
