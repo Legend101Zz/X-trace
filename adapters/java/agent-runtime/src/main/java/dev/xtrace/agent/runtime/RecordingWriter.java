@@ -7,6 +7,7 @@ import dev.xtrace.adapter.XtpSession;
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
 import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.bootstrap.BridgeSink;
+import dev.xtrace.agent.bootstrap.JdbcOperation;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -91,7 +92,14 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   RecordingWriter(XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink)
       throws ClientException {
-    this(new SessionTransport(session), queue, sink, SHUTDOWN_TIMEOUT);
+    this(session, queue, sink, false);
+  }
+
+  RecordingWriter(
+      XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink, boolean pgJdbcEnabled)
+      throws ClientException {
+    this(new SessionTransport(session), queue, sink, SHUTDOWN_TIMEOUT,
+        MAX_PENDING_EVENT_BYTES, pgJdbcEnabled);
   }
 
   RecordingWriter(
@@ -106,6 +114,13 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   RecordingWriter(
       Transport session, BoundedEventQueue queue, RuntimeBridgeSink sink,
       Duration shutdownTimeout, long maxPendingEventBytes) throws ClientException {
+    this(session, queue, sink, shutdownTimeout, maxPendingEventBytes, false);
+  }
+
+  private RecordingWriter(
+      Transport session, BoundedEventQueue queue, RuntimeBridgeSink sink,
+      Duration shutdownTimeout, long maxPendingEventBytes, boolean pgJdbcEnabled)
+      throws ClientException {
     if (shutdownTimeout.isZero() || shutdownTimeout.isNegative()) {
       throw new IllegalArgumentException("shutdown timeout must be positive");
     }
@@ -117,7 +132,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     this.sink = sink;
     this.shutdownTimeout = shutdownTimeout;
     this.maxPendingEventBytes = maxPendingEventBytes;
-    sendCapabilities();
+    sendCapabilities(pgJdbcEnabled);
     this.thread = new Thread(this, "xtrace-java-writer");
     this.thread.setDaemon(true);
   }
@@ -212,7 +227,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           recording.throwEventIds.add(event.eventId());
           recording.retainedThrowBytes += bytes;
         }
-        recording.batchBytes += toProto(event, 2).getSerializedSize() + 8;
+        recording.batchBytes += toProto(event, 2, recording.start.frameworkDriver()).getSerializedSize() + 8;
         if (recording.events.size() >= MAX_BATCH_EVENTS
             || recording.batchBytes >= MAX_BATCH_BYTES) flush(recording, false);
       } else {
@@ -462,7 +477,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     for (int index = 0; index < count; index++) {
       QueueSignal.Event event = pending.events.get(index);
       long sequence = Math.addExact(pending.sequence, 1);
-      RecordingEvent proto = toProto(event, sequence);
+      RecordingEvent proto = toProto(event, sequence, pending.start.frameworkDriver());
       batch.addEvents(proto);
       if (!fitsBatch(pending, batch)) {
         batch.removeEvents(batch.getEventsCount() - 1);
@@ -679,6 +694,11 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   static RecordingEvent toProto(QueueSignal.Event event, long sequence)
       throws ClientException {
+    return toProto(event, sequence, "spring-mvc");
+  }
+
+  private static RecordingEvent toProto(QueueSignal.Event event, long sequence, String frameworkDriver)
+      throws ClientException {
     RecordingEventKind kind = RecordingEventKind.forNumber(event.kind());
     if (kind == null || kind == RecordingEventKind.RECORDING_EVENT_KIND_UNSPECIFIED) {
       throw new ClientException("XTR-JAVA-EVENT", "recording event kind is invalid");
@@ -740,30 +760,33 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       builder.setException(exception);
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_REQUEST_UPDATE) {
-      // The request event symbol is "http.request <METHOD> <route template>", both validated by
-      // the bridge; nothing about the route is assumed here.
+      // Only a matched handler contributes the third part, a validated route template.
       String[] parts = event.symbol().split(" ", 3);
-      boolean shaped = parts.length == 3 && parts[0].equals("http.request");
+      boolean filterOnly = frameworkDriver.equals("servlet");
+      boolean shaped = parts.length == (filterOnly ? 2 : 3) && parts[0].equals("http.request");
       builder.setInteraction(
           Interaction.newBuilder()
               .setKind(InteractionKind.INTERACTION_KIND_FRAMEWORK)
-              .setDriver("spring-mvc")
+              .setDriver(frameworkDriver)
               .setMethod(shaped ? parts[1] : "")
-              .setPath(shaped ? parts[2] : ""));
+              .setPath(shaped && !filterOnly ? parts[2] : ""));
     } else if (kind == RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE) {
       builder.setInteraction(
           Interaction.newBuilder()
               .setKind(InteractionKind.INTERACTION_KIND_FRAMEWORK)
-              .setDriver("spring-mvc")
+              .setDriver(frameworkDriver)
               .setMethod("status")
               .setPath(event.detail() == 0 ? "unavailable" : Long.toString(event.detail())));
     } else if (kind == RecordingEventKind.RECORDING_EVENT_KIND_DATABASE_START
         || kind == RecordingEventKind.RECORDING_EVENT_KIND_DATABASE_END) {
-      builder.setInteraction(
-          Interaction.newBuilder()
-              .setKind(InteractionKind.INTERACTION_KIND_DATABASE)
-              .setDriver("h2")
-              .setMethod("executeUpdate"));
+      JdbcOperation operation = JdbcOperation.forSymbol(event.symbol());
+      if (operation != null) {
+        builder.setInteraction(
+            Interaction.newBuilder()
+                .setKind(InteractionKind.INTERACTION_KIND_DATABASE)
+                .setDriver(operation.driver())
+                .setMethod(operation.method()));
+      }
     }
     return builder.build();
   }
@@ -813,14 +836,15 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         .build();
   }
 
-  private void sendCapabilities() throws ClientException {
+  private void sendCapabilities(boolean pgJdbcEnabled) throws ClientException {
     Capability frames =
         Capability.newBuilder()
             .setName("method_frames")
             .putConfig("scope", "application_scope")
             .build();
-    Capability database =
-        Capability.newBuilder().setName("database").putConfig("driver", "h2").build();
+    Capability.Builder database =
+        Capability.newBuilder().setName("database").putConfig("driver", "h2");
+    if (pgJdbcEnabled) database.putConfig("drivers", "h2,pgjdbc");
     session.send(
         "java-premain-capabilities",
         "",

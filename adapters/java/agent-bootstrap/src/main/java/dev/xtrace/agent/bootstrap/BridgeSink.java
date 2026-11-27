@@ -13,6 +13,11 @@ public interface BridgeSink {
   /** Offers a recording start without waiting for queue capacity. */
   boolean offerStart(String recordingId, long monotonicNs, String method, String route);
 
+  /** A sink must explicitly support Jersey provenance before accepting a named Jersey root. */
+  default boolean offerJerseyStart(String recordingId, long monotonicNs, String method, String route) {
+    return false;
+  }
+
   /** Offers one sanitized event without retaining application objects. */
   boolean offerEvent(
       String recordingId,

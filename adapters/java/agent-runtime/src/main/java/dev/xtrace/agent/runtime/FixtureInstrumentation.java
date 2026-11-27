@@ -12,9 +12,12 @@ import static net.bytebuddy.matcher.ElementMatchers.nameMatches;
 import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
 import static net.bytebuddy.matcher.ElementMatchers.not;
 import static net.bytebuddy.matcher.ElementMatchers.returns;
+import static net.bytebuddy.matcher.ElementMatchers.takesArgument;
 import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
+import dev.xtrace.agent.bootstrap.JdbcOperation;
+import dev.xtrace.agent.bootstrap.ServletFilterBridge;
 import dev.xtrace.adapter.ClientException;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
@@ -27,7 +30,7 @@ import net.bytebuddy.utility.JavaModule;
 
 /**
  * Installs the Spring MVC request root, method boundary probes on in-scope application classes,
- * and the coarse H2 execute boundary. Attach validation stays fixture-bound until generalized
+ * and coarse JDBC execution boundaries. Attach validation stays fixture-bound until generalized
  * attach lands.
  */
 final class FixtureInstrumentation {
@@ -35,6 +38,7 @@ final class FixtureInstrumentation {
       "org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter";
   static final String DISPATCHER = "org.springframework.web.servlet.DispatcherServlet";
   static final String H2_STATEMENT = "org.h2.jdbc.JdbcPreparedStatement";
+  static final String PG_STATEMENT = "org.postgresql.jdbc.PgStatement";
   static final String CONTROLLER = "dev.xtrace.fixture.OrderController";
   static final String SERVICE = "dev.xtrace.fixture.OrderService";
   static final String REPOSITORY = "dev.xtrace.fixture.OrderRepository";
@@ -111,7 +115,9 @@ final class FixtureInstrumentation {
     if (!INSTALLED.compareAndSet(false, true)) {
       throw new IllegalStateException("fixture instrumentation is already installed");
     }
-    SafeListener listener = new SafeListener(onFailure, scope, limitations);
+    boolean launch = !attach;
+    SafeListener listener = new SafeListener(onFailure, scope, limitations, launch);
+    if (launch) ServletFilterBridge.enable();
     AgentBuilder builder =
         new AgentBuilder.Default()
             .disableClassFormatChanges()
@@ -210,6 +216,14 @@ final class FixtureInstrumentation {
                                     .and(named("executeUpdate"))
                                     .and(takesArguments(0))
                                     .and(not(isSynthetic())))));
+    // Do not broaden the fixture-only attach admission or retransformation set.
+    if (launch) {
+      builder =
+          builder.type(named(PG_STATEMENT)).transform(
+              (target, type, loader, module, domain) ->
+                  target.visit(Advice.to(PgJdbcAdvice.class).on(pgJdbcMethods())));
+    }
+    if (launch) JerseyInstrumentation.install(instrumentation);
     builder.installOn(instrumentation);
     ServletBoundaryInstrumentation.install(instrumentation, onFailure, attach);
   }
@@ -364,6 +378,7 @@ final class FixtureInstrumentation {
     private final Runnable onFailure;
     private final ApplicationScope scope;
     private final CaptureLimitations limitations;
+    private final boolean pgJdbcEnabled;
     // Only in-flight callbacks are retained. Loader identity separates equal names, and a stack
     // preserves the outer verdict when class loading recursively transforms another class.
     private final ThreadLocal<java.util.Deque<ScopedType>> transforming = new ThreadLocal<>();
@@ -384,9 +399,15 @@ final class FixtureInstrumentation {
     }
 
     SafeListener(Runnable onFailure, ApplicationScope scope, CaptureLimitations limitations) {
+      this(onFailure, scope, limitations, false);
+    }
+
+    SafeListener(Runnable onFailure, ApplicationScope scope, CaptureLimitations limitations,
+        boolean pgJdbcEnabled) {
       this.onFailure = java.util.Objects.requireNonNull(onFailure, "onFailure");
       this.scope = scope;
       this.limitations = limitations;
+      this.pgJdbcEnabled = pgJdbcEnabled;
     }
 
     @Override
@@ -445,7 +466,10 @@ final class FixtureInstrumentation {
         boolean loaded,
         Throwable throwable) {
       if (recordedScope(classLoader, typeName, false) == ApplicationScope.APPLICATION) limitations.report();
-      if (isExplicitTarget(typeName)) {
+      if (isExplicitTarget(typeName) || (pgJdbcEnabled && PG_STATEMENT.equals(typeName))) {
+        if (DISPATCHER.equals(typeName) || SPRING_ADAPTER.equals(typeName)) {
+          ServletFilterBridge.boundaryUnavailable();
+        }
         try {
           onFailure.run();
         } catch (Throwable ignored) {
@@ -462,6 +486,22 @@ final class FixtureInstrumentation {
         || DISPATCHER.equals(typeName)
         || H2_STATEMENT.equals(typeName)
         || APPLICATION_TYPES.contains(typeName);
+  }
+
+  private static net.bytebuddy.matcher.ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription>
+      pgJdbcMethods() {
+    // pgjdbc funnels plain, prepared and callable executions through this method, including
+    // driver-internal retry. Both JDBC batch entry points use internalExecuteBatch.
+    var execute = named("execute")
+        .and(takesArguments(3))
+        .and(takesArgument(0, named("org.postgresql.core.CachedQuery")))
+        .and(takesArgument(1, named("org.postgresql.core.ParameterList")))
+        .and(takesArgument(2, int.class))
+        .and(returns(void.class));
+    var batch = named("internalExecuteBatch")
+        .and(takesArguments(0))
+        .and(returns(named("org.postgresql.jdbc.BatchResultHandler")));
+    return isMethod().and(not(isSynthetic())).and(execute.or(batch));
   }
 
   /** Methods that get boundary probes: real behavior, not accessors, bridges or Object plumbing. */
@@ -595,13 +635,28 @@ final class FixtureInstrumentation {
     private H2Advice() {}
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter() {
-      BootstrapBridge.databaseStart();
+    public static String enter() {
+      return BootstrapBridge.databaseStart(JdbcOperation.H2_UPDATE);
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
-    public static void exit(@Advice.Thrown Throwable thrown) {
-      BootstrapBridge.databaseEnd(thrown != null);
+    public static void exit(@Advice.Enter String token, @Advice.Thrown Throwable thrown) {
+      BootstrapBridge.databaseEnd(token, thrown != null);
+    }
+  }
+
+  public static final class PgJdbcAdvice {
+    private PgJdbcAdvice() {}
+
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static String enter(@Advice.Origin("#m") String method) {
+      return BootstrapBridge.databaseStart(
+          "execute".equals(method) ? JdbcOperation.PGJDBC_EXECUTE : JdbcOperation.PGJDBC_BATCH);
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.Enter String token, @Advice.Thrown Throwable thrown) {
+      BootstrapBridge.databaseEnd(token, thrown != null);
     }
   }
 }
