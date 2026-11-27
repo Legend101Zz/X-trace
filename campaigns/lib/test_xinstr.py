@@ -261,6 +261,40 @@ class T(unittest.TestCase):
         del good["events"][1]["sourceBinding"]  # required by the contract: absent is a violation, not "unreported = fine"
         self.assertEqual(xinstr.analyze({"a": good}, exp)["s"]["expectations"][0]["problems"], ["source-binding-missing"])
 
+    def test_source_optional_only_permits_absent_frames_when_opted_in_with_no_layers(self):
+        detail = rec("GET", "/api/bank-accounts", 401, symbols=())
+        strict = {"s": [{"method": "GET", "route": "/api/bank-accounts", "status": 401, "layers": []}]}
+        self.assertEqual(xinstr.analyze({"a": detail}, strict)["s"]["expectations"][0]["problems"], ["no-source-file-line"])
+        opted_in = {"s": [{"method": "GET", "route": "/api/bank-accounts", "status": 401, "layers": [], "sourceOptional": True}]}
+        verdict = xinstr.analyze({"a": detail}, opted_in)["s"]
+        self.assertTrue(verdict["passed"], verdict)
+        self.assertEqual(verdict["expectations"][0]["recordingsWithSource"], 0)
+        layered = {"s": [{"method": "GET", "route": "/api/bank-accounts", "status": 401, "layers": ["controller"], "sourceOptional": True}]}
+        problems = xinstr.analyze({"a": detail}, layered)["s"]["expectations"][0]["problems"]
+        self.assertEqual(problems, ["no-controller-frame", "no-source-file-line"])
+        # Even with sourceOptional=True, a matched source without an acceptable binding remains a contract violation.
+        bad_binding = rec("GET", "/api/bank-accounts", 401, symbols=("SomeFilter.check",))
+        del bad_binding["events"][1]["sourceBinding"]
+        self.assertEqual(xinstr.analyze({"a": bad_binding}, opted_in)["s"]["expectations"][0]["problems"], ["source-binding-missing"])
+
+    def test_canary_hook_preserves_existing_auth_and_honors_skip_auth_paths(self):
+        canaries = {
+            "authorization-header": "Bearer XTCANARY.auth.0123",
+            "cookie-header": "XTCANARY_session=0123",
+            "query-token": "XTCANARYqt0123",
+            "json-body-password": "pw",
+        }
+        hook = xinstr.canary_hook(canaries, skip_auth_paths=frozenset({"/api/authenticate"}))
+        p1, h1, _ = hook("GET", "/api/bank-accounts", {}, None)
+        self.assertEqual(h1["Authorization"], canaries["authorization-header"])
+        self.assertEqual(h1["Cookie"], canaries["cookie-header"])
+        self.assertIn("xt_token=", p1)
+        _, h2, _ = hook("GET", "/api/bank-accounts", {"Authorization": "Bearer real-jwt"}, None)
+        self.assertEqual(h2["Authorization"], "Bearer real-jwt")
+        _, h3, _ = hook("POST", "/api/authenticate?foo=1", {}, b"{}")
+        self.assertNotIn("Authorization", h3)
+        self.assertEqual(h3["Cookie"], canaries["cookie-header"])
+
     def _exc_rec(self, typ="java.lang.RuntimeException", kind="exception_propagated"):
         r = rec("GET", "/oups", None, symbols=("CrashController.triggerException",), kind=kind,
                 resp_symbol="http.response unavailable")

@@ -306,6 +306,31 @@ class T(unittest.TestCase):
             self.assertNotIn(canaries["query-token"], json.dumps(report))
             self.assertFalse(canary.run_scan(canaries, {"bundle-files": [dest / "missing"]}, {"bundle-files": 6})["clean"])
 
+    def test_optional_source_root_and_framework_handle_jaxrs_honestly(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = pathlib.Path(td)
+            exe = td / "fake"
+            exe.write_text("#!/bin/sh\n"
+                           "printf '%s\\n' \"$*\" > \"" + str(td / "scan-args.txt") + "\"\n"
+                           "echo '{\"kind\":\"error\",\"message\":\"no jaxrs analyzer exists yet; use spring-mvc, spring-webflux, express, fastify or nest\"}' >&2\n"
+                           "exit 2\n")
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            summ = td / "s.json"
+            subprocess.run([sys.executable, "-B", str(pathlib.Path(ce.__file__)), "--xtrace", str(exe),
+                            "--project-dir", str(td), "--source-root", "fineract-provider/src/main/java",
+                            "--framework", "jaxrs", "--analyzer", "real-analyzer", "--out", str(td / "o"),
+                            "--file", str(summ), "--project", "fineract"], check=True, capture_output=True)
+            args = (td / "scan-args.txt").read_text()
+            self.assertIn("fineract-provider/src/main/java", args)
+            self.assertIn("--framework jaxrs", args)
+            steps = {s["step"]: s for s in json.loads(summ.read_text())["steps"]}
+            self.assertEqual(steps["export-catalog-scan"]["status"], "not-implemented")
+            self.assertIn("no jaxrs analyzer", steps["export-catalog-scan"]["note"])
+            self.assertEqual(steps["export-formats"]["status"], "not-implemented")
+            self.assertEqual(steps["export-bundle"]["status"], "not-implemented")
+            # A generic exit 2 without the jaxrs message stays a failure, never relabelled as not-implemented.
+            self.assertEqual(ce.judge_scan(2, {"message": "bad source"}, framework="jaxrs")[0], "fail")
+
 
 if __name__ == "__main__":
     unittest.main()

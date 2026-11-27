@@ -460,27 +460,35 @@ class Stack:
         return f"http://127.0.0.1:{self.host_port}"
 
     # ---- database access (read-only effect queries use the campaign role)
+    WRITE_BARRIER_TABLES = {
+        "petclinic": frozenset({"owners"}),
+        "jhipster": frozenset({"bank_account"}),
+        "fineract": frozenset({"m_client"}),
+    }
+
     @contextmanager
-    def hold_owner_writes(self):
-        """Block Petclinic inserts after MVC entry until the interruption probe releases them.
+    def hold_table_writes(self, table: str):
+        """Block inserts into an allowlisted campaign table until the interruption probe releases them.
 
         The acknowledgement proves the transaction owns the lock. SHARE permits the
         handler's reads but blocks its INSERT; closing stdin rolls the transaction back.
         This changes only the disposable campaign database, never upstream source.
         """
         import select
-        if self.project != "petclinic" or not self.db_name:
-            raise RuntimeError("owner write barrier requires the Petclinic campaign database")
+        allowed = self.WRITE_BARRIER_TABLES.get(self.project, frozenset())
+        if table not in allowed or not self.db_name:
+            raise RuntimeError(f"table write barrier for {table!r} requires a configured {self.project} campaign database")
+        target_db = self.effect_db or self.db_name
         proc = subprocess.Popen(
             ["docker", "exec", "-i", self.db, "psql", "-X", "-qAt", "-U", self.db_user,
-             "-d", self.db_name, "-v", "ON_ERROR_STOP=1"],
+             "-d", target_db, "-v", "ON_ERROR_STOP=1"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
-            proc.stdin.write(b"BEGIN; LOCK TABLE owners IN SHARE MODE; SELECT 1;\n")
+            proc.stdin.write(f"BEGIN; LOCK TABLE {table} IN SHARE MODE; SELECT 1;\n".encode())
             proc.stdin.flush()
             ready, _, _ = select.select([proc.stdout], [], [], 10.0)
             if not ready or proc.stdout.readline() != b"1\n":
-                raise RuntimeError("owner write barrier was not acknowledged")
+                raise RuntimeError("write barrier was not acknowledged")
             yield
         finally:
             try:
@@ -493,6 +501,19 @@ class Stack:
                     proc.wait(timeout=10)
                 finally:
                     proc.stdout.close()
+
+    @contextmanager
+    def hold_owner_writes(self):
+        """Block Petclinic inserts after MVC entry until the interruption probe releases them.
+
+        The acknowledgement proves the transaction owns the lock. SHARE permits the
+        handler's reads but blocks its INSERT; closing stdin rolls the transaction back.
+        This changes only the disposable campaign database, never upstream source.
+        """
+        if self.project != "petclinic" or not self.db_name:
+            raise RuntimeError("owner write barrier requires the Petclinic campaign database")
+        with self.hold_table_writes("owners"):
+            yield
 
     def psql(self, query: str, db: str | None = None) -> list[list[str]]:
         if not self.db_name:

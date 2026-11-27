@@ -695,8 +695,12 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 elif w:
                     why.add(w)
             if with_status and not src:
-                problems.append("source-binding-unacceptable" if "unacceptable" in why else
-                                "source-binding-missing" if "missing" in why else "no-source-file-line")
+                if "unacceptable" in why:
+                    problems.append("source-binding-unacceptable")
+                elif "missing" in why:
+                    problems.append("source-binding-missing")
+                elif not (e.get("sourceOptional") is True and not e.get("layers")):
+                    problems.append("no-source-file-line")
             items.append({"method": e["method"], "route": e["route"], "expectedStatus": e.get("status"),
                           "expectedStatuses": e.get("statuses"), "expectedOutcome": e.get("outcome"), "attribution": attribution,
                           "recordingsMatchingRoute": len(matched), "recordingsWithStatus": len(with_status),
@@ -731,14 +735,17 @@ CANARY_LOCATIONS = {
 }
 
 
-def canary_hook(canaries: dict[str, str]) -> Callable[..., tuple]:
+def canary_hook(canaries: dict[str, str], skip_auth_paths: frozenset[str] = frozenset()) -> Callable[..., tuple]:
     """REQUEST_HOOK adding Authorization, Cookie, a query token and a form password to every scenario request."""
     import urllib.parse
 
     def hook(method: str, path: str, headers: dict, raw: Any) -> tuple:
         h = dict(headers)
-        h["Authorization"] = canaries["authorization-header"]
-        h["Cookie"] = canaries["cookie-header"]
+        base_path = path.split("?", 1)[0]
+        if not any(k.lower() == "authorization" for k in h) and base_path not in skip_auth_paths:
+            h["Authorization"] = canaries["authorization-header"]
+        if not any(k.lower() == "cookie" for k in h):
+            h["Cookie"] = canaries["cookie-header"]
         p = path + ("&" if "?" in path else "?") + "xt_token=" + urllib.parse.quote(canaries["query-token"], safe="")
         r = raw
         if method == "POST" and raw is not None and h.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
@@ -773,7 +780,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
                      out_dir: pathlib.Path, norm_extra: list, expectations: dict[str, list[dict]], xtrace: str,
                      project_dir: pathlib.Path, data_home: pathlib.Path, adaptations: list[str],
                      canaries: dict[str, str] | None, baseline_receipt: pathlib.Path | None,
-                     extra_canary_paths: list[tuple[str, str]], harness_files: list[pathlib.Path]) -> dict[str, Any]:
+                     extra_canary_paths: list[tuple[str, str]], harness_files: list[pathlib.Path],
+                     skip_canary_auth_paths: tuple[str, ...] | frozenset[str] = ()) -> dict[str, Any]:
     """Launch (via XCAMP_LAUNCH_PREFIX = xtrace run ... --), run scenarios, stop, read recordings back, judge."""
     import xcamp
     out_dir.mkdir(parents=True, exist_ok=False)
@@ -793,7 +801,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     before_ids = list_recording_ids(xtrace, project_dir, env)
     if canaries:
         notes["canaryLocations"] = dict(CANARY_LOCATIONS)
-        xcamp.REQUEST_HOOK = canary_hook(canaries)
+        xcamp.REQUEST_HOOK = canary_hook(canaries, skip_auth_paths=frozenset(skip_canary_auth_paths))
         os.environ["XTRACE_CANARY_ENV"] = canaries["env-var"]
     os.environ["XTRACE_DATA_HOME"] = str(data_home)
     run_id = out_dir.name.replace("instrumented-", "i") + str(int(time.time()) % 100000)

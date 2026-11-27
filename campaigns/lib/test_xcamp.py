@@ -121,6 +121,33 @@ class Ports(unittest.TestCase):
                     self.fail("wrong database")
         launch.assert_not_called()
 
+    def test_table_write_barrier_supports_jhipster_and_fineract_effect_db(self):
+        cases = (
+            ("jhipster", "jhipsterSampleApplication", None, "jhipsterSampleApplication", "bank_account"),
+            ("fineract", "fineract_tenants", "fineract_default", "fineract_default", "m_client"),
+        )
+        for project, db_name, effect_db, expected_db, table in cases:
+            with self.subTest(project=project):
+                stack = xcamp.Stack(project=project, jdk_image="jdk", jar=pathlib.Path("app.jar"),
+                                    app_args=[], app_port=8080, ready_path="/health",
+                                    db_name=db_name, effect_db=effect_db)
+                proc = mock.Mock(stdin=mock.Mock(), stdout=io.BytesIO(b"1\n"))
+                with mock.patch.object(xcamp.subprocess, "Popen", return_value=proc) as launch, \
+                        mock.patch("select.select", return_value=([proc.stdout], [], [])):
+                    with stack.hold_table_writes(table):
+                        pass
+                cmd = launch.call_args.args[0]
+                self.assertEqual(cmd[cmd.index("-d") + 1], expected_db)
+                proc.stdin.write.assert_called_once_with(
+                    f"BEGIN; LOCK TABLE {table} IN SHARE MODE; SELECT 1;\n".encode())
+        with mock.patch.object(xcamp.subprocess, "Popen") as launch:
+            bad = xcamp.Stack(project="jhipster", jdk_image="jdk", jar=pathlib.Path("app.jar"),
+                              app_args=[], app_port=8080, ready_path="/health", db_name="jhipsterSampleApplication")
+            with self.assertRaises(RuntimeError):
+                with bad.hold_table_writes("owners"):
+                    self.fail("mismatched table must be rejected")
+        launch.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,37 @@ MAX_EVENTS_PER_RECORDING = 128
 ROUTES = frozenset(("/", "/owners", "/owners/find", "/owners/new", "/owners/{ownerId}",
                     "/owners/{ownerId}/edit", "/owners/{ownerId}/pets/new",
                     "/owners/{ownerId}/pets/{petId}/visits/new", "/vets", "/vets.html", "/oups"))
+JHIPSTER_ROUTES = frozenset((
+    "/api/authenticate", "/api/account", "/api/admin/users", "/api/admin/users/{login}",
+    "/api/bank-accounts", "/api/bank-accounts/{id}",
+    "/api/labels", "/api/labels/{id}",
+    "/api/operations", "/api/operations/{id}",
+    "/management/health",
+))
+FINERACT_ROUTES = frozenset((
+    "/fineract-provider/api/v1/offices",
+    "/fineract-provider/api/v1/offices/{officeId}",
+    "/fineract-provider/api/v1/clients",
+    "/fineract-provider/api/v1/clients/{clientId}",
+    "/fineract-provider/actuator/health",
+))
+PROJECT_ROUTES = {
+    "petclinic": ROUTES,
+    "jhipster": JHIPSTER_ROUTES,
+    "fineract": FINERACT_ROUTES,
+}
+PROJECT_APP_PREFIXES = {
+    "petclinic": "org.springframework.samples.petclinic.",
+    "jhipster": "io.github.jhipster.sample.",
+    "fineract": "org.apache.fineract.",
+}
+
+
+def project_config(project: str = "petclinic") -> tuple[frozenset[str], str]:
+    """Return (allowlisted_routes, application_package_prefix) for a campaign project."""
+    if project not in PROJECT_ROUTES:
+        raise ValueError(f"unknown campaign diagnostics project: {project!r}")
+    return PROJECT_ROUTES[project], PROJECT_APP_PREFIXES[project]
 KINDS = frozenset("unspecified request_update frame_enter frame_exit frame_throw line_cursor value_snapshot "
                   "database_start database_end outbound_http_start outbound_http_end async_link exception response gap".split())
 GAP_REASONS = frozenset("unspecified line_budget value_budget throttle queue_full correlation_lost class_not_transformed "
@@ -59,7 +90,7 @@ REQUEST = re.compile(r"http\.request (?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) 
 RESPONSE = re.compile(r"http\.response (?:[1-5][0-9]{2}|unavailable)")
 
 FLOW_SOURCES = {
-    "record-stop-flow": ("api-record-stop", "api-live-record-stop/1", "api-live-record-stop/2", "api-live-record-stop/3"),
+    "record-stop-flow": ("api-record-stop", "api-live-record-stop/1", "api-live-record-stop/2", "api-live-record-stop/3", "api-live-record-stop/4"),
     "restart-reopen": ("api-after-restart", "api-before-restart"),
     "partial-recording-reopen": ("api-partial",),
     "active-line-frames": ("api-focused",), "frame-values": ("api-focused",),
@@ -122,7 +153,7 @@ def event_kind(value):
     return enum(value.removeprefix("recording_event_kind:"), KINDS) or "unrecognized"
 
 
-def safe_symbol(value):
+def safe_symbol(value, project: str = "petclinic"):
     """Keep allowlisted HTTP metadata; replace Java text with a layer and hash.
 
     Layers are naming heuristics, not proof that a class or member was built.
@@ -130,9 +161,10 @@ def safe_symbol(value):
     """
     if not isinstance(value, str) or len(value) > 256:
         return None
+    routes, app_prefix = project_config(project)
     request = REQUEST.fullmatch(value)
     if request:
-        return value if request[1] in ROUTES else None
+        return value if request[1] in routes else None
     if RESPONSE.fullmatch(value):
         return value
     java = JAVA_SYMBOL.fullmatch(value)
@@ -141,20 +173,22 @@ def safe_symbol(value):
         layer = "other"
         # MethodIdentity uses simple class names. These suffixes remain naming
         # heuristics; retain the whole identity in the hash to distinguish overloads.
-        if declaring_class.startswith("org.springframework.samples.petclinic.") or (
+        if declaring_class.startswith(app_prefix) or (
                 java["identity"] and "." not in declaring_class):
             class_name = declaring_class.rsplit(".", 1)[-1]
-            for suffix in ("Controller", "Service", "Repository"):
-                if class_name.endswith(suffix):
-                    layer = suffix.lower()
-                    break
+            if class_name.endswith(("Controller", "Resource")):
+                layer = "controller"
+            elif class_name.endswith(("Service", "ServiceImpl")) or "ServiceJpaRepositoryImpl" in class_name:
+                layer = "service"
+            elif class_name.endswith(("Repository", "RepositoryWrapper", "Dao")):
+                layer = "repository"
         elif any(declaring_class.startswith(package + ".") for package in FRAMEWORK_PACKAGES):
             layer = "framework"
         return f"withheld:{layer}:sha256:" + hashlib.sha256(value.encode()).hexdigest()
     return None
 
 
-def recording(doc: dict) -> dict:
+def recording(doc: dict, project: str = "petclinic") -> dict:
     """Copy only structural fields; line is never filled from a method extent."""
     events = doc.get("events")
     available = isinstance(events, list) and "_http" not in doc
@@ -167,7 +201,7 @@ def recording(doc: dict) -> dict:
         if not isinstance(event, dict):
             continue
         kind = event_kind(event.get("kind"))
-        symbol = safe_symbol(event.get("symbol"))
+        symbol = safe_symbol(event.get("symbol"), project=project)
         request = REQUEST.fullmatch(symbol or "")
         if kind == "request_update" and request:
             route = route or request[1]
@@ -249,7 +283,7 @@ def proxy_diagnostics(path: pathlib.Path, needles: list[bytes]) -> dict:
 
 
 def skeleton(step: str, roots: list[pathlib.Path], needles: list[bytes], excluded: frozenset[str] = frozenset(),
-             proxy: dict | None = None) -> dict:
+             proxy: dict | None = None, project: str = "petclinic") -> dict:
     """Keep all event-kind counts even when event rows hit the output cap.
 
     Repeated ids in different snapshots are retained: a before/after comparison
@@ -286,7 +320,7 @@ def skeleton(step: str, roots: list[pathlib.Path], needles: list[bytes], exclude
                 result["filesUnreadable"] += 1
                 continue
             seen.add(rid)
-            row = recording(doc)
+            row = recording(doc, project=project)
             # Canary-shaped text can be syntactically valid as a symbol or id.
             # Apply the scanner's own raw/encoded needles to every output string.
             def scrub(value):
@@ -326,7 +360,8 @@ def skeleton(step: str, roots: list[pathlib.Path], needles: list[bytes], exclude
 
 
 def write_failures(summary: pathlib.Path, instrumented: pathlib.Path, flows: pathlib.Path,
-                   out: pathlib.Path, canaries: dict[str, str]) -> int:
+                   out: pathlib.Path, canaries: dict[str, str], project: str = "petclinic") -> int:
+    project_config(project)
     doc = load(summary)
     steps = {s["step"]: s.get("status") for s in (doc or {}).get("steps", [])}
     needles = [raw for _, _, raw in canary.build_index(canaries)]
@@ -343,7 +378,7 @@ def write_failures(summary: pathlib.Path, instrumented: pathlib.Path, flows: pat
             before = instrumented / "boundary-before"
         excluded = frozenset(p.stem.removeprefix("recording-") for p in before.glob("recording-*.json")) if before else frozenset()
         proxy = proxy_diagnostics(instrumented / "application.log", needles) if step in INSTRUMENTED_STEPS else None
-        report = skeleton(step, roots, needles, excluded, proxy)
+        report = skeleton(step, roots, needles, excluded, proxy, project=project)
         if len(encoded(report)) > MAX_BYTES:
             raise ValueError("diagnostic size cap exceeded")
         (out / f"{step}.json").write_bytes(encoded(report))
@@ -357,12 +392,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ("summary", "instrumented", "flows", "out", "canaries"):
         ap.add_argument(f"--{name}", required=True, type=pathlib.Path)
+    ap.add_argument("--project", default="petclinic", choices=tuple(PROJECT_ROUTES))
     args = ap.parse_args()
     canaries = load(args.canaries)
     if not isinstance(canaries, dict) or not canaries:
         print("campaign diagnostics: private canary file unavailable")
         return 1
-    count = write_failures(args.summary, args.instrumented, args.flows, args.out, canaries)
+    count = write_failures(args.summary, args.instrumented, args.flows, args.out, canaries, project=args.project)
     print(f"campaign diagnostics: {count} failed step skeleton(s) written")
     return 0
 
