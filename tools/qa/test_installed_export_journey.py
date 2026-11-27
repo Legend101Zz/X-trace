@@ -8,6 +8,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 sys.dont_write_bytecode = True
@@ -406,6 +407,19 @@ class DownloadJudgeTests(unittest.TestCase):
     def test_host_blake3_known_vectors(self):
         self.assertEqual(journey.blake3_bytes(b""), "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
         self.assertEqual(journey.blake3_bytes(b"abc"), self.cli["files"][0]["blake3"])
+
+    def test_pure_python_blake3_fallback_matches_official_vectors(self):
+        vectors = (
+            (b"", "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
+            (b"abc", "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"),
+            (bytes(i % 251 for i in range(1024)), "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7"),
+            (bytes(i % 251 for i in range(1025)), "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444"),
+        )
+        with mock.patch.object(journey.shutil, "which", return_value=None):
+            for payload, expected in vectors:
+                with self.subTest(length=len(payload)):
+                    self.assertEqual(journey._blake3_pure_python(payload), expected)
+                    self.assertEqual(journey.blake3_bytes(payload), expected)
 
     def test_matching_fraudulent_metadata_fails(self):
         self.cli["files"][0]["blake3"] = "b" * 64

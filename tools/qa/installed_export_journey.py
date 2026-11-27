@@ -3,7 +3,8 @@
 
 Requires an enclosing job's fresh official installation of the digest-pinned archive,
 the matching source checkout, built Spring fixture JAR, host JDK and Playwright Chromium.
-Requires host b3sum for independent logical-file BLAKE3 verification.
+Requires host b3sum when available, or an independent pure-Python stdlib BLAKE3 fallback,
+for logical-file BLAKE3 verification.
 This command rebuilds nothing and deliberately provides no analyzer override. Example:
   python3 tools/qa/installed_export_journey.py --prefix PREFIX --package ARCHIVE \
     --package-sha256 SHA256 --source-sha SHA --repo REPO --fixture-jar JAR \
@@ -28,6 +29,7 @@ import selectors
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -336,13 +338,109 @@ def safe_member(name):
     return bool(name) and not path.is_absolute() and "\\" not in name and "\0" not in name and all(part not in ("", ".", "..") for part in name.split("/"))
 
 
+_BLAKE3_IV = (
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+)
+_BLAKE3_PERMUTATION = (2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+_BLAKE3_CHUNK_START = 1
+_BLAKE3_CHUNK_END = 2
+_BLAKE3_PARENT = 4
+_BLAKE3_ROOT = 8
+
+
+def _blake3_compress(cv, block_words, counter, block_len, flags):
+    state = [
+        cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7],
+        _BLAKE3_IV[0], _BLAKE3_IV[1], _BLAKE3_IV[2], _BLAKE3_IV[3],
+        counter & 0xFFFFFFFF, (counter >> 32) & 0xFFFFFFFF, block_len, flags,
+    ]
+    m = list(block_words)
+    for round_index in range(7):
+        for a, b, c, d, mx, my in (
+            (0, 4, 8, 12, m[0], m[1]),
+            (1, 5, 9, 13, m[2], m[3]),
+            (2, 6, 10, 14, m[4], m[5]),
+            (3, 7, 11, 15, m[6], m[7]),
+            (0, 5, 10, 15, m[8], m[9]),
+            (1, 6, 11, 12, m[10], m[11]),
+            (2, 7, 8, 13, m[12], m[13]),
+            (3, 4, 9, 14, m[14], m[15]),
+        ):
+            state[a] = (state[a] + state[b] + mx) & 0xFFFFFFFF
+            v = state[d] ^ state[a]
+            state[d] = ((v >> 16) | (v << 16)) & 0xFFFFFFFF
+            state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+            v = state[b] ^ state[c]
+            state[b] = ((v >> 12) | (v << 20)) & 0xFFFFFFFF
+            state[a] = (state[a] + state[b] + my) & 0xFFFFFFFF
+            v = state[d] ^ state[a]
+            state[d] = ((v >> 8) | (v << 24)) & 0xFFFFFFFF
+            state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+            v = state[b] ^ state[c]
+            state[b] = ((v >> 7) | (v << 25)) & 0xFFFFFFFF
+        if round_index < 6:
+            m = [m[index] for index in _BLAKE3_PERMUTATION]
+    for index in range(8):
+        state[index] ^= state[index + 8]
+        state[index + 8] ^= cv[index]
+    return tuple(state)
+
+
+def _blake3_pure_python(value):
+    """Pure-Python stdlib BLAKE3 reference hash (32-byte digest, hex)."""
+    data = bytes(value)
+    if not data:
+        out = _blake3_compress(_BLAKE3_IV, (0,) * 16, 0, 0,
+                               _BLAKE3_CHUNK_START | _BLAKE3_CHUNK_END | _BLAKE3_ROOT)
+        return struct.pack("<8I", *out[:8]).hex()
+
+    cv_stack = []
+    chunk_counter = 0
+    total_len = len(data)
+    for offset in range(0, total_len, 1024):
+        chunk = data[offset:offset + 1024]
+        is_last_chunk = (offset + len(chunk) == total_len)
+        chunk_cv = _BLAKE3_IV
+        for block_offset in range(0, len(chunk), 64):
+            block = chunk[block_offset:block_offset + 64]
+            is_first_block = (block_offset == 0)
+            is_last_block = (block_offset + len(block) == len(chunk))
+            words = struct.unpack("<16I", block.ljust(64, b"\0"))
+            flags = ((_BLAKE3_CHUNK_START if is_first_block else 0)
+                     | (_BLAKE3_CHUNK_END if is_last_block else 0))
+            if is_last_chunk and is_last_block and not cv_stack:
+                out = _blake3_compress(chunk_cv, words, chunk_counter, len(block), flags | _BLAKE3_ROOT)
+                return struct.pack("<8I", *out[:8]).hex()
+            chunk_cv = _blake3_compress(chunk_cv, words, chunk_counter, len(block), flags)[:8]
+
+        if not is_last_chunk:
+            completed = chunk_counter + 1
+            while (completed & 1) == 0:
+                left = cv_stack.pop()
+                chunk_cv = _blake3_compress(_BLAKE3_IV, left + chunk_cv, 0, 64, _BLAKE3_PARENT)[:8]
+                completed >>= 1
+            cv_stack.append(chunk_cv)
+            chunk_counter += 1
+        else:
+            right = chunk_cv
+            while len(cv_stack) > 1:
+                left = cv_stack.pop()
+                right = _blake3_compress(_BLAKE3_IV, left + right, 0, 64, _BLAKE3_PARENT)[:8]
+            left = cv_stack.pop()
+            out = _blake3_compress(_BLAKE3_IV, left + right, 0, 64, _BLAKE3_PARENT | _BLAKE3_ROOT)
+            return struct.pack("<8I", *out[:8]).hex()
+    raise AssertionError("unreachable")
+
+
 def blake3_bytes(value):
-    """Independent host utility, not either product metadata source."""
+    """Independent host BLAKE3 hash (b3sum when installed, else pure-Python stdlib fallback)."""
     executable = shutil.which("b3sum")
-    require(executable is not None, "b3sum-prerequisite")
-    result = subprocess.run([executable, "--no-names"], input=value, capture_output=True, timeout=30, check=False)
-    require(result.returncode == 0 and re.fullmatch(rb"[0-9a-f]{64}\n?", result.stdout), "b3sum-failed")
-    return result.stdout.decode().strip()
+    if executable is not None:
+        result = subprocess.run([executable, "--no-names"], input=value, capture_output=True, timeout=30, check=False)
+        require(result.returncode == 0 and re.fullmatch(rb"[0-9a-f]{64}\n?", result.stdout), "b3sum-failed")
+        return result.stdout.decode().strip()
+    return _blake3_pure_python(value)
 
 
 def omission_groups(omissions, export_format):
