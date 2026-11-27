@@ -34,13 +34,29 @@ export async function runBaseline({ project, n, root, buildStack, scenarios, met
     failure = String(e && e.message).slice(0, 800);
     console.error("baseline failed:", failure);
   } finally {
-    const logs = container.logs(names.app);
-    fs.writeFileSync(path.join(outDir, "app.log"), (logs.stdout || "") + (logs.stderr || ""), { mode: 0o600 });
-    for (const extra of ["worker", "dep"]) {
-      const l = container.logs(names[extra]);
-      if ((l.stdout || l.stderr)) fs.writeFileSync(path.join(outDir, `${extra}.log`), (l.stdout || "") + (l.stderr || ""), { mode: 0o600 });
+    let exit = "";
+    if (ctx?.stopHost) {
+      const code = await ctx.stopHost();
+      exit = code === null || code === undefined ? "" : String(code);
     }
-    const exit = docker(["inspect", "-f", "{{.State.ExitCode}}", names.app], { allowFail: true }).stdout.trim();
+    if (ctx?.stopWorker) {
+      await ctx.stopWorker();
+    }
+    const appLogPath = path.join(outDir, "app.log");
+    if (!fs.existsSync(appLogPath)) {
+      const logs = container.logs(names.app);
+      fs.writeFileSync(appLogPath, (logs.stdout || "") + (logs.stderr || ""), { mode: 0o600 });
+    }
+    for (const extra of ["worker", "dep"]) {
+      const extraLogPath = path.join(outDir, `${extra}.log`);
+      if (!fs.existsSync(extraLogPath)) {
+        const l = container.logs(names[extra]);
+        if (l.stdout || l.stderr) fs.writeFileSync(extraLogPath, (l.stdout || "") + (l.stderr || ""), { mode: 0o600 });
+      }
+    }
+    if (!ctx?.stopHost) {
+      exit = docker(["inspect", "-f", "{{.State.ExitCode}}", names.app], { allowFail: true }).stdout.trim();
+    }
     if (!keep) {
       container.rm(names.worker);
       container.rm(names.dep);
@@ -58,8 +74,18 @@ export async function runBaseline({ project, n, root, buildStack, scenarios, met
       status,
       failure,
       appContainerExitCodeAtTeardown: exit,
-      appLogSha256: sha256Hex(fs.readFileSync(path.join(outDir, "app.log"))),
+      appLogSha256: sha256Hex(fs.readFileSync(appLogPath)),
       fingerprints: summary ? Object.fromEntries(summary.scenarios.map((s) => [s.id, s.semanticEffectFingerprint ?? null])) : null,
+      scenarios: summary
+        ? summary.scenarios.map((s) => ({
+            id: s.id,
+            name: s.name,
+            kind: s.kind,
+            result: s.result,
+            semanticEffectFingerprint: s.semanticEffectFingerprint ?? null,
+            durationMs: s.durationMs,
+          }))
+        : [],
       ...meta,
     };
     fs.writeFileSync(path.join(outDir, "receipt.json"), JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });

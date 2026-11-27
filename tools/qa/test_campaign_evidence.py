@@ -47,5 +47,19 @@ class WorkflowEvidence(unittest.TestCase):
         self.assertIn('camp_overhead.py --manifest "$CAMP_ROOT/java/$CAMP_PROJECT/overhead/runs.json"', text)
 
 
+    def test_node_campaigns_wire_instrumented_host_execution_and_fail_closed_privacy_scans(self):
+        text = (ROOT / ".github/workflows/campaigns.yml").read_text()
+        self.assertIn("node-version: ${{ matrix.nodeVersion }}", text)
+        self.assertIn('XCAMP_NODE_ADAPTER=$top/share/xtrace/packs/node/dist', text)
+        self.assertIn('node "campaigns/node/$CAMP_PROJECT/harness/run.mjs" instrumented', text)
+        node_scan = text[text.index("      - name: Node privacy canary scan"):
+                         text.index("      - name: Collect artifacts")]
+        for req in ("--require store:1", "--require daemon-log:2", "--require ui-json:1",
+                    "--require receipts:1", "--require ci-output:1", "--require browser-dom:1"):
+            self.assertIn(req, node_scan)
+        final_step = text[text.index("      - name: Final privacy re-scan"):]
+        self.assertIn("matrix.kind == 'node'", final_step)
+
+
 if __name__ == "__main__":
     unittest.main()

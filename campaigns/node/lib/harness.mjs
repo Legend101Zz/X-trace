@@ -6,13 +6,16 @@ import path from "node:path";
 import { canonicalJson, sha256Hex, Normalizer } from "./canonical.mjs";
 import { Recorder } from "./http.mjs";
 
-export async function runScenarios({ project, baseUrl, outDir, scenarios, ctxExtra = {} }) {
+export async function runScenarios({ project, baseUrl, outDir, scenarios, ctxExtra = {}, requestHook = null, onCall = null, kind = "uninstrumented_baseline_only" }) {
   fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
   const results = [];
   let allPassed = true;
   for (const sc of scenarios) {
     const norm = new Normalizer();
-    const rec = new Recorder(baseUrl, norm);
+    const rec = new Recorder(baseUrl, norm, {
+      requestHook,
+      onCall: onCall ? (call) => onCall({ scenarioId: sc.id, ...call }) : null,
+    });
     const ctx = { http: rec, norm, ...ctxExtra };
     const t0 = performance.now();
     let result;
@@ -52,7 +55,7 @@ export async function runScenarios({ project, baseUrl, outDir, scenarios, ctxExt
   const summary = {
     schemaVersion: 1,
     project,
-    kind: "uninstrumented_baseline_only",
+    kind,
     releaseAcceptance: false,
     result: allPassed ? "passed" : "failed",
     scenarioCount: results.length,

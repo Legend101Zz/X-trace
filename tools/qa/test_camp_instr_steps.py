@@ -105,6 +105,20 @@ class T(unittest.TestCase):
         self.assertEqual(d["instrumented-fingerprints-equal-baseline"][0], "fail")
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
 
+    def test_node_receipt_fails_source_identity_honestly_when_unavailable(self):
+        r = {"runtime": "node", "scenarios": [sc("a"), sc("b")], "api": {"ok": True, "recordings": 4},
+             "problemClasses": {}, "recordingsWithSource": 0,
+             "observedLimitations": ["source_locations_unavailable", "values_unavailable"],
+             "notes": {"launcherExitCode": 143}}
+        d = by(s.instrumented_steps(r))
+        self.assertEqual(d["instrumented-run"][0], "pass")
+        self.assertEqual(d["instrumented-fingerprints-equal-baseline"][0], "pass")
+        self.assertEqual(d["recordings-per-scenario"][0], "pass")
+        self.assertEqual(d["api-json-artifact"][0], "pass")
+        self.assertEqual(d["launcher-exit-after-sigterm"][0], "pass")
+        self.assertEqual(d["source-identity"][0], "fail")
+        self.assertIn("source_locations_unavailable", d["source-identity"][1])
+
     def test_browser_and_tui(self):
         j = {"widths": [{"width": 320}], "linear": "pass", "canvas": "not-implemented", "overflowAt": []}
         d = by(s.browser_steps(j))
