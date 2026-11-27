@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import shutil
-import stat
 import sys
 import tarfile
 import tempfile
@@ -26,6 +25,10 @@ FILES = {
     "share/xtrace/web/assets.sha256": "x",
     "share/xtrace/packs/java/agent/xtrace-agent.jar": "jar",
     "share/xtrace/packs/node/pack.manifest": "m",
+    "share/xtrace/packs/node/dist/manifest.sha256": "d",
+    "share/xtrace/analyzers/java/bin/xtrace-java-static": "#!/bin/sh\n",
+    "share/xtrace/analyzers/java/lib/static-analyzer-0.0.1.jar": "analyzer",
+    "share/xtrace/analyzers/java/lib/javaparser-core-3.28.1.jar": "parser",
     "share/xtrace/packs/node/dist/register.cjs": "c",
     "share/xtrace/schema/proto/xtp-agent/v1.proto": "p",
     "share/xtrace/schema/xtp-client/openapi.yaml": "o",
@@ -43,8 +46,8 @@ def build(root, trust="unsigned", version="0.0.1", drop=(), extra=None):
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(body)
-        if rel == "bin/xtrace":
-            p.chmod(p.stat().st_mode | stat.S_IXUSR)
+        if rel in ("bin/xtrace", "share/xtrace/analyzers/java/bin/xtrace-java-static"):
+            p.chmod(0o755)
     rows = [f"{vp.sha256_file(root / r)}  {r}" for r in sorted(files)]
     (root / "share/xtrace/payload.sha256").write_text("\n".join(rows) + "\n")
     listed = sorted(list(files) + ["share/xtrace/payload.sha256"])
@@ -71,13 +74,23 @@ class VerifyPackage(unittest.TestCase):
         report = vp.verify(self.root)
         self.assertTrue(report["ok"], report)
         self.assertFalse(report["release_evidence"])
-        for drop in ("share/xtrace/packs/node/pack.manifest", "share/xtrace/web/index.html",
-                     "share/xtrace/schema/xtp-client/openapi.yaml", "bin/xtrace"):
+        for drop in ("share/xtrace/packs/node/pack.manifest",
+                     "share/xtrace/packs/node/dist/manifest.sha256", "share/xtrace/web/index.html",
+                     "share/xtrace/schema/xtp-client/openapi.yaml", "bin/xtrace",
+                     "share/xtrace/analyzers/java/bin/xtrace-java-static",
+                     "share/xtrace/analyzers/java/lib/static-analyzer-0.0.1.jar",
+                     "share/xtrace/analyzers/java/lib/javaparser-core-3.28.1.jar"):
             shutil.rmtree(self.root)
             self.root.mkdir()
             build(self.root, drop=[drop])
             v = verdict(vp.verify(self.root))
             self.assertFalse(v["required_components"], drop)
+
+    def test_java_analyzer_launcher_requires_executable_mode(self):
+        build(self.root)
+        launcher = self.root / "share/xtrace/analyzers/java/bin/xtrace-java-static"
+        launcher.chmod(0o644)
+        self.assertFalse(verdict(vp.verify(self.root))["java_analyzer_executable"])
 
     def test_version_matches_package_name(self):
         build(self.root, version="0.1.0")
@@ -130,6 +143,35 @@ class VerifyPackage(unittest.TestCase):
         v = verdict(vp.verify(self.root))
         self.assertTrue(v["manifest_hashes"])
         self.assertFalse(v["payload_hashes"])
+
+    def test_archive_cli_mode_is_checked_before_extraction(self):
+        build(self.root)
+        archive = self.tmp / "xtrace-0.0.1-linux-x86_64.tar.gz"
+        member = self.root / "bin/xtrace"
+        for mode in (0o755, 0o644, 0o775):
+            with self.subTest(mode=mode):
+                member.chmod(mode)
+                with tarfile.open(archive, "w:gz") as tf:
+                    tf.add(self.root, arcname=self.root.name)
+                if mode == 0o755:
+                    self.assertTrue(vp.verify(archive)["ok"])
+                else:
+                    with self.assertRaisesRegex(SystemExit, "regular bin/xtrace at mode 0755"):
+                        vp.verify(archive)
+
+    def test_archive_cli_manifest_mode_must_agree_with_header(self):
+        build(self.root)
+        path = self.root / vp.MANIFEST_REL
+        manifest = json.loads(path.read_text())
+        cli_row, = (row for row in manifest["files"] if row["path"] == "bin/xtrace")
+        archive = self.tmp / "xtrace-0.0.1-linux-x86_64.tar.gz"
+        for declared in ("0755", "0644"):
+            with self.subTest(declared=declared):
+                cli_row["mode"] = declared
+                path.write_text(json.dumps(manifest))
+                with tarfile.open(archive, "w:gz") as tf:
+                    tf.add(self.root, arcname=self.root.name)
+                self.assertEqual(verdict(vp.verify(archive))["manifest_schema"], declared == "0755")
 
     def test_archive_with_a_fifo_member_is_rejected(self):
         build(self.root)

@@ -21,6 +21,8 @@ export interface InteractionFacts {
   method: string;
   /** Sanitized shape only: never literals, query strings, headers or bodies. */
   summary: string;
+  schema?: string;
+  table?: string;
   host?: string;
   port?: number;
   statusCode?: number;

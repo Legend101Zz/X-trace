@@ -95,7 +95,7 @@ public final class AgentRuntime {
       BoundedEventQueue queue = new BoundedEventQueue(8192, 2L * 1024 * 1024);
       sink = new RuntimeBridgeSink(queue);
       sink.useScope(config.scope());
-      writer = new RecordingWriter(session, queue, sink);
+      writer = new RecordingWriter(session, queue, sink, !attach);
       FixtureInstrumentation.CaptureLimitations limitations =
           new FixtureInstrumentation.CaptureLimitations();
       sink.untransformedCount(limitations::count);
@@ -115,6 +115,9 @@ public final class AgentRuntime {
         throw new ClientException("XTR-JAVA-AGENT", "proxy sink is already active");
       }
       ProxyInstrumentation.install(instrumentation, writer::stopIncomplete, attach);
+      ReactorContextInstrumentation.install(instrumentation, limitations::report, attach);
+      WebFluxInstrumentation.install(instrumentation, limitations::report, attach);
+      ProcessLinkageInstrumentation.install(instrumentation, limitations::report, attach);
       FixtureInstrumentation.install(
           instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes, limitations);
       if (lineSink != null && !BootstrapBridge.installLineSink(lineSink)) {
@@ -259,6 +262,30 @@ public final class AgentRuntime {
 
     private void close() {
       if (!closed.compareAndSet(false, true)) return;
+      JerseyInstrumentation.reportCoverageAtShutdown();
+      WebFluxInstrumentation.reportCoverageAtShutdown();
+      ReactorContextInstrumentation.reportCoverageAtShutdown();
+      ProcessLinkageInstrumentation.reportCoverageAtShutdown();
+      if (dev.xtrace.agent.bootstrap.JerseyBridge.takeObservationUnavailable()) {
+        System.err.println("{\"code\":\"XTR-JAVA-INSTRUMENTATION\","
+            + "\"message\":\"Jersey dispatch identity or route observation unavailable\"}");
+      }
+      if (dev.xtrace.agent.bootstrap.WebFluxBridge.takeObservationUnavailable()) {
+        System.err.println("{\"code\":\"XTR-JAVA-INSTRUMENTATION\","
+            + "\"message\":\"Spring WebFlux dispatch identity or route observation unavailable\"}");
+      }
+      if (dev.xtrace.agent.bootstrap.WebFluxBridge.takeInstrumentationUnavailable()) {
+        System.err.println("{\"code\":\"XTR-JAVA-INSTRUMENTATION\","
+            + "\"message\":\"Spring WebFlux instrumentation degraded during request execution\"}");
+      }
+      if (dev.xtrace.agent.bootstrap.ReactorContextBridge.takePropagationUnavailable()) {
+        System.err.println("{\"code\":\"XTR-JAVA-INSTRUMENTATION\","
+            + "\"message\":\"Reactor context propagation degraded across async boundaries\"}");
+      }
+      if (dev.xtrace.agent.bootstrap.ReactorContextBridge.takeCorrelationGapObserved()) {
+        System.err.println("{\"code\":\"XTR-JAVA-INSTRUMENTATION\","
+            + "\"message\":\"one or more reactive requests observed missing or detached correlation context\"}");
+      }
       if (lineSink != null) BootstrapBridge.disableLineSink(lineSink);
       proxySink.close();
       writer.close();

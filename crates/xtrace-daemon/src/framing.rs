@@ -135,14 +135,11 @@ impl<W: AsyncWrite + Unpin> EnvelopeAsyncEncoder<W> {
     /// envelope exceeds the negotiated limit, or the protobuf
     /// encoder reports an error.
     pub async fn write_envelope(&mut self, envelope: &AgentEnvelope) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(envelope.encoded_len());
-        envelope
-            .encode(&mut buf)
-            .map_err(|err| io::Error::other(format!("encode envelope: {err}")))?;
-        let len = u32::try_from(buf.len()).map_err(|_| {
+        let encoded_len = envelope.encoded_len();
+        let len = u32::try_from(encoded_len).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("envelope length {} does not fit in u32", buf.len()),
+                format!("envelope length {encoded_len} does not fit in u32"),
             )
         })?;
         if len > self.codec.max_envelope_bytes {
@@ -151,8 +148,14 @@ impl<W: AsyncWrite + Unpin> EnvelopeAsyncEncoder<W> {
                 format!("envelope length {len} exceeds limit {}", self.codec.max_envelope_bytes),
             ));
         }
-        self.writer.write_all(&len.to_be_bytes()).await?;
-        self.writer.write_all(&buf).await?;
+        // Stop-and-wait clients need the entire ACK before they can send again.
+        // Give TLS the prefix and body together so the prefix is not sent on its own.
+        let mut frame = Vec::with_capacity(encoded_len + size_of::<u32>());
+        frame.extend_from_slice(&len.to_be_bytes());
+        envelope
+            .encode(&mut frame)
+            .map_err(|err| io::Error::other(format!("encode envelope: {err}")))?;
+        self.writer.write_all(&frame).await?;
         // TLS may buffer writes; peers can wait for this frame before sending more.
         self.writer.flush().await
     }
@@ -217,6 +220,7 @@ pub(crate) mod test_writer {
     #[derive(Default)]
     pub(crate) struct BufferedWriter {
         pub(crate) pending: Vec<u8>,
+        pub(crate) write_count: usize,
         pub(crate) delivered: Vec<u8>,
         pub(crate) fail_flush: bool,
         pub(crate) hold_flush: Option<std::sync::Arc<tokio::sync::Notify>>,
@@ -228,6 +232,7 @@ pub(crate) mod test_writer {
             _: &mut Context<'_>,
             bytes: &[u8],
         ) -> Poll<io::Result<usize>> {
+            self.write_count += 1;
             self.pending.extend_from_slice(bytes);
             Poll::Ready(Ok(bytes.len()))
         }
@@ -282,6 +287,7 @@ mod tests {
         encoder.write_envelope(&envelope).await.expect("write ACK");
         let writer = encoder.writer_mut();
         assert!(writer.pending.is_empty());
+        assert_eq!(writer.write_count, 1, "offer the complete ACK to TLS in one write");
         let mut reader = writer.delivered.as_slice();
         let decoded =
             EnvelopeDecoder::new(&mut reader, 1024).read_envelope().expect("complete frame");

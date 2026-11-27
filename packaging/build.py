@@ -35,7 +35,8 @@ PLATFORMS = {
     "linux-x86_64": ("x86_64-unknown-linux-gnu", "Linux", "x86_64"),
     "linux-aarch64-dev": ("aarch64-unknown-linux-gnu", "Linux", "aarch64"),
 }
-EXECUTABLES = {"bin/xtrace", "install.sh", "uninstall.sh"}
+JAVA_ANALYZER = "share/xtrace/analyzers/java/bin/xtrace-java-static"
+EXECUTABLES = {"bin/xtrace", "install.sh", "uninstall.sh", JAVA_ANALYZER}
 
 
 def run(cmd, cwd=None, env=None, capture=False):
@@ -144,7 +145,12 @@ def node_pack(src: Path, env: dict, stage_pack: Path):
         return (parts[0] == "test" or rel.name.endswith((".d.ts", ".d.cts", ".d.mts", ".map", ".tsbuildinfo"))
                 or rel.as_posix() == "manifest.sha256")
 
-    copy_tree(dist, stage_pack / "dist", skip)
+    packaged_dist = stage_pack / "dist"
+    copy_tree(dist, packaged_dist, skip)
+    # The launcher validates the exact installed dist inventory. The source build's
+    # manifest also covers files omitted from the package.
+    (packaged_dist / "manifest.sha256").write_text(
+        "\n".join(sha_rows(packaged_dist, {"manifest.sha256"})) + "\n", encoding="utf-8")
     # ADR 0004 unbundled layout: licenses/THIRD_PARTY.txt lists every bundled dependency.
     lic = ["Third-party packages bundled in the Node adapter pack", ""]
     for pj in sorted((stage_pack / "dist" / "node_modules").rglob("package.json")):
@@ -245,9 +251,16 @@ def main(argv=None):
     # 3. Java pack (attach helper + agent), strict dependency verification, reproducible archives
     java = src / "adapters" / "java"
     run(["./gradlew", "--no-daemon", "--dependency-verification", "strict",
-         "-I", str(HERE / "gradle" / "reproducible.init.gradle"), "clean", "javaPackDist"], cwd=java, env=env)
+         "-I", str(HERE / "gradle" / "reproducible.init.gradle"), "clean", "javaPackDist",
+         ":static-analyzer:installDist"], cwd=java, env=env)
     pack = java / "build" / "java-pack-dist"
     copy_tree(pack, stage / "share" / "xtrace" / "packs" / "java")
+    # The analyzer is a host tool and must stay outside the attach pack's exact membership.
+    analyzer = java / "static-analyzer" / "build" / "install" / "xtrace-java-static"
+    if not (analyzer / "lib").is_dir():
+        sys.exit("Spring static analyzer distribution is missing its runtime libraries")
+    shutil.copyfile(analyzer / "bin" / "xtrace-java-static", _mk(stage / JAVA_ANALYZER))
+    copy_tree(analyzer / "lib", (stage / JAVA_ANALYZER).parent.parent / "lib")
     # 4. Node pack
     node_pack(src, env, stage / "share" / "xtrace" / "packs" / "node")
     # 5. schemas
@@ -303,7 +316,8 @@ def main(argv=None):
     (out / "licenses.json").write_text(lic_text, encoding="utf-8")
     (out / "THIRD_PARTY_LICENSES").write_text(notices, encoding="utf-8")
     lockfiles = ["Cargo.lock", "adapters/node/package-lock.json", "web/app/package-lock.json",
-                 "adapters/java/gradle.lockfile", "adapters/java/gradle/verification-metadata.xml"]
+                 "adapters/java/gradle.lockfile", "adapters/java/static-analyzer/gradle.lockfile",
+                 "adapters/java/gradle/verification-metadata.xml"]
     info_doc = {
         "schema": "xtrace-build-info/1", "platform": plat, "version": a.version, "sourceCommit": commit,
         "sourceDateEpoch": epoch, "packTrust": "unsigned", "archive": archive.name,

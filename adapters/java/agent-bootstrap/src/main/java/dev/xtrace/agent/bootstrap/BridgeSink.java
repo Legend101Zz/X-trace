@@ -13,6 +13,16 @@ public interface BridgeSink {
   /** Offers a recording start without waiting for queue capacity. */
   boolean offerStart(String recordingId, long monotonicNs, String method, String route);
 
+  /** A sink must explicitly support Jersey provenance before accepting a named Jersey root. */
+  default boolean offerJerseyStart(String recordingId, long monotonicNs, String method, String route) {
+    return false;
+  }
+
+  /** Offers a Spring WebFlux request root start at the observed boundary time. */
+  default boolean offerWebFluxStart(String recordingId, long monotonicNs, String method, String route) {
+    return offerStart(recordingId, monotonicNs, method, route);
+  }
+
   /** Offers one sanitized event without retaining application objects. */
   boolean offerEvent(
       String recordingId,
@@ -102,6 +112,22 @@ public interface BridgeSink {
         recordingId, startedMonotonicNs, finishedMonotonicNs, responseStatus, droppedEvents);
   }
 
+  /**
+   * Offers the terminal marker together with the observed request outcome and any capability codes
+   * advertised by the adapter that could not be exercised for this recording.
+   */
+  default boolean offerFinishWithOutcome(
+      String recordingId,
+      long startedMonotonicNs,
+      long finishedMonotonicNs,
+      int responseStatus,
+      long droppedEvents,
+      Outcome outcome,
+      String[] unsupportedCapabilities) {
+    return offerFinishWithOutcome(
+        recordingId, startedMonotonicNs, finishedMonotonicNs, responseStatus, droppedEvents, outcome);
+  }
+
   /** What the adapter observed about how the request ended. */
   record Outcome(
       int kind, int httpStatus, String exceptionType, String exceptionMessage,
@@ -110,6 +136,8 @@ public interface BridgeSink {
     public static final int RESPONDED = 1;
     /** An exception left the handler and no response status was observed. */
     public static final int EXCEPTION_PROPAGATED = 2;
+    /** The client or reactive subscriber aborted/cancelled before a response completed. */
+    public static final int CLIENT_ABORTED = 3;
     /** Nothing about the end of the request was observed. */
     public static final int UNOBSERVED = 4;
   }

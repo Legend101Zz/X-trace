@@ -9,8 +9,31 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
       String method,
       String route,
       int estimatedBytes,
-      boolean metadataOnly)
+      boolean metadataOnly,
+      boolean jersey,
+      boolean webFlux)
       implements QueueSignal {
+    Start(
+        String recordingId,
+        long monotonicNs,
+        String method,
+        String route,
+        int estimatedBytes,
+        boolean metadataOnly,
+        boolean jersey) {
+      this(recordingId, monotonicNs, method, route, estimatedBytes, metadataOnly, jersey, false);
+    }
+
+    Start(String recordingId, long monotonicNs, String method, String route, int estimatedBytes, boolean metadataOnly) {
+      this(recordingId, monotonicNs, method, route, estimatedBytes, metadataOnly, false, false);
+    }
+
+    String frameworkDriver() {
+      return jersey
+          ? "jersey"
+          : webFlux ? "spring-webflux" : route.isEmpty() ? "servlet" : "spring-mvc";
+    }
+
     Start(String recordingId, long monotonicNs, String method, String route, int estimatedBytes) {
       this(recordingId, monotonicNs, method, route, estimatedBytes, false);
     }
@@ -95,7 +118,8 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
       long droppedEvents,
       int estimatedBytes,
       dev.xtrace.agent.bootstrap.BridgeSink.Outcome outcome,
-      long untransformedCount)
+      long untransformedCount,
+      java.util.List<String> unsupportedCapabilities)
       implements QueueSignal {
     Finish(
         String recordingId,
@@ -103,9 +127,38 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
         long finishedMonotonicNs,
         int responseStatus,
         long droppedEvents,
+        int estimatedBytes,
+        dev.xtrace.agent.bootstrap.BridgeSink.Outcome outcome,
+        long untransformedCount) {
+      this(
+          recordingId,
+          startedMonotonicNs,
+          finishedMonotonicNs,
+          responseStatus,
+          droppedEvents,
+          estimatedBytes,
+          outcome,
+          untransformedCount,
+          java.util.List.of());
+    }
+
+    Finish(
+        String recordingId,
+        long startedMonotonicNs,
+        long finishedMonotonicNs,
+        int responseStatus,
+        long droppedEvents,
         int estimatedBytes) {
-      this(recordingId, startedMonotonicNs, finishedMonotonicNs, responseStatus, droppedEvents,
-          estimatedBytes, null, 0);
+      this(
+          recordingId,
+          startedMonotonicNs,
+          finishedMonotonicNs,
+          responseStatus,
+          droppedEvents,
+          estimatedBytes,
+          null,
+          0,
+          java.util.List.of());
     }
   }
 }

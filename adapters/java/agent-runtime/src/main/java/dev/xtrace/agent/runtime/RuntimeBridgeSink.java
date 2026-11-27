@@ -64,6 +64,27 @@ final class RuntimeBridgeSink implements BridgeSink {
 
   @Override
   public boolean offerStart(String recordingId, long monotonicNs, String method, String route) {
+    return offerStart(recordingId, monotonicNs, method, route, false, false);
+  }
+
+  @Override
+  public boolean offerJerseyStart(String recordingId, long monotonicNs, String method, String route) {
+    return offerStart(recordingId, monotonicNs, method, route, true, false);
+  }
+
+  @Override
+  public boolean offerWebFluxStart(
+      String recordingId, long monotonicNs, String method, String route) {
+    return offerStart(recordingId, monotonicNs, method, route, false, true);
+  }
+
+  private boolean offerStart(
+      String recordingId,
+      long monotonicNs,
+      String method,
+      String route,
+      boolean jersey,
+      boolean webFlux) {
     inFlightStartAdmissions.incrementAndGet();
     try {
       afterStartIncrement.run();
@@ -77,7 +98,8 @@ final class RuntimeBridgeSink implements BridgeSink {
       int bytes = estimate(recordingId, method, route);
       boolean accepted =
           queue.offerLifecycle(
-              new QueueSignal.Start(recordingId, monotonicNs, method, route, bytes, metadata));
+              new QueueSignal.Start(
+                  recordingId, monotonicNs, method, route, bytes, metadata, jersey, webFlux));
       if (!accepted) {
         if (metadata) {
           metadataOnly.remove(recordingId);
@@ -282,23 +304,69 @@ final class RuntimeBridgeSink implements BridgeSink {
       int responseStatus,
       long droppedEvents,
       Outcome outcome) {
+    return offerFinishWithOutcome(
+        recordingId,
+        startedMonotonicNs,
+        finishedMonotonicNs,
+        responseStatus,
+        droppedEvents,
+        outcome,
+        null);
+  }
+
+  @Override
+  public boolean offerFinishWithOutcome(
+      String recordingId,
+      long startedMonotonicNs,
+      long finishedMonotonicNs,
+      int responseStatus,
+      long droppedEvents,
+      Outcome outcome,
+      String[] unsupportedCapabilities) {
     // The recording slot stays counted until the writer has written (or abandoned) it, so the
     // sink never admits more recordings than the writer can hold. A rejected finish keeps its
     // slot: the writer still holds the recording and the shortfall is reported as incomplete.
-    {
-      if (!acceptingExisting.get() || !bounded(recordingId)) return false;
-      int bytes = estimate(recordingId) + (outcome == null ? 0 : 1800);
-      return queue.offerLifecycle(
-          new QueueSignal.Finish(
-              recordingId,
-              startedMonotonicNs,
-              finishedMonotonicNs,
-              responseStatus,
-              droppedEvents,
-              bytes,
-              outcome,
-              untransformed.getAsLong()));
+    if (!acceptingExisting.get() || !bounded(recordingId)) return false;
+    List<String> sanitizedCaps = sanitizeCapabilities(unsupportedCapabilities);
+    int capBytes = 0;
+    for (String cap : sanitizedCaps) capBytes += cap.length() + 4;
+    int bytes = estimate(recordingId) + (outcome == null ? 0 : 1800) + capBytes;
+    return queue.offerLifecycle(
+        new QueueSignal.Finish(
+            recordingId,
+            startedMonotonicNs,
+            finishedMonotonicNs,
+            responseStatus,
+            droppedEvents,
+            bytes,
+            outcome,
+            untransformed.getAsLong(),
+            sanitizedCaps));
+  }
+
+  private static List<String> sanitizeCapabilities(String[] capabilities) {
+    if (capabilities == null || capabilities.length == 0) return List.of();
+    java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+    int totalBytes = 0;
+    for (String raw : capabilities) {
+      if (!isValidCapabilityCode(raw)) continue;
+      if (totalBytes + raw.length() > 512 || out.size() >= 16) break;
+      if (out.add(raw)) totalBytes += raw.length();
     }
+    return out.isEmpty() ? List.of() : List.copyOf(out);
+  }
+
+  private static boolean isValidCapabilityCode(String code) {
+    if (code == null || code.isEmpty() || code.length() > 128) return false;
+    char first = code.charAt(0);
+    if (first < 'a' || first > 'z') return false;
+    for (int i = 1; i < code.length(); i++) {
+      char c = code.charAt(i);
+      boolean lower = c >= 'a' && c <= 'z';
+      boolean digit = c >= '0' && c <= '9';
+      if (!lower && !digit && c != '_') return false;
+    }
+    return true;
   }
 
   /** Called by the writer once a recording is written or abandoned; frees its admission slot. */

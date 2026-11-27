@@ -95,6 +95,12 @@ const CAPABILITY_CONFIG: Record<string, Record<string, string>> = {
   },
   async_correlation: { mechanism: "AsyncLocalStorage", scope: "request-callback-and-descendant-async-resources" },
   "http.server.route_template": { source: "express-layer-match", express: "4.x-and-5.x", scope: "literal-route-path-composed-with-literal-mount-paths", mounted_routers: "composed-when-literal-else-unresolved", resolved_at: "route-match", path_form: "as-authored" },
+  "http.server.fastify": { source: "fastify-public-hooks", fastify: "4.x-and-5.x", scope: "encapsulated-plugin-scope", hooks: "onRequest,preHandler,onError,onResponse", resolved_at: "route-match", path_form: "as-authored" },
+  "framework.nest": { source: "nest-controller-service-frames", adapters: "express,fastify", root_policy: "attach-only-no-duplicate-root" },
+  "interactions.pg": { driver: "pg", sanitization: "literals-and-params-redacted" },
+  "interactions.mysql": { driver: "mysql,mysql2", sanitization: "literals-and-params-redacted" },
+  "interactions.outbound_http": { clients: "node:http,node:https,fetch,undici", sanitization: "host-method-sanitized-path-only" },
+  process_linkage: { boundaries: "worker_threads.Worker,child_process.spawn,child_process.fork,child_process.execFile", env_policy: "no_env_leak_explicit_gap_or_opt_in_link" },
 };
 
 const START_KINDS: Record<CaptureEventKind, RecordingEventKind> = {
@@ -152,6 +158,8 @@ function interactionPayload(facts: InteractionFacts) {
   return create(InteractionSchema, {
     kind: INTERACTION_KINDS[facts.kind],
     driver: facts.driver,
+    schema: facts.schema ?? "",
+    table: facts.table ?? "",
     method: facts.method,
     host: facts.host ?? "",
     port: facts.port ?? 0,

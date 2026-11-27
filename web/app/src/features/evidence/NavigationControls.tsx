@@ -4,11 +4,12 @@ import type { NavAction, NavFrameNavigation } from '../../replay/navigation';
 export interface NavigationControlsProps {
   navigation: NavFrameNavigation | null | undefined;
   loadedFrameIds: ReadonlySet<string>;
+  actions?: readonly NavAction[];
   onNavigate: (action: NavAction, frameId: string) => void;
 }
 
-export function NavigationControls({ navigation, loadedFrameIds, onNavigate }: NavigationControlsProps) {
-  const controls = navigationControls(navigation, loadedFrameIds);
+export function NavigationControls({ navigation, loadedFrameIds, actions, onNavigate }: NavigationControlsProps) {
+  const controls = navigationControls(navigation, loadedFrameIds).filter(({ action }) => !actions || actions.includes(action));
   return <div className="inspector-section nav-controls" role="group" aria-label="Frame navigation">
     <div className="inspector-label">Frame navigation</div>
     <div className="nav-buttons">

@@ -12,6 +12,7 @@ description = "Local loopback XTP-Agent ingress daemon with pinned TLS 1.3."
 workspace = true
 
 [dependencies]
+xtrace-export = { path = "../xtrace-export" }
 xtrace-domain = { path = "../xtrace-domain" }
 xtrace-application = { path = "../xtrace-application" }
 xtrace-protocol = { path = "../xtrace-protocol" }
@@ -47,7 +48,7 @@ zeroize = { workspace = true }
 # `test` brings in `tokio::test` (current-thread runtime + async assertions)
 # so integration tests can exercise the daemon without a separate
 # runtime dependency.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
 # RAII temporary directories for integration tests. The crate's
 # `TempDir` guard removes the directory on drop so a panic in a test
 # never strands an unwiped bootstrap artifact or secret-bearing file.

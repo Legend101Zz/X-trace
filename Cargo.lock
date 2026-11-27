@@ -1557,6 +1557,7 @@ dependencies = [
  "tracing",
  "uuid",
  "xtrace-domain",
+ "xtrace-exercise",
 ]
 
 [[package]]
@@ -1624,6 +1625,7 @@ dependencies = [
  "uuid",
  "xtrace-application",
  "xtrace-domain",
+ "xtrace-export",
  "xtrace-ingest",
  "xtrace-private-storage",
  "xtrace-protocol",
@@ -1652,7 +1654,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "serde_json",
- "xtrace-export",
+ "xtrace-domain",
 ]
 
 [[package]]
@@ -1661,6 +1663,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "serde_json",
+ "xtrace-application",
  "xtrace-domain",
 ]
 

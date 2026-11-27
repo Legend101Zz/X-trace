@@ -49,11 +49,17 @@ public final class SpringMvcBridge {
   private static final ThreadLocal<DispatchState> DISPATCH = new ThreadLocal<>();
   private static final ThreadLocal<ServletState> SERVLET = new ThreadLocal<>();
 
+  // A transform failure has no request identity. A downstream request wrapper may
+  // implement startAsync even when both sampled request objects report false.
+  private static volatile boolean jerseyAsyncProbeUnavailable;
+
   private static final class ServletState {
     private int depth;
     private boolean recorded;
     private boolean errorPending;
+    private boolean jersey;
     private boolean asyncStarted;
+    private boolean jerseyOutcomeUncertain;
   }
 
   private static final class DispatchState {
@@ -90,8 +96,40 @@ public final class SpringMvcBridge {
     state.depth++;
   }
 
+  static boolean jerseyMayStart() {
+    ServletState state = SERVLET.get();
+    return state != null && !state.recorded && !state.errorPending && DISPATCH.get() == null
+        && !BootstrapBridge.hasContext();
+  }
+
+  static void jerseyStarted() {
+    ServletState state = SERVLET.get();
+    state.recorded = true;
+    state.jersey = true;
+  }
+
+  /** A launch-time Jakarta request implementation lost its async-entry observer. */
+  public static void jerseyAsyncProbeUnavailable() {
+    jerseyAsyncProbeUnavailable = true;
+  }
+
+  /** Records a servlet startAsync entry for the current or potential Jersey request owner. */
+  public static void servletAsyncStarting() {
+    ServletState state = SERVLET.get();
+    // The transition may happen before Jersey admits a matched resource. Only Jersey
+    // completion consumes this signal, and it expires with the enclosing servlet owner.
+    if (state != null) state.jerseyOutcomeUncertain = true;
+  }
+
+  /** A recorded Jersey activation encountered ambiguous dispatch or service completion. */
+  static void jerseyOutcomeUncertain() {
+    ServletState state = SERVLET.get();
+    if (state != null && state.jersey) state.jerseyOutcomeUncertain = true;
+  }
+
   /** sendError may report committed before the container has rendered its error page. */
   public static void servletSendError() {
+    ServletFilterBridge.sendError();
     ServletState state = SERVLET.get();
     if (state != null) state.errorPending = true;
   }
@@ -107,7 +145,9 @@ public final class SpringMvcBridge {
     if (--state.depth != 0) return;
     try {
       if (state.recorded && BootstrapBridge.hasContext()) {
-        if (state.asyncStarted || (request != null && asyncStarted(request))) {
+        Boolean async = asyncState(request);
+        if (state.asyncStarted || Boolean.TRUE.equals(async)
+            || (state.jersey && (jerseyAsyncProbeUnavailable || state.jerseyOutcomeUncertain || async == null))) {
           BootstrapBridge.provisionalRequestEnd(status(response), null);
         } else {
           finish(response, thrown, !state.errorPending && thrown == null);
@@ -125,6 +165,7 @@ public final class SpringMvcBridge {
 
   /** Called on entry to each {@code DispatcherServlet#doDispatch} on this thread. */
   public static void dispatchEnter() {
+    ServletFilterBridge.downstreamEnter();
     DispatchState state = DISPATCH.get();
     if (state == null) {
       state = new DispatchState();
@@ -152,6 +193,7 @@ public final class SpringMvcBridge {
   }
 
   static void resetForTest() {
+    jerseyAsyncProbeUnavailable = false;
     DISPATCH.remove();
     SERVLET.remove();
   }
@@ -162,6 +204,7 @@ public final class SpringMvcBridge {
    * is already open on this thread (nested or forwarded dispatch).
    */
   public static boolean start(Object request, Object handlerMethod) {
+    ServletFilterBridge.downstreamEnter();
     DispatchState state = DISPATCH.get();
     ServletState servlet = SERVLET.get();
     if (request == null || handlerMethod == null || BootstrapBridge.inRequest()
@@ -267,22 +310,31 @@ public final class SpringMvcBridge {
   }
 
   static boolean asyncStarted(Object request) {
+    return Boolean.TRUE.equals(asyncState(request));
+  }
+
+  static Boolean asyncState(Object request) {
     try {
       Method method = REQUEST_METHODS.get(request.getClass())[2];
-      return method != null && Boolean.TRUE.equals(method.invoke(request));
+      Object value = method == null ? null : method.invoke(request);
+      return value instanceof Boolean started ? started : null;
     } catch (ReflectiveOperationException | RuntimeException ignored) {
-      return false;
+      return null;
     }
   }
 
   static boolean isContinuationDispatch(Object request) {
+    String kind = dispatchType(request);
+    return "ASYNC".equals(kind) || "ERROR".equals(kind);
+  }
+
+  static String dispatchType(Object request) {
     try {
       Method method = REQUEST_METHODS.get(request.getClass())[3];
       Object value = method == null ? null : method.invoke(request);
-      return value instanceof Enum<?> kind
-          && (kind.name().equals("ASYNC") || kind.name().equals("ERROR"));
+      return value instanceof Enum<?> kind ? kind.name() : null;
     } catch (ReflectiveOperationException | RuntimeException ignored) {
-      return false;
+      return null;
     }
   }
 

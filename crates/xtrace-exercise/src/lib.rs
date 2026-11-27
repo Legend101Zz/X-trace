@@ -16,6 +16,7 @@
 pub mod candidate;
 pub mod canonical;
 pub mod effect;
+pub mod executor;
 pub mod input_json;
 pub mod plan;
 pub mod preview;
@@ -27,3 +28,14 @@ pub use candidate::{
 pub use effect::{Effect, classify};
 pub use plan::{ParamValue, Plan, PlanItem, ValueSource};
 pub use preview::preview;
+
+/// Best-effort input screening shared by the private exercise lifecycle.
+/// This deny-list is not proof that arbitrary text contains no secret.
+#[must_use]
+pub fn is_secret_input(name: &str, value: &str) -> bool {
+    xtrace_domain::secret_shapes::is_secret_name(name)
+        || xtrace_domain::secret_shapes::is_secret_value(value)
+}
+
+/// Screens decoded JSON keys and values in a private operator-provided body.
+pub use xtrace_domain::secret_shapes::json_has_secret;

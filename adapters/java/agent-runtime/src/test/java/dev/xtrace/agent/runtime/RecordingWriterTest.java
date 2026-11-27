@@ -74,6 +74,21 @@ class RecordingWriterTest {
   }
 
   @Test
+  void pgjdbcFailureHasOnlyDriverAndMethodMetadata() throws Exception {
+    var database = event("r:6", "r:5", BridgeEventKind.DATABASE_END, "pgjdbc.executeBatch.failed", 1);
+    var proto = RecordingWriter.toProto(database, 7);
+    assertEquals("pgjdbc.executeBatch.failed", proto.getSymbol());
+    assertEquals(
+        xtp.agent.v1.Recording.Interaction.newBuilder()
+            .setKind(InteractionKind.INTERACTION_KIND_DATABASE)
+            .setDriver("pgjdbc")
+            .setMethod("executeBatch")
+            .build(),
+        proto.getInteraction());
+    assertFalse(proto.hasException());
+  }
+
+  @Test
   void durationAndDropArithmeticRemainBoundedAcrossLongWrap() {
     assertEquals(50, RecordingWriter.duration(100, 150));
     assertEquals(11, RecordingWriter.duration(Long.MAX_VALUE - 5, Long.MIN_VALUE + 5));

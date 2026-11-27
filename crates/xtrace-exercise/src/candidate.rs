@@ -1,6 +1,6 @@
 //! Candidate synthesis: catalog operations in, an immutable plan out.
 
-use xtrace_export::sanitize;
+use xtrace_domain::secret_shapes as sanitize;
 
 use crate::canonical;
 use crate::effect::{Effect, classify};

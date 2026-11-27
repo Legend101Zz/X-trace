@@ -10,8 +10,9 @@ import static net.bytebuddy.matcher.ElementMatchers.not;
 import static net.bytebuddy.matcher.ElementMatchers.takesArgument;
 import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 
+import dev.xtrace.agent.bootstrap.ServletFilterBridge;
+import dev.xtrace.agent.bootstrap.SpringMvcBridge;
 import java.lang.instrument.Instrumentation;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
@@ -39,6 +40,19 @@ final class ServletBoundaryInstrumentation {
         .and(takesArguments(1).or(takesArguments(2).and(takesArgument(1, String.class))));
   }
 
+  private static ElementMatcher.Junction<MethodDescription> chainMethods(String api) {
+    return isMethod().and(not(isAbstract())).and(named("doFilter")).and(takesArguments(2))
+        .and(takesArgument(0, named(api + ".ServletRequest")))
+        .and(takesArgument(1, named(api + ".ServletResponse")));
+  }
+
+  private static ElementMatcher.Junction<MethodDescription> asyncStartMethods(String api) {
+    return isMethod().and(not(isAbstract())).and(named("startAsync"))
+        .and(takesArguments(0).or(takesArguments(2)
+            .and(takesArgument(0, named(api + ".ServletRequest")))
+            .and(takesArgument(1, named(api + ".ServletResponse")))));
+  }
+
   static void install(Instrumentation instrumentation, Runnable onFailure, boolean attach) {
     FailureListener listener = new FailureListener(onFailure);
     AgentBuilder builder = new AgentBuilder.Default()
@@ -59,25 +73,64 @@ final class ServletBoundaryInstrumentation {
               .and(hasSuperType(named(api + ".http.HttpServletResponse")))))
           .transform((target, type, loader, module, domain) ->
               target.visit(Advice.to(SendErrorAdvice.class).on(sendErrorMethods())));
+      if (!attach) {
+        builder = builder
+            .type(listener.selectedFallback(not(isInterface())
+                .and(hasSuperType(named(api + ".FilterChain")))))
+            .transform((target, type, loader, module, domain) ->
+                target.visit(Advice.to(ChainAdvice.class).on(chainMethods(api))))
+            .type(listener.selectedAsyncStart(api, not(isInterface())
+                .and(hasSuperType(named(api + ".ServletRequest")))))
+            .transform((target, type, loader, module, domain) ->
+                target.visit(Advice.to(AsyncStartAdvice.class).on(asyncStartMethods(api))));
+      }
     }
     builder.installOn(instrumentation);
   }
 
   static final class FailureListener extends AgentBuilder.Listener.Adapter {
-    private record Candidate(String name, ClassLoader loader) {}
+    private record Candidate(String name, ClassLoader loader) {
+      @Override public boolean equals(Object other) {
+        return other instanceof Candidate c && name.equals(c.name) && loader == c.loader;
+      }
+      @Override public int hashCode() { return 31 * name.hashCode() + System.identityHashCode(loader); }
+    }
 
+    // All selected seams invalidate the filter-only fallback on failure. Only a
+    // failed Jakarta async observer also makes a sampled Jersey status uncertain.
+    private static final int FALLBACK = 1;
+    private static final int JERSEY_ASYNC = 2;
+    private static final int EXISTING_BOUNDARY = 4;
     private final Runnable onFailure;
-    private final Set<Candidate> selected = ConcurrentHashMap.newKeySet();
+    private final Runnable onJerseyAsyncFailure;
+    private final ConcurrentHashMap<Candidate, Integer> selected = new ConcurrentHashMap<>();
 
     FailureListener(Runnable onFailure) {
+      this(onFailure, SpringMvcBridge::jerseyAsyncProbeUnavailable);
+    }
+
+    FailureListener(Runnable onFailure, Runnable onJerseyAsyncFailure) {
       this.onFailure = java.util.Objects.requireNonNull(onFailure);
+      this.onJerseyAsyncFailure = java.util.Objects.requireNonNull(onJerseyAsyncFailure);
     }
 
     AgentBuilder.RawMatcher selected(ElementMatcher<? super TypeDescription> matcher) {
+      return selected(matcher, EXISTING_BOUNDARY);
+    }
+
+    AgentBuilder.RawMatcher selectedFallback(ElementMatcher<? super TypeDescription> matcher) {
+      return selected(matcher, FALLBACK);
+    }
+
+    AgentBuilder.RawMatcher selectedAsyncStart(String api, ElementMatcher<? super TypeDescription> matcher) {
+      return selected(matcher, "jakarta.servlet".equals(api) ? JERSEY_ASYNC : FALLBACK);
+    }
+
+    private AgentBuilder.RawMatcher selected(ElementMatcher<? super TypeDescription> matcher, int consequence) {
       return (type, loader, module, redefined, domain) -> {
         // A failed hierarchy walk is not evidence that this is a servlet boundary.
         if (!matcher.matches(type)) return false;
-        selected.add(new Candidate(type.getName(), loader));
+        selected.merge(new Candidate(type.getName(), loader), consequence, (prior, added) -> prior | added);
         return true;
       };
     }
@@ -85,8 +138,11 @@ final class ServletBoundaryInstrumentation {
     @Override
     public void onError(String name, ClassLoader loader, JavaModule module,
         boolean loaded, Throwable failure) {
-      if (!selected.remove(new Candidate(name, loader))) return;
-      // A missing outer probe must never leave an inner status looking authoritative.
+      Integer consequences = selected.remove(new Candidate(name, loader));
+      if (consequences == null) return;
+      ServletFilterBridge.boundaryUnavailable();
+      if ((consequences & JERSEY_ASYNC) != 0) onJerseyAsyncFailure.run();
+      if ((consequences & EXISTING_BOUNDARY) == 0) return;
       try {
         onFailure.run();
       } catch (RuntimeException | LinkageError ignored) {
@@ -105,14 +161,41 @@ final class ServletBoundaryInstrumentation {
     private BoundaryAdvice() {}
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter() {
-      dev.xtrace.agent.bootstrap.SpringMvcBridge.servletEnter();
+    public static void enter(@Advice.Origin("#m") String method,
+        @Advice.Argument(0) Object request) {
+      SpringMvcBridge.servletEnter();
+      ServletFilterBridge.servletEnter(method.equals("doFilter"), request);
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exit(@Advice.Argument(0) Object request,
         @Advice.Argument(1) Object response, @Advice.Thrown Throwable thrown) {
-      dev.xtrace.agent.bootstrap.SpringMvcBridge.servletEnd(request, response, thrown);
+      SpringMvcBridge.servletEnd(request, response, thrown);
+    }
+  }
+
+  public static final class ChainAdvice {
+    private ChainAdvice() {}
+
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static Object enter(@Advice.Argument(0) Object request, @Advice.Argument(1) Object response) {
+      return ServletFilterBridge.chainEnter(request, response);
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.Enter Object owner, @Advice.Argument(0) Object request,
+        @Advice.Argument(1) Object response, @Advice.Thrown Throwable thrown) {
+      ServletFilterBridge.chainEnd(owner, request, response, thrown);
+    }
+  }
+
+  public static final class AsyncStartAdvice {
+    private AsyncStartAdvice() {}
+
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static void enter() {
+      SpringMvcBridge.servletAsyncStarting();
+      ServletFilterBridge.downstreamEnter();
     }
   }
 
@@ -121,7 +204,7 @@ final class ServletBoundaryInstrumentation {
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static void enter() {
-      dev.xtrace.agent.bootstrap.SpringMvcBridge.servletSendError();
+      SpringMvcBridge.servletSendError();
     }
   }
 }

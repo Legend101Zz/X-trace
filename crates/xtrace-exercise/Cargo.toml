@@ -14,4 +14,4 @@ workspace = true
 [dependencies]
 blake3 = { workspace = true }
 serde_json = { workspace = true }
-xtrace-export = { path = "../xtrace-export" }
+xtrace-domain = { path = "../xtrace-domain" }

@@ -2,7 +2,7 @@
 # Install / upgrade / uninstall journey for a built archive, in a throwaway HOME (fresh profile).
 #   packaging/test/install_test.sh dist/<platform>
 # Scratch: $XTRACE_TEST_PRIVATE_SCRATCH (a private 0700 dir) when set, else $TMPDIR; only the self-created, marked work dir is removed.
-# Needs only POSIX sh, tar and sha256sum|shasum. Exits non-zero on the first failed assertion (every check is `cmd && ok || fail`; the final count is
+# Uses POSIX sh, tar, sha256sum|shasum and the repository's Python package verifier. Exits non-zero on the first failed assertion (the final count is
 # asserted so a silently skipped check also fails).
 set -eu
 dist=$(cd "${1:?usage: install_test.sh dist/<platform>}" && pwd)
@@ -32,17 +32,18 @@ cleanup() {
 }
 trap cleanup EXIT
 export HOME="$work/home"; mkdir -p "$HOME"
-unset XTRACE_DATA_HOME XDG_DATA_HOME XTRACE_PREFIX
+unset XTRACE_DATA_HOME XDG_DATA_HOME XTRACE_PREFIX XTRACE_JAVA_ANALYZER
 pass=0
 ok() { pass=$((pass+1)); echo "ok $pass - $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 sums() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+has_mode() { [ "$(find "$1" -prune -type "$2" -perm "$3" -print)" = "$1" ]; }
 
 sh "$(dirname "$0")/../install.sh" verify-dist "$dist" >/dev/null && ok "release SHA256SUMS verify" || fail "release SHA256SUMS verify"
 mkdir "$work/x1" && tar -xzf "$archive" -C "$work/x1"
 top=$(ls "$work/x1")
 v1="$work/x1/$top"
-prefix="$work/prefix"
+prefix="$work/install prefix"
 
 # --- fresh profile install
 case "$(uname -s)" in Darwin) data="$HOME/Library/Application Support/xtrace" ;; *) data="$HOME/.local/share/xtrace" ;; esac
@@ -55,10 +56,51 @@ case "$(uname -s)" in Darwin) data="$HOME/Library/Application Support/xtrace" ;;
 "$prefix/current/install.sh" verify --prefix "$prefix" >/dev/null && ok "installed payload verifies" || fail "installed payload verifies"
 [ -d "$prefix/current/share/xtrace/packs/java/agent" ] && [ -f "$prefix/current/share/xtrace/packs/node/pack.manifest" ] && ok "java and node packs present" || fail "java and node packs present"
 
+# A private caller may have already unpacked the analyzer as 0700 before invoking the installer.
+private_unpack="$work/private extraction"
+private_prefix="$work/private installation"
+mkdir "$private_unpack"
+(umask 077 && tar --no-same-permissions -xzf "$archive" -C "$private_unpack") || fail "private extraction"
+private_src="$private_unpack/$top"
+private_launcher="$private_src/share/xtrace/analyzers/java/bin/xtrace-java-static"
+has_mode "$private_launcher" f 0700 && ok "private extraction masks the analyzer mode" || fail "private extraction mode"
+(umask 077 && sh "$private_src/install.sh" --prefix "$private_prefix" --data-home "$work/private data") \
+  >"$work/private-install.log" 2>&1 || fail "install under private umask"
+python3 -B "$(dirname "$0")/../verify_package.py" "$private_prefix/current" --repo "$(dirname "$0")/../.." --run-binary \
+  >"$work/private-verify.json" || fail "private installation package verification"
+sh "$private_prefix/current/install.sh" verify --prefix "$private_prefix" >/dev/null &&
+  ok "private installation passes package and installed verification" || fail "private installed verify"
+has_mode "$private_launcher" f 0700 && has_mode "$private_prefix" d 0700 &&
+  has_mode "$private_prefix/install-receipt.json" f 0600 && has_mode "$private_prefix/current/share/xtrace/VERSION" f 0600 &&
+  [ ! -e "$work/private data" ] && ok "unrelated private files keep caller permissions" || fail "private caller permissions"
+
 # --- lifecycle on the installed binary: init, record, stop (the daemon is stopped before any upgrade)
 repo="$work/repo"; mkdir -p "$repo"
 "$prefix/bin/xtrace" init --project-dir "$repo" >"$work/init.json" 2>&1 || { cat "$work/init.json"; fail "xtrace init"; }
 ok "init created a project in the fresh profile"
+# The real installed Java analyzer must resolve its launcher and JARs through the public CLI path.
+launcher="$prefix/current/share/xtrace/analyzers/java/bin/xtrace-java-static"
+[ -x "$launcher" ] && ok "installed Spring analyzer launcher is executable" || fail "installed analyzer launcher"
+mkdir "$repo/src"
+cat > "$repo/src/PackagedController.java" <<'EOF'
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+@RestController
+class PackagedController {
+  @GetMapping("/packaged-scan")
+  String route() { return "fixture"; }
+}
+EOF
+(cd "$work" && "$prefix/bin/xtrace" scan --project-dir "$repo" --source "$repo/src" --framework spring-mvc --json) >"$work/scan.json" 2>&1 || fail "installed Spring scan"
+grep -q '"routeTemplate": "/packaged-scan"' "$work/scan.json" &&
+  grep -Eq '"catalogRevisionId": *"[0-9a-f-]+"' "$work/scan.json" &&
+  ok "installed Spring scanner persisted the annotated route" || fail "installed Spring scan did not publish the route"
+mv "$launcher" "$work/missing-analyzer"
+if "$prefix/bin/xtrace" scan --project-dir "$repo" --source "$repo/src" --framework spring-mvc --json >"$work/missing-scan.json" 2>&1; then
+  fail "scan accepted a missing analyzer"
+fi
+mv "$work/missing-analyzer" "$launcher"
+ok "scan refuses a missing installed Spring analyzer"
 "$prefix/bin/xtrace" record --project-dir "$repo" >"$work/rec.json" 2>&1 || { cat "$work/rec.json"; fail "xtrace record"; }
 grep -q '"kind": "record_started"' "$work/rec.json" && ok "record started a detached daemon" || fail "record started a detached daemon"
 "$prefix/bin/xtrace" stop --project-dir "$repo" >"$work/stop.json" 2>&1 || { cat "$work/stop.json"; fail "xtrace stop"; }
@@ -85,6 +127,10 @@ if "$v1/install.sh" --prefix "$prefix" >/dev/null 2>&1; then fail "downgrade was
 cp -R "$v1" "$work/bad"; echo tamper >> "$work/bad/bin/xtrace"
 if "$work/bad/install.sh" --prefix "$work/prefix2" >/dev/null 2>&1; then fail "tampered payload installed"; else ok "tampered payload refused"; fi
 [ ! -e "$work/prefix2/current" ] && ok "refused install left no partial prefix state" || fail "refused install left no partial prefix state"
+echo tamper >> "$prefix/current/share/xtrace/analyzers/java/bin/xtrace-java-static"
+if "$prefix/current/install.sh" verify --prefix "$prefix" >/dev/null 2>&1; then fail "verify missed analyzer tampering"; else ok "verify detects modified installed analyzer"; fi
+cp "$work/v2/share/xtrace/analyzers/java/bin/xtrace-java-static" "$launcher"
+"$prefix/current/install.sh" verify --prefix "$prefix" >/dev/null || fail "restored analyzer payload did not verify"
 echo tamper >> "$prefix/current/bin/xtrace"
 if "$prefix/current/install.sh" verify --prefix "$prefix" >/dev/null 2>&1; then fail "verify missed tampering"; else ok "verify detects modified installed file"; fi
 
@@ -96,6 +142,6 @@ if "$v1/install.sh" --prefix "$data/inner" >/dev/null 2>&1; then fail "prefix in
 [ ! -e "$prefix/bin/xtrace" ] && [ ! -e "$prefix/versions" ] && ok "uninstall removed program files" || fail "uninstall removed program files"
 [ "$(cat "$data/projects/p1/rec-1.xtf")" = r1 ] && ok "uninstall left user data untouched" || fail "uninstall left user data untouched"
 [ -d "$prefix/backups" ] && ok "uninstall kept backups" || fail "uninstall kept backups"
-EXPECTED=25
+EXPECTED=32
 [ "$pass" -eq "$EXPECTED" ] || fail "expected $EXPECTED checks, ran $pass"
 echo "all $pass checks passed"

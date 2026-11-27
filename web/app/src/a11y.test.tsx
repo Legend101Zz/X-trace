@@ -3,7 +3,7 @@
 // rules over the rendered DOM): accessible names, unique ids, valid references, roving tabindex,
 // landmarks, hidden decoration, and the keyboard-only focus order. They do not replace a manual
 // screen-reader pass (UX-ACCESSIBILITY stays partial until the owner does one).
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './main';
@@ -54,8 +54,10 @@ function audit(): string[] {
   for (const svg of document.querySelectorAll('svg')) {
     if (svg.getAttribute('aria-hidden') !== 'true' && !svg.querySelector('title')) problems.push('svg is neither hidden nor titled');
   }
-  const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
-  if (tabs.filter((tab) => tab.getAttribute('tabindex') === '0').length !== 1) problems.push('tablist must have exactly one tab stop');
+  for (const tablist of document.querySelectorAll('[role="tablist"]')) {
+    const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+    if (tabs.filter((tab) => tab.getAttribute('tabindex') === '0').length !== 1) problems.push('tablist must have exactly one tab stop');
+  }
   if (document.querySelector('[role="tree"]')) {
     const stops = Array.from(document.querySelectorAll('[role="treeitem"]')).filter((item) => item.getAttribute('tabindex') === '0');
     if (stops.length !== 1) problems.push(`tree must have exactly one tab stop, found ${stops.length}`);
@@ -73,8 +75,8 @@ async function openRecording() {
   render(<App />);
   fireEvent.click(await screen.findByRole('button', { name: /POST \/orders/ }));
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
-  await screen.findByText('Controller.create');
-  fireEvent.click(screen.getByRole('tab', { name: 'events' }));
+  await within(screen.getAllByRole('tabpanel', { name: 'Steps' }).find((panel) => panel.id === 'events-panel')!).findByText('Controller.create');
+  fireEvent.click(within(screen.getByRole('tablist', { name: 'Viewer panes' })).getByRole('tab', { name: 'Steps' }));
 }
 
 describe('accessibility rules over the rendered viewer', () => {
@@ -98,8 +100,34 @@ describe('accessibility rules over the rendered viewer', () => {
 
   it('has no structural violations in the Canvas view', async () => {
     await openRecording();
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(within(screen.getByRole('tablist', { name: 'Replay view' })).getByRole('tab', { name: 'Map' }));
     expect(screen.getByRole('tree')).toBeInTheDocument();
+    expect(audit()).toEqual([]);
+  });
+
+  it('associates each replay view tab with its actual panel without changing the outer pane', async () => {
+    await openRecording();
+    const outer = document.getElementById('events-panel')!;
+    expect(outer).toHaveAccessibleName('Steps');
+    const views = within(outer).getByRole('tablist', { name: 'Replay view' });
+    const steps = within(views).getByRole('tab', { name: 'Steps' });
+    const map = within(views).getByRole('tab', { name: 'Map' });
+    const stepsPanel = document.getElementById(steps.getAttribute('aria-controls')!)!;
+    const mapPanel = document.getElementById(map.getAttribute('aria-controls')!)!;
+    expect(stepsPanel).toHaveAttribute('role', 'tabpanel');
+    expect(stepsPanel).toHaveAttribute('aria-labelledby', steps.id);
+    expect(stepsPanel).toHaveAccessibleName('Steps');
+    expect(stepsPanel).toBeVisible();
+    expect(within(stepsPanel).getByText('Controller.create')).toBeInTheDocument();
+    expect(mapPanel).toHaveAttribute('role', 'tabpanel');
+    expect(mapPanel).toHaveAttribute('aria-labelledby', map.id);
+    expect(mapPanel).not.toBeVisible();
+    fireEvent.click(map);
+    expect(mapPanel).toHaveAccessibleName('Map');
+    expect(mapPanel).toBeVisible();
+    expect(within(mapPanel).getByRole('tree')).toBeInTheDocument();
+    expect(stepsPanel).not.toBeVisible();
+    expect(outer).toHaveAccessibleName('Steps');
     expect(audit()).toEqual([]);
   });
 
@@ -114,7 +142,7 @@ describe('accessibility rules over the rendered viewer', () => {
   it('keyboard-only: Tab visits the active tab, then controls in DOM order, with one tree stop', async () => {
     const user = userEvent.setup();
     await openRecording();
-    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.click(within(screen.getByRole('tablist', { name: 'Replay view' })).getByRole('tab', { name: 'Map' }));
     (document.activeElement as HTMLElement | null)?.blur();
     const order: string[] = [];
     for (let step = 0; step < 60; step += 1) {
@@ -124,13 +152,14 @@ describe('accessibility rules over the rendered viewer', () => {
       order.push(`${role}:${accessibleName(active).slice(0, 40)}`);
       if (active === document.body) break;
     }
-    // The first stop is the single active tab, never an inactive one.
-    expect(order[0]).toBe('tab:events');
+    // The header request shortcut precedes the one active viewer-pane tab.
+    expect(order[0]).toBe('button:Requests');
+    expect(order.filter((entry) => ['tab:Requests', 'tab:Steps', 'tab:Inspector', 'tab:Map'].includes(entry))).toEqual(['tab:Steps', 'tab:Map']);
     expect(order.filter((entry) => entry.startsWith('treeitem:'))).toHaveLength(1);
     // Expand buttons inside the tree are reachable by pointer, not by Tab (roving tabindex).
     expect(order.some((entry) => entry.startsWith('button:Expand') || entry.startsWith('button:Collapse'))).toBe(false);
     // The tree stop comes after the Linear/Canvas switch.
-    const canvasIndex = order.indexOf('button:Canvas');
+    const canvasIndex = order.indexOf('tab:Map');
     const treeIndex = order.findIndex((entry) => entry.startsWith('treeitem:'));
     expect(canvasIndex).toBeGreaterThan(-1);
     expect(treeIndex).toBeGreaterThan(canvasIndex);

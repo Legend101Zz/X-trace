@@ -132,4 +132,25 @@ class WireMappingTest {
     assertEquals("GET", proto.getInteraction().getMethod());
     assertEquals("/owners/{ownerId}", proto.getInteraction().getPath());
   }
+
+  @Test
+  void reactiveCorrelationLostClientAbortedAndAsyncLinkMapCleanly() throws Exception {
+    RecordingEvent correlationGap =
+        RecordingWriter.toProto(
+            plain(BridgeEventKind.GAP, BootstrapBridge.CORRELATION_LOST_SYMBOL, 3), 2);
+    assertEquals(GapReason.GAP_REASON_CORRELATION_LOST, correlationGap.getGap().getReason());
+    assertEquals(3, correlationGap.getGap().getCount());
+
+    var aborted =
+        RecordingWriter.outcomeProto(
+            new BridgeSink.Outcome(BridgeSink.Outcome.CLIENT_ABORTED, 0, null, null, null));
+    assertEquals(OutcomeKind.OUTCOME_KIND_CLIENT_ABORTED, aborted.getKind());
+    assertEquals(0, aborted.getHttpStatus());
+
+    RecordingEvent link =
+        RecordingWriter.toProto(
+            plain(BridgeEventKind.ASYNC_LINK, "reactor.publishOn", 0), 4);
+    assertEquals(
+        xtp.agent.v1.Recording.RecordingEventKind.RECORDING_EVENT_KIND_ASYNC_LINK, link.getKind());
+  }
 }

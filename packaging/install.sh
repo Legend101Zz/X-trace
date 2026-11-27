@@ -90,11 +90,21 @@ fi
 
 mkdir -p "$prefix/versions" "$prefix/bin"
 target="$prefix/versions/$version"
-staging="$prefix/versions/.incoming-$$"
-trap 'rm -rf "$staging"' EXIT INT TERM
-rm -rf "$staging"; mkdir "$staging"
+incoming=$(mktemp -d "$prefix/versions/.incoming.XXXXXX") || die "cannot create private staging directory"
+trap 'rm -rf "$incoming"' EXIT INT TERM
+staging="$incoming/payload"
+mkdir "$staging"
 (cd "$here" && tar -cf - bin share install.sh uninstall.sh) | (cd "$staging" && tar -xf -)
 sha_check share/xtrace/payload.sha256 "$staging" || die "staged copy failed verification"
+
+# Either unpacking or staging under a private umask can mask the packaged launcher mode.
+# Only normalize the checksum-listed, single-link regular file within the private staging tree.
+launcher=share/xtrace/analyzers/java/bin/xtrace-java-static
+grep -Eq "^[0-9a-f]{64}  ${launcher}$" "$staging/share/xtrace/payload.sha256" ||
+  die "staged analyzer is missing from the payload checksums"
+normalized=$(cd "$staging" && find share -path "$launcher" -type f -links 1 -exec chmod 0755 {} \; -print) ||
+  die "cannot inspect staged analyzer"
+[ "$normalized" = "$launcher" ] || die "cannot set the packaged mode on the staged analyzer"
 
 # Back up existing user data before anything that could migrate it becomes active.
 backup_dir=

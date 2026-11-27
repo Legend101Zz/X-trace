@@ -37,6 +37,7 @@
     )
 )]
 
+pub mod canonical_json;
 pub mod capture_budget;
 pub mod catalog;
 pub mod catalog_admission;
@@ -50,11 +51,13 @@ pub mod hash;
 pub mod honesty;
 pub mod ids;
 pub mod observation_classifier;
+pub mod process_linkage;
 pub mod project;
 pub mod provenance;
 pub mod recording;
 pub mod run;
 pub mod runtime;
+pub mod secret_shapes;
 pub mod static_claims;
 pub mod time;
 pub mod value;
@@ -73,8 +76,12 @@ pub use hash::{ContentHash, HashParseError};
 pub use honesty::{HonestyMarker, honesty_flags};
 pub use ids::{
     CatalogRevisionId, ClaimId, CorrelationId, FrameId, InteractionId, OperationId,
-    OperationVersionId, PolicyId, ProjectId, RecordingId, RunId, RuntimeSessionId,
+    OperationVersionId, PolicyId, ProjectId, RecordingId, RunId, RuntimeSessionId, SessionLinkId,
     SourceArtifactId, SourceRevisionId,
+};
+pub use process_linkage::{
+    MAX_CORRELATION_TOKEN_BYTES, ProcessLinkValidationError, RuntimeSessionLink, SessionLinkStatus,
+    SpawnKind, hash_correlation_token,
 };
 pub use project::{FingerprintParseError, Project, RepositoryFingerprint};
 pub use provenance::{

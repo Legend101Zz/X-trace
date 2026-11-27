@@ -184,6 +184,10 @@ uuid_id! {
     /// Identity of a named policy (capture, redaction, retention).
     PolicyId
 }
+uuid_id! {
+    /// Identity of one parent-child runtime session link or explicit gap record.
+    SessionLinkId
+}
 /// Identity of a correlated set of work, surfaced in diagnostics and
 /// error responses so user support requests never carry a captured value.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

@@ -34,6 +34,7 @@ public class SpringMvcBridgeTest {
     Response response = new Response(200);
     SpringMvcBridge.servletEnter(); // outer filter
     SpringMvcBridge.servletEnter(); // inner filter
+    SpringMvcBridge.servletAsyncStarting(); // candidate observation must not alter Spring completion
     SpringMvcBridge.servletEnter(); // Servlet.service
     SpringMvcBridge.dispatchEnter();
     assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
@@ -70,6 +71,118 @@ public class SpringMvcBridgeTest {
     assertEquals("http.response 210", sink.symbols.get(1));
     assertEquals(1, sink.finishes);
     assertEquals(0, sink.dropped, "a buffered response is not event loss");
+  }
+
+  private void recordJerseyDispatchExit(Throwable thrown) {
+    SpringMvcBridge.servletEnter();
+    assertTrue(BootstrapBridge.jerseyStart("POST", "/items/{id}", System.nanoTime()));
+    SpringMvcBridge.jerseyStarted();
+    BootstrapBridge.frameEnter("org.glassfish.jersey.server.model.ResourceMethodInvoker.apply");
+    JerseyBridge.dispatchExit(null, thrown);
+    BootstrapBridge.frameExit(JerseyBridge.SERVICE, null);
+    assertEquals(0, sink.finishes);
+  }
+
+  @Test
+  void mappedJerseyDispatchThrowUsesStatusAtNormalOuterReturn() {
+    recordJerseyDispatchExit(new IllegalArgumentException("conversion"));
+    SpringMvcBridge.servletEnd(new Request("POST", "/items/{id}"), new Response(404), null);
+    assertEquals(1, sink.finishes);
+    assertTrue(sink.kinds.contains(BridgeEventKind.FRAME_THROW));
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(404, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void normalNullJerseyDispatchKeepsOuterStatusProvisional() {
+    recordJerseyDispatchExit(null);
+    SpringMvcBridge.servletEnd(new Request("POST", "/items/{id}"), new Response(200), null);
+    assertEquals(1, sink.finishes);
+    assertProvisional(200);
+  }
+
+  @Test
+  void jerseyAsyncEntryBeforeAdmissionKeepsStatusProvisionalAfterAsyncEnds() {
+    Request request = new Request("GET", "/items/{id}");
+    Response response = new Response(200);
+    SpringMvcBridge.servletEnter(); // outer filter
+    SpringMvcBridge.servletEnter(); // nested servlet
+    Object service = JerseyBridge.serviceEnter(SpringMvcBridgeTest.class, request);
+    try {
+      assertTrue(SpringMvcBridge.jerseyMayStart());
+      SpringMvcBridge.servletAsyncStarting();
+      // startAsync was observed after service entry, but its active state no longer
+      // appears at admission or outer return.
+      assertFalse(request.isAsyncStarted());
+      assertTrue(SpringMvcBridge.jerseyMayStart());
+      assertTrue(BootstrapBridge.jerseyStart("GET", "/items/{id}", System.nanoTime()));
+      SpringMvcBridge.jerseyStarted();
+    } finally {
+      JerseyBridge.serviceExit(service, null);
+    }
+    BootstrapBridge.frameExit(JerseyBridge.SERVICE, null);
+    SpringMvcBridge.servletEnd(request, response, null);
+    assertEquals(0, sink.finishes);
+    SpringMvcBridge.servletEnd(request, response, null);
+    assertEquals(1, sink.finishes);
+    assertProvisional(200);
+  }
+
+  @Test
+  void failedAsyncProbeMakesJerseyOutcomeProvisionalWithClearedAsyncFlag() {
+    Request request = new Request("POST", "/items/{id}");
+    assertFalse(request.isAsyncStarted());
+    recordJerseyDispatchExit(new IllegalArgumentException("mapped"));
+    SpringMvcBridge.jerseyAsyncProbeUnavailable();
+    SpringMvcBridge.servletEnd(request, new Response(404), null);
+    assertEquals(1, sink.finishes);
+    assertProvisional(404);
+
+    Request springRequest = new Request("GET", "/buffered");
+    Response springResponse = new Response(210);
+    SpringMvcBridge.servletEnter();
+    assertTrue(SpringMvcBridge.start(springRequest, new Handler(Controller.class)));
+    SpringMvcBridge.end(springRequest, springResponse, null);
+    SpringMvcBridge.servletEnd(springRequest, springResponse, null);
+    assertEquals(2, sink.finishes);
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(210, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void asyncEntryDuringTransientDispatchSurvivesUntilLaterJerseyAdmission() {
+    Request request = new Request("GET", "/items/{id}");
+    Response response = new Response(200);
+    SpringMvcBridge.servletEnter();
+    SpringMvcBridge.dispatchEnter();
+    assertFalse(SpringMvcBridge.jerseyMayStart());
+    SpringMvcBridge.servletAsyncStarting();
+    SpringMvcBridge.dispatchEnd(response, null);
+    assertFalse(request.isAsyncStarted());
+    assertTrue(SpringMvcBridge.jerseyMayStart());
+    assertTrue(BootstrapBridge.jerseyStart("GET", "/items/{id}", System.nanoTime()));
+    SpringMvcBridge.jerseyStarted();
+    BootstrapBridge.frameExit(JerseyBridge.SERVICE, null);
+    SpringMvcBridge.servletEnd(request, response, null);
+    assertEquals(1, sink.finishes);
+    assertProvisional(200);
+  }
+
+  @Test
+  void unclaimedAsyncObservationExpiresWithTheServletOwner() {
+    Request first = new Request("GET", "/unrecorded");
+    SpringMvcBridge.servletEnter();
+    SpringMvcBridge.servletAsyncStarting();
+    SpringMvcBridge.servletEnd(first, new Response(200), null);
+    assertEquals(0, sink.starts());
+    assertEquals(0, sink.finishes);
+
+    recordJerseyDispatchExit(new IllegalArgumentException("mapped"));
+    SpringMvcBridge.servletEnd(new Request("POST", "/items/{id}"), new Response(404), null);
+    assertEquals(1, sink.starts());
+    assertEquals(1, sink.finishes);
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(404, sink.outcome.httpStatus());
   }
 
   @Test
@@ -204,6 +317,7 @@ public class SpringMvcBridgeTest {
     SpringMvcBridge.servletEnter();
     SpringMvcBridge.dispatchEnter();
     assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.servletAsyncStarting();
     request.asyncStarted = true;
     SpringMvcBridge.end(request, response, null);
     SpringMvcBridge.dispatchEnd(response, null);
@@ -969,6 +1083,11 @@ public class SpringMvcBridgeTest {
         starts.add(new String[] {method, route});
       }
       return true;
+    }
+
+    @Override
+    public boolean offerJerseyStart(String id, long ns, String method, String route) {
+      return offerStart(id, ns, method, route);
     }
 
     @Override

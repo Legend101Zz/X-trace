@@ -1,0 +1,342 @@
+.shell.viewer-shell { height: 100dvh; grid-template-rows: 48px auto auto minmax(0, 1fr) auto; }
+.shell > .topbar { grid-row: 1; }
+.shell > .recording-tabs { grid-row: 2; }
+.shell > .replay-context { grid-row: 3; }
+.shell > .viewer-workspace { grid-row: 4; }
+.shell > .viewer-preferences { grid-row: 5; }
+.viewer-workspace { position: relative; --requests-extent: var(--requests-size); }
+.workspace-requests, .workspace-inspector, .workspace-code, .steps-and-code,
+.viewer-workspace .pane, .workspace-code-body { min-width: 0; min-height: 0; }
+.workspace-requests, .workspace-inspector { display: flex; flex-direction: column; }
+.workspace-requests > .pane, .workspace-inspector > .pane { flex: 1; }
+.workspace-code, .panel-splitter, .collapsed-panel, .reset-panels { display: none; }
+.workspace-code-body { padding: 12px; overflow-wrap: anywhere; }
+.workspace-code-body > p { margin-top: 8px; }
+.viewer-workspace .pane { background: var(--bg); }
+.recording-tabs { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 8px; border-bottom: 1px solid var(--line); background: var(--chrome); }
+.recording-tabs-list { display: flex; min-width: 0; flex: 1; gap: 4px; overflow: auto; }
+.open-recording { min-height: 44px; min-width: 44px; max-width: 20rem; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 4px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); }
+.open-recording[aria-selected='true'] { background: var(--select); border-color: var(--amber); }
+.open-recording:focus-visible { outline-offset: -2px; }
+.recording-tabs-close-icon { display: none; }
+.shell > .viewer-preferences { justify-content: space-between; align-items: center; gap: 8px; }
+.phone-back-to-step { display: none; }
+.recording-why > summary { display: list-item; padding: 8px 12px; color: var(--amber); cursor: pointer; }
+.recording-why > summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+@media (max-width: 1023px), (pointer: coarse) { .recording-why > summary { min-height: 44px; } }
+
+/* Keep recording evidence and the event list inside the Steps pane. */
+.steps-and-code > .pane { container: replay-steps / inline-size; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; }
+.steps-and-code > .pane > *, .steps-content > * { flex-shrink: 0; }
+.steps-and-code .replay-view-panel > .event-rail { overflow: visible; }
+.replay-view-panel { min-width: 0; }
+
+@media (min-width: 861px) {
+  /* Give first-run instructions more of the unused replay area while keeping
+     keyboard and pointer adjustments proportional to the Requests preference. */
+  .viewer-workspace:has(> .workspace-requests[data-collapsed='false'] .first-recording) {
+    --requests-extent: calc(var(--requests-size) + 12%);
+  }
+  .workspace.viewer-workspace { grid-template-columns: minmax(0, var(--requests-extent)) 8px minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); grid-template-rows: minmax(0, 1fr) auto; }
+  .steps-and-code { display: grid; grid-template-columns: minmax(152px, 1fr) 8px minmax(0, min(var(--code-size), calc(100% - 160px))); }
+  .viewer-workspace :is(.mode-switch, .catalog-actions, .page-controls) { flex-wrap: wrap; }
+  /* A narrow split can wrap the navigation onto several lines. Its controls
+     remain scrollable without consuming the reader's entire height. */
+  .steps-and-code .replay-toolbar { max-block-size: 50%; overflow: auto; }
+  .steps-content > .center-head { min-height: 44px; padding-block: 4px; }
+  .workspace-code { display: block; background: var(--bg); overflow: auto; }
+  .reset-panels { display: block; grid-row: 2; grid-column: 1 / -1; justify-self: end; margin: 8px; }
+  .workspace-requests[data-collapsed='true'] > .pane,
+  .workspace-inspector[data-collapsed='true'] > .pane { display: none; }
+  .collapsed-panel { display: block; min-height: 44px; padding: 0 4px; writing-mode: vertical-rl; }
+}
+
+@media (min-width: 861px), (min-width: 700px) and (max-width: 860px) {
+  .panel-splitter { position: relative; flex: 0 0 auto; min-width: 0; min-height: 0; background: var(--line-strong); touch-action: none; cursor: col-resize; }
+  .panel-splitter:focus-visible { outline-offset: -2px; background: var(--amber); }
+  .panel-splitter::before { content: ''; position: absolute; inset: 0; }
+}
+
+@media (min-width: 861px) {
+  .panel-splitter { display: block; }
+}
+
+@media (max-width: 860px) {
+  .shell.viewer-shell { grid-template-rows: 48px auto auto minmax(0, 1fr) auto 44px; }
+  .shell > .tabs { grid-row: 6; }
+  .workspace.viewer-workspace { grid-template-columns: minmax(0, 1fr); }
+  .workspace-requests, .steps-and-code, .workspace-inspector { display: none; }
+  .viewer-workspace[data-pane='recordings'] > .workspace-requests,
+  .viewer-workspace[data-pane='events'] > .steps-and-code,
+  .viewer-workspace[data-pane='evidence'] > .workspace-inspector { display: flex; flex-direction: column; }
+  .phone-back-to-step { display: block; margin: 8px 12px; }
+}
+
+@media (min-width: 700px) and (max-width: 860px) {
+  .viewer-workspace[data-pane='events'] { grid-template-rows: minmax(0, 1fr) 16px minmax(0, var(--inspector-size)) auto; }
+  .viewer-workspace[data-pane='events'] > :is(.panel-splitter--inspector, .reset-panels) { display: block; }
+  .viewer-workspace[data-pane='events'] > .panel-splitter--inspector { cursor: row-resize; }
+  .viewer-workspace[data-pane='events'] > .workspace-inspector { display: flex; overflow: auto; }
+  .viewer-workspace[data-pane='events'] > .workspace-inspector .pane { display: flex; }
+  .viewer-workspace[data-pane='events'] > .workspace-inspector[data-collapsed='true'] .pane { display: none; }
+  .viewer-workspace[data-pane='events'] > .workspace-inspector[data-collapsed='true'] .collapsed-panel { display: block; min-height: 44px; }
+  .viewer-workspace[data-pane='events'] .phone-back-to-step { display: none; }
+  .steps-content > .center-head { min-height: 0; padding-block: 4px; }
+}
+
+@media (pointer: coarse) {
+  .panel-splitter::before { min-width: 44px; left: 50%; transform: translateX(-50%); z-index: 1; }
+  .panel-splitter--inspector::before { min-height: 44px; }
+}
+
+@media (min-width: 700px) and (max-width: 860px) and (pointer: coarse) {
+  .panel-splitter--inspector::before { inset: 50% 0 auto; transform: translateY(-50%); }
+  /* Keep the revealed row above the 14px of the 44px hit target inside Steps. */
+  .steps-and-code > .pane > .steps-content { margin-block-end: 14px; }
+}
+
+.request-tree { list-style: none; margin: 4px 0; padding: 0 8px; overflow: auto; }
+.request-branch { margin-left: 8px; padding-left: 4px; border-left: 1px solid var(--line-strong); }
+.request-search { margin: 8px 12px 4px; font-size: 13px; }
+.request-search-input { min-width: 0; margin: 0 12px 8px; padding: 6px; color: var(--text); background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.request-search-input:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.recording-arrival { display: inline-block; color: var(--amber); margin-top: 4px; font: 12px var(--mono); }
+@media (max-width: 1023px), (pointer: coarse) { .request-search-input { min-height: 44px; } }
+
+.recording-tabs > .button { flex: 0 0 auto; }
+
+/* Request context stays in the shell while the selected pane scrolls. */
+.header-requests { display: none; }
+.replay-context { position: relative; min-width: 0; padding: 4px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.replay-context-request, .replay-context-event { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.replay-context-request { min-height: 34px; font-size: 13px; }
+.replay-context-route, .replay-context-event > :last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.replay-context-http { flex-shrink: 0; padding: 2px 4px; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.replay-context-status { flex-shrink: 0; font-weight: 600; }
+.replay-context-status--complete { color: var(--good); }
+.replay-context-status--partial { color: var(--amber); }
+.replay-context-status--invalid { color: var(--danger); }
+.replay-context-status--unavailable { color: var(--muted); font-size: 11px; }
+.recording-duration { font-size: 12px; }
+.recording-capture summary { display: grid; place-items: center; min-width: 44px; min-height: 44px; padding-inline: 8px; border: 1px solid var(--line-strong); border-radius: 2rem; cursor: pointer; }
+.recording-capture summary::-webkit-details-marker { display: none; }
+.recording-capture summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+.compact-capture-evidence { display: none; }
+@media (min-width: 700px) {
+  .replay-context-request { flex-wrap: wrap; }
+}
+.replay-context-event { min-height: 25px; font-size: 12px; }
+.replay-context-event > :first-child { flex-shrink: 0; color: var(--amber); }
+.replay-context-why summary { display: flex; min-width: 44px; min-height: 32px; align-items: center; justify-content: center; color: var(--text); text-decoration: underline; cursor: pointer; }
+.replay-context-why summary:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+/* Disclosure text must paint above the later workspace toolbar (layer 3). */
+.replay-context-explanation { position: absolute; z-index: 4; inset: 100% 8px auto; max-height: min(52dvh, 22rem); overflow: auto; padding: 12px; background: var(--panel-raised); border: 1px solid var(--line-strong); border-radius: var(--radius); overflow-wrap: anywhere; }
+.replay-context-explanation ul { margin: 6px 0 0; padding-inline-start: 18px; }
+.replay-context-explanation li + li { margin-block-start: 3px; }
+
+@media (max-width: 860px) {
+  .shell[data-reading='true'][data-pane='evidence'] > .recording-tabs { display: none; }
+  .shell .topbar { justify-content: start; gap: 12px; }
+  .shell .brand .top-meta { display: none; }
+  .header-requests { display: block; min-height: 44px; }
+  .replay-context-why summary { min-height: 44px; }
+  .replay-context-request { gap: 6px; }
+  .replay-context-event { min-height: 23px; }
+  .workspace-requests > .pane { flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; }
+  .workspace-requests > .pane > *, .catalog-start-actions > * { flex-shrink: 0; }
+  .workspace-requests > .pane > :is(.request-tree, .recording-list) { overflow: visible; }
+  .shell .evidence-pane > .pane-head { display: none; }
+  .shell .phone-back-to-step { margin: 6px 8px; font-size: 13px; }
+  .shell .viewer-preferences { padding-block: 3px; font-size: 12px; }
+}
+
+@media (min-width: 861px) {
+  .recording-list .recording > span { min-width: 0; }
+  .recording-list .recording-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+}
+
+@container replay-steps (max-width: 300px) {
+  .steps-and-code .event-rail { padding: 8px 6px 16px 10px; }
+  .steps-and-code .step-row { margin-inline-start: min(var(--event-indent, 0px), 8%, 52px); }
+  .steps-and-code .event { grid-template-columns: minmax(0, 3ch) minmax(0, 1fr); gap: 3px 6px; padding-inline: 6px; }
+  .steps-and-code .event-time { grid-column: 2; justify-self: start; text-align: start; }
+}
+
+/* At the desktop splitter limit, reserve the full row for the sentence. */
+@container replay-steps (max-width: 175px) {
+  .steps-and-code .step-row { margin-inline-start: min(var(--event-indent, 0px), 5%); }
+  .steps-and-code .event { grid-template-columns: minmax(0, 1fr); }
+  .steps-and-code .event-time { grid-column: 1; }
+}
+
+.steps-content { display: contents; }
+@media (min-width: 700px) {
+  .steps-and-code > .pane { overflow: hidden; }
+  .steps-and-code > .pane > .steps-content { display: block; flex: 1 1 auto; min-height: 0; overflow: auto; }
+}
+
+@media (min-width: 861px) {
+  .viewer-workspace[data-dock='bottom'] {
+    grid-template-columns: minmax(0, var(--requests-extent)) 8px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) 8px minmax(0, var(--inspector-size)) auto;
+  }
+  .viewer-workspace[data-dock='bottom'] > :is(.workspace-requests, .panel-splitter--requests) { grid-row: 1 / 4; }
+  .viewer-workspace[data-dock='bottom'] > .steps-and-code { grid-area: 1 / 3; }
+  .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector { grid-area: 2 / 3; cursor: row-resize; }
+  .viewer-workspace[data-dock='bottom'] > .workspace-inspector { grid-area: 3 / 3; }
+  .viewer-workspace[data-dock='bottom'] > .workspace-inspector > .collapsed-panel { writing-mode: horizontal-tb; align-self: start; }
+  /* The shallow bottom dock has room for one control row above its scrolling facts. */
+  .viewer-workspace[data-dock='bottom'] > .workspace-inspector[data-collapsed='false'] > .evidence-pane:has(> .wide-focus-event) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .viewer-workspace[data-dock='bottom'] .wide-focus-event { align-self: center; }
+  .viewer-workspace[data-dock='bottom'] .inspector-tabs { align-items: center; }
+  .viewer-workspace[data-dock='bottom'] .evidence-content { grid-column: 1 / -1; }
+  .viewer-workspace[data-tour-pane='evidence'][data-dock='bottom'] .evidence-pane > .pane-head {
+    min-height: 0;
+    padding-block: 4px;
+  }
+  .viewer-workspace[data-dock='bottom'] > .reset-panels { grid-row: 4; }
+}
+
+/* A verified empty desktop project has a Requests sidebar and one main action.
+   The tour still opens the ordinary pane layout to explain Steps and Inspector. */
+@media (min-width: 1200px) {
+  .viewer-workspace:not([data-tour-pane]):has(> .workspace-requests[data-collapsed='false'] .first-recording) {
+    grid-template-columns: minmax(0, var(--requests-size)) 8px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+
+    & > .workspace-requests, & #recordings-panel {
+      display: grid;
+      grid-column: 1 / -1;
+      grid-template-columns: subgrid;
+    }
+    & > .workspace-requests { grid-row: 1; }
+    & #recordings-panel { grid-template-rows: auto auto auto auto minmax(0, 1fr) auto; }
+    & #recordings-panel > * { grid-column: 1; }
+    & #recordings-panel > .catalog-start-actions {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: safe center;
+      grid-area: 1 / 3 / -1 / 4;
+      min-height: 0;
+      overflow: auto;
+    }
+    & > .panel-splitter--requests { grid-area: 1 / 2; z-index: 1; }
+    & > :is(.steps-and-code, .workspace-inspector, .panel-splitter--inspector) { display: none; }
+    & > .reset-panels { grid-area: 2 / 1 / 3 / -1; }
+  }
+}
+
+@media (min-width: 861px) and (max-width: 1199px) {
+  .header-requests { display: block; min-height: 44px; }
+  .viewer-workspace[data-dock='bottom'] { grid-template-columns: minmax(0, 1fr); }
+  .viewer-workspace[data-dock='right'] { grid-template-columns: minmax(0, 1fr) 8px minmax(0, var(--inspector-size)); }
+  .viewer-workspace[data-dock='bottom'] > :is(.steps-and-code, .panel-splitter--inspector, .workspace-inspector) { grid-column: 1; }
+  .viewer-workspace > .workspace-requests {
+    position: absolute; z-index: 4; inset: 0 auto 0 0; width: max(240px, var(--requests-extent));
+    overflow: auto; background: var(--bg); border-right: 1px solid var(--line-strong);
+  }
+  .viewer-workspace > .panel-splitter--requests {
+    position: absolute; z-index: 5; inset: 0 auto 0 max(240px, var(--requests-extent)); width: 8px;
+  }
+  .viewer-workspace:not([data-pane='recordings']) > :is(.workspace-requests, .panel-splitter--requests) { display: none; }
+  /* On first use both the command and the Steps guidance must be readable.
+     Reserve the open drawer's width before laying out the empty panes. */
+  .viewer-workspace[data-pane='recordings']:has(.first-recording) {
+    padding-inline-start: calc(max(240px, var(--requests-extent)) + 8px);
+  }
+  .viewer-workspace[data-pane='recordings']:has(.workspace-requests[data-collapsed='true'] .first-recording) {
+    padding-inline-start: 52px;
+  }
+  .viewer-workspace > .workspace-requests[data-collapsed='true'] { width: 44px; }
+  .viewer-workspace:has(> .workspace-requests[data-collapsed='true']) > .panel-splitter--requests { left: 44px; }
+}
+
+@media (min-width: 861px) and (pointer: coarse) {
+  /* The 44px hit areas extend 18px beyond each 8px divider. Keep both
+     the fixed controls and the scrolled-to row clear of those edges. */
+  .steps-and-code .replay-toolbar { padding-inline: 18px; }
+  .steps-and-code .event-rail { padding-inline: 18px; }
+  .viewer-workspace[data-dock='bottom'] .steps-and-code > .pane > .steps-content { margin-block-end: 18px; }
+  .viewer-workspace[data-dock='bottom'] > .workspace-inspector[data-collapsed='false']:has(.wide-focus-event) { padding-block-start: 18px; }
+  .viewer-workspace[data-dock='bottom'] > .panel-splitter--inspector::before {
+    inset: 50% 0 auto; transform: translateY(-50%);
+  }
+}
+
+/* Keep the selected phone view and its existing navigation in one bounded pane.
+   Only the steps body scrolls; the replay actions remain reachable below it. */
+@media (max-width: 699px) {
+  .viewer-workspace[data-pane='events'] .steps-and-code > .pane { overflow: hidden; }
+  .viewer-workspace[data-pane='events'] .steps-content { display: block; flex: 1 1 auto; min-height: 0; overflow: auto; order: 1; }
+  /* More moves focus into the bottom controls. Keep Refresh visible even when
+     the selected step has already scrolled the recording heading out of view. */
+  #events-panel:has(.phone-more:not([hidden])) .steps-content > .center-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--panel);
+  }
+  #events-panel .center-head > .button { min-width: 44px; min-height: 44px; }
+  .viewer-workspace[data-pane='events'] .replay-toolbar { order: 2; flex: 0 0 auto; }
+  .shell .phone-back-to-step { text-align: left; overflow-wrap: anywhere; }
+}
+
+@media (max-width: 699px) {
+  .shell.viewer-shell[data-reading='true']:not([data-pane='recordings']) {
+    grid-template-rows: 0 auto auto minmax(0, 1fr) auto 44px;
+  }
+  .shell[data-reading='true']:not([data-pane='recordings']) > .topbar { display: none; }
+  /* The recording summary stays first. Moving focus off a tab must not move
+     the pointer target between pointerdown and click. */
+  .shell[data-reading='true']:not([data-pane='recordings']) > .replay-context { grid-row: 2; }
+  .shell[data-reading='true']:not([data-pane='recordings']) > .recording-tabs { grid-row: 3; }
+  .replay-context { padding-inline: 8px; }
+  .replay-context-request { gap: 3px; }
+  .recording-duration, .recording-capture { display: none; }
+  .compact-capture-evidence { display: block; }
+  .replay-context-event { margin: 0; }
+  .phone-replay-toolbar { position: relative; background: var(--panel); }
+  .phone-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; }
+  .recording-tabs-list .open-recording {
+    display: grid;
+    align-content: center;
+    /* Two choices fit without spending their route space on the close label.
+       Further tabs scroll within the same finite strip, regardless of label length. */
+    flex: 1 0 calc(50% - 2px);
+    min-width: 0;
+    max-width: none;
+    padding-inline: 5px;
+    line-height: 1.15;
+  }
+  .recording-tabs-close { width: 44px; min-width: 44px; height: 44px; padding: 0; }
+  .recording-tabs-close-label { display: none; }
+  .recording-tabs-close-icon { display: inline; font-size: 20px; line-height: 1; }
+  .open-recording-route { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .open-recording-separator { display: none; }
+  .open-recording-id { font: 11px/1.2 var(--mono); }
+  .phone-actions .button { min-width: 0; min-height: 44px; padding-inline: 2px; }
+  /* Keep the action row stationary when hover or focus changes which reason is shown. */
+  .phone-navigation-reasons { display: grid; }
+  .phone-navigation-reasons > p { grid-area: 1 / 1; }
+  .phone-navigation-reasons > [data-visible='false'] { visibility: hidden; }
+  .phone-more { position: absolute; z-index: 5; bottom: 100%; right: 0; width: min(100%, 28rem); max-height: 50dvh; overflow: auto; padding: 8px; background: var(--panel-raised); border: 1px solid var(--line-strong); }
+  .phone-more .button { min-height: 44px; }
+  .phone-more p { color: var(--muted); font-size: 12px; }
+}
+
+@media (min-width: 1280px) {
+  .replay-context {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.4fr);
+    align-items: center;
+    column-gap: 16px;
+  }
+  .replay-context-request { grid-area: 1 / 1; }
+  .replay-context-event { grid-area: 1 / 2; margin: 0; }
+  .replay-context > .replay-playback { grid-area: 1 / 3; }
+}

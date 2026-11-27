@@ -39,8 +39,10 @@ pub mod application;
 pub mod catalog_discovery;
 pub mod commands;
 pub mod error;
+pub mod exercise;
 pub mod observed_endpoint_queries;
 pub mod ports;
+pub mod process_linkage;
 pub mod queries;
 pub mod recording;
 pub mod recording_queries;
@@ -64,6 +66,10 @@ pub use observed_endpoint_queries::{
     ObservedRecordingPage,
 };
 pub use ports::{IdempotencyStore, ProjectRepository, StoredReceipt};
+pub use process_linkage::{
+    ChildHandshakeClaim, LinkChildSession, ParentSpawnClaim, ProcessLinkagePort,
+    ProcessLinkageService, RecordProcessGap,
+};
 pub use queries::{
     CapabilityReport, GetProject, GetStoreStatus, ProjectStatus, Query, QueryResult,
     StoreStatusReport,

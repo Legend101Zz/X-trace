@@ -3,6 +3,9 @@ package dev.xtrace.agent.bootstrap;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -27,6 +30,22 @@ public final class BootstrapBridge {
   /** Symbol of the GAP event that records line events withheld by the per-request budget. */
   public static final String LINE_BUDGET_SYMBOL = "xtrace.capture.gap.line-budget";
 
+  /** Symbol of the GAP event that records an unresolvable application handler. */
+  public static final String HANDLER_UNRESOLVED_SYMBOL = "xtrace.capture.handler_unresolved";
+
+  /** Symbol of the GAP event that records lost reactive or async correlation. */
+  public static final String CORRELATION_LOST_SYMBOL = "xtrace.capture.gap.correlation-lost";
+
+  /** Symbol of the GAP event that records an uninstrumented child process spawn. */
+  public static final String CHILD_PROCESS_NOT_INSTRUMENTED_SYMBOL =
+      "xtrace.capture.gap.child-process-not-instrumented";
+
+  /** Symbol of the GAP event that records an already-consumed child bootstrap claim. */
+  public static final String BOOTSTRAP_CONSUMED_SYMBOL = "xtrace.capture.gap.bootstrap-consumed";
+
+  /** Symbol of the ASYNC_LINK event that records an explicitly linked JVM child process. */
+  public static final String PROCESS_LINK_SYMBOL = "xtrace.process.jvm_fork";
+
   private BootstrapBridge() {}
 
   /** Installs the one process-wide runtime sink. Reinstallation is rejected. */
@@ -37,6 +56,10 @@ public final class BootstrapBridge {
   /** Disables a failed sink without replacing a newer runtime instance. */
   public static void disable(BridgeSink sink) {
     SINK.compareAndSet(sink, null);
+  }
+
+  static boolean hasBridgeSink() {
+    return SINK.get() != null;
   }
 
   /** Installs the focused-mode line sink. Only effective focused arming does this. */
@@ -57,7 +80,7 @@ public final class BootstrapBridge {
       LineSink sink = LINE_SINK.get();
       if (sink == null) return;
       RequestContext context = CONTEXT.get();
-      if (context == null || context.deferred) {
+      if (context == null || context.state.deferred || context.state.closed) {
         sink.lineIgnored();
         return;
       }
@@ -65,23 +88,29 @@ public final class BootstrapBridge {
       if (current == null || current.eventId.isEmpty()) {
         // Queue capacity can recover before a pending cursor is flushed. Its missing entry must
         // never be replaced with an ancestor's id, even when both methods have the same name.
-        context.dropped++;
+        context.state.dropped.incrementAndGet();
         sink.lineIgnored();
         return;
       }
-      if (context.lineEvents >= MAX_LINE_EVENTS_PER_REQUEST) {
-        context.lineDropped++;
-        sink.lineIgnored();
-        return;
-      }
-      if (sink.line(
-          context.recordingId, context.nextEventId(), current.eventId, siteId,
-          System.nanoTime(), current.symbol)) {
-        context.lineEvents++;
-        context.linePending = true;
-      } else {
-        context.dropped++;
-        sink.lineIgnored();
+      synchronized (context.state.emitLock) {
+        if (context.state.closed) {
+          sink.lineIgnored();
+          return;
+        }
+        if (context.state.lineEvents.get() >= MAX_LINE_EVENTS_PER_REQUEST) {
+          context.state.lineDropped.incrementAndGet();
+          sink.lineIgnored();
+          return;
+        }
+        if (sink.line(
+            context.state.recordingId, context.state.nextEventId(), current.eventId, siteId,
+            System.nanoTime(), current.symbol)) {
+          context.state.lineEvents.incrementAndGet();
+          context.linePending = true;
+        } else {
+          context.state.dropped.incrementAndGet();
+          sink.lineIgnored();
+        }
       }
     } catch (Throwable ignored) {
       // fail open: a probe can never break application code
@@ -158,7 +187,12 @@ public final class BootstrapBridge {
     context.linePending = false;
     try {
       LineSink sink = LINE_SINK.get();
-      if (sink != null) sink.flush();
+      if (sink == null) return;
+      if (context.state.closed) {
+        sink.discardPending();
+      } else {
+        sink.flush();
+      }
     } catch (Throwable ignored) {
       // fail open
     }
@@ -166,36 +200,310 @@ public final class BootstrapBridge {
 
   /** Opens a request context for one matched route and emits its sanitized request identity. */
   public static boolean requestStart(String method, String route) {
+    return requestStart(method, route, 0, false, false);
+  }
+
+  /** Closes a route-less root from a completed standard filter-chain observation. */
+  static void filterRefusal(String method, long started, int status, boolean errorPending) {
+    if (!hasContext() && requestStart(method, "", started, true, false)) {
+      if (errorPending) provisionalRequestEnd(status, null);
+      else requestEnd(status, (Throwable) null);
+    }
+  }
+
+  /** The concrete service entry was reached earlier on this thread. */
+  static boolean jerseyStart(String method, String route, long serviceStarted) {
+    return requestStart(method, route, serviceStarted, false, true);
+  }
+
+  private static boolean requestStart(
+      String method, String route, long boundaryStarted, boolean filterOnly, boolean jersey) {
     RequestContext stale = CONTEXT.get();
     // A request whose end was deferred for exception resolution but never resolved on this
     // thread is closed without a status so it cannot leak into the next request. Only the
     // exception that caused deferral can propagate, never a handled frame throw.
-    if (stale != null && stale.deferred) requestEnd(0, stale.deferredThrown);
-    if (CONTEXT.get() != null || !validMethod(method) || !validRoute(route)) return false;
+    if (stale != null && stale.state.deferred) requestEnd(0, stale.state.deferredThrown);
+    if (CONTEXT.get() != null || !validMethod(method) || (!filterOnly && !validRoute(route))) {
+      return false;
+    }
     BridgeSink sink = SINK.get();
     if (sink == null) return false;
     String recordingId = UuidV7.random().toString();
-    long started = System.nanoTime();
-    RequestContext context = new RequestContext(recordingId, started);
-    if (!safeStart(sink, context, method, route)) {
+    long started = filterOnly || jersey ? boundaryStarted : System.nanoTime();
+    RecordingState state = new RecordingState(recordingId, started);
+    if (!safeStart(sink, state, method, route, jersey)) {
       safeIncomplete(sink, BridgeSink.INCOMPLETE_START_REJECTED);
       return false;
     }
+    RequestContext context = new RequestContext(state, "");
     CONTEXT.set(context);
-    String requestId = context.nextEventId();
+    if (jersey) {
+      // Emit the buffered concrete service entrance at its observed time, before the
+      // later dispatch publishes the matched template. No source binding is implied.
+      String service = JerseyBridge.SERVICE;
+      String event = state.nextEventId();
+      boolean accepted = safeEventAt(sink, state, event, "", BridgeEventKind.FRAME_ENTER,
+          service, started, 0);
+      if (!accepted) state.dropped.incrementAndGet();
+      context.frames.push(new Frame(service, accepted ? event : ""));
+    }
+    String requestId = state.nextEventId();
     if (safeEvent(
         sink,
-        context,
+        state,
         requestId,
         "",
         BridgeEventKind.REQUEST_UPDATE,
-        "http.request " + method + " " + route,
+        "http.request " + method + (route.isEmpty() ? "" : " " + route),
         0)) {
-      context.requestEventId = requestId;
+      state.requestEventId = requestId;
     } else {
-      context.dropped++;
+      state.dropped.incrementAndGet();
     }
     return true;
+  }
+
+  /** Opens a reactive WebFlux recording without binding a sticky ThreadLocal context. */
+  static RecordingState startReactiveRecording(
+      String method, String route, long boundaryStarted, boolean unresolvedHandler) {
+    if (!validMethod(method) || route == null || (!route.isEmpty() && !validRoute(route))) {
+      return null;
+    }
+    BridgeSink sink = SINK.get();
+    if (sink == null) return null;
+    String recordingId = UuidV7.random().toString();
+    long started = boundaryStarted != 0 ? boundaryStarted : System.nanoTime();
+    RecordingState state = new RecordingState(recordingId, started);
+    boolean offered;
+    try {
+      offered = sink.offerWebFluxStart(recordingId, started, method, route);
+    } catch (RuntimeException | LinkageError ignored) {
+      disable(sink);
+      offered = false;
+    }
+    if (!offered) {
+      safeIncomplete(sink, BridgeSink.INCOMPLETE_START_REJECTED);
+      return null;
+    }
+    synchronized (state.emitLock) {
+      String requestId = state.nextEventId();
+      if (safeEvent(
+          sink,
+          state,
+          requestId,
+          "",
+          BridgeEventKind.REQUEST_UPDATE,
+          "http.request " + method + (route.isEmpty() ? "" : " " + route),
+          0)) {
+        state.requestEventId = requestId;
+      } else {
+        state.dropped.incrementAndGet();
+      }
+      if (unresolvedHandler && state.unresolvedReported.compareAndSet(false, true)) {
+        if (!safeEvent(
+            sink, state, state.nextEventId(), state.requestEventId, BridgeEventKind.GAP,
+            HANDLER_UNRESOLVED_SYMBOL, 0)) {
+          state.dropped.incrementAndGet();
+        }
+      }
+    }
+    return state;
+  }
+
+  static String emitReactiveEvent(
+      RecordingState state, String parentEventId, int kind, String symbol, int detail) {
+    BridgeSink sink = SINK.get();
+    if (state == null || sink == null || !validSymbol(symbol)) return null;
+    synchronized (state.emitLock) {
+      if (state.closed) return null;
+      String parent = parentEventId == null || parentEventId.isEmpty()
+          ? state.requestEventId : parentEventId;
+      String eventId = state.nextEventId();
+      if (safeEvent(sink, state, eventId, parent, kind, symbol, detail)) {
+        return eventId;
+      }
+      state.dropped.incrementAndGet();
+      return "";
+    }
+  }
+
+  static String emitReactiveThrow(
+      RecordingState state, String parentEventId, String symbol, Throwable thrown) {
+    BridgeSink sink = SINK.get();
+    if (state == null || sink == null || !validSymbol(symbol)) return null;
+    Throwable actual = thrown == null ? UNKNOWN_THROWABLE : thrown;
+    synchronized (state.emitLock) {
+      if (state.closed) return null;
+      String parent = parentEventId == null || parentEventId.isEmpty()
+          ? state.requestEventId : parentEventId;
+      String eventId = state.nextEventId();
+      boolean accepted = safeThrow(sink, state, eventId, parent, symbol, actual);
+      state.lastThrowEventId = accepted ? eventId : "";
+      state.lastThrown = actual;
+      if (!accepted) {
+        state.dropped.incrementAndGet();
+        return "";
+      }
+      return eventId;
+    }
+  }
+
+  static boolean emitCorrelationLostGap(RecordingState state, String parentEventId, int count) {
+    BridgeSink sink = SINK.get();
+    if (state == null || sink == null) return false;
+    synchronized (state.emitLock) {
+      if (state.closed) return false;
+      String parent = parentEventId == null || parentEventId.isEmpty()
+          ? state.requestEventId : parentEventId;
+      boolean accepted = safeEvent(
+          sink, state, state.nextEventId(), parent, BridgeEventKind.GAP,
+          CORRELATION_LOST_SYMBOL, Math.max(1, count));
+      if (!accepted) state.dropped.incrementAndGet();
+      return accepted;
+    }
+  }
+
+  static String activeRecordingId() {
+    RequestContext context = CONTEXT.get();
+    if (!captureActive(context) || SINK.get() == null) return "";
+    return context.state.recordingId;
+  }
+
+  static boolean emitProcessGap(String symbol, int count) {
+    RequestContext context = CONTEXT.get();
+    BridgeSink sink = SINK.get();
+    if (!captureActive(context) || sink == null || !validSymbol(symbol)) return false;
+    synchronized (context.state.emitLock) {
+      if (context.state.closed) return false;
+      flushLine(context);
+      boolean accepted = safeEvent(
+          sink, context.state, context.state.nextEventId(), context.currentParent(),
+          BridgeEventKind.GAP, symbol, Math.max(1, count));
+      if (!accepted) context.state.dropped.incrementAndGet();
+      return accepted;
+    }
+  }
+
+  static boolean emitProcessLink(String symbol) {
+    RequestContext context = CONTEXT.get();
+    BridgeSink sink = SINK.get();
+    if (!captureActive(context) || sink == null || !validSymbol(symbol)) return false;
+    synchronized (context.state.emitLock) {
+      if (context.state.closed) return false;
+      flushLine(context);
+      boolean accepted = safeEvent(
+          sink, context.state, context.state.nextEventId(), context.currentParent(),
+          BridgeEventKind.ASYNC_LINK, symbol, 0);
+      if (!accepted) context.state.dropped.incrementAndGet();
+      return accepted;
+    }
+  }
+
+  static ReactiveScope activateReactiveScope(RecordingState state, String parentEventId) {
+    if (state == null || state.closed) return null;
+    RequestContext previous = CONTEXT.get();
+    String targetParent = parentEventId == null ? "" : parentEventId;
+    if (previous != null && previous.state == state
+        && (!previous.frames.isEmpty() || previous.rootParentEventId.equals(targetParent))) {
+      return new ReactiveScope(previous, previous, false);
+    }
+    RequestContext activated = new RequestContext(state, targetParent);
+    CONTEXT.set(activated);
+    return new ReactiveScope(previous, activated, true);
+  }
+
+  static ReactiveScope suspendActiveScope() {
+    RequestContext previous = CONTEXT.get();
+    if (previous == null) return null;
+    CONTEXT.remove();
+    return new ReactiveScope(previous, null, true);
+  }
+
+  static void deactivateReactiveScope(ReactiveScope scope) {
+    if (scope == null || !scope.switched) return;
+    if (scope.activated != null) {
+      synchronized (scope.activated.state.emitLock) {
+        flushLine(scope.activated);
+      }
+    }
+    if (scope.previous == null) CONTEXT.remove();
+    else CONTEXT.set(scope.previous);
+  }
+
+  static RecordingState currentReactiveState() {
+    RequestContext context = CONTEXT.get();
+    if (context == null || context.state.closed) return null;
+    return context.state;
+  }
+
+  static String currentReactiveParent() {
+    RequestContext context = CONTEXT.get();
+    if (context == null || context.state.closed) return "";
+    return context.currentParent();
+  }
+
+  static boolean finishReactiveRecording(
+      RecordingState state,
+      int responseStatus,
+      Throwable thrown,
+      boolean provisional,
+      boolean cancelled,
+      String... unsupportedCapabilities) {
+    if (state == null) return false;
+    BridgeSink sink = SINK.get();
+    synchronized (state.emitLock) {
+      if (state.closed) return false;
+      RequestContext active = CONTEXT.get();
+      if (active != null && active.state == state) {
+        flushLine(active);
+      }
+      state.closed = true;
+      if (sink == null) return false;
+      emitPendingLineBudgetGap(sink, state);
+      int sanitizedStatus = responseStatus >= 100 && responseStatus <= 599 ? responseStatus : 0;
+      String responseLabel;
+      int wireStatus;
+      BridgeSink.Outcome outcome;
+      if (cancelled) {
+        wireStatus = 0;
+        responseLabel = "http.response unavailable; cancelled";
+        outcome = new BridgeSink.Outcome(BridgeSink.Outcome.CLIENT_ABORTED, 0, null, null, null);
+      } else if (thrown != null) {
+        wireStatus = 0;
+        responseLabel = sanitizedStatus == 0
+            ? "http.response unavailable"
+            : "http.response unavailable; final status not observed; observed status was "
+                + sanitizedStatus + " (provisional)";
+        outcome = outcome(state, 0, thrown);
+      } else if (provisional) {
+        wireStatus = 0;
+        responseLabel = "http.response unavailable; final status not observed; "
+            + (sanitizedStatus == 0 ? "provisional status unavailable"
+                : "observed status was " + sanitizedStatus + " (provisional)");
+        outcome = new BridgeSink.Outcome(BridgeSink.Outcome.UNOBSERVED, 0, null, null, null);
+      } else if (sanitizedStatus != 0) {
+        wireStatus = sanitizedStatus;
+        responseLabel = "http.response " + sanitizedStatus;
+        outcome = new BridgeSink.Outcome(
+            BridgeSink.Outcome.RESPONDED, sanitizedStatus, null, null, null);
+      } else {
+        wireStatus = 0;
+        responseLabel = "http.response unavailable";
+        outcome = new BridgeSink.Outcome(BridgeSink.Outcome.UNOBSERVED, 0, null, null, null);
+      }
+      if (!safeEvent(
+          sink,
+          state,
+          state.nextEventId(),
+          state.requestEventId,
+          BridgeEventKind.RESPONSE,
+          responseLabel,
+          wireStatus)) {
+        state.dropped.incrementAndGet();
+      }
+      safeFinish(sink, state, wireStatus, outcome, unsupportedCapabilities);
+      return true;
+    }
   }
 
   /** Emits a fixture method entry and pushes its event identity as the active parent. */
@@ -208,15 +516,18 @@ public final class BootstrapBridge {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (!captureActive(context) || sink == null || !validSymbol(symbol)) return;
-    flushLine(context);
-    String eventId = context.nextEventId();
-    String parent = context.currentParent();
-    boolean accepted = safeMethodEvent(
-        sink, context, eventId, parent, BridgeEventKind.FRAME_ENTER, symbol, 0, method);
-    if (!accepted) {
-      context.dropped++;
+    synchronized (context.state.emitLock) {
+      if (context.state.closed) return;
+      flushLine(context);
+      String eventId = context.state.nextEventId();
+      String parent = context.currentParent();
+      boolean accepted = safeMethodEvent(
+          sink, context.state, eventId, parent, BridgeEventKind.FRAME_ENTER, symbol, 0, method);
+      if (!accepted) {
+        context.state.dropped.incrementAndGet();
+      }
+      context.frames.push(new Frame(symbol, accepted ? eventId : ""));
     }
-    context.frames.push(new Frame(symbol, accepted ? eventId : ""));
   }
 
   /**
@@ -231,21 +542,24 @@ public final class BootstrapBridge {
     String symbol = LINE_SINK.get() == null ? simpleName(type.getName()) + "." + method
         : MethodIdentity.symbol(type.getName(), method, descriptor);
     if (!validSymbol(symbol)) return null;
-    flushLine(context);
-    String eventId = context.nextEventId();
-    String parent = context.currentParent();
-    boolean accepted;
-    try {
-      accepted = sink.offerFrameEvent(
-          context.recordingId, eventId, parent, BridgeEventKind.FRAME_ENTER, symbol,
-          System.nanoTime(), 0, type, method, descriptor);
-    } catch (RuntimeException | LinkageError ignored) {
-      disable(sink);
-      accepted = false;
+    synchronized (context.state.emitLock) {
+      if (context.state.closed) return null;
+      flushLine(context);
+      String eventId = context.state.nextEventId();
+      String parent = context.currentParent();
+      boolean accepted;
+      try {
+        accepted = sink.offerFrameEvent(
+            context.state.recordingId, eventId, parent, BridgeEventKind.FRAME_ENTER, symbol,
+            System.nanoTime(), 0, type, method, descriptor);
+      } catch (RuntimeException | LinkageError ignored) {
+        disable(sink);
+        accepted = false;
+      }
+      if (!accepted) context.state.dropped.incrementAndGet();
+      context.frames.push(new Frame(symbol, accepted ? eventId : ""));
+      return symbol;
     }
-    if (!accepted) context.dropped++;
-    context.frames.push(new Frame(symbol, accepted ? eventId : ""));
-    return symbol;
   }
 
   /** Constructor body entry; no receiver is passed, and probe failures never escape. */
@@ -272,55 +586,57 @@ public final class BootstrapBridge {
     RequestContext context = CONTEXT.get();
     if (!captureActive(context) || SINK.get() == null) return false;
     if (!validSymbol(call.symbol())) {
-      context.dropped++;
+      context.state.dropped.incrementAndGet();
       return false;
     }
-    flushLine(context);
-    String parent = context.currentParent();
-    if (!entering) {
-      if (context.frames.isEmpty()) return false;
-      Frame frame = context.frames.pop();
-      if (!frame.symbol.equals(call.symbol())) {
-        context.dropped++;
-        context.frames.clear();
-        return false;
+    synchronized (context.state.emitLock) {
+      flushLine(context);
+      String parent = context.currentParent();
+      if (!entering) {
+        if (context.frames.isEmpty()) return false;
+        Frame frame = context.frames.pop();
+        if (!frame.symbol.equals(call.symbol())) {
+          context.state.dropped.incrementAndGet();
+          context.frames.clear();
+          return false;
+        }
+        if (!frame.eventId.isEmpty()) parent = frame.eventId;
       }
-      if (!frame.eventId.isEmpty()) parent = frame.eventId;
+      if (context.state.closed) return false;
+      String eventId = context.state.nextEventId();
+      int kind = entering ? BridgeEventKind.FRAME_ENTER
+          : thrown == null ? BridgeEventKind.FRAME_EXIT : BridgeEventKind.FRAME_THROW;
+      boolean accepted = false;
+      try {
+        accepted = call.sink().offer(context.state.recordingId, eventId, parent, kind, call.symbol(),
+            System.nanoTime(), call.method(), arguments, result, thrown);
+      } catch (Throwable ignored) {
+        // Count loss and retain the balanced stack even when a sink fails.
+      }
+      if (!accepted) context.state.dropped.incrementAndGet();
+      if (entering) context.frames.push(new Frame(call.symbol(), accepted ? eventId : ""));
+      else if (thrown != null) {
+        context.state.lastThrown = thrown;
+        if (accepted) context.state.lastThrowEventId = eventId;
+      }
+      return true;
     }
-    String eventId = context.nextEventId();
-    int kind = entering ? BridgeEventKind.FRAME_ENTER
-        : thrown == null ? BridgeEventKind.FRAME_EXIT : BridgeEventKind.FRAME_THROW;
-    boolean accepted = false;
-    try {
-      accepted = call.sink().offer(context.recordingId, eventId, parent, kind, call.symbol(),
-          System.nanoTime(), call.method(), arguments, result, thrown);
-    } catch (Throwable ignored) {
-      // Count loss and retain the balanced stack even when a sink fails.
-    }
-    if (!accepted) context.dropped++;
-    if (entering) context.frames.push(new Frame(call.symbol(), accepted ? eventId : ""));
-    else if (thrown != null) {
-      context.lastThrown = thrown;
-      if (accepted) context.lastThrowEventId = eventId;
-    }
-    return true;
   }
 
   /** Marks the active request as having no resolvable application handler (scope unknown). */
   public static void handlerUnresolved() {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || context.unresolvedReported) return;
-    context.unresolvedReported = true;
-    if (!safeEvent(
-        sink, context, context.nextEventId(), context.requestEventId, BridgeEventKind.GAP,
-        HANDLER_UNRESOLVED_SYMBOL, 0)) {
-      context.dropped++;
+    if (context == null || sink == null) return;
+    synchronized (context.state.emitLock) {
+      if (context.state.closed || !context.state.unresolvedReported.compareAndSet(false, true)) return;
+      if (!safeEvent(
+          sink, context.state, context.state.nextEventId(), context.state.requestEventId,
+          BridgeEventKind.GAP, HANDLER_UNRESOLVED_SYMBOL, 0)) {
+        context.state.dropped.incrementAndGet();
+      }
     }
   }
-
-  /** Symbol of the GAP event that records an unresolvable application handler. */
-  public static final String HANDLER_UNRESOLVED_SYMBOL = "xtrace.capture.handler_unresolved";
 
   /** Returns the sink's scope verdict for a handler type: 1 in scope, 0 out of scope, -1 unknown. */
   public static int scopeOf(Class<?> type) {
@@ -337,7 +653,7 @@ public final class BootstrapBridge {
   /** True when a live request context is already open on this thread. */
   public static boolean inRequest() {
     RequestContext context = CONTEXT.get();
-    return context != null && !context.deferred;
+    return context != null && !context.state.deferred && !context.state.closed;
   }
 
   /**
@@ -348,26 +664,26 @@ public final class BootstrapBridge {
   public static boolean deferRequestEnd(Throwable thrown) {
     RequestContext context = CONTEXT.get();
     if (context == null) return false;
-    if (!context.deferred) context.deferredBoundary = SpringMvcBridge.captureBoundary();
-    context.deferred = true;
-    context.deferredThrown = thrown;
-    if (thrown == null || thrown != context.lastThrown) context.lastThrowEventId = "";
-    context.lastThrown = thrown;
+    if (!context.state.deferred) context.state.deferredBoundary = SpringMvcBridge.captureBoundary();
+    context.state.deferred = true;
+    context.state.deferredThrown = thrown;
+    if (thrown == null || thrown != context.state.lastThrown) context.state.lastThrowEventId = "";
+    context.state.lastThrown = thrown;
     return true;
   }
 
   /** True when the request on this thread is waiting for exception resolution. */
   public static boolean awaitingResolution() {
     RequestContext context = CONTEXT.get();
-    return context != null && context.deferred;
+    return context != null && context.state.deferred;
   }
 
   static Object exceptionResolutionEnter() {
     RequestContext context = CONTEXT.get();
-    if (context == null || !context.deferred) return null;
-    if (context.deferredBoundary == null ? SpringMvcBridge.captureBoundary() != null
-        : !SpringMvcBridge.boundaryActive(context.deferredBoundary)) return null;
-    context.resolutionDepth++;
+    if (context == null || !context.state.deferred) return null;
+    if (context.state.deferredBoundary == null ? SpringMvcBridge.captureBoundary() != null
+        : !SpringMvcBridge.boundaryActive(context.state.deferredBoundary)) return null;
+    context.state.resolutionDepth++;
     return context;
   }
 
@@ -376,7 +692,9 @@ public final class BootstrapBridge {
   }
 
   static void exceptionResolutionEnd(Object boundary) {
-    if (boundary instanceof RequestContext context && context.resolutionDepth > 0) context.resolutionDepth--;
+    if (boundary instanceof RequestContext context && context.state.resolutionDepth > 0) {
+      context.state.resolutionDepth--;
+    }
   }
 
   static String simpleName(String binaryName) {
@@ -423,7 +741,7 @@ public final class BootstrapBridge {
 
   private static boolean safeMethodEvent(
       BridgeSink sink,
-      RequestContext context,
+      RecordingState state,
       String eventId,
       String parentEventId,
       int kind,
@@ -432,7 +750,7 @@ public final class BootstrapBridge {
       java.lang.reflect.Method method) {
     try {
       return sink.offerMethodEvent(
-          context.recordingId, eventId, parentEventId, kind, symbol, System.nanoTime(), detail, method);
+          state.recordingId, eventId, parentEventId, kind, symbol, System.nanoTime(), detail, method);
     } catch (RuntimeException | LinkageError ignored) {
       disable(sink);
       return false;
@@ -454,29 +772,32 @@ public final class BootstrapBridge {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (!captureActive(context) || sink == null || context.frames.isEmpty()) return;
-    flushLine(context);
-    Frame frame = context.frames.pop();
-    if (!frame.symbol.equals(symbol)) {
-      context.dropped++;
-      context.frames.clear();
-      return;
+    synchronized (context.state.emitLock) {
+      flushLine(context);
+      Frame frame = context.frames.pop();
+      if (!frame.symbol.equals(symbol)) {
+        context.state.dropped.incrementAndGet();
+        context.frames.clear();
+        return;
+      }
+      if (context.state.closed) return;
+      String eventId = context.state.nextEventId();
+      String parent = frame.eventId.isEmpty() ? context.currentParent() : frame.eventId;
+      boolean accepted;
+      if (thrown == null) {
+        accepted = safeEvent(sink, context.state, eventId, parent, BridgeEventKind.FRAME_EXIT, symbol, 0);
+      } else {
+        accepted = safeThrow(sink, context.state, eventId, parent, symbol, thrown);
+        context.state.lastThrowEventId = accepted ? eventId : "";
+        context.state.lastThrown = thrown;
+      }
+      if (!accepted) context.state.dropped.incrementAndGet();
     }
-    String eventId = context.nextEventId();
-    String parent = frame.eventId.isEmpty() ? context.currentParent() : frame.eventId;
-    boolean accepted;
-    if (thrown == null) {
-      accepted = safeEvent(sink, context, eventId, parent, BridgeEventKind.FRAME_EXIT, symbol, 0);
-    } else {
-      accepted = safeThrow(sink, context, eventId, parent, symbol, thrown);
-      context.lastThrowEventId = accepted ? eventId : "";
-      context.lastThrown = thrown;
-    }
-    if (!accepted) context.dropped++;
   }
 
   private static boolean safeThrow(
       BridgeSink sink,
-      RequestContext context,
+      RecordingState state,
       String eventId,
       String parent,
       String symbol,
@@ -494,7 +815,7 @@ public final class BootstrapBridge {
     }
     try {
       return sink.offerThrowEvent(
-          context.recordingId, eventId, parent, symbol, System.nanoTime(), type, message);
+          state.recordingId, eventId, parent, symbol, System.nanoTime(), type, message);
     } catch (RuntimeException | LinkageError ignored) {
       disable(sink);
       return false;
@@ -506,48 +827,60 @@ public final class BootstrapBridge {
     return value.length() <= max ? value : value.substring(0, max);
   }
 
-  /** Emits the coarse H2 execute boundary without reading SQL or bind values. */
-  public static void databaseStart() {
+  /** Opens a coarse JDBC boundary without reading SQL, bind values or driver objects. */
+  public static String databaseStart(JdbcOperation operation) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (!captureActive(context) || sink == null || context.databaseActive) return;
-    flushLine(context);
-    context.databaseActive = true;
-    context.databaseEventId = "";
-    String eventId = context.nextEventId();
-    if (safeEvent(
-        sink,
-        context,
-        eventId,
-        context.currentParent(),
-        BridgeEventKind.DATABASE_START,
-        "h2.executeUpdate",
-        0)) {
-      context.databaseEventId = eventId;
-    } else {
-      context.dropped++;
+    if (operation == null || !captureActive(context) || sink == null
+        || context.databaseToken != null) return null;
+    synchronized (context.state.emitLock) {
+      if (context.state.closed) return null;
+      flushLine(context);
+      context.databaseEventId = "";
+      String eventId = context.state.nextEventId();
+      context.databaseToken = eventId;
+      context.databaseOperation = operation;
+      if (safeEvent(
+          sink,
+          context.state,
+          eventId,
+          context.currentParent(),
+          BridgeEventKind.DATABASE_START,
+          operation.symbol(false),
+          0)) {
+        context.databaseEventId = eventId;
+      } else {
+        context.state.dropped.incrementAndGet();
+      }
+      return eventId;
     }
   }
 
-  /** Emits the coarse H2 completion boundary. */
-  public static void databaseEnd(boolean threw) {
+  /** Only the entry that opened this boundary can close it. */
+  public static void databaseEnd(String token, boolean threw) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (!captureActive(context) || sink == null || !context.databaseActive) return;
-    flushLine(context);
-    String start = context.databaseEventId;
-    context.databaseActive = false;
-    context.databaseEventId = "";
-    String eventId = context.nextEventId();
-    if (!safeEvent(
-        sink,
-        context,
-        eventId,
-        start.isEmpty() ? context.currentParent() : start,
-        BridgeEventKind.DATABASE_END,
-        threw ? "h2.executeUpdate.failed" : "h2.executeUpdate",
-        threw ? 1 : 0)) {
-      context.dropped++;
+    if (token == null || !captureActive(context) || sink == null
+        || context.databaseToken != token) return;
+    synchronized (context.state.emitLock) {
+      flushLine(context);
+      String start = context.databaseEventId;
+      JdbcOperation operation = context.databaseOperation;
+      context.databaseToken = null;
+      context.databaseOperation = null;
+      context.databaseEventId = "";
+      if (context.state.closed) return;
+      String eventId = context.state.nextEventId();
+      if (!safeEvent(
+          sink,
+          context.state,
+          eventId,
+          start.isEmpty() ? context.currentParent() : start,
+          BridgeEventKind.DATABASE_END,
+          operation.symbol(threw),
+          threw ? 1 : 0)) {
+        context.state.dropped.incrementAndGet();
+      }
     }
   }
 
@@ -581,41 +914,48 @@ public final class BootstrapBridge {
     try {
       BridgeSink sink = SINK.get();
       if (context == null || sink == null) return;
-      flushLine(context);
-      if (context.lineDropped > 0) {
-        long withheld = context.lineDropped;
-        context.lineDropped = 0;
+      synchronized (context.state.emitLock) {
+        if (context.state.closed) return;
+        flushLine(context);
+        context.state.closed = true;
+        emitPendingLineBudgetGap(sink, context.state);
+        int sanitizedStatus = responseStatus >= 100 && responseStatus <= 599 ? responseStatus : 0;
+        String eventId = context.state.nextEventId();
         if (!safeEvent(
-            sink, context, context.nextEventId(), context.requestEventId, BridgeEventKind.GAP,
-            LINE_BUDGET_SYMBOL, (int) Math.min(Integer.MAX_VALUE, withheld))) {
-          context.dropped++;
+            sink,
+            context.state,
+            eventId,
+            context.state.requestEventId,
+            BridgeEventKind.RESPONSE,
+            responseLabel != null ? responseLabel
+                : sanitizedStatus == 0 ? "http.response unavailable" : "http.response " + sanitizedStatus,
+            sanitizedStatus)) {
+          context.state.dropped.incrementAndGet();
         }
+        // The caller decides whether a status is final. Pending container error handling or an
+        // escaping servlet exception supplies only provisional evidence, not a dropped event.
+        safeFinish(sink, context.state, sanitizedStatus, outcome(context.state, sanitizedStatus, thrown));
       }
-      int sanitizedStatus = responseStatus >= 100 && responseStatus <= 599 ? responseStatus : 0;
-      String eventId = context.nextEventId();
-      if (!safeEvent(
-          sink,
-          context,
-          eventId,
-          context.requestEventId,
-          BridgeEventKind.RESPONSE,
-          responseLabel != null ? responseLabel
-              : sanitizedStatus == 0 ? "http.response unavailable" : "http.response " + sanitizedStatus,
-          sanitizedStatus)) {
-        context.dropped++;
-      }
-      // The caller decides whether a status is final. Pending container error handling or an
-      // escaping servlet exception supplies only provisional evidence, not a dropped event.
-      safeFinish(sink, context, sanitizedStatus, outcome(context, sanitizedStatus, thrown));
     } finally {
       CONTEXT.remove();
     }
   }
 
+  private static void emitPendingLineBudgetGap(BridgeSink sink, RecordingState state) {
+    long withheld = state.lineDropped.getAndSet(0);
+    if (withheld > 0) {
+      if (!safeEvent(
+          sink, state, state.nextEventId(), state.requestEventId, BridgeEventKind.GAP,
+          LINE_BUDGET_SYMBOL, (int) Math.min(Integer.MAX_VALUE, withheld))) {
+        state.dropped.incrementAndGet();
+      }
+    }
+  }
+
   private static BridgeSink.Outcome outcome(
-      RequestContext context, int status, Throwable thrown) {
-    String thrownFrom = thrown == UNKNOWN_THROWABLE || thrown == context.lastThrown
-        ? context.lastThrowEventId : "";
+      RecordingState state, int status, Throwable thrown) {
+    String thrownFrom = thrown == UNKNOWN_THROWABLE || thrown == state.lastThrown
+        ? state.lastThrowEventId : "";
     if (status != 0) {
       // The caller supplied a final status, including buffered responses at normal servlet exit.
       return new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, status, null, null, null);
@@ -625,7 +965,7 @@ public final class BootstrapBridge {
     }
     String type = null;
     String message = null;
-    Throwable source = thrown == UNKNOWN_THROWABLE ? context.lastThrown : thrown;
+    Throwable source = thrown == UNKNOWN_THROWABLE ? state.lastThrown : thrown;
     if (source != null && source != UNKNOWN_THROWABLE) {
       type = boundedText(source.getClass().getName(), 200);
       try {
@@ -640,12 +980,14 @@ public final class BootstrapBridge {
   }
 
   public static boolean hasContext() {
-    return CONTEXT.get() != null;
+    RequestContext context = CONTEXT.get();
+    return context != null && !context.state.closed;
   }
 
   private static boolean captureActive(RequestContext context) {
-    return context != null && (!context.deferred || context.resolutionDepth > 0
-        || SpringMvcBridge.boundaryActive(context.deferredBoundary));
+    return context != null && !context.state.closed
+        && (!context.state.deferred || context.state.resolutionDepth > 0
+            || SpringMvcBridge.boundaryActive(context.state.deferredBoundary));
   }
 
   /** Called only by methods whose focused line probes were skipped at transformation time. */
@@ -655,9 +997,14 @@ public final class BootstrapBridge {
       BridgeSink sink = SINK.get();
       // A retained thread-local alone is not evidence that later work belongs to this request.
       if (!captureActive(context) || sink == null) return;
-      flushLine(context);
-      if (!safeEvent(sink, context, context.nextEventId(), context.currentParent(),
-          BridgeEventKind.GAP, "xtrace.capture.gap.not-transformed", 1)) context.dropped++;
+      synchronized (context.state.emitLock) {
+        if (context.state.closed) return;
+        flushLine(context);
+        if (!safeEvent(sink, context.state, context.state.nextEventId(), context.currentParent(),
+            BridgeEventKind.GAP, "xtrace.capture.gap.not-transformed", 1)) {
+          context.state.dropped.incrementAndGet();
+        }
+      }
     } catch (Throwable ignored) {
       // Limitation probes cannot affect application behavior.
     }
@@ -667,12 +1014,16 @@ public final class BootstrapBridge {
     CONTEXT.remove();
     LINE_SINK.set(null);
     SINK.set(null);
+    ReactorContextBridge.resetForTest();
+    WebFluxBridge.resetForTest();
+    ProcessLinkageBridge.resetForTest();
   }
 
   private static boolean safeStart(
-      BridgeSink sink, RequestContext context, String method, String route) {
+      BridgeSink sink, RecordingState state, String method, String route, boolean jersey) {
     try {
-      return sink.offerStart(context.recordingId, context.startedMonotonicNs, method, route);
+      if (jersey) return sink.offerJerseyStart(state.recordingId, state.startedMonotonicNs, method, route);
+      return sink.offerStart(state.recordingId, state.startedMonotonicNs, method, route);
     } catch (RuntimeException | LinkageError ignored) {
       disable(sink);
       return false;
@@ -681,21 +1032,19 @@ public final class BootstrapBridge {
 
   private static boolean safeEvent(
       BridgeSink sink,
-      RequestContext context,
+      RecordingState state,
       String eventId,
       String parentEventId,
       int kind,
       String symbol,
       int detail) {
+    return safeEventAt(sink, state, eventId, parentEventId, kind, symbol, System.nanoTime(), detail);
+  }
+
+  private static boolean safeEventAt(BridgeSink sink, RecordingState state, String eventId,
+      String parentEventId, int kind, String symbol, long observedAt, int detail) {
     try {
-      return sink.offerEvent(
-          context.recordingId,
-          eventId,
-          parentEventId,
-          kind,
-          symbol,
-          System.nanoTime(),
-          detail);
+      return sink.offerEvent(state.recordingId, eventId, parentEventId, kind, symbol, observedAt, detail);
     } catch (RuntimeException | LinkageError ignored) {
       disable(sink);
       return false;
@@ -703,15 +1052,26 @@ public final class BootstrapBridge {
   }
 
   private static void safeFinish(
-      BridgeSink sink, RequestContext context, int responseStatus, BridgeSink.Outcome outcome) {
+      BridgeSink sink, RecordingState state, int responseStatus, BridgeSink.Outcome outcome,
+      String... unsupportedCapabilities) {
     try {
-      if (!sink.offerFinishWithOutcome(
-          context.recordingId,
-          context.startedMonotonicNs,
-          System.nanoTime(),
-          responseStatus,
-          context.dropped,
-          outcome)) {
+      boolean accepted = unsupportedCapabilities == null || unsupportedCapabilities.length == 0
+          ? sink.offerFinishWithOutcome(
+              state.recordingId,
+              state.startedMonotonicNs,
+              System.nanoTime(),
+              responseStatus,
+              state.dropped.get(),
+              outcome)
+          : sink.offerFinishWithOutcome(
+              state.recordingId,
+              state.startedMonotonicNs,
+              System.nanoTime(),
+              responseStatus,
+              state.dropped.get(),
+              outcome,
+              unsupportedCapabilities);
+      if (!accepted) {
         safeIncomplete(sink, BridgeSink.INCOMPLETE_FINISH_REJECTED);
         disable(sink);
       }
@@ -729,40 +1089,65 @@ public final class BootstrapBridge {
     }
   }
 
-  private static final class RequestContext {
-    private final String recordingId;
-    private final long startedMonotonicNs;
-    private final Deque<Frame> frames = new ArrayDeque<>(3);
-    private int nextEvent = 1;
-    private String requestEventId = "";
-    private boolean deferred;
-    private Object deferredBoundary;
-    private int resolutionDepth;
-    private Throwable deferredThrown;
-    private boolean unresolvedReported;
-    private String lastThrowEventId = "";
-    private Throwable lastThrown;
-    private boolean databaseActive;
-    private String databaseEventId = "";
-    private long dropped;
-    private boolean linePending;
-    private int lineEvents;
-    private long lineDropped;
+  static final class RecordingState {
+    final String recordingId;
+    final long startedMonotonicNs;
+    final Object emitLock = new Object();
+    final AtomicInteger nextEvent = new AtomicInteger(1);
+    volatile String requestEventId = "";
+    volatile boolean closed;
+    final AtomicBoolean unresolvedReported = new AtomicBoolean();
+    final AtomicLong dropped = new AtomicLong();
+    final AtomicInteger lineEvents = new AtomicInteger();
+    final AtomicLong lineDropped = new AtomicLong();
+    volatile String lastThrowEventId = "";
+    volatile Throwable lastThrown;
+    volatile boolean deferred;
+    volatile Object deferredBoundary;
+    volatile int resolutionDepth;
+    volatile Throwable deferredThrown;
 
-    private RequestContext(String recordingId, long startedMonotonicNs) {
+    RecordingState(String recordingId, long startedMonotonicNs) {
       this.recordingId = recordingId;
       this.startedMonotonicNs = startedMonotonicNs;
     }
 
-    private String nextEventId() {
-      return recordingId + ":" + nextEvent++;
+    String nextEventId() {
+      return recordingId + ":" + nextEvent.getAndIncrement();
+    }
+  }
+
+  static final class ReactiveScope {
+    final RequestContext previous;
+    final RequestContext activated;
+    final boolean switched;
+
+    ReactiveScope(RequestContext previous, RequestContext activated, boolean switched) {
+      this.previous = previous;
+      this.activated = activated;
+      this.switched = switched;
+    }
+  }
+
+  private static final class RequestContext {
+    private final RecordingState state;
+    private final String rootParentEventId;
+    private final Deque<Frame> frames = new ArrayDeque<>(3);
+    private String databaseToken;
+    private JdbcOperation databaseOperation;
+    private String databaseEventId = "";
+    private boolean linePending;
+
+    private RequestContext(RecordingState state, String rootParentEventId) {
+      this.state = state;
+      this.rootParentEventId = rootParentEventId == null ? "" : rootParentEventId;
     }
 
     private String currentParent() {
       for (Frame frame : frames) {
         if (!frame.eventId.isEmpty()) return frame.eventId;
       }
-      return requestEventId;
+      return rootParentEventId.isEmpty() ? state.requestEventId : rootParentEventId;
     }
   }
 

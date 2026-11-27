@@ -498,6 +498,7 @@ async fn streamed_recording_journey(focused: bool) {
                     recording_id,
                     limit: 100,
                     after_sequence: None,
+                    before_sequence: None,
                 })
                 .expect("acknowledged events are readable while open");
             assert_eq!(live.status, RecordingStatus::Recording);
@@ -522,6 +523,7 @@ async fn streamed_recording_journey(focused: bool) {
                 recording_id,
                 limit: 500,
                 after_sequence,
+                before_sequence: None,
             })
             .expect("complete detail");
         assert_eq!(window.status, RecordingStatus::Complete);
@@ -697,6 +699,7 @@ async fn finished_recording_budget_journey(abandoned: bool) {
                     ),
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 })
                 .expect("abandoned recording reads at finish ACK");
             assert_eq!(window.status, RecordingStatus::Partial);
@@ -727,6 +730,7 @@ async fn finished_recording_budget_journey(abandoned: bool) {
                 recording_id: companion_id,
                 limit: 10,
                 after_sequence: None,
+                before_sequence: None,
             })
             .expect("companion remained active across abandoned requests");
         assert_eq!(companion.status, RecordingStatus::Recording);
@@ -769,6 +773,7 @@ async fn finished_recording_budget_journey(abandoned: bool) {
                     recording_id,
                     limit: 10,
                     after_sequence: None,
+                    before_sequence: None,
                 })
                 .expect("verified complete recording");
             assert_eq!(window.status, RecordingStatus::Complete);

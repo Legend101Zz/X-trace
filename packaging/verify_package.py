@@ -58,7 +58,11 @@ REQUIRED = [
     ("web_asset_hashes", _has("share/xtrace/web/assets.sha256")),
     ("java_pack_agent", _any("share/xtrace/packs/java/agent/")),
     ("java_pack_files", _any("share/xtrace/packs/java/")),
+    ("java_analyzer_launcher", _has("share/xtrace/analyzers/java/bin/xtrace-java-static")),
+    ("java_analyzer_main_jar", _any("share/xtrace/analyzers/java/lib/static-analyzer-", ".jar")),
+    ("java_analyzer_parser_jar", _any("share/xtrace/analyzers/java/lib/javaparser-core-", ".jar")),
     ("node_pack_manifest", _has("share/xtrace/packs/node/pack.manifest")),
+    ("node_runtime_manifest", _has("share/xtrace/packs/node/dist/manifest.sha256")),
     ("node_pack_dist", _any("share/xtrace/packs/node/dist/", ".cjs")),
     ("schema_proto", _any("share/xtrace/schema/proto/", ".proto")),
     ("schema_openapi", _has("share/xtrace/schema/xtp-client/openapi.yaml")),
@@ -92,10 +96,17 @@ def resolve_root(package, scratch):
         raise SystemExit(f"no {MANIFEST_REL} under {package}")
     if package.is_file() and package.name.endswith(".tar.gz"):
         with tarfile.open(package, "r:gz") as tf:
+            cli_members = []
             for m in tf.getmembers():
                 parts = Path(m.name).parts
+                if len(parts) == 3 and parts[1:] == ("bin", "xtrace"):
+                    cli_members.append(m)
                 if m.name.startswith("/") or ".." in parts or not (m.isfile() or m.isdir()):
                     raise SystemExit(f"unsafe archive member: {m.name}")
+            # Extraction filters can normalize permissions. Check the CLI's actual
+            # header before extraction so unchanged payload bytes cannot mask a bad mode.
+            if len(cli_members) != 1 or not cli_members[0].isfile() or cli_members[0].mode != 0o755:
+                raise SystemExit("archive must contain one regular bin/xtrace at mode 0755")
             if hasattr(tarfile, "data_filter"):
                 tf.extractall(scratch, filter="data")
             else:
@@ -143,6 +154,9 @@ def read_manifest(root, rep):
                     and isinstance(f.get("size"), int)):
                 problems.append(f"malformed file row {f!r}")
                 break
+            if f["path"] == "bin/xtrace" and "mode" in f and f["mode"] != "0755":
+                problems.append("bin/xtrace declares a mode other than 0755")
+                break
             p = Path(f["path"])
             if p.is_absolute() or ".." in p.parts:
                 problems.append(f"unsafe path {f['path']!r}")
@@ -164,6 +178,9 @@ def check_manifest(root, manifest, expected_version, rep):
     paths = {f["path"] for f in manifest["files"]}
     missing = [name for name, pred in REQUIRED if not pred(paths)]
     rep.add("required_components", not missing, "missing: " + ", ".join(missing) if missing else "all present")
+    analyzer = root / "share/xtrace/analyzers/java/bin/xtrace-java-static"
+    rep.add("java_analyzer_executable", analyzer.is_file() and not analyzer.is_symlink()
+            and (analyzer.stat().st_mode & 0o777) == 0o755)
 
     bad = []
     for f in manifest["files"]:
