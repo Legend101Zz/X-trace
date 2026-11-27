@@ -88,6 +88,13 @@ export const container = {
     const out = docker(["port", name, `${containerPort}/tcp`]).stdout.trim().split("\n")[0];
     return Number(out.split(":").pop());
   },
+  ipAddress(name) {
+    guard(name);
+    const out = docker(["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", name]).stdout.trim();
+    const ip = out.split(/\s+/).find(Boolean);
+    if (!ip) throw new Error(`container ${name} has no bridge IP address`);
+    return ip;
+  },
   running(name) {
     guard(name);
     return docker(["inspect", "-f", "{{.State.Running}}", name], { allowFail: true }).stdout.trim() === "true";

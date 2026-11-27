@@ -78,15 +78,29 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
     else:
         v = [s for s in sc if (s.get("recordingVerdict") or {}).get("passed")]
         pc = r.get("problemClasses", {})
-        out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) else "fail",
-                    f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
-                    f"({api.get('recordings', 0)} recordings); problems: {json.dumps(pc, sort_keys=True)}"))
-        n_src = r.get("recordingsWithSource", 0)
-        bad_src = [k for k in ("no-source-file-line", "source-binding-unacceptable", "source-binding-missing") if pc.get(k)]
-        out.append(("source-identity", "pass" if n_src > 0 and not bad_src else "fail",
-                    (f"{n_src} recordings carry a matched .java file and method-range start line with an accepted source binding "
-                     f"(not an executed line)" if n_src > 0 else "no recording frame carried a matched .java file and start line")
-                    + (f"; problems: {','.join(bad_src)}" if bad_src else "")))
+        is_node = r.get("runtime") == "node"
+        if is_node:
+            out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) else "fail",
+                        f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and runtime frame/interaction expectations "
+                        f"({api.get('recordings', 0)} recordings); problems: {json.dumps(pc, sort_keys=True)}"))
+            n_src = r.get("recordingsWithSource", 0)
+            bad_src = [k for k in ("no-source-file-line", "source-binding-unacceptable", "source-binding-missing") if pc.get(k)]
+            lims = r.get("observedLimitations") or []
+            lim_note = " (Node adapter reports source_locations_unavailable)" if "source_locations_unavailable" in lims else ""
+            out.append(("source-identity", "pass" if n_src > 0 and not bad_src else "fail",
+                        (f"{n_src} recordings carry a matched source file and start line with an accepted source binding"
+                         if n_src > 0 else f"no recording frame carried a matched source file and start line{lim_note}")
+                        + (f"; problems: {','.join(bad_src)}" if bad_src else "")))
+        else:
+            out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) else "fail",
+                        f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
+                        f"({api.get('recordings', 0)} recordings); problems: {json.dumps(pc, sort_keys=True)}"))
+            n_src = r.get("recordingsWithSource", 0)
+            bad_src = [k for k in ("no-source-file-line", "source-binding-unacceptable", "source-binding-missing") if pc.get(k)]
+            out.append(("source-identity", "pass" if n_src > 0 and not bad_src else "fail",
+                        (f"{n_src} recordings carry a matched .java file and method-range start line with an accepted source binding "
+                         f"(not an executed line)" if n_src > 0 else "no recording frame carried a matched .java file and start line")
+                        + (f"; problems: {','.join(bad_src)}" if bad_src else "")))
         n_rec = api.get("recordings", 0)
         out.append(("api-json-artifact", "pass" if n_rec > 0 else "fail",
                     f"{n_rec} recordings saved as API JSON" if n_rec > 0 else "the read API returned 0 recordings, nothing to save"))

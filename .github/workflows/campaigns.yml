@@ -1,10 +1,10 @@
 name: campaigns
 
 # Real-project campaigns. Builds the candidate package, clones each upstream project at its pinned SHA, runs the pinned
-# UNINSTRUMENTED baseline and (Java campaigns) the instrumented scenarios through the packaged `xtrace run`, reads recordings
-# back through the viewer API, scans every surface for privacy canaries and runs the browser and TUI journeys. Every step
-# whose product feature does not exist yet is recorded as `not-implemented` and the final gate FAILS the job: an
-# incomplete campaign is never green. A NON-RELEASE unsigned receipt is only ever an artifact. No secrets are used.
+# UNINSTRUMENTED baseline and instrumented scenarios (Java and Node campaigns) through the packaged `xtrace run`, reads
+# recordings back through the viewer API, scans every surface for privacy canaries and runs the browser and TUI journeys.
+# Every step whose product feature does not exist yet is recorded as `not-implemented` and the final gate FAILS the job:
+# an incomplete campaign is never green. A NON-RELEASE unsigned receipt is only ever an artifact. No secrets are used.
 on:
   workflow_dispatch:
     inputs:
@@ -193,19 +193,45 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: matrix.kind == 'node'
         with:
-          node-version: 22
-      - name: Pinned baseline (x86_64 Docker images, node harness)
+          node-version: ${{ matrix.nodeVersion }}
+      - name: Prepare and build upstream Node project (host, no source changes)
         if: matrix.kind == 'node'
         env:
+          XCAMP_APP_MODE: host
+          XCAMP_PLATFORM: linux/amd64
+        run: |
+          export XTRACE_CAMP_NODE_ROOT="$CAMP_ROOT/node"
+          case "$CAMP_PROJECT" in
+            directus) node_dir="$CAMP_ROOT/node/directus/upstream" ;;
+            medusa) node_dir="$CAMP_ROOT/node/medusa/starter" ;;
+            vendure) node_dir="$CAMP_ROOT/node/vendure/app" ;;
+            *) echo "unknown node project: $CAMP_PROJECT"; exit 2 ;;
+          esac
+          echo "NODE_PROJECT_DIR=$node_dir" >> "$GITHUB_ENV"
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --step build-upstream -- sh tools/qa/camp_node_baseline.sh "$CAMP_PROJECT" prepare
+      - name: Pinned uninstrumented baseline (host Node, Postgres in a campaign container)
+        if: matrix.kind == 'node'
+        env:
+          XCAMP_APP_MODE: host
           XCAMP_PLATFORM: linux/amd64
         run: |
           export XTRACE_CAMP_NODE_ROOT="$CAMP_ROOT/node"
           python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
-            --step baseline -- sh tools/qa/camp_node_baseline.sh "$CAMP_PROJECT"
-          # the x86_64 node baselines are single own-check runs: no pin compare, no stability run yet
+            --step baseline -- node "campaigns/node/$CAMP_PROJECT/harness/run.mjs" baseline 1
+      - name: Second Node baseline run and stability compare (same runner, host Node)
+        if: matrix.kind == 'node' && always()
+        env:
+          XCAMP_APP_MODE: host
+          XCAMP_PLATFORM: linux/amd64
+        run: |
+          export XTRACE_CAMP_NODE_ROOT="$CAMP_ROOT/node"
+          node "campaigns/node/$CAMP_PROJECT/harness/run.mjs" baseline 2 || true
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --step baseline-stability-across-runs -- node "campaigns/node/$CAMP_PROJECT/harness/run.mjs" compare 1 2
           python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
             --step baseline-fingerprints-vs-pinned --status not-implemented \
-            --note "no x86_64 pin to compare with and no repeat run; baseline above is one own-check run"
+            --note "no tracked x86_64 baseline-summary pin to compare with yet (stability across two fresh runs is checked above)"
       # ---- instrumented stages (Java campaigns have instrumented harnesses; other kinds record not-implemented below)
       - name: Unpack the candidate package
         id: unpack
@@ -399,8 +425,127 @@ jobs:
               --loc "browser-assets=$RUNNER_TEMP/priv/browser" \
               --loc "tui-transcript=$RUNNER_TEMP/priv/tui" \
               --report "$CAMP_OUT/privacy-canary-report.json"
+      # ---- Node instrumented stages (host Node + Docker Postgres through the packaged xtrace run)
+      - name: Unpack the candidate package (Node)
+        if: matrix.kind == 'node' && always()
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/xpkg"
+          tar -xzf "$RUNNER_TEMP"/pkg/xtrace-*-linux-x86_64.tar.gz -C "$RUNNER_TEMP/xpkg"
+          top=$(ls -d "$RUNNER_TEMP"/xpkg/xtrace-* | head -n1)
+          echo "XCAMP_XTRACE=$top/bin/xtrace" >> "$GITHUB_ENV"
+          echo "XCAMP_NODE_ADAPTER=$top/share/xtrace/packs/node/dist" >> "$GITHUB_ENV"
+          echo "XCAMP_NODE=$(command -v node)" >> "$GITHUB_ENV"
+          sha256sum "$RUNNER_TEMP"/pkg/xtrace-*-linux-x86_64.tar.gz | cut -d' ' -f1 > "$CAMP_OUT/package.sha256"
+          test -x "$top/bin/xtrace"
+          test -d "$top/share/xtrace/packs/node/dist"
+          test -f "$top/share/xtrace/packs/node/dist/manifest.sha256"
+          "$top/bin/xtrace" --version
+      - name: Private canaries and scanner self-check (Node)
+        if: matrix.kind == 'node' && always()
+        run: |
+          set -eu
+          umask 077
+          mkdir -p "$RUNNER_TEMP/priv"
+          python3 -B tools/qa/canary.py probe
+          python3 -B tools/qa/canary.py gen --out "$RUNNER_TEMP/priv/canaries.json"
+      - name: Instrumented Node scenarios through the packaged xtrace run
+        if: matrix.kind == 'node' && always()
+        env:
+          XCAMP_APP_MODE: host
+          XCAMP_PLATFORM: linux/amd64
+        run: |
+          set -o pipefail
+          export XTRACE_CAMP_NODE_ROOT="$CAMP_ROOT/node"
+          export XCAMP_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          mkdir -p "$XCAMP_DATA_HOME" "$TMPDIR"
+          chmod 700 "$RUNNER_TEMP/xt" "$XCAMP_DATA_HOME" "$TMPDIR"
+          export XCAMP_CANARY_FILE="$RUNNER_TEMP/priv/canaries.json"
+          export XCAMP_BASELINE_RECEIPT="$CAMP_ROOT/node/$CAMP_PROJECT/baseline-1/receipt.json"
+          export XCAMP_PROJECT_DIR="$NODE_PROJECT_DIR"
+          node "campaigns/node/$CAMP_PROJECT/harness/run.mjs" instrumented 2>&1 | tee "$RUNNER_TEMP/priv/ci-output.log"
+      - name: Judge the Node instrumented run
+        if: matrix.kind == 'node' && always()
+        run: |
+          d=$(ls -d "$CAMP_ROOT/node/$CAMP_PROJECT"/instrumented-* 2>/dev/null | sort -V | tail -n1 || true)
+          echo "INSTR_DIR=${d}" >> "$GITHUB_ENV"
+          python3 -B tools/qa/camp_instr_steps.py instrumented --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --receipt "${d:-/nonexistent}/receipt.json"
+      - name: Node browser journeys, Linear and Canvas at 320, 736 and 1280 px
+        if: matrix.kind == 'node' && always()
+        run: |
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          rc=0
+          (npm ci --prefix web/app --ignore-scripts --no-audit --no-fund && cd web/app && npx playwright install --with-deps chromium) \
+            > "$RUNNER_TEMP/browser-setup.log" 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            node tools/qa/browser_journeys.mjs --xtrace "$XCAMP_XTRACE" --project-dir "$NODE_PROJECT_DIR" \
+              --out "$RUNNER_TEMP/priv/browser" --widths 320,736,1280 || true
+          else
+            echo "browser tooling setup failed (exit $rc); last lines:"; tail -n 5 "$RUNNER_TEMP/browser-setup.log"
+          fi
+          python3 -B tools/qa/camp_instr_steps.py browser --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --journeys "$RUNNER_TEMP/priv/browser/journeys.json"
+      - name: Node TUI PTY transcript
+        if: matrix.kind == 'node' && always()
+        run: |
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          python3 -B tools/qa/tui_transcript.py --xtrace "$XCAMP_XTRACE" --project-dir "$NODE_PROJECT_DIR" \
+            --out "$RUNNER_TEMP/priv/tui" || true
+          python3 -B tools/qa/camp_instr_steps.py tui --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --tui "$RUNNER_TEMP/priv/tui/tui.json"
+      - name: Node lifecycle, xtrace record then xtrace stop (daemon only, no application launch)
+        if: matrix.kind == 'node' && always()
+        run: |
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          python3 -B tools/qa/camp_lifecycle.py --xtrace "$XCAMP_XTRACE" --project-dir "$NODE_PROJECT_DIR" \
+            --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT"
+      - name: Record Node steps whose product feature or harness does not exist yet
+        if: matrix.kind == 'node' && always()
+        run: |
+          python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --step export-formats --status not-implemented \
+            --note "Node static analyzer and catalog export pipeline are not wired into the Node campaign yet"
+          python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --step overhead-measurement --status not-implemented \
+            --note "interleaved Node overhead repeat harness is not implemented yet"
+          for step in record-stop-flow restart-reopen partial-recording-reopen active-line-frames frame-values focused-canary-injection focused-redaction-control focused-value-control standard-no-values; do
+            python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+              --step "$step" --status not-implemented \
+              --note "Node focused capture (values_unavailable) and multi-process flow harness are not implemented yet"
+          done
+      - name: Node privacy canary scan (class names only, canaries are never printed)
+        if: matrix.kind == 'node' && always()
+        run: |
+          set -u
+          I="${INSTR_DIR:-/nonexistent}"
+          req="--require store:1 --require daemon-log:2 --require ui-json:1 --require receipts:1 --require ci-output:1 --require browser-dom:1"
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("verdict")=="pass" else 1)' "$RUNNER_TEMP/priv/tui/tui.json" 2>/dev/null; then
+            req="$req --require tui-transcript:1"
+          else
+            echo "tui surface: no passing transcript; NOT counted as scanned"
+            python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+              --step privacy-scan-tui --status not-implemented --note "no real TUI transcript exists to scan (tui verdict is not pass)"
+          fi
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --step privacy-canary-scan -- python3 -B tools/qa/canary.py scan $req \
+              --canaries "$RUNNER_TEMP/priv/canaries.json" \
+              --loc "store=$RUNNER_TEMP/xt/data" \
+              --loc "store=$RUNNER_TEMP/xt/tmp" \
+              --loc "project-pointer=${NODE_PROJECT_DIR:-/nonexistent}/.xtrace" \
+              --loc "daemon-log=$I/viewer.log" \
+              --loc "daemon-log=$I/application.log" \
+              --loc "ui-json=$I/api" \
+              --loc "receipts=$I/receipt.json" \
+              --loc "receipts=$I/scenarios.json" \
+              --loc "receipts=$CAMP_OUT/summary.json" \
+              --loc "ci-output=$RUNNER_TEMP/priv/ci-output.log" \
+              --loc "browser-dom=$RUNNER_TEMP/priv/browser/dom" \
+              --loc "browser-assets=$RUNNER_TEMP/priv/browser" \
+              --loc "tui-transcript=$RUNNER_TEMP/priv/tui" \
+              --report "$CAMP_OUT/privacy-canary-report.json"
       - name: Record steps whose product feature does not exist for this project yet
-        if: matrix.kind != 'java' && always()
+        if: matrix.kind != 'java' && matrix.kind != 'node' && always()
         run: |
           for step in instrumented-run instrumented-fingerprints-equal-baseline recordings-per-scenario source-identity export-formats \
                       browser-journeys-linear browser-journeys-canvas tui-pty-transcript privacy-canary-scan \
@@ -432,7 +577,7 @@ jobs:
               # names and sizes of the private store, and the CLI's own view of the recordings (cross-check of the read path)
               (cd "$RUNNER_TEMP/xt" && find . -type f -printf '%P %s\n' | sort) > "$CAMP_OUT/instrumented-raw/store-tree.txt" 2>/dev/null || true
               XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp" "$XCAMP_XTRACE" recording list \
-                --project-dir "$CAMP_ROOT/java/$CAMP_PROJECT/src" > "$CAMP_OUT/instrumented-raw/cli-recording-list.json" 2>&1 || true
+                --project-dir "${NODE_PROJECT_DIR:-$CAMP_ROOT/java/$CAMP_PROJECT/src}" > "$CAMP_OUT/instrumented-raw/cli-recording-list.json" 2>&1 || true
             else
               echo "privacy scan not clean or absent: raw instrumented logs, API JSON, screenshots, DOM text and TUI transcripts are NOT uploaded"
             fi
@@ -452,7 +597,7 @@ jobs:
               --step campaign-receipt-artifact --status reported --note "NON-RELEASE unsigned receipt written as an artifact"
           fi
       - name: Final privacy re-scan of the exact upload tree (a hit leaves only the reports)
-        if: matrix.kind == 'java' && always()
+        if: (matrix.kind == 'java' || matrix.kind == 'node') && always()
         run: |
           set -u
           if [ ! -f "$RUNNER_TEMP/priv/canaries.json" ]; then

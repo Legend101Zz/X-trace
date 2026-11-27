@@ -31,10 +31,16 @@ class SelectTests(unittest.TestCase):
             cs.select("", "ultra/campaign/nope-1")
 
     def test_matrix_reads_pins(self):
-        m = cs.matrix(ROOT, ["petclinic", "directus"])["include"]
+        m = cs.matrix(ROOT, ["petclinic", "directus", "medusa", "vendure"])["include"]
         self.assertEqual(m[0]["jdk"], 17)
         self.assertEqual(len(m[0]["sha"]), 40)
+        self.assertNotIn("nodeVersion", m[0])
         self.assertEqual(m[1]["kind"], "node")
+        self.assertEqual(m[1]["nodeVersion"], 22)
+        self.assertEqual(m[2]["kind"], "node")
+        self.assertEqual(m[2]["nodeVersion"], 24)
+        self.assertEqual(m[3]["kind"], "node")
+        self.assertEqual(m[3]["nodeVersion"], 24)
 
 
 class GateTests(unittest.TestCase):

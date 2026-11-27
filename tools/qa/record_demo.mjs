@@ -17,7 +17,7 @@ for (const k of ["xtrace", "project-dir", "out"]) {
     process.exit(2);
   }
 }
-const pauseMs = Number(args["pause-ms"] || 1500);
+const pauseMs = Number(args["pause-ms"] || 950);
 const out = path.resolve(args.out);
 mkdirSync(out, { recursive: true });
 const require = createRequire(path.resolve("web/app/package.json"));
@@ -80,12 +80,11 @@ async function settle(page, ms = pauseMs) {
   await page.waitForTimeout(ms);
 }
 
-async function hoverAndClick(page, locator, hoverMs = 500, afterMs = pauseMs) {
+async function hoverAndClick(page, locator, hoverMs = 280, afterMs = pauseMs) {
   await locator.scrollIntoViewIfNeeded().catch(() => {});
   await locator.hover({ timeout: 10000 }).catch(() => {});
   await page.waitForTimeout(hoverMs);
   await locator.click({ timeout: 10000 });
-  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   await page.waitForTimeout(afterMs);
 }
 
@@ -117,8 +116,8 @@ try {
 
     // 1. Open viewer and browse Requests (Endpoints / Not linked to an endpoint)
     await page.goto(ready.url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-    await settle(page, Math.round(pauseMs * 1.1));
+    await page.locator("#recordings-panel").waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+    await settle(page, Math.round(pauseMs * 1.0));
 
     const requestsTab = page.locator("#recordings-tab");
     if ((await page.locator("#recordings-panel").getAttribute("data-active").catch(() => null)) !== "true" && (await requestsTab.isVisible().catch(() => false))) {
@@ -183,12 +182,18 @@ try {
         stepped += 1;
       }
     }
-    // Also click a frame_enter event row directly if present to highlight Code source line.
+    // Prefer a line_cursor row so Code highlights the exact executed source line and inline values, falling back to frame_enter.
+    const lineRows = page.locator('#events-panel .event-rail .event[data-event-kind*="line_cursor"]');
     const frameRows = page.locator('#events-panel .event-rail .event[data-event-kind*="frame_enter"]');
+    const lineCount = await lineRows.count();
     const frameCount = await frameRows.count();
-    if (frameCount > 0) {
+    if (lineCount > 0) {
+      const pickIdx = Math.min(2, lineCount - 1);
+      await hoverAndClick(page, lineRows.nth(pickIdx), 280, Math.round(pauseMs * 0.9));
+      stepped += 1;
+    } else if (frameCount > 0) {
       const pickIdx = Math.min(1, frameCount - 1);
-      await hoverAndClick(page, frameRows.nth(pickIdx), 400, Math.round(pauseMs * 0.9));
+      await hoverAndClick(page, frameRows.nth(pickIdx), 280, Math.round(pauseMs * 0.9));
       stepped += 1;
     }
 

@@ -48,7 +48,8 @@ def matrix(repo: pathlib.Path, names: list[str]) -> dict:
             entry["buildCommand"] = camp["build"]["command"]
             entry["timeout"] = 180
         else:
-            entry["timeout"] = 90
+            entry["nodeVersion"] = int(camp["runtime"]["nodeMajor"])
+            entry["timeout"] = 120
         include.append(entry)
     return {"include": include}
 

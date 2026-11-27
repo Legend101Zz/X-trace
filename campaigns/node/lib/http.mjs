@@ -2,9 +2,11 @@
 import { sha256Hex, canonicalJson } from "./canonical.mjs";
 
 export class Recorder {
-  constructor(baseUrl, normalizer) {
+  constructor(baseUrl, normalizer, { requestHook = null, onCall = null } = {}) {
     this.baseUrl = baseUrl;
     this.norm = normalizer;
+    this.requestHook = requestHook;
+    this.onCall = onCall;
     this.calls = [];
   }
 
@@ -13,22 +15,32 @@ export class Recorder {
    * fingerprint; project(body) -> semantic projection of the parsed body (default: whole body).
    */
   async call(label, method, path, { route, token, body, headers = {}, project, raw, timeoutMs = 20000 } = {}) {
-    const h = { ...headers };
+    let reqPath = path;
+    let h = { ...headers };
     let payload;
     if (body !== undefined) {
       payload = typeof body === "string" ? body : JSON.stringify(body);
       h["content-type"] ||= "application/json";
     }
     if (token) h.authorization = `Bearer ${token}`;
+    if (this.requestHook) {
+      const next = this.requestHook({ label, method, path: reqPath, route: route || reqPath, headers: h, payload });
+      if (next) {
+        if (next.path !== undefined) reqPath = next.path;
+        if (next.headers !== undefined) h = next.headers;
+        if (next.payload !== undefined) payload = next.payload;
+      }
+    }
     const t0 = performance.now();
     let res;
     let text = "";
     try {
-      res = await fetch(this.baseUrl + path, { method, headers: h, body: payload, signal: AbortSignal.timeout(timeoutMs) });
+      res = await fetch(this.baseUrl + reqPath, { method, headers: h, body: payload, signal: AbortSignal.timeout(timeoutMs) });
       text = await res.text();
     } catch (e) {
       const rec = { label, method, route: route || path, status: 0, error: e.name, durationMs: Math.round(performance.now() - t0) };
       this.calls.push(rec);
+      if (this.onCall) this.onCall({ method, path, route: route || path, status: 0 });
       return { status: 0, json: null, text: "", rec };
     }
     const durationMs = Math.round(performance.now() - t0);
@@ -53,6 +65,7 @@ export class Recorder {
       durationMs,
     };
     this.calls.push(rec);
+    if (this.onCall) this.onCall({ method, path, route: route || path, status: res.status });
     return { status: res.status, json, text, rec, headers: res.headers };
   }
 

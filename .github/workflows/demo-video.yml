@@ -87,6 +87,7 @@ jobs:
           fi
 
           "$XTRACE_BIN" run --project-dir "$PETCLINIC_DIR" --java-agent "$XTRACE_AGENT" \
+            --capture-depth focused \
             --app-package org.springframework.samples.petclinic --source-root src/main/java -- \
             "$JAVA_HOME/bin/java" -Xmx768m -jar "$PETCLINIC_JAR" \
             --server.port=18080 --server.address=127.0.0.1 > "$RUNNER_TEMP/petclinic.log" 2>&1 &
@@ -167,6 +168,15 @@ jobs:
               "$MEDIA_OUT/xtrace-demo.gif"
             GIF_BYTES=$(wc -c < "$MEDIA_OUT/xtrace-demo.gif")
             echo "re-encoded xtrace-demo.gif size: ${GIF_BYTES} bytes"
+          fi
+          if [ "$GIF_BYTES" -ge 5242880 ]; then
+            ffmpeg -y -i "$WEBM" -vf "fps=6,scale=720:-1:flags=lanczos,palettegen=max_colors=96:stats_mode=diff" \
+              "$RUNNER_TEMP/demo-raw/palette-small.png"
+            ffmpeg -y -i "$WEBM" -i "$RUNNER_TEMP/demo-raw/palette-small.png" \
+              -lavfi "fps=6,scale=720:-1:flags=lanczos [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+              "$MEDIA_OUT/xtrace-demo.gif"
+            GIF_BYTES=$(wc -c < "$MEDIA_OUT/xtrace-demo.gif")
+            echo "compact xtrace-demo.gif size: ${GIF_BYTES} bytes"
           fi
           test "$GIF_BYTES" -lt 5242880
 
