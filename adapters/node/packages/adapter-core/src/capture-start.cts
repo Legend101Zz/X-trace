@@ -15,7 +15,12 @@ import {
 } from "./modules.cjs";
 import { setCaptureProfile, withoutCapture } from "./runtime/context.cjs";
 import { ModuleRegistry, type InstallEnvironment, type InstrumentationModule } from "./runtime/registry.cjs";
-import type { HttpCaptureTransport } from "./runtime/transport.cjs";
+import {
+  CONTROL_STARTUP_INDEX,
+  SHARED_CONTROL_WORDS,
+  installProcessShutdownHooks,
+  type HttpCaptureTransport,
+} from "./runtime/transport.cjs";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 
@@ -78,7 +83,7 @@ export function startCaptureFromRequire(): void {
     return;
   }
   const plan = planCapture();
-  const startupBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const startupBarrier = new SharedArrayBuffer(SHARED_CONTROL_WORDS * Int32Array.BYTES_PER_ELEMENT);
   let worker: Worker;
   try {
     worker = withoutCapture(() => new Worker(join(__dirname, "transport-worker.js"), {
@@ -95,14 +100,16 @@ export function startCaptureFromRequire(): void {
     return;
   }
   const state = new Int32Array(startupBarrier);
-  const wait = Atomics.wait(state, 0, 0, STARTUP_TIMEOUT_MS);
-  if (wait === "timed-out" || Atomics.load(state, 0) !== 1) {
+  const wait = Atomics.wait(state, CONTROL_STARTUP_INDEX, 0, STARTUP_TIMEOUT_MS);
+  if (wait === "timed-out" || Atomics.load(state, CONTROL_STARTUP_INDEX) !== 1) {
     void worker.terminate();
     warnUnavailable("XTR-NODE-STARTUP");
     return;
   }
   try {
-    plan.install(createHttpCaptureTransport(worker));
+    const transport = createHttpCaptureTransport(worker, { sharedControl: state });
+    plan.install(transport);
+    installProcessShutdownHooks(transport);
     worker.unref();
   } catch {
     void worker.terminate();

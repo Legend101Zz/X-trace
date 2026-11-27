@@ -306,14 +306,26 @@ class T(unittest.TestCase):
             self.assertNotIn(canaries["query-token"], json.dumps(report))
             self.assertFalse(canary.run_scan(canaries, {"bundle-files": [dest / "missing"]}, {"bundle-files": 6})["clean"])
 
-    def test_optional_source_root_and_framework_handle_jaxrs_honestly(self):
+    def test_optional_source_root_and_framework_handle_jaxrs_as_supported(self):
         with tempfile.TemporaryDirectory() as td:
             td = pathlib.Path(td)
+            tmpl_bundle = td / "tmpl-bundle"
+            write_bundle(tmpl_bundle)
             exe = td / "fake"
             exe.write_text("#!/bin/sh\n"
-                           "printf '%s\\n' \"$*\" > \"" + str(td / "scan-args.txt") + "\"\n"
-                           "echo '{\"kind\":\"error\",\"message\":\"no jaxrs analyzer exists yet; use spring-mvc, spring-webflux, express, fastify or nest\"}' >&2\n"
-                           "exit 2\n")
+                           "if [ \"$1\" = scan ]; then\n"
+                           "  printf '%s\\n' \"$*\" > \"" + str(td / "scan-args.txt") + "\"\n"
+                           "  echo '{\"persisted\":true,\"catalogRevisionId\":\"rev\",\"changes\":{\"added\":1,\"unknown\":0},\"result\":{\"framework\":\"jaxrs\",\"operations\":[{\"method\":\"GET\",\"routeTemplate\":\"/v1/clients\"}]}}'\n"
+                           "  exit 0\n"
+                           "fi\n"
+                           "while [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=$2; [ \"$1\" = --format ] && fmt=$2; shift; done\n"
+                           "if [ \"$fmt\" = bundle ]; then\n"
+                           "  cp -R \"" + str(tmpl_bundle) + "\" \"$out\"\n"
+                           "else\n"
+                           "  mkdir -p \"$out\"\n"
+                           "  echo data > \"$out/payload\"\n"
+                           "  echo '{\"written\":true,\"operationCount\":1}'\n"
+                           "fi\n")
             exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
             summ = td / "s.json"
             subprocess.run([sys.executable, "-B", str(pathlib.Path(ce.__file__)), "--xtrace", str(exe),
@@ -324,12 +336,13 @@ class T(unittest.TestCase):
             self.assertIn("fineract-provider/src/main/java", args)
             self.assertIn("--framework jaxrs", args)
             steps = {s["step"]: s for s in json.loads(summ.read_text())["steps"]}
-            self.assertEqual(steps["export-catalog-scan"]["status"], "not-implemented")
-            self.assertIn("no jaxrs analyzer", steps["export-catalog-scan"]["note"])
-            self.assertEqual(steps["export-formats"]["status"], "not-implemented")
-            self.assertEqual(steps["export-bundle"]["status"], "not-implemented")
-            # A generic exit 2 without the jaxrs message stays a failure, never relabelled as not-implemented.
+            self.assertEqual(steps["export-catalog-scan"]["status"], "pass")
+            self.assertEqual(steps["export-bundle"]["status"], "pass")
+            self.assertEqual(steps["export-formats"]["status"], "pass")
+            # Exit 2 is always a failure for jaxrs (never relabelled as not-implemented).
+            self.assertEqual(ce.judge_scan(2, {"message": "no jaxrs analyzer exists yet"}, framework="jaxrs")[0], "fail")
             self.assertEqual(ce.judge_scan(2, {"message": "bad source"}, framework="jaxrs")[0], "fail")
+            self.assertEqual(ce.judge_scan(0, CATALOG, framework="jaxrs")[0], "pass")
 
 
 if __name__ == "__main__":

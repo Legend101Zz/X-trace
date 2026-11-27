@@ -1659,14 +1659,12 @@ mod tests {
 
     #[test]
     fn snapshots_verified_pack_and_keeps_executed_bytes_after_source_changes() {
-        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
-            .map(PathBuf::from)
-            .expect("the gate must provide an owner-enforced private scratch root");
-        attach_result(|| admit_private_directory(&scratch))
+        let scratch = private_slot().path();
+        attach_result(|| admit_private_directory(scratch))
             .expect("gate-provided scratch admission");
-        let source = private_tempdir_in(&scratch).expect("temporary source pack under scratch");
+        let source = private_tempdir_in(scratch).expect("temporary source pack under scratch");
         make_pack(source.path());
-        let cache = private_tempdir_in(&scratch).expect("temporary private cache under scratch");
+        let cache = private_tempdir_in(scratch).expect("temporary private cache under scratch");
         let cache_path = cache.path().join("cache");
         std::fs::create_dir(&cache_path).expect("cache directory");
         std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o700))
@@ -1706,14 +1704,50 @@ mod tests {
         cache: PathBuf,
     }
 
-    fn private_scratch() -> PathBuf {
-        std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+    const SCRATCH_SLOT_COUNT: usize = 128;
+
+    static SCRATCH_SLOTS: std::sync::OnceLock<Vec<xtrace_private_storage::AdmittedPrivateRoot>> =
+        std::sync::OnceLock::new();
+    static NEXT_SCRATCH_SLOT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Pre-allocate exclusive private slots inside `XTRACE_TEST_PRIVATE_SCRATCH` before any test
+    /// begins running so sibling tests never mutate the shared scratch directory's metadata
+    /// (`ctime`/`mtime`) during another test's `AdmittedPrivateRoot` ancestor walk.
+    fn init_scratch_slots() -> Vec<xtrace_private_storage::AdmittedPrivateRoot> {
+        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .map(PathBuf::from)
-            .expect("the gate must provide an owner-enforced private scratch root")
+            .expect("the gate must provide an owner-enforced private scratch root");
+        let root = xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("gate-provided scratch admission");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let family_name = format!("xt-java-attach-{}-{nanos}", std::process::id());
+        let family =
+            root.create_private_child(&family_name).expect("private java_attach test family");
+        (0..SCRATCH_SLOT_COUNT)
+            .map(|slot| {
+                family
+                    .create_private_child(&format!("s{slot:03}"))
+                    .expect("pre-allocated private java_attach test slot")
+            })
+            .collect()
+    }
+
+    fn private_slot() -> &'static xtrace_private_storage::AdmittedPrivateRoot {
+        let slots = SCRATCH_SLOTS.get_or_init(init_scratch_slots);
+        let index = NEXT_SCRATCH_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            index < slots.len(),
+            "java_attach::tests::SCRATCH_SLOT_COUNT ({SCRATCH_SLOT_COUNT}) exhausted; increase SCRATCH_SLOT_COUNT"
+        );
+        &slots[index]
     }
 
     fn cache_fixture() -> CacheFixture {
-        cache_fixture_in(&private_scratch())
+        cache_fixture_in(private_slot().path())
     }
 
     fn cache_fixture_in(scratch: &Path) -> CacheFixture {
@@ -1729,7 +1763,7 @@ mod tests {
 
     /// Creates a tagged source pack and returns its validated handle plus the owning directory.
     fn tagged_source(tag: &str) -> (tempfile::TempDir, JavaAttachPack) {
-        tagged_source_in(&private_scratch(), tag)
+        tagged_source_in(private_slot().path(), tag)
     }
 
     fn tagged_source_in(scratch: &Path, tag: &str) -> (tempfile::TempDir, JavaAttachPack) {
@@ -2007,7 +2041,7 @@ mod tests {
         // Only these four workers should change this cache's ancestry during the race.
         let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_IO_ROOT")
             .map(|root| PathBuf::from(root).join("first-attach"))
-            .unwrap_or_else(private_scratch);
+            .unwrap_or_else(|| private_slot().path().to_path_buf());
         // The CI receipt associates bounded diagnostics with libtest's test name.
         let worker_name = std::thread::current().name().unwrap_or("first-attach").to_owned();
         for _ in 0..8 {

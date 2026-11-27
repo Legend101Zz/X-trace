@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan the Spring MVC catalog, then export and judge all developer formats, including the bundle.
+"""Scan the catalog (Spring MVC or JAX-RS), then export and judge all developer formats, including the bundle.
 
   camp_exports.py --xtrace BIN --project-dir DIR --analyzer BIN --out DIR --file SUMMARY --project P
 
@@ -39,13 +39,15 @@ def judge(results: dict[str, tuple[int, int]]) -> tuple[str, str]:
     return "pass", "all formats exported and wrote output: " + ",".join(results)
 
 
+def _framework_label(framework: str) -> str:
+    return {"spring-mvc": "Spring MVC", "jaxrs": "JAX-RS"}.get(framework, framework)
+
+
 def judge_scan(code: int, doc: dict, framework: str = "spring-mvc") -> tuple[str, str]:
     data = doc.get("data", doc)
-    label = "Spring MVC" if framework == "spring-mvc" else framework
+    label = _framework_label(framework)
     if code == 9:
         return "not-implemented", f"{label} scan exited 9 (not implemented in this build); exports not attempted"
-    if code == 2 and framework == "jaxrs" and isinstance(doc, dict) and "no jaxrs analyzer" in str(doc.get("message", "")):
-        return "not-implemented", "no jaxrs analyzer exists yet (xtrace scan exited 2); exports not attempted"
     if code != 0:
         return "fail", f"{label} scan exited {code}; exports not attempted"
     if not isinstance(data, dict) or data.get("persisted") is not True or not data.get("catalogRevisionId") or not \
@@ -124,7 +126,7 @@ def run_exports(xtrace: str, project_dir: str, analyzer: str, out: pathlib.Path,
                 source_root: str = "src/main/java", framework: str = "spring-mvc") -> list[tuple[str, str, str]]:
     """Scan before exporting. Never count pre-existing output as evidence from this invocation."""
     out.mkdir(parents=True, exist_ok=True)
-    label = "Spring MVC" if framework == "spring-mvc" else framework
+    label = _framework_label(framework)
     try:
         scan = subprocess.run([xtrace, "scan", "--project-dir", project_dir,
                                "--source", str(pathlib.Path(project_dir) / source_root),

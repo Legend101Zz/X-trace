@@ -239,9 +239,11 @@ CLIENT_WRITE = {
 
 EXPECT = {
     "denied-without-valid-credentials": [
-        # Pre-dispatch Spring Security BasicAuthenticationFilter 401s occur before Jersey dispatch.
-        {"method": "GET", "route": f"{BASE}/clients", "statuses": [401, 401], "layers": [], "sourceOptional": True},
-        {"method": "POST", "route": f"{BASE}/clients", "status": 401, "layers": [], "sourceOptional": True},
+        # Pre-dispatch Spring Security BasicAuthenticationFilter 401s occur before Jersey dispatch (sendError(401)).
+        {"method": "GET", "route": f"{BASE}/clients", "statuses": [401, 401], "layers": [], "sourceOptional": True,
+         "preDispatch": True, "allowUnobserved": True},
+        {"method": "POST", "route": f"{BASE}/clients", "status": 401, "layers": [], "sourceOptional": True,
+         "preDispatch": True, "allowUnobserved": True},
     ],
     "authenticated-seed-read": [
         {"method": "GET", "route": f"{BASE}/offices", "status": 200, "layers": ["controller", "service"],

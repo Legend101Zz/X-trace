@@ -50,7 +50,7 @@ pub struct ScanArgs {
     /// Source tree to analyze. Must be inside the project directory.
     #[arg(long, value_name = "DIR")]
     pub source: PathBuf,
-    /// Framework family: spring-mvc, spring-webflux, express, fastify or nest.
+    /// Framework family: spring-mvc, spring-webflux, jaxrs, express, fastify or nest.
     #[arg(long, value_name = "FAMILY")]
     pub framework: String,
     /// Analyzer executable. The environment override takes precedence over the
@@ -439,7 +439,7 @@ async fn run_analyzer(
 
 /// Resolve the real CLI path so invoking it through the public installer symlink
 /// still selects the analyzer from the same version directory.
-fn installed_spring_analyzer(executable: &Path) -> Option<PathBuf> {
+fn installed_java_analyzer(executable: &Path) -> Option<PathBuf> {
     let executable = executable.canonicalize().ok()?;
     let bin = executable.parent()?;
     if bin.file_name()? != "bin" {
@@ -477,25 +477,19 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
     if !source.starts_with(&project) {
         return Err(invalid("source must be inside the project directory"));
     }
-    // jaxrs is a valid claim vocabulary entry but no analyzer produces it yet.
-    if args.framework == "jaxrs" {
-        return Err(invalid(
-            "no jaxrs analyzer exists yet; use spring-mvc, spring-webflux, express, fastify or nest",
-        ));
-    }
     framework_syntax(&args.framework).map_err(|_| {
-        invalid("framework must be spring-mvc, spring-webflux, express, fastify or nest")
+        invalid("framework must be spring-mvc, spring-webflux, jaxrs, express, fastify or nest")
     })?;
-    let spring = args.framework.starts_with("spring");
-    let variable = if spring { "XTRACE_JAVA_ANALYZER" } else { "XTRACE_NODE_ANALYZER" };
-    let analyzer = args
-        .analyzer
-        .clone()
-        .or_else(|| std::env::var_os(variable).map(PathBuf::from))
-        .or_else(|| {
-            if spring { installed_spring_analyzer(&std::env::current_exe().ok()?) } else { None }
-        })
-        .ok_or_else(|| invalid(format!("no analyzer: pass --analyzer or set {variable}")))?;
+    let java = matches!(args.framework.as_str(), "spring-mvc" | "spring-webflux" | "jaxrs");
+    let variable = if java { "XTRACE_JAVA_ANALYZER" } else { "XTRACE_NODE_ANALYZER" };
+    let analyzer =
+        args.analyzer
+            .clone()
+            .or_else(|| std::env::var_os(variable).map(PathBuf::from))
+            .or_else(|| {
+                if java { installed_java_analyzer(&std::env::current_exe().ok()?) } else { None }
+            })
+            .ok_or_else(|| invalid(format!("no analyzer: pass --analyzer or set {variable}")))?;
 
     let (lines, problem) = run_analyzer(
         &analyzer,
@@ -608,6 +602,10 @@ fn coverage_statement(framework: &str) -> &'static str {
         "spring-mvc" | "spring-webflux" => {
             "annotation-declared mappings in class bodies only; functional RouterFunction routes, \
              interface-declared mappings and programmatic registration are not analyzed"
+        }
+        "jaxrs" => {
+            "annotation-declared @Path and HTTP method resources; sub-resource locators, \
+             dynamic ResourceConfig and programmatic registration are not analyzed"
         }
         "express" => {
             "app/router calls with a statically known receiver; routers built by factories, \
@@ -1284,7 +1282,7 @@ mod tests {
             .expect("writes");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("coverage: app/router calls"), "{text}");
-        for framework in ["spring-mvc", "spring-webflux", "express", "fastify", "nest"] {
+        for framework in ["spring-mvc", "spring-webflux", "jaxrs", "express", "fastify", "nest"] {
             assert!(
                 !coverage_statement(framework).starts_with("unknown"),
                 "{framework} has a statement"

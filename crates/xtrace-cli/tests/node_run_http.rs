@@ -203,6 +203,317 @@ fn direct_node_run_preserves_application_exit_code() {
     );
 }
 
+#[test]
+fn direct_node_http_burst_with_explicit_exit_zero_persists_all_recordings() {
+    let root = temp_root();
+    let repo = root.path().join("repository");
+    let data_home = root.path().join("data");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let init = cli()
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize project");
+    assert!(init.status.success(), "init failed: {}", diagnostic(&init));
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adapter_dist = workspace.join("adapters/node/packages/adapter-core/dist");
+    assert!(
+        adapter_dist.join("manifest.sha256").is_file(),
+        "run `npm run build:core --offline` before this test"
+    );
+
+    let app = root.path().join("burst-exit.cjs");
+    std::fs::write(
+        &app,
+        r#"const http = require('node:http');
+let completed = 0;
+const server = http.createServer((_request, response) => {
+  response.on('finish', () => {
+    completed += 1;
+    if (completed === 40) {
+      server.close(() => process.exit(0));
+    }
+  });
+  response.statusCode = 201;
+  response.end('ok');
+});
+server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.address().port));
+"#,
+    )
+    .expect("write burst app");
+
+    let mut child = RunChild(
+        cli()
+            .args(["run", "--project-dir"])
+            .arg(&repo)
+            .args(["--node-adapter"])
+            .arg(&adapter_dist)
+            .args(["--node-mode", "auto", "--", "node", "--no-warnings"])
+            .arg(&app)
+            .env("XTRACE_DATA_HOME", &data_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start burst Node app"),
+    );
+    let stdout = child.stdout.take().expect("stdout");
+    let (line_sender, line_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let _ = line_sender.send(line);
+                }
+            }
+        }
+    });
+    let stderr = child.stderr.take().expect("stderr");
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::BufReader::new(stderr).read_to_end(&mut bytes).expect("drain stderr");
+        bytes
+    });
+
+    let ready = line_receiver.recv_timeout(Duration::from_secs(10)).expect("readiness line");
+    let port = ready
+        .trim()
+        .strip_prefix("NODE_HTTP_READY ")
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .expect("bound port");
+
+    let address = format!("127.0.0.1:{port}");
+    let mut workers = Vec::new();
+    for idx in 0..40 {
+        let addr = address.clone();
+        workers.push(thread::spawn(move || post(&addr, &format!("/burst/{idx}"), "CANARY_BURST")));
+    }
+    for handle in workers {
+        assert!(handle.join().expect("join burst request"));
+    }
+
+    let status = wait_for_child(&mut child, Duration::from_secs(15));
+    assert!(status.success(), "burst exit failed: {status}");
+    let _ = stdout_reader.join();
+    let stderr_text =
+        String::from_utf8_lossy(&stderr_reader.join().expect("join stderr")).into_owned();
+    assert!(
+        !stderr_text.contains("XTR-RUN-CAPTURE-INCOMPLETE"),
+        "clean explicit exit reported incomplete capture: {stderr_text}"
+    );
+    assert!(!stderr_text.contains("CANARY_BURST"), "canary leaked to stderr");
+
+    let list = list_recordings_limit(&repo, &data_home, 50);
+    assert_eq!(list["recordings"].as_array().expect("recordings").len(), 40);
+    assert_recording_evidence(&list, &repo, &data_home);
+}
+
+#[test]
+fn sigterm_drains_node_http_capture_cleanly_without_false_incomplete_notice() {
+    let root = temp_root();
+    let repo = root.path().join("repository");
+    let data_home = root.path().join("data");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let init = cli()
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize project");
+    assert!(init.status.success(), "init failed: {}", diagnostic(&init));
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adapter_dist = workspace.join("adapters/node/packages/adapter-core/dist");
+    assert!(
+        adapter_dist.join("manifest.sha256").is_file(),
+        "run `npm run build:core --offline` before this test"
+    );
+
+    let app = root.path().join("sigterm-app.cjs");
+    std::fs::write(
+        &app,
+        r#"const http = require('node:http');
+const server = http.createServer((_request, response) => {
+  response.statusCode = 201;
+  response.end('ok');
+});
+server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.address().port));
+"#,
+    )
+    .expect("write SIGTERM app");
+
+    let mut child = RunChild(
+        cli()
+            .args(["run", "--project-dir"])
+            .arg(&repo)
+            .args(["--node-adapter"])
+            .arg(&adapter_dist)
+            .args(["--node-mode", "auto", "--", "node", "--no-warnings"])
+            .arg(&app)
+            .env("XTRACE_DATA_HOME", &data_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start SIGTERM Node app"),
+    );
+    let stdout = child.stdout.take().expect("stdout");
+    let (line_sender, line_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let _ = line_sender.send(line);
+                }
+            }
+        }
+    });
+    let stderr = child.stderr.take().expect("stderr");
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::BufReader::new(stderr).read_to_end(&mut bytes).expect("drain stderr");
+        bytes
+    });
+
+    let ready = line_receiver.recv_timeout(Duration::from_secs(10)).expect("readiness line");
+    let port = ready
+        .trim()
+        .strip_prefix("NODE_HTTP_READY ")
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .expect("bound port");
+
+    let address = format!("127.0.0.1:{port}");
+    for idx in 0..4 {
+        assert!(post(&address, &format!("/item/{idx}"), "CANARY_SIGTERM"));
+    }
+
+    let cli_pid = rustix::process::Pid::from_raw(child.id() as i32).expect("CLI pid");
+    rustix::process::kill_process(cli_pid, rustix::process::Signal::TERM)
+        .expect("send SIGTERM to xtrace run");
+
+    let status = wait_for_child(&mut child, Duration::from_secs(15));
+    assert_eq!(status.code(), Some(143), "expected SIGTERM exit code 143: {status}");
+    let _ = stdout_reader.join();
+    let stderr_text =
+        String::from_utf8_lossy(&stderr_reader.join().expect("join stderr")).into_owned();
+    assert!(
+        !stderr_text.contains("XTR-RUN-CAPTURE-INCOMPLETE"),
+        "clean drained SIGTERM reported incomplete capture: {stderr_text}"
+    );
+    assert!(!stderr_text.contains("CANARY_SIGTERM"), "canary leaked to stderr");
+
+    let list = list_recordings_limit(&repo, &data_home, 10);
+    assert_eq!(list["recordings"].as_array().expect("recordings").len(), 4);
+    assert_recording_evidence(&list, &repo, &data_home);
+}
+
+#[test]
+fn sigterm_during_unfinished_node_request_reports_capture_incomplete_honestly() {
+    let root = temp_root();
+    let repo = root.path().join("repository");
+    let data_home = root.path().join("data");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let init = cli()
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize project");
+    assert!(init.status.success(), "init failed: {}", diagnostic(&init));
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adapter_dist = workspace.join("adapters/node/packages/adapter-core/dist");
+    assert!(
+        adapter_dist.join("manifest.sha256").is_file(),
+        "run `npm run build:core --offline` before this test"
+    );
+
+    let app = root.path().join("sigterm-inflight.cjs");
+    std::fs::write(
+        &app,
+        r#"const http = require('node:http');
+const server = http.createServer((_request, _response) => {
+  console.log('INFLIGHT_ACTIVE');
+});
+server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.address().port));
+"#,
+    )
+    .expect("write inflight SIGTERM app");
+
+    let mut child = RunChild(
+        cli()
+            .args(["run", "--project-dir"])
+            .arg(&repo)
+            .args(["--node-adapter"])
+            .arg(&adapter_dist)
+            .args(["--node-mode", "auto", "--", "node", "--no-warnings"])
+            .arg(&app)
+            .env("XTRACE_DATA_HOME", &data_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start inflight Node app"),
+    );
+    let stdout = child.stdout.take().expect("stdout");
+    let (line_sender, line_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let _ = line_sender.send(line);
+                }
+            }
+        }
+    });
+    let stderr = child.stderr.take().expect("stderr");
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::BufReader::new(stderr).read_to_end(&mut bytes).expect("drain stderr");
+        bytes
+    });
+
+    let ready = line_receiver.recv_timeout(Duration::from_secs(10)).expect("readiness line");
+    let port = ready
+        .trim()
+        .strip_prefix("NODE_HTTP_READY ")
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .expect("bound port");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect inflight");
+    stream
+        .write_all(b"GET /hanging HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .expect("send inflight request");
+    let inflight = line_receiver.recv_timeout(Duration::from_secs(10)).expect("inflight marker");
+    assert_eq!(inflight.trim(), "INFLIGHT_ACTIVE");
+
+    let cli_pid = rustix::process::Pid::from_raw(child.id() as i32).expect("CLI pid");
+    rustix::process::kill_process(cli_pid, rustix::process::Signal::TERM)
+        .expect("send SIGTERM to xtrace run");
+
+    let status = wait_for_child(&mut child, Duration::from_secs(15));
+    drop(stream);
+    assert_eq!(status.code(), Some(143), "expected SIGTERM exit code 143: {status}");
+    let _ = stdout_reader.join();
+    let stderr_text =
+        String::from_utf8_lossy(&stderr_reader.join().expect("join stderr")).into_owned();
+    assert!(
+        stderr_text.contains("XTR-RUN-CAPTURE-INCOMPLETE"),
+        "incomplete active recording on SIGTERM must emit XTR-RUN-CAPTURE-INCOMPLETE: {stderr_text}"
+    );
+}
+
 fn run_application(repo: &Path, data_home: &Path, adapter_dist: &Path, mode: &str) {
     run_application_as(repo, data_home, adapter_dist, mode, mode);
 }
@@ -370,10 +681,15 @@ fn post(address: &str, target: &str, canary: &str) -> bool {
 }
 
 fn list_recordings(repo: &Path, data_home: &Path) -> Value {
+    list_recordings_limit(repo, data_home, 10)
+}
+
+fn list_recordings_limit(repo: &Path, data_home: &Path, limit: usize) -> Value {
+    let limit_arg = limit.to_string();
     let output = cli()
         .args(["recording", "list", "--project-dir"])
         .arg(repo)
-        .args(["--limit", "10"])
+        .args(["--limit", &limit_arg])
         .env("XTRACE_DATA_HOME", data_home)
         .output()
         .expect("query persisted recording list");

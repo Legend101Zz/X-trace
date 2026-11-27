@@ -8,7 +8,19 @@ import type { Worker } from "node:worker_threads";
 import type { CaptureEvent, HttpCaptureTransport } from "../http-capture.cjs";
 
 const require = createRequire(import.meta.url);
-const { installHttpCapture, createHttpCaptureTransport, wrapRequestListener } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
+const {
+  installHttpCapture,
+  createHttpCaptureTransport,
+  installProcessShutdownHooks,
+  wrapRequestListener,
+} = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
+const {
+  CONTROL_DRAIN_INDEX,
+  CONTROL_STAGED_INDEX,
+  DEFAULT_MAX_ACTIVE_RECORDINGS,
+  DEFAULT_MAX_IN_FLIGHT_MESSAGES,
+  SHARED_CONTROL_WORDS,
+} = require("../runtime/transport.cjs") as typeof import("../runtime/transport.cjs");
 
 class CapturedTransport implements HttpCaptureTransport {
   readonly recordings = new Map<string, { method: string; events: CaptureEvent[]; finish?: { finalSequence: bigint; durationNs: bigint; droppedEvents: number } }>();
@@ -126,7 +138,10 @@ test("a real response close is distinct and queue saturation is carried as a dro
     postMessage(message: unknown): void { this.sent.push(message); }
   }
   const worker = new DelayedWorker();
-  const bounded = createHttpCaptureTransport(worker as unknown as Worker);
+  const bounded = createHttpCaptureTransport(worker as unknown as Worker, {
+    maxInFlightMessages: 64,
+    maxActiveRecordings: 64,
+  });
   assert.equal(bounded.start("01900000-0000-7000-8000-000000000001", "GET", 1n), true);
   for (let index = 0; index < 62; index += 1) {
     assert.equal(bounded.event("01900000-0000-7000-8000-000000000001", {
@@ -142,4 +157,174 @@ test("a real response close is distinct and queue saturation is carried as a dro
   const terminal = worker.sent.at(-1) as { type: string; droppedEvents: number };
   assert.equal(terminal.type, "finish");
   assert.equal(terminal.droppedEvents, 1);
+});
+
+test("default transport burst capacity admits concurrent bursts while remaining bounded and updating shared credits", () => {
+  class BurstWorker extends EventEmitter {
+    readonly sent: Array<Record<string, unknown>> = [];
+    unrefCalled = false;
+    refCalled = false;
+    postMessage(message: Record<string, unknown>): void { this.sent.push(message); }
+    ref(): void { this.refCalled = true; }
+    unref(): void { this.unrefCalled = true; }
+  }
+  const sharedBuffer = new SharedArrayBuffer(SHARED_CONTROL_WORDS * Int32Array.BYTES_PER_ELEMENT);
+  const sharedControl = new Int32Array(sharedBuffer);
+  const worker = new BurstWorker();
+  const transport = createHttpCaptureTransport(worker as unknown as Worker, { sharedControl });
+
+  assert.ok(DEFAULT_MAX_ACTIVE_RECORDINGS >= 128);
+  assert.ok(DEFAULT_MAX_IN_FLIGHT_MESSAGES >= 1024);
+
+  // Admit a concurrent burst exceeding the old 64 limit without main-thread message callbacks.
+  for (let i = 0; i < 80; i += 1) {
+    const id = `01900000-0000-7000-8000-${String(i).padStart(12, "0")}`;
+    assert.equal(transport.start(id, "GET", BigInt(i + 1), true), true, `start ${i} admitted`);
+    for (let ev = 0; ev < 8; ev += 1) {
+      assert.equal(transport.event(id, {
+        kind: "frame-enter",
+        eventId: `${id}:${ev}`,
+        sequence: BigInt(ev + 2),
+        monotonicNs: BigInt(ev + 2),
+        parentEventId: "",
+        symbol: "express.handler",
+        exceptionType: "",
+      }), true);
+    }
+    assert.equal(transport.route?.(id, "/store/products"), true);
+    assert.equal(transport.finish(id, 10n, 50n, 0, { route: "/store/products", httpStatus: 200, outcome: "responded" }), true);
+    // Worker atomically retires staged messages via SharedArrayBuffer without posting to main thread.
+    Atomics.add(sharedControl, CONTROL_STAGED_INDEX, 11);
+  }
+  assert.equal(transport.rejectedStarts?.(), 0);
+
+  // Fill active recording cap to verify strict bounding and honest rejection counting.
+  for (let i = 0; i < DEFAULT_MAX_ACTIVE_RECORDINGS; i += 1) {
+    const id = `01900000-0001-7000-8000-${String(i).padStart(12, "0")}`;
+    assert.equal(transport.start(id, "GET", 1n), true);
+    Atomics.add(sharedControl, CONTROL_STAGED_INDEX, 1);
+  }
+  assert.equal(transport.start("01900000-0002-7000-8000-000000000001", "GET", 1n), false);
+  assert.equal(transport.rejectedStarts?.(), 1);
+});
+
+test("process.exit hook runs synchronous drain once, respects re-entrant exit, and bounds timeout", () => {
+  class SyncDrainWorker extends EventEmitter {
+    readonly sent: Array<Record<string, unknown>> = [];
+    constructor(private readonly shared: Int32Array, private readonly completeImmediately: boolean) { super(); }
+    postMessage(message: Record<string, unknown>): void {
+      this.sent.push(message);
+      if (message.type === "close" && this.completeImmediately) {
+        Atomics.store(this.shared, CONTROL_DRAIN_INDEX, 1);
+        Atomics.notify(this.shared, CONTROL_DRAIN_INDEX);
+      }
+    }
+    ref(): void {}
+    unref(): void {}
+  }
+
+  // Case 1: complete drain before native exit, plus re-entrant process.exit inside exit handler.
+  const buf1 = new SharedArrayBuffer(SHARED_CONTROL_WORDS * Int32Array.BYTES_PER_ELEMENT);
+  const ctrl1 = new Int32Array(buf1);
+  const w1 = new SyncDrainWorker(ctrl1, true);
+  const t1 = createHttpCaptureTransport(w1 as unknown as Worker, { sharedControl: ctrl1, drainTimeoutMs: 250 });
+  assert.equal(t1.start("01900000-0000-7000-8000-000000000010", "GET", 1n), true);
+  assert.equal(t1.finish("01900000-0000-7000-8000-000000000010", 2n, 5n, 0), true);
+
+  const originalExit = process.exit;
+  const exitCalls: Array<number | string | null | undefined> = [];
+  process.exit = ((code?: number | string | null): never => {
+    exitCalls.push(code);
+    if (exitCalls.length === 1) {
+      // Simulate a re-entrant process.exit() triggered by an exit hook.
+      process.exit(99);
+    }
+    return undefined as never;
+  }) as typeof process.exit;
+
+  const dispose1 = installProcessShutdownHooks(t1, { drainTimeoutMs: 200 });
+  try {
+    process.exit(0);
+    assert.deepEqual(exitCalls, [0, 99]);
+    assert.equal(w1.sent.filter((m) => m.type === "close").length, 1, "close posted exactly once across re-entrant exit");
+  } finally {
+    dispose1();
+    process.exit = originalExit;
+  }
+
+  // Case 2: stalled worker respects bounded timeout without hanging.
+  const buf2 = new SharedArrayBuffer(SHARED_CONTROL_WORDS * Int32Array.BYTES_PER_ELEMENT);
+  const ctrl2 = new Int32Array(buf2);
+  const w2 = new SyncDrainWorker(ctrl2, false);
+  const t2 = createHttpCaptureTransport(w2 as unknown as Worker, { sharedControl: ctrl2, drainTimeoutMs: 25 });
+  assert.equal(t2.start("01900000-0000-7000-8000-000000000011", "GET", 1n), true);
+  const startedAt = Date.now();
+  assert.equal(t2.drainSync?.(25), false);
+  assert.ok(Date.now() - startedAt < 500, "stalled drainSync returned within bounded deadline");
+});
+
+test("SIGTERM and SIGINT hooks drain cleanly without app handlers and flush non-destructively with app handlers", async () => {
+  // Case 1: App has its own SIGTERM listener -> non-blocking flush only, never swallows or re-signals.
+  const flushed: string[] = [];
+  const signalsRaised: NodeJS.Signals[] = [];
+  let closed = false;
+  const appMockTransport: HttpCaptureTransport = {
+    start: () => true,
+    event: () => true,
+    finish: () => true,
+    onFailure() {},
+    flush() { flushed.push("flushed"); },
+    drainAsync: async () => { closed = true; return true; },
+    close() { closed = true; },
+  };
+  let appListenerRan = false;
+  const appListener = () => { appListenerRan = true; };
+  const disposeApp = installProcessShutdownHooks(appMockTransport, {
+    drainTimeoutMs: 100,
+    onExitSignal: (sig) => { signalsRaised.push(sig); },
+  });
+  process.on("SIGTERM", appListener);
+  try {
+    process.emit("SIGTERM", "SIGTERM");
+    assert.deepEqual(flushed, ["flushed"]);
+    assert.equal(appListenerRan, true);
+    assert.equal(closed, false, "app-owned signal lifecycle must not close transport prematurely");
+    assert.deepEqual(signalsRaised, []);
+  } finally {
+    process.off("SIGTERM", appListener);
+    disposeApp();
+  }
+
+  // Case 2: App has NO SIGTERM listener -> bounded drainAsync completes before re-raising signal.
+  class AsyncDrainWorker extends EventEmitter {
+    readonly sent: Array<Record<string, unknown>> = [];
+    postMessage(message: Record<string, unknown>): void {
+      this.sent.push(message);
+      if (message.type === "close") {
+        setTimeout(() => this.emit("message", { type: "drained" }), 5);
+      }
+    }
+    ref(): void {}
+    unref(): void {}
+  }
+  const worker = new AsyncDrainWorker();
+  const t2 = createHttpCaptureTransport(worker as unknown as Worker, { drainTimeoutMs: 200 });
+  const raised: NodeJS.Signals[] = [];
+  let resolveSignal!: () => void;
+  const signalDone = new Promise<void>((resolve) => { resolveSignal = resolve; });
+  const disposeNoApp = installProcessShutdownHooks(t2, {
+    drainTimeoutMs: 200,
+    onExitSignal: (sig) => {
+      raised.push(sig);
+      resolveSignal();
+    },
+  });
+  try {
+    process.emit("SIGTERM", "SIGTERM");
+    await signalDone;
+    assert.deepEqual(raised, ["SIGTERM"]);
+    assert.equal(worker.sent.filter((m) => m.type === "close").length, 1);
+  } finally {
+    disposeNoApp();
+  }
 });

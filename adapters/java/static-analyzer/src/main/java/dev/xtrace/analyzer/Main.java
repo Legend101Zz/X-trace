@@ -4,6 +4,7 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 /** Command line entry point: {@code xtrace-java-static --source-root DIR [--framework F]}. */
 public final class Main {
@@ -12,8 +13,8 @@ public final class Main {
     public static void main(String[] args) throws Exception {
         Path root = null;
         String framework = SpringMvcAnalyzer.FRAMEWORK_MVC;
-        int maxFiles = SpringMvcAnalyzer.DEFAULT_MAX_FILES;
-        long maxFileBytes = SpringMvcAnalyzer.DEFAULT_MAX_FILE_BYTES;
+        int maxFiles = StaticAnalysisSupport.DEFAULT_MAX_FILES;
+        long maxFileBytes = StaticAnalysisSupport.DEFAULT_MAX_FILE_BYTES;
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--source-root" -> root = Path.of(next(args, ++i));
@@ -29,13 +30,19 @@ public final class Main {
         if (!Files.isDirectory(root)) {
             usage("source root is not a directory");
         }
-        if (!framework.equals(SpringMvcAnalyzer.FRAMEWORK_MVC)
-                && !framework.equals(SpringMvcAnalyzer.FRAMEWORK_WEBFLUX)) {
-            usage("framework must be spring-mvc or spring-webflux");
+        List<String> lines;
+        switch (framework) {
+            case SpringMvcAnalyzer.FRAMEWORK_MVC, SpringMvcAnalyzer.FRAMEWORK_WEBFLUX ->
+                    lines = new SpringMvcAnalyzer(framework, maxFiles, maxFileBytes).analyze(root);
+            case JaxRsAnalyzer.FRAMEWORK_JAXRS ->
+                    lines = new JaxRsAnalyzer(maxFiles, maxFileBytes).analyze(root);
+            default -> {
+                usage("framework must be spring-mvc, spring-webflux or jaxrs");
+                return;
+            }
         }
-        SpringMvcAnalyzer analyzer = new SpringMvcAnalyzer(framework, maxFiles, maxFileBytes);
         PrintStream out = new PrintStream(System.out, false, StandardCharsets.UTF_8);
-        for (String line : analyzer.analyze(root)) {
+        for (String line : lines) {
             out.print(line);
             out.print('\n');
         }
@@ -51,8 +58,9 @@ public final class Main {
 
     private static void usage(String message) {
         System.err.println("xtrace-java-static: " + message);
-        System.err.println("usage: xtrace-java-static --source-root DIR [--framework spring-mvc|spring-webflux]"
-                + " [--max-files N] [--max-file-bytes N]");
+        System.err.println(
+                "usage: xtrace-java-static --source-root DIR [--framework spring-mvc|spring-webflux|jaxrs]"
+                        + " [--max-files N] [--max-file-bytes N]");
         System.exit(2);
     }
 }

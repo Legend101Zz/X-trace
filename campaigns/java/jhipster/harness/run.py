@@ -238,8 +238,10 @@ OP_HINTS = {"controller": "OperationResource", "repository": ["OperationReposito
 EXPECT = {
     "anonymous-and-invalid-login-denied": [
         # Pre-dispatch Spring Security 401s occur in the servlet filter chain before any controller frame.
-        {"method": "GET", "route": "/api/bank-accounts", "status": 401, "layers": [], "sourceOptional": True},
-        {"method": "GET", "route": "/api/admin/users", "status": 401, "layers": [], "sourceOptional": True},
+        {"method": "GET", "route": "/api/bank-accounts", "status": 401, "layers": [], "sourceOptional": True,
+         "preDispatch": True},
+        {"method": "GET", "route": "/api/admin/users", "status": 401, "layers": [], "sourceOptional": True,
+         "preDispatch": True},
         {"method": "POST", "route": "/api/authenticate", "status": 401, "layers": ["controller"],
          "layerHints": AUTH_HINTS},
     ],
@@ -248,9 +250,12 @@ EXPECT = {
          "layerHints": AUTH_HINTS},
         {"method": "GET", "route": "/api/account", "status": 200, "layers": ["controller", "service", "repository"],
          "layerHints": {"controller": "AccountResource", **USER_HINTS}},
-        {"method": "GET", "route": "/api/admin/users", "statuses": [200, 403],
+        {"method": "GET", "route": "/api/admin/users", "status": 200,
          "layers": ["controller", "service", "repository"],
          "layerHints": {"controller": "UserResource", **USER_HINTS}},
+        # Pre-dispatch Spring Security 403 for ROLE_USER occurs in the filter chain before UserResource.
+        {"method": "GET", "route": "/api/admin/users", "status": 403, "layers": [], "sourceOptional": True,
+         "preDispatch": True},
     ],
     "account-create-read-roundtrip": [
         {"method": "POST", "route": "/api/authenticate", "status": 200, "layers": ["controller"],

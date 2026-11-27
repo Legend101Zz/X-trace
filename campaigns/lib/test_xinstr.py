@@ -785,6 +785,165 @@ class T(unittest.TestCase):
                 xinstr.start_viewer(str(exe), pathlib.Path(d), dict(os.environ), pathlib.Path(d) / "v.log", timeout=2.0)
             self.assertLess(time.time() - t0, 10)
 
+    def _routeless_refusal(self, method, status, *, kind="responded", ts="2026-10-10T00:00:00.000Z",
+                           symbols=(), resp_symbol=None):
+        evs = [{"kind": "recording_event_kind:request_update", "symbol": f"http.request {method}",
+                "interaction": {"method": method}, "source": None}]
+        for sy in symbols:
+            evs.append({"kind": "recording_event_kind:frame_enter", "symbol": sy, "interaction": {},
+                        "source": {"path": "src/main/java/X.java", "startLine": 3, "status": "matched"},
+                        "sourceBinding": "verified"})
+        evs.append({"kind": "recording_event_kind:response",
+                    "symbol": resp_symbol or (f"http.response {status}" if status is not None else "http.response unavailable"),
+                    "interaction": {}, "source": None})
+        return {"events": evs, "completion": "complete", "_openedAt": ts,
+                "outcome": {"kind": kind, "httpStatus": status if kind == "responded" else None}}
+
+    def test_routeless_request_method_only_matches_when_request_info_is_none(self):
+        self.assertEqual(xinstr.routeless_request_method(self._routeless_refusal("GET", 401)), "GET")
+        self.assertEqual(xinstr.routeless_request_method(self._routeless_refusal("POST", 403)), "POST")
+        routed = rec("GET", "/owners/{id}", 200)
+        self.assertEqual(xinstr.request_info(routed), ("GET", "/owners/{id}"))
+        self.assertIsNone(xinstr.routeless_request_method(routed))
+        mixed = rec("GET", "/owners/{id}", 200)
+        mixed["events"].append({"kind": "recording_event_kind:request_update", "symbol": "http.request GET"})
+        self.assertIsNone(xinstr.routeless_request_method(mixed))
+        for bad in ("http.request", "http.request get", "http.response 401", "other GET"):
+            self.assertIsNone(xinstr.routeless_request_method({"events": [{"symbol": bad}]}))
+
+    def test_pre_dispatch_requires_opt_in_and_rejects_frames_or_2xx(self):
+        refusal = self._routeless_refusal("GET", 401)
+        default_exp = {"s": [{"method": "GET", "route": "/api/bank-accounts", "status": 401, "layers": [], "sourceOptional": True}]}
+        sent = [("s", "GET", "/api/bank-accounts")]
+        self.assertFalse(xinstr.burst_accounting({"r": refusal}, sent, default_exp, {})["verified"])
+        self.assertEqual(xinstr.analyze({"r": refusal}, default_exp, sent)["s"]["expectations"][0]["problems"],
+                         ["no-recording-for-route"])
+        opted_exp = {"s": [{**default_exp["s"][0], "preDispatch": True}]}
+        self.assertTrue(xinstr.burst_accounting({"r": refusal}, sent, opted_exp, {})["verified"])
+        self.assertTrue(xinstr.analyze({"r": refusal}, opted_exp, sent)["s"]["passed"])
+        # Non-refusal (200), wrong method (POST), or recording with frame_enter events must never match.
+        for bad in (self._routeless_refusal("GET", 200), self._routeless_refusal("POST", 401),
+                    self._routeless_refusal("GET", 401, symbols=("SecurityFilter.check",))):
+            with self.subTest(bad=bad):
+                self.assertFalse(xinstr.is_routeless_refusal(bad, "GET"))
+                self.assertFalse(xinstr.burst_accounting({"r": bad}, sent, opted_exp, {})["verified"])
+
+    def test_jhipster_pre_dispatch_401_403_pooling_and_serial_boundary(self):
+        exp = {
+            "anon": [
+                {"method": "GET", "route": "/api/bank-accounts", "status": 401, "layers": [], "sourceOptional": True, "preDispatch": True},
+                {"method": "GET", "route": "/api/admin/users", "status": 401, "layers": [], "sourceOptional": True, "preDispatch": True},
+                {"method": "POST", "route": "/api/authenticate", "status": 401, "layers": ["controller"],
+                 "layerHints": {"controller": "AuthenticateController"}},
+            ],
+            "auth": [
+                {"method": "GET", "route": "/api/admin/users", "status": 200, "layers": ["controller", "service", "repository"],
+                 "layerHints": {"controller": "UserResource", "service": "UserService", "repository": "UserRepository"}},
+                {"method": "GET", "route": "/api/admin/users", "status": 403, "layers": [], "sourceOptional": True, "preDispatch": True},
+            ],
+            "burst": [
+                {"method": "GET", "route": "/api/account", "status": 200, "layers": ["controller"],
+                 "layerHints": {"controller": "AccountResource"}, "minCount": 2},
+            ],
+        }
+        serial_sent = [
+            ("anon", "GET", "/api/bank-accounts"),
+            ("anon", "GET", "/api/admin/users"),
+            ("anon", "POST", "/api/authenticate"),
+            ("auth", "GET", "/api/admin/users"),
+            ("auth", "GET", "/api/admin/users"),
+        ]
+        serial_details = {
+            "r0": self._routeless_refusal("GET", 401, ts="2026-10-10T00:00:01Z"),
+            "r1": self._routeless_refusal("GET", 401, ts="2026-10-10T00:00:02Z"),
+            "r2": {**rec("POST", "/api/authenticate", 401, symbols=("AuthenticateController.authorize",)),
+                   "completion": "complete", "_openedAt": "2026-10-10T00:00:03Z"},
+            "r3": {**rec("GET", "/api/admin/users", 200, symbols=("UserResource.getAllUsers", "UserService.getUsers", "UserRepository.findAll")),
+                   "completion": "complete", "_openedAt": "2026-10-10T00:00:04Z"},
+            "r4": self._routeless_refusal("GET", 403, ts="2026-10-10T00:00:05Z"),
+        }
+        serial_boundary = xinstr.burst_accounting(serial_details, serial_sent, exp, {})
+        self.assertTrue(serial_boundary["verified"], serial_boundary)
+        self.assertEqual(serial_boundary["recordingCount"], 5)
+        burst_sent = [("burst", "GET", "/api/account"), ("burst", "GET", "/api/account")]
+        burst_details = {
+            "b0": {**rec("GET", "/api/account", 200, symbols=("AccountResource.getAccount",)),
+                   "completion": "complete", "_openedAt": "2026-10-10T00:00:06Z"},
+            "b1": {**rec("GET", "/api/account", 200, symbols=("AccountResource.getAccount",)),
+                   "completion": "complete", "_openedAt": "2026-10-10T00:00:07Z"},
+        }
+        all_details = {**serial_details, **burst_details}
+        boundary = xinstr.burst_accounting(all_details, burst_sent, exp, serial_details)
+        self.assertTrue(boundary["verified"], boundary)
+        verdicts = xinstr.analyze(all_details, exp, serial_sent + burst_sent, frozenset({"burst"}), boundary, serial_boundary)
+        for sid in ("anon", "auth", "burst"):
+            self.assertTrue(verdicts[sid]["passed"], verdicts[sid])
+        self.assertEqual(verdicts["auth"]["frameSymbols"],
+                         ["UserRepository.findAll", "UserResource.getAllUsers", "UserService.getUsers"])
+        # Swapping chronological order of 401 and 403 fails outcome check on the misordered refusal.
+        swapped = {**all_details,
+                   "r0": self._routeless_refusal("GET", 403, ts="2026-10-10T00:00:01Z"),
+                   "r4": self._routeless_refusal("GET", 401, ts="2026-10-10T00:00:05Z")}
+        v_swap = xinstr.analyze(swapped, exp, serial_sent + burst_sent, frozenset({"burst"}), boundary, serial_boundary)
+        self.assertFalse(v_swap["anon"]["passed"])
+        self.assertFalse(v_swap["auth"]["passed"])
+        # Missing one refusal or adding an unexpected refusal must fail burst_accounting.
+        missing = {k: v for k, v in serial_details.items() if k != "r4"}
+        self.assertFalse(xinstr.burst_accounting(missing, serial_sent, exp, {})["verified"])
+        extra = {**serial_details, "extra": self._routeless_refusal("GET", 401, ts="2026-10-10T00:00:05.500Z")}
+        self.assertFalse(xinstr.burst_accounting(extra, serial_sent, exp, {})["verified"])
+
+    def test_fineract_pre_dispatch_send_error_unobserved_and_routed_split(self):
+        base = "/fineract-provider/api/v1"
+        prov_401 = "http.response unavailable; final status not observed; observed status was 401 (provisional)"
+        prov_500 = "http.response unavailable; final status not observed; observed status was 500 (provisional)"
+        exp = {
+            "denied": [
+                {"method": "GET", "route": f"{base}/clients", "statuses": [401, 401], "layers": [],
+                 "sourceOptional": True, "preDispatch": True, "allowUnobserved": True},
+                {"method": "POST", "route": f"{base}/clients", "status": 401, "layers": [],
+                 "sourceOptional": True, "preDispatch": True, "allowUnobserved": True},
+            ],
+            "seed": [
+                {"method": "GET", "route": f"{base}/clients", "status": 200, "layers": ["controller", "service"],
+                 "layerHints": {"controller": "ClientsApiResource", "service": "ClientReadPlatformServiceImpl"}},
+            ],
+            "create": [
+                {"method": "POST", "route": f"{base}/clients", "status": 200, "layers": ["controller", "service", "repository"],
+                 "layerHints": {"controller": "ClientsApiResource", "service": "ClientWritePlatformServiceJpaRepositoryImpl",
+                                "repository": "ClientRepository"}},
+            ],
+        }
+        sent = [
+            ("denied", "GET", f"{base}/clients"),
+            ("denied", "GET", f"{base}/clients"),
+            ("denied", "POST", f"{base}/clients"),
+            ("seed", "GET", f"{base}/clients?limit=5"),
+            ("create", "POST", f"{base}/clients"),
+        ]
+        details = {
+            "g1": self._routeless_refusal("GET", None, kind="unobserved", ts="2026-10-10T00:00:01Z", resp_symbol=prov_401),
+            "g2": self._routeless_refusal("GET", None, kind="unobserved", ts="2026-10-10T00:00:02Z", resp_symbol=prov_401),
+            "p1": self._routeless_refusal("POST", None, kind="unobserved", ts="2026-10-10T00:00:03Z", resp_symbol=prov_401),
+            "g_ok": {**rec("GET", f"{base}/clients", 200, symbols=("ClientsApiResource.retrieveAll", "ClientReadPlatformServiceImpl.retrieveAll")),
+                     "completion": "complete", "_openedAt": "2026-10-10T00:00:04Z"},
+            "p_ok": {**rec("POST", f"{base}/clients", 200, symbols=("ClientsApiResource.create", "ClientWritePlatformServiceJpaRepositoryImpl.createClient", "ClientRepository.save")),
+                     "completion": "complete", "_openedAt": "2026-10-10T00:00:05Z"},
+        }
+        serial = xinstr.burst_accounting(details, sent, exp, {})
+        self.assertTrue(serial["verified"], serial)
+        verdicts = xinstr.analyze(details, exp, sent, serial_boundary=serial)
+        for sid in ("denied", "seed", "create"):
+            self.assertTrue(verdicts[sid]["passed"], verdicts[sid])
+        # Without allowUnobserved, unobserved sendError(401) must fail.
+        strict_exp = {**exp, "denied": [{**e, "allowUnobserved": False} for e in exp["denied"]]}
+        v_strict = xinstr.analyze(details, strict_exp, sent, serial_boundary=serial)
+        self.assertFalse(v_strict["denied"]["passed"])
+        # Provisional 500 must not satisfy 401 even when allowUnobserved=True.
+        wrong_prov = {**details, "p1": self._routeless_refusal("POST", None, kind="unobserved", ts="2026-10-10T00:00:03Z", resp_symbol=prov_500)}
+        v_wrong = xinstr.analyze(wrong_prov, exp, sent, serial_boundary=serial)
+        self.assertFalse(v_wrong["denied"]["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,16 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { openXtpSession, readBootstrap, type AuthenticatedXtpSession } from "./index.js";
-import { capabilitySetFor, createRecordingAssembler, type InputMessage } from "./worker-core.js";
+import { CONTROL_DRAIN_INDEX, CONTROL_STAGED_INDEX, CONTROL_STARTUP_INDEX } from "./runtime/transport.cjs";
+import {
+  HOLD_START_MS,
+  capabilitySetFor,
+  createRecordingAssembler,
+  createWorkerDeliveryScheduler,
+  healthForRejectedStarts,
+  type InputMessage,
+  type RecordingAssembler,
+  type WorkerDeliveryScheduler,
+} from "./worker-core.js";
 
 interface StartupData {
   bootstrapPath: string;
@@ -10,37 +20,59 @@ interface StartupData {
   capabilities?: string[];
 }
 
+type WorkerControlMessage =
+  | InputMessage
+  | { type: "flush" }
+  | { type: "close"; rejectedStarts?: number | undefined };
+
+const DEFAULT_WORKER_BATCH_EVENTS = 64;
+
 const data = workerData as StartupData;
 const startup = new Int32Array(data.startupBarrier);
 let session: AuthenticatedXtpSession | undefined;
-let delivery = Promise.resolve();
+let assembler: RecordingAssembler | undefined;
+let scheduler: WorkerDeliveryScheduler | undefined;
 let shuttingDown = false;
 let closingRequested = false;
-
-const assembler = createRecordingAssembler((id, payload, token) => session!.send(id, payload, token));
+let maxRejectedStarts = 0;
+let closePromise: Promise<void> | undefined;
+const earlyMessages: InputMessage[] = [];
 
 function setStartup(state: 1 | 2): void {
-  Atomics.store(startup, 0, state);
-  Atomics.notify(startup, 0);
+  Atomics.store(startup, CONTROL_STARTUP_INDEX, state);
+  Atomics.notify(startup, CONTROL_STARTUP_INDEX);
   parentPort?.postMessage({ type: state === 1 ? "ready" : "startup-failure" });
+}
+
+function setDrainState(state: 1 | 2): void {
+  if (startup.length <= CONTROL_DRAIN_INDEX) return;
+  Atomics.store(startup, CONTROL_DRAIN_INDEX, state);
+  Atomics.notify(startup, CONTROL_DRAIN_INDEX);
+}
+
+function markStaged(count: number): void {
+  if (count <= 0) return;
+  if (startup.length > CONTROL_STAGED_INDEX) {
+    Atomics.add(startup, CONTROL_STAGED_INDEX, count);
+    return;
+  }
+  for (let i = 0; i < count; i += 1) parentPort?.postMessage({ type: "staged" });
 }
 
 function fail(): void {
   setStartup(2);
+  setDrainState(2);
   parentPort?.postMessage({ type: "failure" });
   shuttingDown = true;
   void session?.close().catch(() => undefined);
 }
 
-async function deliver(message: InputMessage): Promise<void> {
-  if (!session || shuttingDown) return;
-  await assembler.handle(message);
-  parentPort?.postMessage({ type: "staged" });
-}
+let markReady!: () => void;
+const readyPromise = new Promise<void>((resolve) => { markReady = resolve; });
 
 async function initialize(): Promise<void> {
   const bootstrap = await readBootstrap(data.bootstrapPath);
-  session = await openXtpSession(bootstrap, data.manifestPath, {
+  const opened = await openXtpSession(bootstrap, data.manifestPath, {
     adapterName: "xtrace-node-http",
     adapterVersion: "0.0.1",
     language: "node",
@@ -49,27 +81,82 @@ async function initialize(): Promise<void> {
     pid: BigInt(process.pid),
     processStartMonotonicNs: process.hrtime.bigint(),
   });
-  await session.send("node-http-capabilities", {
+  session = opened;
+  await opened.send("node-http-capabilities", {
     case: "capabilitySet",
     value: capabilitySetFor(data.capabilities ?? ["http.server.request_root", "async_correlation"]),
   });
+  const maxBatchEvents = Math.max(1, Math.min(DEFAULT_WORKER_BATCH_EVENTS, opened.maxBatchEvents));
+  const createdAssembler = createRecordingAssembler(
+    (id, payload, token) => opened.send(id, payload, token),
+    undefined,
+    HOLD_START_MS,
+    { maxBatchEvents },
+  );
+  const createdScheduler = createWorkerDeliveryScheduler(createdAssembler, {
+    maxBatchEvents,
+    onStaged: markStaged,
+    onError: fail,
+  });
+  assembler = createdAssembler;
+  scheduler = createdScheduler;
+  for (const queued of earlyMessages.splice(0)) createdScheduler.enqueue(queued);
   setStartup(1);
+  markReady();
 }
 
-parentPort?.on("message", (message: InputMessage) => {
+function runClose(): Promise<void> {
+  if (closePromise) return closePromise;
+  closingRequested = true;
+  closePromise = (async () => {
+    await readyPromise;
+    await scheduler?.drain();
+    // Held starts are released so an unfinished request reopens as partial instead of vanishing.
+    if (session && assembler && !shuttingDown) {
+      await assembler.flushHeld();
+    }
+    if (session && !shuttingDown && maxRejectedStarts > 0) {
+      await session.send("node-http-health-rejections", {
+        case: "health",
+        value: healthForRejectedStarts(maxRejectedStarts, process.hrtime.bigint()),
+      });
+    }
+    shuttingDown = true;
+    await session?.close();
+    setDrainState(1);
+    parentPort?.postMessage({ type: "drained" });
+    parentPort?.close();
+  })().catch(() => fail());
+  return closePromise;
+}
+
+parentPort?.on("message", (message: WorkerControlMessage) => {
   if (message.type === "close") {
-    closingRequested = true;
-    delivery = delivery.then(async () => {
-      // Held starts are released so an unfinished request reopens as partial instead of vanishing.
-      if (session && !shuttingDown) await assembler.flushHeld();
-      shuttingDown = true;
-      await session?.close();
-      parentPort?.close();
-    }).catch(() => fail());
+    const rejected = "rejectedStarts" in message ? message.rejectedStarts : undefined;
+    if (typeof rejected === "number" && rejected > maxRejectedStarts) {
+      maxRejectedStarts = Math.trunc(rejected);
+    }
+    void runClose();
     return;
   }
-  if (closingRequested) return;
-  delivery = delivery.then(() => deliver(message)).catch(() => fail());
+  if (message.type === "flush") {
+    if (!closingRequested && !shuttingDown) {
+      void scheduler?.flush().catch(() => fail());
+    }
+    return;
+  }
+  if (closingRequested || shuttingDown) {
+    markStaged(1);
+    return;
+  }
+  if (scheduler) {
+    scheduler.enqueue(message);
+  } else {
+    earlyMessages.push(message);
+  }
 });
 
-void initialize().catch(() => fail());
+void initialize().catch(() => {
+  markReady();
+  fail();
+});

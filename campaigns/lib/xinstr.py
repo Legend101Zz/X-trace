@@ -276,7 +276,9 @@ def route_regex(template: str) -> re.Pattern[str]:
 
 
 REQUEST_SYMBOL = re.compile(r"^http\.request ([A-Z]+) (\S+)$")
+ROUTELESS_REQUEST_SYMBOL = re.compile(r"^http\.request ([A-Z]+)$")
 RESPONSE_SYMBOL = re.compile(r"^http\.response (\d{3})$")
+PROVISIONAL_RESPONSE_SYMBOL = re.compile(r"^http\.response unavailable;.*observed status was (\d{3}) \(provisional\)$")
 REQUEST_CORRELATION_GAP = (
     "Spring MVC records method and route template only, without concrete path, query or headers; "
     "standard capture has no argument bindings; focused Owner form objects are unavailable. "
@@ -295,10 +297,30 @@ def request_info(detail: dict) -> tuple[str, str] | None:
     return None
 
 
+def routeless_request_method(detail: dict) -> str | None:
+    """Method from a route-less boundary request (`http.request GET`) ONLY when `request_info(detail)` is None."""
+    if request_info(detail) is not None:
+        return None
+    for ev in detail.get("events", []):
+        m = ROUTELESS_REQUEST_SYMBOL.match(ev.get("symbol") or "")
+        if m:
+            return m.group(1)
+    return None
+
+
 def response_event_status(detail: dict) -> int | None:
     """Status printed by the boundary response event (`http.response 200`); `http.response unavailable` gives None."""
     for ev in detail.get("events", []):
         m = RESPONSE_SYMBOL.match(ev.get("symbol") or "")
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def provisional_response_status(detail: dict) -> int | None:
+    """Provisional status from `http.response unavailable; ... observed status was 401 (provisional)`."""
+    for ev in detail.get("events", []):
+        m = PROVISIONAL_RESPONSE_SYMBOL.match(ev.get("symbol") or "")
         if m:
             return int(m.group(1))
     return None
@@ -351,13 +373,23 @@ def exception_matches(detail: dict, wanted: str | None, controller_hint: str | l
     return False
 
 
+def _effective_status(detail: dict, expectation: dict) -> int | None:
+    st = recording_http_status(detail)
+    if st is None and expectation.get("allowUnobserved") is True and (detail.get("outcome") or {}).get("kind") == "unobserved":
+        return provisional_response_status(detail)
+    return st
+
+
 def outcome_matches(detail: dict, expectation: dict) -> bool:
     hint = expectation.get("layerHints", {}).get("controller")
     if expectation.get("outcome") == "exception_propagated":
         return recording_http_status(detail) is None and exception_matches(detail, expectation.get("exception"), hint)
+    st = _effective_status(detail, expectation)
+    if st is None and expectation.get("allowUnobserved") is True and (detail.get("outcome") or {}).get("kind") == "unobserved":
+        return True
     if "statuses" in expectation:
-        return recording_http_status(detail) in expectation["statuses"]
-    if recording_http_status(detail) == expectation["status"]:
+        return st in expectation["statuses"]
+    if st == expectation["status"]:
         return True
     return expectation["status"] >= 500 and exception_matches(detail, expectation.get("exception"), hint)
 
@@ -454,33 +486,106 @@ def capacity_counts(details: dict[str, dict]) -> dict[str, int]:
     return counts
 
 
+def is_routeless_refusal(detail: dict, method: str | None = None) -> bool:
+    """Route-less refusal recording (ADR 0016): `http.request <METHOD>` only, zero frame_enter events, 4xx/5xx or unobserved."""
+    m = routeless_request_method(detail)
+    if not m or (method is not None and m != method):
+        return False
+    if any(str(ev.get("kind", "")).endswith("frame_enter") for ev in detail.get("events", [])):
+        return False
+    st = recording_http_status(detail)
+    kind = (detail.get("outcome") or {}).get("kind") if isinstance(detail.get("outcome"), dict) else None
+    return (isinstance(st, int) and 400 <= st < 600) or (st is None and kind == "unobserved")
+
+
+def _expected_count(e: dict) -> int:
+    if "statuses" in e:
+        return len(e["statuses"])
+    return int(e.get("minCount", 1))
+
+
+def _classify_sent(sent: list[tuple[str | None, str, str]], expectations: dict[str, list[dict]],
+                   literals: frozenset[str]) -> list[tuple[bool, int | None]]:
+    """Tag each sent request as routed `(False, None)` or opted-in preDispatch `(True, id(exp))`."""
+    tags: list[tuple[bool, int | None]] = [(False, None)] * len(sent)
+    for sid, exps in expectations.items():
+        by_route: dict[tuple[str, str], list[dict]] = {}
+        for e in exps:
+            by_route.setdefault((e["method"], e["route"]), []).append(e)
+        for (method, route), group in by_route.items():
+            if not any(e.get("preDispatch") is True for e in group):
+                continue
+            idxs = [i for i, (r_sid, r_m, r_path) in enumerate(sent)
+                    if r_sid == sid and r_m == method and _path_matches(r_path, route, literals)]
+            if not idxs:
+                continue
+            if all(e.get("preDispatch") is True for e in group):
+                pos = 0
+                for e in group:
+                    count = _expected_count(e)
+                    for j in idxs[pos:pos + count]:
+                        tags[j] = (True, id(e))
+                    pos += count
+                for j in idxs[pos:]:
+                    tags[j] = (True, id(group[-1]))
+            else:
+                pos = 0
+                for e in group:
+                    count = _expected_count(e)
+                    is_pre = e.get("preDispatch") is True
+                    for j in idxs[pos:pos + count]:
+                        tags[j] = (is_pre, id(e) if is_pre else None)
+                    pos += count
+    return tags
+
+
 def burst_accounting(details: dict[str, dict], sent: list[tuple[str | None, str, str]],
                      expectations: dict[str, list[dict]], before: dict[str, dict]) -> dict[str, Any]:
-    """Account for terminal recordings and session refusals, without assigning refusals to routes."""
+    """Account for terminal recordings and session refusals, pooling opted-in preDispatch refusals by method."""
     routes = {(e["method"], e["route"]) for exps in expectations.values() for e in exps}
-    literals = frozenset(route for _, route in routes if "{" not in route)
+    literals = frozenset((route.rstrip("/") or "/") for _, route in routes if "{" not in route)
+    tags = _classify_sent(sent, expectations, literals)
+    pre_methods = frozenset(sent[i][1] for i, (is_pre, _) in enumerate(tags) if is_pre)
     fresh = {rid: d for rid, d in details.items() if rid not in before}
     rows = []
     ids: set[str] = set()
     partial: set[str] = set()
+    pre_requests_by_method: dict[str, int] = {}
     for method, route in sorted(routes):
-        requests = sum(m == method and _path_matches(path, route, literals) for _, m, path in sent)
-        if not requests:
+        matched_idxs = [i for i, (_, m, path) in enumerate(sent) if m == method and _path_matches(path, route, literals)]
+        if not matched_idxs:
             continue
+        pre_reqs = sum(1 for i in matched_idxs if tags[i][0])
+        routed_reqs = len(matched_idxs) - pre_reqs
+        if pre_reqs:
+            pre_requests_by_method[method] = pre_requests_by_method.get(method, 0) + pre_reqs
         hits = {rid: d for rid, d in fresh.items() if recording_matches(d, method, route, literals)
                 and d.get("completion") in ("complete", "partial")}
         ids.update(hits)
         partial.update(rid for rid, d in hits.items() if d.get("completion") == "partial")
-        rows.append({"method": method, "route": route, "requests": requests, "recordings": len(hits),
-                     "recordingIds": sorted(hits), "missing": requests - len(hits)})
+        row: dict[str, Any] = {"method": method, "route": route, "requests": len(matched_idxs), "recordings": len(hits),
+                               "recordingIds": sorted(hits), "missing": routed_reqs - len(hits)}
+        if pre_reqs:
+            row["preDispatchRequests"] = pre_reqs
+        rows.append(row)
+    refusal_ids: set[str] = set()
+    pre_ok = True
+    for method in sorted(pre_methods):
+        refusals = {rid: d for rid, d in fresh.items() if is_routeless_refusal(d, method)
+                    and d.get("completion") in ("complete", "partial")}
+        refusal_ids.update(refusals)
+        partial.update(rid for rid, d in refusals.items() if d.get("completion") == "partial")
+        if len(refusals) > pre_requests_by_method.get(method, 0):
+            pre_ok = False
+    all_ids = ids | refusal_ids
     previous = capacity_counts(before)
     counters = capacity_counts(details)
     rejected = sum(max(0, count - previous.get(session, 0)) for session, count in counters.items())
-    missing = len(sent) - len(ids) - rejected
-    accounted = (missing == 0 and sum(row["requests"] for row in rows) == len(sent)
-                 and all(row["missing"] >= 0 for row in rows) and set(fresh) == ids)
+    missing = len(sent) - len(all_ids) - rejected
+    accounted = (missing == 0 and pre_ok and sum(row["requests"] for row in rows) == len(sent)
+                 and all(row["missing"] >= 0 for row in rows) and set(fresh) == all_ids)
     return {"verified": accounted, "verifiedAt": time.time() if accounted else None,
-            "recordingIds": sorted(ids), "recordingCount": len(ids), "snapshotIds": sorted(details),
+            "recordingIds": sorted(all_ids), "recordingCount": len(all_ids), "snapshotIds": sorted(details),
             "requests": len(sent), "capacityDrops": rejected, "capacityCounts": counters,
             "partialRecordingIds": sorted(partial), "unaccounted": missing, "routes": rows}
 
@@ -514,19 +619,26 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
 
 
 def scenario_frame_symbols(details: dict[str, dict], sent: list, burst: frozenset,
-                           boundary: dict | None, serial_boundary: dict) -> dict[str, list[str]]:
+                           boundary: dict | None, serial_boundary: dict,
+                           expectations: dict[str, list[dict]] | None = None) -> dict[str, list[str]]:
     """Inventory every attributable request, including routes without a scenario expectation."""
     names: dict[str, set[str]] = {}
     if not serial_boundary["verified"]:
         return {}
     routes = {info for d in details.values() if (info := request_info(d)) is not None}
-    literals = frozenset(route for _, route in routes if "{" not in route)
+    literals = frozenset((route.rstrip("/") or "/") for _, route in routes if "{" not in route)
+    if expectations is not None:
+        exp_literals = frozenset((e["route"].rstrip("/") or "/") for exps in expectations.values() for e in exps if "{" not in e["route"])
+        tags = _classify_sent(sent, expectations, exp_literals)
+    else:
+        tags = None
     phases = [(False, set(serial_boundary["recordingIds"]))]
     if boundary is not None:
         phases.append((True, set(boundary["recordingIds"]) - set(serial_boundary["snapshotIds"])))
     for concurrent, ids in phases:
         for method, route in routes:
-            requests = [r for r in sent if r[0] is not None and (r[0] in burst) == concurrent
+            requests = [r for idx, r in enumerate(sent)
+                        if (tags is None or not tags[idx][0]) and r[0] is not None and (r[0] in burst) == concurrent
                         and r[1] == method and _path_matches(r[2], route, literals)]
             recordings = [d for rid, d in details.items() if rid in ids and request_info(d) == (method, route)]
             if not requests or not recordings:
@@ -559,24 +671,35 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
     Without `sent`, results are explicitly campaign-wide.
     """
     literal_routes = frozenset((e["route"].rstrip("/") or "/") for exps in expectations.values() for e in exps if "{" not in e["route"])
+    tags = _classify_sent(sent, expectations, literal_routes) if sent is not None else None
     verdicts: dict[str, Any] = {}
-    inventory = scenario_frame_symbols(details, sent, burst, boundary, serial_boundary) \
+    inventory = scenario_frame_symbols(details, sent, burst, boundary, serial_boundary, expectations=expectations) \
         if sent is not None and serial_boundary is not None else None
     for sid, exps in expectations.items():
         items = []
         attributed_total = 0
         symbols: set[str] = set()
         for e in exps:
-            matched_all = [d for d in details.values() if recording_matches(d, e["method"], e["route"], literal_routes)]
+            is_pre = e.get("preDispatch") is True
+            rec_pred = (lambda d, _m=e["method"]: is_routeless_refusal(d, _m)) if is_pre else \
+                (lambda d, _m=e["method"], _r=e["route"]: recording_matches(d, _m, _r, literal_routes))
+            matched_all = [d for d in details.values() if rec_pred(d)]
             problems: list[str] = []
             attribution = "campaign-wide"
             matched = matched_all
             if sent is not None:
+                assert tags is not None
                 attribution = "order"
-                reqs = [r for r in sent if r[1] == e["method"] and _path_matches(r[2], e["route"], literal_routes)]
-                mine = [i for i, r in enumerate(reqs) if r[0] == sid]
+                if is_pre:
+                    reqs_with_idx = [(i, r) for i, r in enumerate(sent) if tags[i][0] and r[1] == e["method"]]
+                    mine_pred = lambda orig_i, _r, _eid=id(e): tags[orig_i][1] == _eid
+                else:
+                    reqs_with_idx = [(i, r) for i, r in enumerate(sent)
+                                     if not tags[i][0] and r[1] == e["method"] and _path_matches(r[2], e["route"], literal_routes)]
+                    mine_pred = lambda _orig_i, r, _sid=sid: r[0] == _sid
+                mine = [pos for pos, (orig_i, r) in enumerate(reqs_with_idx) if mine_pred(orig_i, r)]
                 times = [recording_time(d) for d in matched_all]
-                first_burst = next((i for i, r in enumerate(reqs) if r[0] in burst), None)
+                first_burst = next((pos for pos, (_, r) in enumerate(reqs_with_idx) if r[0] in burst), None)
                 if serial_boundary is not None:
                     attribution = "verified-boundary"
                     serial_ids = set(serial_boundary["recordingIds"])
@@ -588,15 +711,13 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                             problems.append("burst-boundary-not-verified")
                         if boundary is not None:
                             matched = [d for rid, d in details.items() if rid in set(boundary["recordingIds"])
-                                       and rid not in serial_ids
-                                       and recording_matches(d, e["method"], e["route"], literal_routes)]
+                                       and rid not in serial_ids and rec_pred(d)]
                             if boundary["capacityDrops"] or boundary["partialRecordingIds"]:
                                 problems.append(f"burst-drops(capacity {boundary['capacityDrops']}, partial {len(boundary['partialRecordingIds'])})")
                     else:
-                        serial_reqs = [r for r in reqs if r[0] is not None and r[0] not in burst]
-                        mine = [i for i, r in enumerate(serial_reqs) if r[0] == sid]
-                        serial = [d for rid, d in details.items() if rid in serial_ids
-                                  and recording_matches(d, e["method"], e["route"], literal_routes)]
+                        serial_reqs = [(orig_i, r) for orig_i, r in reqs_with_idx if r[0] is not None and r[0] not in burst]
+                        mine = [pos for pos, (orig_i, r) in enumerate(serial_reqs) if mine_pred(orig_i, r)]
+                        serial = [d for rid, d in details.items() if rid in serial_ids and rec_pred(d)]
                         times = [recording_time(d) for d in serial]
                         if len(serial) != len(serial_reqs):
                             problems.append(f"serial-count-mismatch(recordings {len(serial)}, requests {len(serial_reqs)})")
@@ -610,8 +731,7 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                     burst_ids = set(boundary["recordingIds"])
                     snapshot_ids = set(boundary["snapshotIds"])
                     if sid in burst:
-                        matched = [d for rid, d in details.items() if rid in burst_ids
-                                   and recording_matches(d, e["method"], e["route"], literal_routes)]
+                        matched = [d for rid, d in details.items() if rid in burst_ids and rec_pred(d)]
                         if not boundary["verified"]:
                             problems.append(f"burst-unaccounted(requests {boundary['requests']}, recordings {boundary['recordingCount']}, "
                                             f"capacity drops {boundary['capacityDrops']}, unaccounted {boundary['unaccounted']})")
@@ -621,10 +741,9 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                         matched = []
                         problems.append("burst-boundary-not-verified(serial requests not sent)")
                     else:
-                        serial_reqs = [r for r in reqs if r[0] not in burst]
-                        mine = [i for i, r in enumerate(serial_reqs) if r[0] == sid]
-                        serial = [d for rid, d in details.items() if rid not in snapshot_ids
-                                  and recording_matches(d, e["method"], e["route"], literal_routes)]
+                        serial_reqs = [(orig_i, r) for orig_i, r in reqs_with_idx if r[0] not in burst]
+                        mine = [pos for pos, (orig_i, r) in enumerate(serial_reqs) if mine_pred(orig_i, r)]
+                        serial = [d for rid, d in details.items() if rid not in snapshot_ids and rec_pred(d)]
                         times = [recording_time(d) for d in serial]
                         matched = []
                         if len(serial) != len(serial_reqs):
@@ -641,9 +760,9 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                                     + REQUEST_CORRELATION_GAP + ")")
                 elif not matched_all:
                     matched = []
-                elif len(matched_all) != len(reqs):
+                elif len(matched_all) != len(reqs_with_idx):
                     matched = []
-                    problems.append(f"attribution-ambiguous(recordings {len(matched_all)}, requests {len(reqs)})")
+                    problems.append(f"attribution-ambiguous(recordings {len(matched_all)}, requests {len(reqs_with_idx)})")
                 elif any(t is None for t in times):
                     matched = []
                     problems.append("attribution-ambiguous(recording time unknown)")
@@ -663,10 +782,10 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             elif not matched:
                 problems.append("no-recording-for-route")
             else:
-                seen = sorted({str(recording_http_status(d) or (d.get("outcome") or {}).get("kind")) for d in matched})
+                seen = sorted({str(_effective_status(d, e) or (d.get("outcome") or {}).get("kind")) for d in matched})
                 expected = e.get("outcome", e.get("status"))
-                if "statuses" in e and Counter(recording_http_status(d) for d in matched) != Counter(e["statuses"]):
-                    observed = sorted((recording_http_status(d) for d in matched), key=str)
+                if "statuses" in e and Counter(_effective_status(d, e) for d in matched) != Counter(e["statuses"]):
+                    observed = sorted((_effective_status(d, e) for d in matched), key=str)
                     problems.append(f"http-outcome-multiset-mismatch(expected {e['statuses']}, saw {observed})")
                 elif not with_status:
                     problems.append(f"http-outcome-mismatch(expected {expected}, saw {','.join(seen)})")
@@ -676,7 +795,8 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                     problems.append(f"count-below-minimum(need {need}, have {len(with_status)})")
             if (boundary is not None or serial_boundary is not None) and sid not in burst and any(d.get("completion") == "partial" for d in matched):
                 problems.append("partial-recording")
-            unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in OBSERVED_OUTCOME_KINDS]
+            allowed_kinds = (*OBSERVED_OUTCOME_KINDS, "unobserved") if e.get("allowUnobserved") is True else OBSERVED_OUTCOME_KINDS
+            unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in allowed_kinds]
             if with_status and unobserved:
                 problems.append("outcome-unobserved")
             layer_report = {}

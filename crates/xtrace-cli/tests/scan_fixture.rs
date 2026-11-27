@@ -10,6 +10,7 @@
 )]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -223,19 +224,107 @@ fn scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper() {
 }
 
 #[test]
-fn scan_rejects_jaxrs_until_an_analyzer_exists() {
-    let project = Project::new();
-    let analyzer = write_analyzer(project.dir.path(), TRANSCRIPT);
+fn scan_persists_jaxrs_operations_and_resolves_java_analyzer() {
+    let base = std::env::temp_dir().canonicalize().expect("canonical temp base");
+    let root = tempfile::Builder::new()
+        .prefix("xt-jaxrs-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(base)
+        .expect("temp root");
+    let repo = root.path().join("repo");
+    let data_home = root.path().join("data");
+    let src = repo.join("src/main/java/org/example");
+    fs::create_dir_all(&src).expect("src dir");
+    fs::write(
+        src.join("ClientsApiResource.java"),
+        "package org.example;\n@Path(\"/v1/clients\")\npublic class ClientsApiResource {\n    @GET\n    public String list() { return \"[]\"; }\n    @GET @Path(\"{clientId:\\\\d+}\")\n    public String one() { return \"{}\"; }\n}\n",
+    )
+    .expect("clients resource");
+    fs::write(
+        src.join("OfficesApiResource.java"),
+        "package org.example;\n@Path(\"/v1/offices\")\npublic class OfficesApiResource {\n    @PUT @Path(\"{officeId}\")\n    public String update() { return \"{}\"; }\n}\n",
+    )
+    .expect("offices resource");
+
+    let init = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("init");
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let jaxrs_transcript = r#"cat <<'EOF'
+{"type":"header","contractVersion":1,"analyzerName":"xtrace-java-static","analyzerVersion":"0.0.1","rulesetId":"jaxrs-annotations/1","framework":"jaxrs"}
+{"type":"claim","method":"GET","routeParts":["/v1/clients",""],"routeBasis":"literal","handler":"org.example.ClientsApiResource#list","limitations":[],"evidence":{"path":"org/example/ClientsApiResource.java","startLine":4,"startColumn":5,"endLine":4,"endColumn":8}}
+{"type":"claim","method":"GET","routeParts":["/v1/clients","{clientId:\\d+}"],"routeBasis":"literal","handler":"org.example.ClientsApiResource#one","limitations":[],"evidence":{"path":"org/example/ClientsApiResource.java","startLine":6,"startColumn":5,"endLine":6,"endColumn":8}}
+{"type":"claim","method":"PUT","routeParts":["/v1/offices","{officeId}"],"routeBasis":"literal","handler":"org.example.OfficesApiResource#update","limitations":[],"evidence":{"path":"org/example/OfficesApiResource.java","startLine":4,"startColumn":5,"endLine":4,"endColumn":8}}
+{"type":"end","claims":3,"filesScanned":2,"complete":true,"incompleteReasons":[]}
+EOF"#;
+    let analyzer = write_analyzer(root.path(), jaxrs_transcript);
+
     let output = Command::new(env!("CARGO_BIN_EXE_xtrace"))
         .args(["scan", "--project-dir"])
-        .arg(project.dir.path())
+        .arg(&repo)
         .arg("--source")
-        .arg(project.dir.path().join("src"))
+        .arg(repo.join("src/main/java"))
         .args(["--framework", "jaxrs", "--analyzer"])
         .arg(&analyzer)
+        .arg("--json")
+        .env("XTRACE_DATA_HOME", &data_home)
         .output()
-        .expect("run");
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
+        .expect("run xtrace scan --framework jaxrs");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document = json(&output);
+    assert_eq!(document["status"], "persisted_complete");
+    assert_eq!(document["persisted"], true);
+    assert!(document["catalogRevisionId"].is_string());
+    assert!(document["coverage"].as_str().expect("coverage").contains("@Path"));
+    let result = &document["result"];
+    assert_eq!(result["framework"], "jaxrs");
+    assert_eq!(result["rulesetId"], "jaxrs-annotations/1");
+    assert_eq!(result["completion"], "complete");
+    assert_eq!(result["claimCount"], 3);
+    let operations = result["operations"].as_array().expect("operations");
+    let routes: Vec<_> = operations
+        .iter()
+        .map(|op| {
+            (
+                op["method"].as_str().expect("method"),
+                op["routeTemplate"].as_str().expect("routeTemplate"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        routes,
+        [("GET", "/v1/clients"), ("GET", "/v1/clients/{id}"), ("PUT", "/v1/offices/{id}"),]
+    );
+
+    // Without --analyzer, jaxrs routes through XTRACE_JAVA_ANALYZER (not XTRACE_NODE_ANALYZER).
+    let via_env = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["scan", "--project-dir"])
+        .arg(&repo)
+        .arg("--source")
+        .arg(repo.join("src/main/java"))
+        .args(["--framework", "jaxrs", "--json"])
+        .env("XTRACE_DATA_HOME", &data_home)
+        .env("XTRACE_JAVA_ANALYZER", &analyzer)
+        .output()
+        .expect("run xtrace scan with XTRACE_JAVA_ANALYZER");
+    assert_eq!(via_env.status.code(), Some(0), "{via_env:?}");
+    assert_eq!(json(&via_env)["persisted"], true);
+
+    let missing_env = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["scan", "--project-dir"])
+        .arg(&repo)
+        .arg("--source")
+        .arg(repo.join("src/main/java"))
+        .args(["--framework", "jaxrs"])
+        .env_remove("XTRACE_JAVA_ANALYZER")
+        .output()
+        .expect("run xtrace scan without analyzer");
+    assert_eq!(missing_env.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing_env.stderr).contains("XTRACE_JAVA_ANALYZER"));
 }
 
 #[test]

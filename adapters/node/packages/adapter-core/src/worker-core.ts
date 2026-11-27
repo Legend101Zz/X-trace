@@ -11,6 +11,7 @@ import {
   ExceptionPayloadSchema,
   GapPayloadSchema,
   GapReason,
+  HealthSchema,
   InteractionKind,
   InteractionSchema,
   OutcomeKind,
@@ -66,6 +67,8 @@ export const MAX_HELD_EVENTS = 4096;
  */
 export const HOLD_START_MS = 250;
 
+const MAX_WORKER_BATCH_EVENTS = 256;
+
 interface RecordingState {
   bytes: Uint8Array;
   eventIds: string[];
@@ -79,7 +82,8 @@ interface RecordingState {
   routeLost: boolean;
   /** Route template announced while the request ran (framework match time); wins over the finish summary. */
   route?: string;
-  timer?: ReturnType<typeof setTimeout>;
+  timer?: ReturnType<typeof setTimeout> | undefined;
+  releasePromise?: Promise<void> | undefined;
 }
 
 /** Config the handshake advertises per capability name; unknown names are never advertised. */
@@ -249,8 +253,25 @@ export function capabilitySetFor(names: readonly string[]) {
   return create(CapabilitySetSchema, { capabilities });
 }
 
+export function healthForRejectedStarts(rejectedStarts: number, monotonicNs: bigint) {
+  const count = Math.max(0, Math.trunc(rejectedStarts));
+  return create(HealthSchema, {
+    monotonicNs,
+    queueDepthBatches: 0,
+    residentBytes: 0n,
+    status: `recording-starts-rejected=${count}`,
+  });
+}
+
+export interface RecordingAssemblerOptions {
+  /** Maximum events packed into one `EventBatch`; defaults to 1 to preserve unit-step assembly. */
+  maxBatchEvents?: number | undefined;
+}
+
 export interface RecordingAssembler {
   handle(message: InputMessage): Promise<boolean>;
+  /** Coalesces multiple ordered event messages for one recording up to the configured batch cap. */
+  handleEventBatch?(recordingId: string, messages: readonly InputMessage[]): Promise<boolean>;
   /** Sends held starts and their events for recordings that never finished (worker closing). */
   flushHeld(): Promise<void>;
 }
@@ -259,7 +280,9 @@ export function createRecordingAssembler(
   send: SendFn,
   now: () => bigint = () => process.hrtime.bigint(),
   holdMs: number = HOLD_START_MS,
+  options: RecordingAssemblerOptions = {},
 ): RecordingAssembler {
+  const batchLimit = Math.max(1, Math.min(Math.trunc(options.maxBatchEvents ?? 1), MAX_WORKER_BATCH_EVENTS));
   const recordings = new Map<string, RecordingState>();
 
   async function sendStart(recordingId: string, state: RecordingState, summary?: RecordingSummary): Promise<void> {
@@ -281,22 +304,79 @@ export function createRecordingAssembler(
     state.started = true;
   }
 
-  async function sendEvent(recordingId: string, state: RecordingState, message: InputMessage): Promise<void> {
-    if (typeof message.eventId !== "string" || typeof message.sequence !== "bigint") return;
-    await send(`node-http-${recordingId}-event-${message.sequence}`, {
+  async function sendEventBatch(recordingId: string, state: RecordingState, messages: readonly InputMessage[]): Promise<void> {
+    const valid = messages.filter(
+      (message): message is InputMessage & { eventId: string; sequence: bigint } =>
+        typeof message.eventId === "string" && typeof message.sequence === "bigint",
+    );
+    if (valid.length === 0) return;
+    const encoded = valid.map((message) => encodeEvent({ ...message, monotonicNs: message.monotonicNs ?? now() }));
+    const firstSeq = valid[0]!.sequence;
+    const lastSeq = valid[valid.length - 1]!.sequence;
+    const messageId = valid.length === 1
+      ? `node-http-${recordingId}-event-${firstSeq}`
+      : `node-http-${recordingId}-events-${firstSeq}-${lastSeq}`;
+    await send(messageId, {
       case: "eventBatch",
-      value: create(EventBatchSchema, { recordingId: state.bytes, events: [encodeEvent({ ...message, monotonicNs: message.monotonicNs ?? now() })] }),
+      value: create(EventBatchSchema, { recordingId: state.bytes, events: encoded }),
     }, recordingId);
-    state.eventIds.push(message.eventId);
+    for (const item of valid) state.eventIds.push(item.eventId);
+  }
+
+  async function sendEventsChunked(recordingId: string, state: RecordingState, messages: readonly InputMessage[]): Promise<void> {
+    for (let offset = 0; offset < messages.length; offset += batchLimit) {
+      await sendEventBatch(recordingId, state, messages.slice(offset, offset + batchLimit));
+    }
   }
 
   async function release(recordingId: string, state: RecordingState, summary?: RecordingSummary): Promise<void> {
-    if (state.timer) clearTimeout(state.timer);
-    if (!state.started) {
-      state.routeLost = summary === undefined;
-      await sendStart(recordingId, state, summary);
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = undefined;
     }
-    for (const held of state.held.splice(0)) await sendEvent(recordingId, state, held);
+    if (state.releasePromise) {
+      await state.releasePromise;
+    }
+    if (state.started && state.held.length === 0) return;
+    const run = (async () => {
+      if (!state.started) {
+        state.routeLost = summary === undefined;
+        await sendStart(recordingId, state, summary);
+      }
+      while (state.held.length > 0) {
+        const chunk = state.held.splice(0, batchLimit);
+        await sendEventBatch(recordingId, state, chunk);
+      }
+    })();
+    state.releasePromise = run;
+    try {
+      await run;
+    } finally {
+      if (state.releasePromise === run) state.releasePromise = undefined;
+    }
+  }
+
+  async function appendEvents(recordingId: string, state: RecordingState, messages: readonly InputMessage[]): Promise<void> {
+    if (messages.length === 0) return;
+    if (state.releasePromise) {
+      // Wait for an in-flight release() to finish draining state.held before sending newer events
+      // so recording_seq ordering stays strictly contiguous.
+      await state.releasePromise;
+    }
+    if (state.started && state.held.length === 0) {
+      await sendEventsChunked(recordingId, state, messages);
+      return;
+    }
+    if (state.held.length + messages.length <= MAX_HELD_EVENTS) {
+      state.held.push(...messages);
+      return;
+    }
+    const room = Math.max(0, MAX_HELD_EVENTS - state.held.length);
+    if (room > 0) state.held.push(...messages.slice(0, room));
+    await release(recordingId, state);
+    if (room < messages.length) {
+      await sendEventsChunked(recordingId, state, messages.slice(room));
+    }
   }
 
   return {
@@ -341,12 +421,7 @@ export function createRecordingAssembler(
         return true;
       }
       if (message.type === "event") {
-        if (state.started) await sendEvent(recordingId, state, message);
-        else if (state.held.length < MAX_HELD_EVENTS) state.held.push(message);
-        else {
-          await release(recordingId, state);
-          await sendEvent(recordingId, state, message);
-        }
+        await appendEvents(recordingId, state, [message]);
         return true;
       }
       if (message.type === "finish") {
@@ -374,10 +449,145 @@ export function createRecordingAssembler(
       }
       return false;
     },
+    async handleEventBatch(recordingId, messages) {
+      const state = recordings.get(recordingId);
+      if (!state) return false;
+      await appendEvents(recordingId, state, messages);
+      return true;
+    },
     async flushHeld() {
       for (const [recordingId, state] of recordings) {
         if (!state.started || state.held.length > 0) await release(recordingId, state);
       }
     },
+  };
+}
+
+export interface WorkerDeliverySchedulerOptions {
+  maxBatchEvents?: number | undefined;
+  beforeDeliver?: (() => Promise<void>) | undefined;
+  onStaged?: ((count: number) => void) | undefined;
+  onError?: ((error: unknown) => void) | undefined;
+}
+
+export interface WorkerDeliveryScheduler {
+  enqueue(message: InputMessage): void;
+  flush(): Promise<void>;
+  drain(): Promise<void>;
+}
+
+/**
+ * Per-recording FIFO scheduler that prioritizes recordings whose `finish` has arrived and
+ * coalesces consecutive `event` messages for the same recording up to `maxBatchEvents`.
+ */
+export function createWorkerDeliveryScheduler(
+  assembler: RecordingAssembler,
+  options: WorkerDeliverySchedulerOptions = {},
+): WorkerDeliveryScheduler {
+  const batchLimit = Math.max(1, Math.min(Math.trunc(options.maxBatchEvents ?? 1), MAX_WORKER_BATCH_EVENTS));
+  const mailboxes = new Map<string, InputMessage[]>();
+  const finishedIds = new Set<string>();
+  const orphanQueue: InputMessage[] = [];
+  let failed = false;
+  let pumpPromise: Promise<void> | undefined;
+
+  const pickNextRecordingId = (): string | undefined => {
+    for (const id of finishedIds) {
+      const box = mailboxes.get(id);
+      if (box && box.length > 0) return id;
+      finishedIds.delete(id);
+    }
+    for (const [id, box] of mailboxes) {
+      if (box.length > 0) return id;
+      mailboxes.delete(id);
+    }
+    return undefined;
+  };
+
+  const runPump = async (): Promise<void> => {
+    await options.beforeDeliver?.();
+    while (!failed) {
+      if (orphanQueue.length > 0) {
+        const orphan = orphanQueue.shift()!;
+        await assembler.handle(orphan);
+        options.onStaged?.(1);
+        continue;
+      }
+      const recordingId = pickNextRecordingId();
+      if (!recordingId) break;
+      const mailbox = mailboxes.get(recordingId)!;
+      const first = mailbox[0]!;
+      if (first.type === "event" && assembler.handleEventBatch) {
+        let count = 1;
+        while (count < batchLimit && count < mailbox.length && mailbox[count]!.type === "event") {
+          count += 1;
+        }
+        const batch = mailbox.splice(0, count);
+        if (mailbox.length === 0) {
+          mailboxes.delete(recordingId);
+          finishedIds.delete(recordingId);
+        }
+        await assembler.handleEventBatch(recordingId, batch);
+        options.onStaged?.(batch.length);
+        continue;
+      }
+      mailbox.shift();
+      if (mailbox.length === 0) {
+        mailboxes.delete(recordingId);
+        finishedIds.delete(recordingId);
+      }
+      await assembler.handle(first);
+      options.onStaged?.(1);
+    }
+  };
+
+  const ensurePump = (): Promise<void> => {
+    if (!pumpPromise) {
+      pumpPromise = runPump()
+        .catch((error) => {
+          failed = true;
+          mailboxes.clear();
+          finishedIds.clear();
+          orphanQueue.length = 0;
+          options.onError?.(error);
+        })
+        .finally(() => {
+          pumpPromise = undefined;
+          if (!failed && (orphanQueue.length > 0 || mailboxes.size > 0)) {
+            void ensurePump();
+          }
+        });
+    }
+    return pumpPromise;
+  };
+
+  const drain = async (): Promise<void> => {
+    while (!failed && (pumpPromise !== undefined || mailboxes.size > 0 || orphanQueue.length > 0)) {
+      await ensurePump();
+    }
+  };
+
+  return {
+    enqueue(message) {
+      if (failed) return;
+      const recordingId = message.recordingId;
+      if (typeof recordingId !== "string") {
+        orphanQueue.push(message);
+        void ensurePump();
+        return;
+      }
+      let mailbox = mailboxes.get(recordingId);
+      if (!mailbox) {
+        mailbox = [];
+        mailboxes.set(recordingId, mailbox);
+      }
+      mailbox.push(message);
+      if (message.type === "finish") {
+        finishedIds.add(recordingId);
+      }
+      void ensurePump();
+    },
+    flush: drain,
+    drain,
   };
 }

@@ -20,9 +20,11 @@ import {
   MAX_HELD_EVENTS,
   capabilitySetFor,
   createRecordingAssembler,
+  createWorkerDeliveryScheduler,
   encodeEvent,
   encodeOutcome,
   eventKindFor,
+  healthForRejectedStarts,
   sourceParts,
   wireStatus,
   type InputMessage,
@@ -309,4 +311,60 @@ test("every shared xtp-agent golden decodes with the shared protocol and re-enco
     checked += 1;
   }
   assert.ok(checked >= 10, `decoded ${checked} goldens`);
+});
+
+test("scheduler prioritizes finished recordings ahead of unfinished events and batches consecutive events", async () => {
+  const sent: Sent[] = [];
+  let releaseFirstSend!: () => void;
+  let sendCount = 0;
+  const assembler = createRecordingAssembler(async (id, payload) => {
+    sendCount += 1;
+    if (sendCount === 1) {
+      await new Promise<void>((resolve) => { releaseFirstSend = resolve; });
+    }
+    sent.push({ id, payload });
+    return undefined;
+  }, () => 5n, 250, { maxBatchEvents: 64 });
+
+  let stagedTotal = 0;
+  const scheduler = createWorkerDeliveryScheduler(assembler, {
+    maxBatchEvents: 64,
+    onStaged: (count) => { stagedTotal += count; },
+  });
+
+  const idA = "01900000-0000-7000-8000-00000000000a";
+  const idB = "01900000-0000-7000-8000-00000000000b";
+
+  // Recording A starts immediately (holdStart: false) and stalls on its first send.
+  scheduler.enqueue({ type: "start", recordingId: idA, method: "GET", startedAtNs: 1n, holdStart: false });
+  await new Promise((resolve) => setTimeout(resolve, 1));
+  scheduler.enqueue({ type: "event", recordingId: idA, kind: "frame-enter", eventId: `${idA}:2`, sequence: 2n, monotonicNs: 2n, symbol: "a" });
+  scheduler.enqueue({ type: "event", recordingId: idA, kind: "frame-exit", eventId: `${idA}:3`, sequence: 3n, monotonicNs: 3n, symbol: "a" });
+
+  // Recording B arrives later but already has its finish ready.
+  scheduler.enqueue({ type: "start", recordingId: idB, method: "POST", startedAtNs: 10n, holdStart: true });
+  scheduler.enqueue({ type: "event", recordingId: idB, kind: "frame-enter", eventId: `${idB}:2`, sequence: 2n, monotonicNs: 11n, symbol: "b1" });
+  scheduler.enqueue({ type: "event", recordingId: idB, kind: "frame-exit", eventId: `${idB}:3`, sequence: 3n, monotonicNs: 12n, symbol: "b2" });
+  scheduler.enqueue({ type: "finish", recordingId: idB, finalSequence: 3n, durationNs: 5n, droppedEvents: 0, summary: { route: "/b", outcome: "responded", httpStatus: 201 } });
+
+  releaseFirstSend();
+  await scheduler.drain();
+
+  // B's start, single batched EventBatch([2,3]), and finish complete BEFORE A's queued unfinished events.
+  assert.deepEqual(sent.map((entry) => entry.payload.case), [
+    "recordingStarted", // A start (was already in flight)
+    "recordingStarted", // B start (prioritized finish)
+    "eventBatch",       // B batched [2,3]
+    "recordingFinished",// B finish
+    "eventBatch",       // A coalesced [2,3]
+  ]);
+  assert.equal((sent[2]!.payload.value as { events: RecordingEvent[] }).events.length, 2);
+  assert.equal((sent[4]!.payload.value as { events: RecordingEvent[] }).events.length, 2);
+  assert.equal(stagedTotal, 7);
+});
+
+test("healthForRejectedStarts encodes canonical rejection count without leaking values", () => {
+  const health = healthForRejectedStarts(18, 123n);
+  assert.equal(health.status, "recording-starts-rejected=18");
+  assert.equal(health.monotonicNs, 123n);
 });
