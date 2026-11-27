@@ -8,7 +8,7 @@ use crate::error::CliError;
 #[cfg(unix)]
 const DAEMON_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(unix)]
-const NODE_PIPELINE_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_000);
+const NODE_PIPELINE_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_000);
 #[cfg(unix)]
 const NODE_PIPELINE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(15);
 #[cfg(unix)]

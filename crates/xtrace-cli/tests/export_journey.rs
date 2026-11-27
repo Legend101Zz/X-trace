@@ -17,11 +17,46 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde_json::Value;
-use tempfile::TempDir;
+
+const EXPORT_SCRATCH_SLOTS: usize = 64;
+static EXPORT_SLOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static NEXT_EXPORT_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+fn init_export_slots() -> Vec<PathBuf> {
+    let base = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .canonicalize()
+        .expect("canonical export test scratch base");
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let family = base.join(format!("xt-export-{}-{nanos}", std::process::id()));
+    fs::create_dir(&family).expect("create export scratch family");
+    fs::set_permissions(&family, fs::Permissions::from_mode(0o700)).expect("chmod family");
+    (0..EXPORT_SCRATCH_SLOTS)
+        .map(|slot| {
+            let dir = family.join(format!("s{slot:02}"));
+            fs::create_dir(&dir).expect("create export scratch slot");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod slot");
+            dir
+        })
+        .collect()
+}
+
+struct SlotDir(PathBuf);
+
+impl SlotDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
 
 struct Fx {
-    _root: TempDir,
+    _root: SlotDir,
     repo: PathBuf,
     data_home: PathBuf,
     project_id: String,
@@ -40,12 +75,13 @@ impl Drop for Fx {
 }
 
 fn fx() -> Fx {
-    let base = std::env::temp_dir().canonicalize().expect("canonical temp base");
-    let root = tempfile::Builder::new()
-        .prefix("xt-export-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(base)
-        .expect("temporary root");
+    let slots = EXPORT_SLOTS.get_or_init(init_export_slots);
+    let index = NEXT_EXPORT_SLOT.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        index < slots.len(),
+        "export_journey::EXPORT_SCRATCH_SLOTS ({EXPORT_SCRATCH_SLOTS}) exhausted"
+    );
+    let root = SlotDir(slots[index].clone());
     let repo = root.path().join("repo");
     let data_home = root.path().join("data");
     fs::create_dir_all(&repo).expect("repo");

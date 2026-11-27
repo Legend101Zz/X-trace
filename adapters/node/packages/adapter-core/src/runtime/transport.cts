@@ -5,7 +5,7 @@ export type { CaptureEvent };
 
 export const DEFAULT_MAX_IN_FLIGHT_MESSAGES = 2048;
 export const DEFAULT_MAX_ACTIVE_RECORDINGS = 256;
-export const DEFAULT_DRAIN_TIMEOUT_MS = 1500;
+export const DEFAULT_DRAIN_TIMEOUT_MS = 5000;
 
 /** Shared Int32Array layout shared between preload, transport, and transport-worker. */
 export const SHARED_CONTROL_WORDS = 4;
