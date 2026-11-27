@@ -91,6 +91,13 @@ fn create_v11_database(
         )
         .expect("seed v11 recording");
     }
+    drop(conn);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict v11 fixture sqlite file mode");
+    }
     (project, parent_rec, child_rec, parent_session, child_session)
 }
 
