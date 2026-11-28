@@ -18,6 +18,7 @@ import io
 import json
 import os
 import platform as pyplatform
+import shlex
 import shutil
 import stat
 import subprocess
@@ -88,23 +89,32 @@ def build_env(src: Path, epoch: int, target_dir: Path) -> dict:
         f"--remap-path-prefix={src}=/xtrace-src",
         f"--remap-path-prefix={cargo_home}=/cargo",
         f"--remap-path-prefix={target_dir}=/xtrace-target",  # build-script OUT_DIR paths (include!) end up in panic locations
-        "-C strip=symbols",
+        "-C",
+        "strip=symbols",
     ]
     if pyplatform.system() == "Darwin":
         # ld64 hashes the pre-strip debug map into LC_UUID; its object paths (N_OSO, below the
         # target directory) are not remapped, so the target directory's path length changed the
         # UUID and the ad-hoc signature. -S omits the debug map at link time; the stripped
         # payload is otherwise identical.
-        flags.append("-C link-arg=-Wl,-S")
-    rustflags = " ".join(flags)
-    cflags = (f"-ffile-prefix-map={src}=/xtrace-src -ffile-prefix-map={cargo_home}=/cargo "
-              f"-ffile-prefix-map={target_dir}=/xtrace-target")
+        flags.extend(["-C", "link-arg=-Wl,-S"])
+    # Use CARGO_ENCODED_RUSTFLAGS (\x1f-separated) so checkout paths containing spaces
+    # (for example, macOS external volumes) do not split --remap-path-prefix arguments.
+    encoded_rustflags = "\x1f".join(flags)
+    cflags = " ".join(
+        shlex.quote(arg)
+        for arg in (
+            f"-ffile-prefix-map={src}=/xtrace-src",
+            f"-ffile-prefix-map={cargo_home}=/cargo",
+            f"-ffile-prefix-map={target_dir}=/xtrace-target",
+        )
+    )
     env.update({
         "SOURCE_DATE_EPOCH": str(epoch), "TZ": "UTC", "LC_ALL": "C", "CARGO_INCREMENTAL": "0",
-        "CARGO_TARGET_DIR": str(target_dir), "RUSTFLAGS": rustflags, "CFLAGS": cflags,
-        "ZERO_AR_DATE": "1",
+        "CARGO_TARGET_DIR": str(target_dir), "CARGO_ENCODED_RUSTFLAGS": encoded_rustflags,
+        "CFLAGS": cflags, "ZERO_AR_DATE": "1",
     })
-    env.pop("CARGO_ENCODED_RUSTFLAGS", None)
+    env.pop("RUSTFLAGS", None)
     return env
 
 

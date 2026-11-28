@@ -1,26 +1,31 @@
 # X-trace
 
 [![Linux CI on main](https://github.com/Legend101Zz/X-trace/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/Legend101Zz/X-trace/actions/workflows/ci.yml?query=branch%3Amain)
-[![First release target 0.0.1, release candidate in progress](https://img.shields.io/badge/target-0.0.1_rc_in_progress-41776f)](docs/releases/v0.01.md)
-[![License MIT](https://img.shields.io/badge/license-MIT-41776f)](LICENSE)
+[![Pre-release v0.0.1](https://img.shields.io/badge/release-v0.0.1_preview-41776f)](https://github.com/Legend101Zz/X-trace/releases/tag/v0.0.1)
+[![Platforms: macOS arm64 & Linux x86_64](https://img.shields.io/badge/platforms-macOS_arm64_%7C_Linux_x86__64-2f5d62)](https://github.com/Legend101Zz/X-trace/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-41776f)](LICENSE)
 
-**Follow an HTTP request through your backend, one recorded call at a time.** X-trace is a local, privacy-first development tool for **Java** and **Node.js** backends. Send a request from a browser, a test, or Postman, then open its saved recording in the local viewer or terminal UI to see which handler ran, which methods and source lines executed, what interactions followed, and what outcome was observed.
+**Follow an HTTP request through your backend, one recorded call at a time.**
 
-[Watch the demo](#see-it-in-action) · [Quickstart](#how-to-use-x-trace) · [Release status](#release-status) · [Documentation](#project-documentation)
+X-trace is a local, privacy-first execution recorder for **Java** and **Node.js** services. Instead of scattering temporary `console.log` statements or pausing your server in a debugger, run your backend once under `xtrace run`, hit an endpoint from your browser, test suite, or Postman, and replay the saved execution afterward—in a local web viewer, an interactive terminal UI, or the CLI.
+
+[Demo](#see-it-in-action) · [Install](#installation) · [Quickstart](#quickstart) · [How it works](#how-it-works) · [Supported stacks](#supported-stacks) · [Privacy & security](#privacy--local-first-security) · [Release status](#release-status)
+
+---
 
 ## See it in action
 
-Recorded directly in Chromium (`1280×800`) against Spring Petclinic running under `xtrace run --capture-depth focused`:
+Recorded directly in Chromium (`1280×800`) against **Spring Petclinic** running under `xtrace run --capture-depth focused`:
 
-![X-trace local viewer walkthrough showing Requests, Steps with highlighted Java source lines and Evidence inspector, Map call tree, and Export sheet](docs/demo/xtrace-demo.gif)
+![X-trace local viewer walkthrough showing Requests, Steps with highlighted Java source lines and Evidence inspector, Map call tree, and Export dialog](docs/demo/xtrace-demo.gif)
 
-**[Download / watch full 1280×800 MP4 video (`xtrace-demo.mp4`)](docs/demo/xtrace-demo.mp4)**
+**[Watch / download the full 1280×800 MP4 video (`xtrace-demo.mp4`)](docs/demo/xtrace-demo.mp4)**
 
 | Steps, highlighted Code & Evidence | Map (call relationships) | Export (OpenAPI, Postman, cURL, Bundle) |
 | --- | --- | --- |
-| ![Steps view with highlighted Petclinic VetController.java line 77 and Evidence inspector](docs/demo/demo-steps.png) | ![Map view showing call tree alongside VetController.java source](docs/demo/demo-map.png) | ![Export dialog showing OpenAPI 3.1, Postman Collection 2.1, cURL recipes, and Developer bundle](docs/demo/demo-export.png) |
+| ![Steps view highlighting VetController.java line 77 with the Evidence inspector](docs/demo/demo-steps.png) | ![Map view showing the recorded call tree alongside VetController.java](docs/demo/demo-map.png) | ![Export dialog showing OpenAPI 3.1, Postman Collection 2.1, cURL recipes, and Developer bundle](docs/demo/demo-export.png) |
 
-Prefer the terminal? Open the exact same recordings in **`xtrace tui`**:
+Prefer staying in the terminal? **`xtrace tui`** opens the exact same saved recordings with keyboard stepping (`↑/↓`, `[ ]`, `i / o / u`):
 
 ```text
 X-trace · recordings
@@ -30,11 +35,19 @@ X-trace · recordings
   01a21ef1-eaa1-7aea-a21d-d0bb95c9c9ab  complete  157 events  GET /owners             responded
 ```
 
-## What problem does it solve?
+---
 
-An endpoint list can tell you that `POST /orders` exists. A response can tell you it returned `201`. When you're new to a codebase or debugging an unexpected status code, the harder question is **which code actually handled this request?** The route definition, controller, service, repository, and error handler often live in different files. A recording gives you one persisted execution to step through after the request has finished.
+## Why X-trace?
 
-The repository includes a small Spring application that makes this concrete. On a successful order, its controller calls a service, the service calls a repository, and the repository inserts a row through JDBC. Its error case returns `500` from the controller after a service exception. Those two requests reach the same endpoint and take different paths. [Fixture source](adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture) · [Capture journey](crates/xtrace-cli/tests/java_premain_spring.rs)
+When you're onboarding to an unfamiliar codebase—or chasing down why a `POST /orders` request returned `500` instead of `201`—existing tools each show only one slice of the picture:
+
+- **Logs** only tell you what someone remembered to log.
+- **Postman and curl** tell you what went over the wire, not which service method or branch ran.
+- **Breakpoints** freeze live traffic and disappear the moment you restart the server.
+
+**X-trace records one real request at a time into a local project store.** You can stop your app, reopen the recording later, step forward and backward through every observed call without re-sending the HTTP request, and—when you've scanned routes—export clean OpenAPI, Postman, or cURL templates straight from your project.
+
+Consider two requests to the same `POST /orders` endpoint in the built-in [Spring fixture](adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture):
 
 ```mermaid
 sequenceDiagram
@@ -44,140 +57,240 @@ sequenceDiagram
     participant R as OrderRepository
     C->>H: POST /orders
     H->>S: place
-    alt Successful request
+    alt Successful request (201)
         S->>R: save
-        Note over R: Insert one row via JDBC
+        Note over R: Inserts a row via JDBC
         H-->>C: 201 Created
-    else Fixture error case
+    else Error case (500)
         S-->>H: FixtureRequestedException
         H-->>C: 500 Internal Server Error
     end
 ```
 
-## What does a recording show?
+Both requests hit the exact same route, yet take different paths through the codebase. X-trace saves both executions so you can compare them side by side.
 
-Choose a request in the local viewer and step through its events. **Steps** displays them in order with keyboard navigation (`Alt+↑/↓`, Step in / over / out). **Map** shows their recorded call relationships. The terminal viewer (`xtrace tui`) and CLI also read saved recordings. You can reopen any recording after stopping the application.
+---
 
-| In the viewer | How to read it |
-| --- | --- |
-| A captured call | The adapter observed that call during this request. A route found by a static scan alone says only that the route was discovered. |
-| A highlighted source line | The recording contains a line event (`--capture-depth focused` on Java). Method-level capture identifies the method without claiming which line executed. |
-| A value or an omission | Focused Java capture includes bounded values from the selected application scope. Redaction, truncation, and unavailable source or values are disclosed explicitly. |
-| A partial recording | Some evidence is missing (for example, a process killed mid-request or an untransformed class). You can inspect every captured event while leaving missing steps clearly disclosed. |
+## Installation
 
-The application adapter sends events over pinned loopback TLS to the local X-trace daemon, which persists them in your private project store. Viewing a recording reads that stored evidence; stepping backward never replays the original HTTP request. [Architecture](docs/plans/x-trace/02-architecture.md) · [Recording limitations](docs/decisions/0011-recording-limitations.md) · [Local security model](docs/security-local.md)
+### Option 1: Pre-built `v0.0.1` archives (macOS Apple Silicon & Linux x86_64)
 
-```mermaid
-flowchart TD
-    Client["Browser, test, or Postman"] -->|HTTP request| App["Your Java or Node.js app"]
-    App -->|Adapter emits observed events over loopback TLS| Daemon["Local X-trace daemon"]
-    Daemon -->|Persist| Store[("Private project store: SQLite + XTF segments")]
-    Store -->|Read recording| Views["Local browser viewer, xtrace tui, or CLI"]
-    Store -->|Read catalog revision| Export["OpenAPI 3.1, Postman 2.1, cURL, or bundle"]
+Download the archive and `SHA256SUMS` from the **[v0.0.1 Pre-release](https://github.com/Legend101Zz/X-trace/releases/tag/v0.0.1)**, verify the checksum, and run the included installer:
+
+```sh
+# 1. Pick your platform: macos-arm64 or linux-x86_64
+PLATFORM="macos-arm64"   # or "linux-x86_64"
+VERSION="0.0.1"
+
+# 2. Extract and install into ~/.local/xtrace (or pass --prefix /your/path)
+tar -xzf "xtrace-${VERSION}-${PLATFORM}.tar.gz"
+cd "xtrace-${VERSION}-${PLATFORM}"
+./install.sh install
+
+# 3. Add X-trace to your PATH (install.sh never modifies shell profiles automatically) and verify
+export PATH="$HOME/.local/xtrace/bin:$PATH"
+xtrace --version
 ```
 
-## How does X-trace fit with Postman?
+> **Note:** Both `v0.0.1` preview archives (macOS `arm64` and Linux `x86_64`) are currently unsigned and not notarized. On macOS, if your browser adds a quarantine attribute to the downloaded tarball, run `xattr -dr com.apple.quarantine xtrace-0.0.1-macos-arm64.tar.gz` before extracting. To uninstall at any time, run `./uninstall.sh`.
 
-| Question | Where to start |
-| --- | --- |
-| What happens if I send this payload or change a header? | **Postman.** Build and send the request, inspect the response, and write assertions against it. |
-| Which application method and source line handled that request? | **X-trace.** Open the recording for your instrumented local service and inspect the observed calls, source evidence, and outcome. |
-| How can I repeat a case and explain a surprising result? | **Use both.** Send requests from Postman (or tests) to your running instrumented service, then inspect the resulting recording in X-trace. |
+### Option 2: Build from source
 
-You can also go from X-trace to Postman. With a persisted catalog revision (`xtrace scan`), export a local Collection v2.1 file, import `collection.postman.json` into Postman, and set its empty `baseUrl` variable to your local service. Exports contain request templates only — captured request bodies, cookies, and credentials are never exported. [X-trace collection exporter](crates/xtrace-export/src/postman.rs)
+Requires **Rust** (stable, per `rust-toolchain.toml`), a C compiler, **JDK 17+**, and **Node.js 22 or 24**.
 
-## How to use X-trace
+```sh
+git clone https://github.com/Legend101Zz/X-trace.git
+cd X-trace
 
-Start in the X-trace checkout on macOS or Linux (or use a candidate `0.0.1` archive built by `packaging/build.py`). From source, replace `xtrace` below with `cargo run --locked -p xtrace-cli --bin xtrace --`. [Setup guide](docs/development/setup.md#experimental-xtrace-run) · [Build environment](tools/dev/README.md)
+# Build a deterministic local package for your machine
+python3 packaging/build.py --out dist
+sh packaging/install.sh verify-dist dist/*
+
+# Or run the CLI directly during development
+cargo run --locked -p xtrace-cli --bin xtrace -- --help
+```
+
+See [tools/dev/README.md](tools/dev/README.md) and [docs/development/setup.md](docs/development/setup.md#experimental-xtrace-run) for build caches and developer tooling.
+
+---
+
+## Quickstart
 
 ### 1. Initialize your application repository
 
-Creates a local `.xtrace/config.toml` pointer in your app repo; recordings stay in your private X-trace data directory (`XTRACE_DATA_HOME`).
+Point X-trace at your app directory once. This writes a lightweight `.xtrace/config.toml` project pointer in the repo while storing all recordings separately in your private X-trace data directory (`XTRACE_DATA_HOME`).
 
 ```sh
 project_dir="/absolute/path/to/your/app"
 xtrace init --project-dir "$project_dir" --display-name "My Service"
 ```
 
-### 2. Optional: Scan routes statically (Java Spring MVC or JAX-RS)
+### 2. Run your backend under X-trace
 
-Persist an endpoint catalog revision so recordings can link to discovered routes and exports are immediately available:
+Start your app normally through `xtrace run`, send requests from your browser, tests, `curl`, or Postman, and press `Ctrl+C` when done. X-trace drains in-flight recordings cleanly on shutdown.
+
+#### Java (Spring MVC, Spring WebFlux, Servlet, Jersey / JAX-RS)
 
 ```sh
-# Spring MVC
+xtrace_home="$HOME/.local/xtrace/current"
+
+# Optional: statically scan routes first so exports & endpoint grouping work immediately
 xtrace scan --project-dir "$project_dir" --source "$project_dir/src/main/java" --framework spring-mvc
+# For JAX-RS / Jersey (jakarta.ws.rs or javax.ws.rs), use: --framework jaxrs
 
-# JAX-RS / Jersey (jakarta.ws.rs & javax.ws.rs)
-xtrace scan --project-dir "$project_dir" --source "$project_dir/src/main/java" --framework jaxrs
-```
-
-### 3. Run your backend with X-trace
-
-Send normal HTTP traffic from your browser, tests, `curl`, or Postman while the service runs, then stop with `Ctrl+C` (X-trace drains in-flight recordings cleanly on shutdown):
-
-```sh
-# Java (Spring MVC, Spring WebFlux, Servlet, Jersey / JAX-RS)
-# Add `--capture-depth focused` for executed source lines and bounded local values.
+# Launch with focused capture (highlights exact executed source lines & bounded local values)
 xtrace run --project-dir "$project_dir" \
-  --java-agent /path/to/xtrace-java-agent.jar \
+  --java-agent "$xtrace_home/share/xtrace/packs/java/agent/xtrace-java-agent.jar" \
   --capture-depth focused \
   --app-package com.example.myapp \
   --source-root src/main/java -- \
   java -jar target/myapp.jar
 ```
 
+#### Node.js (Node 22–24: HTTP, Express 4/5, Fastify 4/5, NestJS, PostgreSQL, MySQL, Outbound HTTP)
+
 ```sh
-# Node.js 22–24 (node:http, Express 4/5, Fastify 4/5, NestJS, pg, mysql/mysql2, outbound HTTP)
+xtrace_home="$HOME/.local/xtrace/current"
+
 xtrace run --project-dir "$project_dir" \
-  --node-adapter /path/to/packs/node/dist \
+  --node-adapter "$xtrace_home/share/xtrace/packs/node/dist" \
   --node-mode auto -- \
   node dist/server.js
 ```
 
-### 4. Inspect recordings in the browser, TUI, or CLI
+*(If you passed a custom `--prefix` to `./install.sh`, set `xtrace_home="<your-prefix>/current"`.)*
 
-The browser viewer prints a short-lived, single-use loopback URL and stays in the foreground. Treat the viewer URL as a temporary local credential.
+### 3. Replay recordings in Chrome, the terminal, or the CLI
 
 ```sh
-# Local browser viewer (Steps, Map, Code, Evidence, Export)
+# Open the local browser viewer (Steps, Map, Code, Evidence, Export)
 xtrace open --project-dir "$project_dir" --viewer
 
-# Interactive terminal viewer (or add `--plain` for non-interactive output)
+# Or browse in the interactive terminal viewer (add --plain for non-interactive output)
 xtrace tui --project-dir "$project_dir"
 
-# CLI listing and JSON detail
+# Or query saved recordings as JSON from scripts
 xtrace recording list --project-dir "$project_dir"
 ```
 
-### 5. Export OpenAPI, Postman, cURL, or a Developer Bundle
+> **Tip:** `xtrace open --viewer` runs in the foreground and prints a short-lived, single-use loopback URL. Keep the terminal running while you explore, and treat the URL like a temporary local credential.
 
-Always preview before writing to a fresh private output directory:
+### 4. Export OpenAPI, Postman, cURL, or a Developer Bundle
+
+Always preview first, then write into a fresh private (`0700`) directory:
 
 ```sh
 xtrace export --project-dir "$project_dir" --format postman --preview
-export_dir="$(mktemp -d)"
+
+export_dir="$(mktemp -d)" && chmod 700 "$export_dir"
 xtrace export --project-dir "$project_dir" --format bundle --output "$export_dir"
+ls -la "$export_dir"
 ```
+
+Supported formats: `openapi` (OpenAPI 3.1), `postman` (Collection v2.1), `curl` (shell recipes), and `bundle` (all three plus a manifest with file hashes and counts).
+
+---
+
+## How it works
+
+```mermaid
+flowchart TD
+    Client["Browser, test suite, or Postman"] -->|HTTP request| App["Your Java or Node.js service"]
+    App -->|Adapter streams events over loopback TLS 1.3| Daemon["Local X-trace daemon"]
+    Daemon -->|Persist| Store[("Private local store: SQLite + XTF segments")]
+    Store -->|Read-only replay| Views["Local web viewer, xtrace tui, or CLI"]
+    Store -->|Read catalog revision| Export["OpenAPI 3.1, Postman 2.1, cURL, or bundle"]
+```
+
+X-trace is built around **honest evidence**. Rather than guessing what happened when something wasn't observed, every view tells you exactly what the recording contains:
+
+| What you see | What it guarantees |
+| --- | --- |
+| **Captured call** | The runtime adapter directly observed that method or handler during this request. Static scan results are shown separately as discovered routes, never disguised as executed calls. |
+| **Highlighted source line** | A `line_cursor` event was recorded (`--capture-depth focused` on Java). Method-level capture shows the method without claiming which line ran. |
+| **Value or omission** | Focused Java capture records bounded values in your configured `--app-package` scope. Redactions, truncations, and unavailable values are explicitly disclosed. |
+| **Partial recording** | Something interrupted capture (for example, a killed process mid-request or an untransformed class). Every captured event remains inspectable with missing parts marked honestly. |
+
+Read more in [Architecture](docs/plans/x-trace/02-architecture.md) and [Recording limitations (ADR 0011)](docs/decisions/0011-recording-limitations.md).
+
+---
+
+## Supported stacks
+
+| Runtime | Frameworks & interactions | Static scan & exports | Source lines & values |
+| --- | --- | --- | --- |
+| **Java 17 & 21** | Spring MVC, Spring WebFlux, Servlet, Jersey / JAX-RS, JDBC (including PostgreSQL) | `spring-mvc` & `jaxrs` (`jakarta.ws.rs` / `javax.ws.rs`) → OpenAPI 3.1, Postman 2.1, cURL, Bundle | Method-level (standard) + executed lines & bounded local values (`--capture-depth focused`) |
+| **Node.js 22 & 24** | `node:http`, Express 4 & 5, Fastify 4 & 5, NestJS, PostgreSQL (`pg`), MySQL (`mysql`/`mysql2`), outbound HTTP/`fetch`, worker & child-process linkage | Planned for upcoming release | Request/framework/DB/outbound frames captured today; source lines & values honestly disclosed as unavailable |
+
+### Using X-trace alongside Postman
+
+- **Need to craft payloads, test headers, or run response assertions?** Start in **Postman**.
+- **Need to see which controller, service, repository, or SQL call actually handled that request?** Open the recording in **X-trace**.
+- **Using both together:** Send requests from Postman to your instrumented local service, inspect the execution in X-trace, or export a fresh `collection.postman.json` from X-trace (with an empty `baseUrl` variable and zero captured secrets) straight into Postman.
+
+---
+
+## Privacy & local-first security
+
+X-trace is designed for local development on real codebases without leaking sensitive data:
+
+- **100% loopback local:** Zero cloud sync, telemetry, or external network requests. The viewer runs strictly on `127.0.0.1`.
+- **Authenticated transport:** Adapters connect to the local daemon over pinned TLS 1.3 with per-session credentials.
+- **Private storage by default:** Project stores and exports enforce `0700` directories and `0600` files, refusing world-writable locations.
+- **No secrets in exports:** Request bodies, `Authorization` headers, cookies, and query secrets are excluded from exported OpenAPI, Postman, cURL, and bundle files.
+- **Continuous canary testing:** Automated real-app campaigns inject synthetic secret canaries across headers, cookies, query strings, JSON bodies, and environment variables and scan every persisted store, log, API response, DOM snapshot, and export surface fail-closed.
+
+See [Local security model](docs/security-local.md) for the full threat model.
+
+---
 
 ## Release status
 
-The first public release target is **v0.01** (package version **0.0.1**). Core product implementation for Java, Node.js, the v2 Simple browser viewer, the interactive TUI, static route scanners, and all four local export formats has merged to `main` and passed Linux CI (`69e3d02`). Formal acceptance across all 55 mandatory requirements awaits final owner Stage C sign-off (macOS arm64 verification, fresh installs, usability sessions, cross-vendor review, and Ed25519 release signing). [Release tracker](https://github.com/Legend101Zz/X-trace/issues/1) · [Acceptance ledger](evidence/v0.01/requirements.json) · [Published releases](https://github.com/Legend101Zz/X-trace/releases)
+The current release is **`v0.0.1` (Early Preview / Pre-release)** for **macOS Apple Silicon (`macos-arm64`)** and **Linux (`linux-x86_64`)**.
 
-| Area | Implemented and verified on Linux CI | Remaining for formal 0.0.1 acceptance |
-| --- | --- | --- |
-| **Java** | Spring MVC, Spring WebFlux, Servlet/Jersey capture; focused executed lines & bounded values; `spring-mvc` and `jaxrs` (`jakarta.ws.rs` / `javax.ws.rs`) static analyzers; graceful shutdown. **Spring Petclinic**: **45/45** checks green (`1.16×` p50 overhead, zero privacy leaks). **JHipster v9.4.0**: 36/45 passing/reported (43 export files, 7/8 scenarios). **Apache Fineract 1.15.0**: 30/45 passing/reported (675 JAX-RS operations exported across OpenAPI, Postman, cURL & bundle). | Remaining JHipster/Fineract class-transformation gaps on optional classes and full 45/45 green gates on those two apps. |
-| **Node.js** | `node:http`, Express 4/5, Fastify 4/5, NestJS, PostgreSQL (`pg`), MySQL (`mysql`/`mysql2`), outbound HTTP/fetch, process linkage, and bounded `10s` graceful shutdown drain & burst capacity. **Directus** (46 recordings), **Medusa** (49 recordings), and **Vendure** (48 recordings) all capture with 100% matching semantic fingerprints, zero dropped requests, clean shutdown, and passing Chromium viewer checks. | Node frame source locations (`source_locations_unavailable`), focused values (`values_unavailable`), and Node static catalog export wiring (all honestly disclosed today). |
-| **Viewer, TUI & Exports** | Local v2 Simple browser viewer (`Steps`, `Map`, `Code`, `Evidence`, `Export` modal; verified in Chromium at `320 / 736 / 1280 px`), interactive `xtrace tui` PTY replay, and OpenAPI 3.1 / Postman 2.1 / cURL / Bundle exports with zero secret leakage. | Usability sessions and final owner UI walkthrough. |
-| **Distribution & Signing** | Linux `x86_64` `0.0.1` candidate archive built and verified (`package.yml`, `package-verification.json: ok`), automated Chromium demo recorder (`demo-video.yml`). | macOS `arm64` release check & archive, fresh Mac/Linux install proofs, cross-vendor review sign-off, and Ed25519 release signing. |
+### What's verified today
 
-**Latest verified CI runs:** [Linux package `0.0.1` on `69e3d02`](https://github.com/Legend101Zz/X-trace/actions/runs/46068763422) · [Java campaigns (Petclinic 45/45, JHipster, Fineract)](https://github.com/Legend101Zz/X-trace/actions/runs/46068767524) · [Node campaigns (Directus, Medusa, Vendure)](https://github.com/Legend101Zz/X-trace/actions/runs/46071080995) · [Chromium demo walkthrough](https://github.com/Legend101Zz/X-trace/actions/runs/46071076492)
+- **Linux CI (`main`)**: 8/8 required gates passing across JDK 17/21 and Node 22/24, including 23 pinned release-floor gates and deterministic package verification.
+- **macOS `arm64`**: `0.0.1` package builds cleanly (`11/11` verifier checks passing, byte-identical embedded UI assets) and runs focused Java & Node capture locally.
+- **Real-world application campaigns (hosted Linux CI)**:
+  - **Spring Petclinic**: **45/45 checks green** (`1.16×` p50 overhead, 65 recordings, focused source lines & bounded values, all 4 exports, Chromium `320/736/1280 px`, `xtrace tui`, zero privacy leaks) — [Run 46068767524](https://github.com/Legend101Zz/X-trace/actions/runs/46068767524).
+  - **JHipster v9.4.0**: 36/45 passing/reported (43 export files / 38 ops, Chromium `320/736/1280 px`, `xtrace tui`, zero leaks).
+  - **Apache Fineract 1.15.0**: 30/45 passing/reported (**675 JAX-RS operations** exported across 680 files via `--framework jaxrs`, Chromium `320/736/1280 px`, `xtrace tui`, zero leaks).
+  - **Directus (Node 22), Medusa (Node 24), Vendure (Node 24)**: All three capture end-to-end with **100% matching semantic fingerprints**, zero dropped requests (`46/45`, `49/48`, `48/47`), clean shutdown drain, and passing Chromium `320/736/1280 px` viewer journeys — [Run 46071080995](https://github.com/Legend101Zz/X-trace/actions/runs/46071080995).
+
+### What's next on the roadmap
+
+- **Formal `0.0.1` signed acceptance** ([Issue #1](https://github.com/Legend101Zz/X-trace/issues/1) · [Acceptance ledger](evidence/v0.01/requirements.json)): full `macos-release-check.sh` archive, fresh-profile install proofs, human usability sessions, owner walkthrough, and Ed25519 release signing.
+- **Node.js source locations & static catalog exports**: source-map-backed file/line bindings and static route scanning for Express/Fastify/NestJS.
+- **Java optional-class transform resilience**: eliminating remaining `class_not_transformed` partial-recording counts on large multi-module apps like Fineract and JHipster.
+
+---
+
+## Frequently asked questions
+
+**Does stepping backward in the viewer re-run my HTTP request?**
+No. Viewing and stepping through a recording is 100% read-only against the saved SQLite + XTF store. You can safely inspect `POST` or `DELETE` requests even after stopping your server.
+
+**Why does a recording say `Partial`?**
+X-trace never pretends an incomplete capture is complete. A recording is marked `Partial` if the app exited or was killed while the request was still in flight, if an event queue reached its memory bound, or if a class could not be instrumented. Click **Why?** in the viewer to see the exact reason.
+
+**Where are recordings stored, and how do I clean them up?**
+Your application repository only contains `.xtrace/config.toml` (safe to add to `.gitignore`). The actual SQLite metadata and XTF event segments live in `$XTRACE_DATA_HOME` (defaulting to your OS user data directory). Deleting that project folder removes all recordings cleanly.
+
+---
 
 ## Project documentation
 
-- [Product design](docs/plans/x-trace/01-product.md) describes the endpoint-to-source workflow.
-- [Development tools](tools/dev/README.md) covers dependencies, build caches, and local checks.
-- [Release specification](docs/releases/v0.01.md) lists the runtime, platform, and usability commitments.
-- [Owner review guide](docs/owner-review/README.md) walks through final Stage C release acceptance.
-- [Documentation index](docs/INDEX.md) links the storage format, protocol, viewer API, and architecture decision records.
+- [Product design](docs/plans/x-trace/01-product.md) — workflow goals and replay concepts
+- [Architecture](docs/plans/x-trace/02-architecture.md) — daemon, XTP transport, XTF storage, and adapters
+- [Local security model](docs/security-local.md) — loopback TLS, permissions, and privacy guarantees
+- [Developer setup & build tools](tools/dev/README.md) — local prerequisites, caches, and verification commands
+- [Release specification (`v0.01`)](docs/releases/v0.01.md) — platform, runtime, and evidence commitments
+- [Owner review checklist](docs/owner-review/README.md) — Stage C manual walkthrough journeys
+- [Full documentation index](docs/INDEX.md) — schemas, protocol specs, viewer API, and ADRs
 
-X-trace uses the [MIT license](LICENSE).
+---
+
+## License
+
+X-trace is open-source software licensed under the [MIT License](LICENSE).
